@@ -1,7 +1,7 @@
-//! The requests of plan_joint_path and check_joint_path, parsed against the robot's arms:
-//! the arms, where each one's path starts, and each arm's goal or its waypoints, in the
-//! terms of motion_planning_core. A request that does not parse is refused with
-//! `rejected`, and the message says what to send instead.
+//! The requests of plan_joint_path, plan_cartesian_path and check_joint_path, parsed
+//! against the robot's arms: the arms, where each one's path starts, and each arm's goal,
+//! its poses or its waypoints, in the terms of motion_planning_core. A request that does
+//! not parse is refused with `rejected`, and the message says what to send instead.
 
 use std::time::Duration;
 
@@ -9,10 +9,11 @@ use chain_kinematics::nalgebra::{Isometry3, Vector3};
 use collision_geometry::chain::Rider;
 use control_core::positive_finite::PositiveFinite;
 use motion_planning_core::{
-    Axis, Frame, Goal, GoalError, JointTarget, OrientationTarget, PositionTarget,
-    orientation_from_parts,
+    Axis, FollowedFrame, Frame, Goal, GoalError, JointTarget, OrientationTarget, PositionTarget,
+    orientation_from_parts, pose_from_parts, poses_in_range,
 };
 use openarm_description::{ARM_DOF, ArmOrder, ArmPair, Side};
+use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalGoalJointConstraintsItem, GoalGoalOrientationConstraintsItem,
     GoalGoalPositionConstraintsItem, GoalRequestData,
@@ -56,6 +57,20 @@ pub struct CheckQuery {
     pub starts: ArmStarts,
     /// The waypoints after the start of the arms the request names, at least one.
     pub waypoints: Checked,
+}
+
+/// A plan_cartesian_path goal that parses.
+#[derive(Debug)]
+pub struct CartesianQuery {
+    /// The arm the path moves.
+    pub side: Side,
+    /// Where its path starts.
+    pub starts: ArmStarts,
+    /// What follows the lines.
+    pub frame: FollowedFrame,
+    /// The poses it passes through.
+    pub poses: Vec<Isometry3<f64>>,
+    pub avoid_collisions: bool,
 }
 
 /// The waypoints of a check: one arm's, or both arms' together, as many for each.
@@ -176,6 +191,54 @@ pub fn parse_plan(
         starts,
         arm_goals,
         time_limit: Duration::from_secs_f64(time),
+    })
+}
+
+/// Parses a plan_cartesian_path goal against `arms`, whose fingers hang as `fingers` hold
+/// them.
+pub fn parse_cartesian(
+    raw: &plan_cartesian_path::GoalRequestData,
+    arms: &ArmPair<ArmModel>,
+    fingers: &ArmPair<Vec<Rider>>,
+) -> Result<CartesianQuery, String> {
+    let side = Side::BOTH
+        .into_iter()
+        .find(|side| arms[*side].name == raw.arm_name)
+        .ok_or_else(|| {
+            format!(
+                "arm_name names \"{}\", no arm of this robot: its arms are \"{}\" and \"{}\"",
+                raw.arm_name,
+                arms[Side::Left].name,
+                arms[Side::Right].name
+            )
+        })?;
+    let arm = &arms[side];
+    let mut starts = ArmPair::new(None, None);
+    starts[side] = start_of(arm, &raw.start_joint_positions)?;
+    let frame = frame_of(arm, &fingers[side], &raw.link_name)
+        .ok_or_else(|| none_has(&[arm], "link", &raw.link_name, |arm| &arm.link_names))?;
+    let frame = FollowedFrame::of(arm.geometry.chain(), frame).ok_or_else(|| {
+        format!(
+            "{} is not fixed to {}, so a path cannot keep it on a line; send {}, or a link fixed to it",
+            raw.link_name, arm.grasp_link, arm.grasp_link
+        )
+    })?;
+    let poses = raw
+        .waypoints
+        .iter()
+        .enumerate()
+        .map(|(k, w)| {
+            pose_from_parts(w.position, w.orientation)
+                .map_err(|e| format!("waypoint {}: {e}", k + 1))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    poses_in_range(&poses)?;
+    Ok(CartesianQuery {
+        side,
+        starts,
+        frame,
+        poses,
+        avoid_collisions: raw.avoid_collisions,
     })
 }
 
@@ -595,6 +658,93 @@ mod tests {
         let fingers =
             riders_of_both_arms(&OPENARM_V2.self_model, arms()).expect("the arms' fingers");
         parse_plan(goal, arms(), &fingers)
+    }
+
+    /// A Cartesian path of the left arm's grasp point through one pose, from where it stands.
+    fn cartesian_goal() -> plan_cartesian_path::GoalRequestData {
+        plan_cartesian_path::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            start_joint_positions: Vec::new(),
+            link_name: "openarm_left_tcp".to_string(),
+            waypoints: vec![plan_cartesian_path::GoalWaypointsItem {
+                position: [0.4, 0.2, 0.5],
+                orientation: [0.0, 0.0, 0.0, 1.0005],
+            }],
+            avoid_collisions: true,
+        }
+    }
+
+    fn parse_cartesian_goal(
+        goal: &plan_cartesian_path::GoalRequestData,
+    ) -> Result<CartesianQuery, String> {
+        let fingers =
+            riders_of_both_arms(&OPENARM_V2.self_model, arms()).expect("the arms' fingers");
+        parse_cartesian(goal, arms(), &fingers)
+    }
+
+    // A Cartesian path names its arm, where it starts, the frame it follows, and each pose
+    // with its orientation normalized.
+    #[test]
+    fn a_cartesian_goal_parses_into_its_arm_frame_and_poses() {
+        let query = parse_cartesian_goal(&cartesian_goal()).expect("a query");
+        assert_eq!(query.side, Side::Left);
+        assert_eq!(query.starts[Side::Left], None);
+        assert!(query.avoid_collisions);
+        assert_eq!(
+            query.frame,
+            FollowedFrame::of(arms()[Side::Left].geometry.chain(), Frame::GraspPoint)
+                .expect("the grasp point")
+        );
+        assert_eq!(query.poses.len(), 1);
+        assert_eq!(query.poses[0].rotation.w, 1.0);
+    }
+
+    // What a Cartesian path cannot take is refused, each refusal saying what to send: an
+    // arm the robot does not have, a start of the wrong length, a link of the other arm, an
+    // inner link, a finger, no pose, and a pose that is no pose.
+    #[test]
+    fn a_cartesian_goal_it_cannot_take_is_refused_with_what_to_send() {
+        let refusal = |change: &dyn Fn(&mut plan_cartesian_path::GoalRequestData)| {
+            let mut goal = cartesian_goal();
+            change(&mut goal);
+            parse_cartesian_goal(&goal).expect_err("a refusal")
+        };
+        assert_eq!(
+            refusal(&|goal| goal.arm_name = "third_arm".to_string()),
+            "arm_name names \"third_arm\", no arm of this robot: its arms are \"left_arm\" and \
+             \"right_arm\""
+        );
+        assert_eq!(
+            refusal(&|goal| goal.start_joint_positions = vec![0.0; 6]),
+            "start_joint_positions of left_arm has 6 values; send one for each of its 7 joints, \
+             or none to start where the arm stands"
+        );
+        let other_arm = refusal(&|goal| goal.link_name = "openarm_right_tcp".to_string());
+        assert!(
+            other_arm.starts_with("left_arm has no link \"openarm_right_tcp\""),
+            "{other_arm}"
+        );
+        for link in ["openarm_left_link3", "openarm_left_ee_link1"] {
+            assert_eq!(
+                refusal(&|goal| goal.link_name = link.to_string()),
+                format!(
+                    "{link} is not fixed to openarm_left_tcp, so a path cannot keep it on a line; \
+                     send openarm_left_tcp, or a link fixed to it"
+                )
+            );
+        }
+        assert_eq!(
+            refusal(&|goal| goal.waypoints.clear()),
+            "waypoints holds no pose: send one or more"
+        );
+        assert!(
+            refusal(&|goal| goal.waypoints[0].orientation = [0.0, 0.0, 0.0, 2.0])
+                .starts_with("waypoint 1: an orientation is a unit quaternion"),
+        );
+        assert!(
+            refusal(&|goal| goal.waypoints[0].position[0] = f64::NAN)
+                .starts_with("waypoint 1: a position is finite"),
+        );
     }
 
     fn refusal(goal: GoalRequestData) -> String {

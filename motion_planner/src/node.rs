@@ -16,9 +16,10 @@ use collision_geometry::chain::BodyGeometry;
 use control_core::latched_log::LatchedLog;
 use control_core::{receiving, serving};
 use motion_planning_core::{
-    Arm, ArmGoal, Arms, CheckFailure, CheckRequest, DepthCamera, Goal, IkGoalSampler, PathCheck,
-    PlanFailure, PlanRequest, PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel,
-    StartFault, check_path, insert_cut_out, plan_path, start_inside_limits,
+    Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
+    DepthCamera, Goal, IkGoalSampler, PathCheck, PlanFailure, PlanRequest, PlanningScene,
+    RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault, cartesian_path, check_path,
+    insert_cut_out, plan_path, pose_parts, start_inside_limits,
 };
 use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
 use ompl_bridge::{PLANNING_THREADS, Planner};
@@ -30,9 +31,10 @@ use peppygen::consumed_services::identity::get_identity;
 use peppygen::consumed_services::workspace::describe_workspace;
 use peppygen::consumed_topics::camera::depth_stream;
 use peppygen::consumed_topics::limb_state::limb_states;
+use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
-    self, ActionHandle, FailureKind, GoalContext, GoalDecision, GoalRequestData,
-    PlanJointPathResultArmsItem, PlanJointPathResultArmsItemWaypointsItem,
+    self, FailureKind, GoalRequestData, PlanJointPathResultArmsItem,
+    PlanJointPathResultArmsItemWaypointsItem,
 };
 use peppygen::exposed_services::motion_planning::{
     apply_attached_collision_object, apply_collision_objects, check_joint_path,
@@ -47,7 +49,10 @@ use crate::config::Config;
 use crate::fingers::{FingerFault, riders, riders_of_both_arms, with_held_objects};
 use crate::history::{ArmJoints, History, Measured};
 use crate::intake::robot_mask;
-use crate::request::{ArmGoals, ArmStarts, CheckQuery, PlanQuery, parse_check, parse_plan};
+use crate::request::{
+    ArmGoals, ArmStarts, CartesianQuery, CheckQuery, PlanQuery, parse_cartesian, parse_check,
+    parse_plan,
+};
 use crate::robot::{ArmModel, Robot, RobotModel};
 use crate::scene::{attach_request, object_requests, scene_response};
 use crate::self_model::{BothArms, HeldOtherArm};
@@ -342,6 +347,7 @@ async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config, fault: F
     tokio::spawn(serve_allowed_pairs(runner.clone(), node.clone()));
     tokio::spawn(serve_scene(runner.clone(), node.clone()));
     tokio::spawn(serve_checks(runner.clone(), node.clone()));
+    tokio::spawn(serve_cartesian_paths(runner.clone(), node.clone()));
     tokio::spawn(serve_plans(runner, node));
 }
 
@@ -1036,6 +1042,7 @@ macro_rules! member_failures {
 
 member_failures!(
     plan_joint_path,
+    plan_cartesian_path,
     check_joint_path,
     apply_collision_objects,
     apply_attached_collision_object,
@@ -1116,9 +1123,7 @@ impl Snapshot {
             framed(node, &map)?;
             (scene.clone(), map.voxels.clone(), map.stamp)
         };
-        let measured = latest
-            .map(|measured| measured.arms)
-            .ok_or_else(|| Refusal::PreconditionFailed(NO_JOINTS.to_string()))?;
+        let measured = measured_arms(latest)?;
         Ok(Self {
             scene,
             voxels,
@@ -1181,8 +1186,21 @@ impl Snapshot {
     /// Where each arm stands for a request whose arms start at `starts`: an arm's start,
     /// or where it was measured.
     fn standing(&self, starts: &ArmStarts) -> ArmJoints {
-        ArmPair::from_fn(|side| starts[side].unwrap_or(self.measured[side]))
+        standing_at(&self.measured, starts)
     }
+}
+
+/// The arms' joints `latest` measured; refused before they are measured.
+fn measured_arms(latest: Option<Measured>) -> std::result::Result<ArmJoints, Refusal> {
+    latest
+        .map(|measured| measured.arms)
+        .ok_or_else(|| Refusal::PreconditionFailed(NO_JOINTS.to_string()))
+}
+
+/// Where each arm stands for a request: at its start in `starts`, or where `measured` has
+/// it.
+fn standing_at(measured: &ArmJoints, starts: &ArmStarts) -> ArmJoints {
+    ArmPair::from_fn(|side| starts[side].unwrap_or(measured[side]))
 }
 
 /// The pieces of the bodies of `model`, the self model, with the arms at `standing`, that
@@ -1507,48 +1525,60 @@ fn check(
     ))
 }
 
-/// Serves plan_joint_path: a goal is refused when it does not parse and before the
-/// planner can plan, and each accepted goal plans on its own task, on the snapshot its
-/// admission took.
-async fn serve_plans(runner: Arc<NodeRunner>, node: Arc<Node>) {
-    let token = runner.cancellation_token().clone();
-    let mut action = match ActionHandle::expose(&runner).await {
-        Ok(action) => action,
-        Err(e) => return error!("plan_joint_path expose: {e}"),
-    };
-    loop {
-        // The goal the decider accepts.
-        let admitted: Mutex<Option<Taken>> = Mutex::new(None);
-        let next = tokio::select! {
-            _ = token.cancelled() => return,
-            next = action.handle_goal_next_request(|goal| {
-                Ok(match admit(&node, &goal.data) {
-                    Ok(taken) => {
-                        *lock(&admitted) = Some(taken);
-                        GoalDecision::accept()
+/// Gives `$serve`, which serves the action `$member`: `$admit` refuses a goal that does
+/// not parse and one the planner cannot take yet, and each goal it takes runs by `$run` on
+/// its own task, on what its admission took.
+macro_rules! serve_action {
+    ($serve:ident, $member:ident, $admit:ident, $run:ident) => {
+        async fn $serve(runner: Arc<NodeRunner>, node: Arc<Node>) {
+            let token = runner.cancellation_token().clone();
+            let mut action = match $member::ActionHandle::expose(&runner).await {
+                Ok(action) => action,
+                Err(e) => return error!("{} expose: {e}", stringify!($member)),
+            };
+            loop {
+                // What the decider takes of the goal it accepts.
+                let admitted = Mutex::new(None);
+                let next = tokio::select! {
+                    _ = token.cancelled() => return,
+                    next = action.handle_goal_next_request(|goal| {
+                        Ok(match $admit(&node, &goal.data) {
+                            Ok(taken) => {
+                                *lock(&admitted) = Some(taken);
+                                $member::GoalDecision::accept()
+                            }
+                            Err(refusal) => {
+                                let failure = $member::Failure::from(refusal);
+                                $member::GoalDecision::refuse(failure.kind, failure.message)
+                            }
+                        })
+                    }) => next,
+                };
+                match next {
+                    Ok(Some(context)) => {
+                        let taken = lock(&admitted)
+                            .take()
+                            .expect("an accepted goal was admitted");
+                        tokio::spawn($run(node.clone(), context, taken));
                     }
-                    Err(refusal) => {
-                        let failure = plan_joint_path::Failure::from(refusal);
-                        GoalDecision::refuse(failure.kind, failure.message)
+                    Ok(None) => return,
+                    Err(e) => {
+                        error!("{}: {e}", stringify!($member));
+                        tokio::time::sleep(RETRY).await;
                     }
-                })
-            }) => next,
-        };
-        match next {
-            Ok(Some(context)) => {
-                let taken = lock(&admitted)
-                    .take()
-                    .expect("an accepted goal was admitted");
-                tokio::spawn(run_plan(node.clone(), context, taken));
-            }
-            Ok(None) => return,
-            Err(e) => {
-                error!("plan_joint_path: {e}");
-                tokio::time::sleep(RETRY).await;
+                }
             }
         }
-    }
+    };
 }
+
+serve_action!(serve_plans, plan_joint_path, admit, run_plan);
+serve_action!(
+    serve_cartesian_paths,
+    plan_cartesian_path,
+    admit_cartesian,
+    run_cartesian
+);
 
 /// A goal the planner takes: its query, the snapshot it plans on, where each arm stands
 /// for it, each arm the goal names at its start moved inside its joint limits, and the
@@ -1570,18 +1600,7 @@ fn admit(node: &Node, goal: &GoalRequestData) -> std::result::Result<Taken, Refu
         .map_err(|e| Refusal::AttemptFailed(format!("the self model's fingers: {e}")))?;
     let query = parse_plan(goal, &node.arms, &fingers).map_err(Refusal::Rejected)?;
     let snapshot = Snapshot::of(node, latest, self_model)?;
-    let standing = query.order.sides().iter().try_fold(
-        snapshot.standing(&query.starts),
-        |mut standing, side| {
-            standing[*side] = start_inside_limits(
-                node.arms[*side].geometry.chain(),
-                &standing[*side],
-                &start_tolerance(node),
-            )
-            .map_err(|fault| Refusal::PreconditionFailed(fault.to_string()))?;
-            Ok::<_, Refusal>(standing)
-        },
-    )?;
+    let standing = inside_limits(node, snapshot.standing(&query.starts), query.order.sides())?;
     let deadline = Instant::now() + query.time_limit;
     Ok(Taken {
         query,
@@ -1591,34 +1610,90 @@ fn admit(node: &Node, goal: &GoalRequestData) -> std::result::Result<Taken, Refu
     })
 }
 
-/// Plans one goal the planner took and answers it; a cancel stops the plan, at any part
-/// of it, and ends the goal cancelled, whatever the plan answered after it.
-async fn run_plan(node: Arc<Node>, context: GoalContext, taken: Taken) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let planned = {
-        let node = node.clone();
-        let stop = stop.clone();
-        tokio::task::spawn_blocking(move || plan(&node, &taken, &stop))
-    };
-    let answer = answer_or_stop(planned, context.cancel_signal(), &stop).await;
-    let ended = match answer {
-        Err(e) => {
-            context
-                .fail(
-                    FailureKind::AttemptFailed,
-                    format!("the plan task failed: {e}"),
-                )
-                .await
-        }
-        Ok(Err(PlanEnd::Stopped)) => end_cancelled(&context).await,
-        Ok(_) if context.is_cancelled() => end_cancelled(&context).await,
-        Ok(Err(PlanEnd::Failed(kind, message))) => context.fail(kind, message).await,
-        Ok(Ok((arms, stamp))) => context.complete(arms, stamp).await,
-    };
-    if let Err(e) = ended {
-        error!("plan_joint_path answer: {e}");
-    }
+/// `standing` with each arm of `sides` at its start moved inside its joint limits; refused
+/// with precondition_failed when one lies outside a limit by more than the start tolerance.
+fn inside_limits(
+    node: &Node,
+    standing: ArmJoints,
+    sides: &[Side],
+) -> std::result::Result<ArmJoints, Refusal> {
+    sides.iter().try_fold(standing, |mut standing, side| {
+        standing[*side] = start_inside_limits(
+            node.arms[*side].geometry.chain(),
+            &standing[*side],
+            &start_tolerance(node),
+        )
+        .map_err(|fault| Refusal::PreconditionFailed(fault.to_string()))?;
+        Ok(standing)
+    })
 }
+
+/// Gives `$run`, which computes one goal the planner took of the action `$member` by `$compute`
+/// and answers it, and `$end_cancelled`: a cancel stops the computation, `$what` to a message,
+/// at any part of it, and ends the goal cancelled, whatever it answered after, with the reason
+/// the cancel gave and `$empty` as its result. `$field`s are the result `$compute` gives.
+macro_rules! run_action {
+    (
+        $run:ident, $end_cancelled:ident, $member:ident, $taken:ty, $compute:ident, $what:literal,
+        ($($field:ident),+), ($($empty:expr),+)
+    ) => {
+        async fn $run(node: Arc<Node>, context: $member::GoalContext, taken: $taken) {
+            let stop = Arc::new(AtomicBool::new(false));
+            let computed = {
+                let node = node.clone();
+                let stop = stop.clone();
+                tokio::task::spawn_blocking(move || $compute(&node, &taken, &stop))
+            };
+            let answer = answer_or_stop(computed, context.cancel_signal(), &stop).await;
+            let ended = match answer {
+                Err(e) => {
+                    context
+                        .fail(
+                            $member::FailureKind::AttemptFailed,
+                            format!("the {} task failed: {e}", $what),
+                        )
+                        .await
+                }
+                Ok(Err(PlanEnd::Stopped)) => $end_cancelled(&context).await,
+                Ok(_) if context.is_cancelled() => $end_cancelled(&context).await,
+                Ok(Err(PlanEnd::Failed(kind, message))) => context.fail(kind, message).await,
+                Ok(Ok(($($field),+))) => context.complete($($field),+).await,
+            };
+            if let Err(e) = ended {
+                error!("{} answer: {e}", stringify!($member));
+            }
+        }
+
+        async fn $end_cancelled(context: &$member::GoalContext) -> Result<()> {
+            let reason = context.cancel_cause().map_or_else(
+                || format!("the {} was stopped", $what),
+                |c| c.reason().to_string(),
+            );
+            context.complete_cancelled(reason, $($empty),+).await
+        }
+    };
+}
+
+run_action!(
+    run_plan,
+    end_cancelled,
+    plan_joint_path,
+    Taken,
+    plan,
+    "plan",
+    (arms, stamp),
+    (Vec::new(), None)
+);
+run_action!(
+    run_cartesian,
+    end_cartesian_cancelled,
+    plan_cartesian_path,
+    TakenCartesian,
+    cartesian,
+    "path",
+    (start_joint_positions, waypoints, fraction, stamp),
+    (Vec::new(), Vec::new(), 0.0, None)
+);
 
 /// The answer of `planned`. A `cancel` that comes first sets `stop`, which ends the plan
 /// at any part of it, and the answer is the plan's after it.
@@ -1637,21 +1712,12 @@ async fn answer_or_stop<T>(
     }
 }
 
-/// Ends the goal of `context` cancelled, with the reason its cancel gave.
-async fn end_cancelled(context: &GoalContext) -> Result<()> {
-    let reason = context.cancel_cause().map_or_else(
-        || "the plan was stopped".to_string(),
-        |c| c.reason().to_string(),
-    );
-    context.complete_cancelled(reason, Vec::new(), None).await
-}
-
-/// How a plan ends without a path.
+/// How a plan or a Cartesian path ends without a path: `Kind` is its member's failure kind.
 #[derive(Debug)]
-enum PlanEnd {
+enum PlanEnd<Kind> {
     /// A cancel stopped it.
     Stopped,
-    Failed(FailureKind, String),
+    Failed(Kind, String),
 }
 
 /// One plan of a goal the planner took, on its snapshot and by its deadline: each arm the
@@ -1663,7 +1729,8 @@ fn plan(
     node: &Node,
     taken: &Taken,
     stop: &AtomicBool,
-) -> std::result::Result<(Vec<PlanJointPathResultArmsItem>, Option<SystemTime>), PlanEnd> {
+) -> std::result::Result<(Vec<PlanJointPathResultArmsItem>, Option<SystemTime>), PlanEnd<FailureKind>>
+{
     let Taken {
         query,
         snapshot,
@@ -1800,6 +1867,139 @@ fn split<const D: usize>(path: &[[f64; D]], group: Group) -> ArmPaths {
                 .collect(),
         )
     })
+}
+
+/// A Cartesian path the planner takes: its query, where each arm stands for it, the arm it
+/// moves at its start moved inside its joint limits, and the snapshot its states keep clear
+/// of, where it checks collisions.
+struct TakenCartesian {
+    query: CartesianQuery,
+    standing: ArmJoints,
+    snapshot: Option<Snapshot>,
+}
+
+/// The Cartesian path the planner takes: refused with rejected when it does not parse, and
+/// with precondition_failed before the arms are measured, where it checks collisions before
+/// the planner's depth frame, and when its start lies outside a joint limit by more than the
+/// start tolerance.
+fn admit_cartesian(
+    node: &Node,
+    goal: &plan_cartesian_path::GoalRequestData,
+) -> std::result::Result<TakenCartesian, Refusal> {
+    let latest = node.latest();
+    let self_model = node.self_model_at(latest.as_ref());
+    let fingers = riders_of_both_arms(&self_model, &node.arms)
+        .map_err(|e| Refusal::AttemptFailed(format!("the self model's fingers: {e}")))?;
+    let query = parse_cartesian(goal, &node.arms, &fingers).map_err(Refusal::Rejected)?;
+    let (standing, snapshot) = if query.avoid_collisions {
+        let snapshot = Snapshot::of(node, latest, self_model)?;
+        (snapshot.standing(&query.starts), Some(snapshot))
+    } else {
+        (standing_at(&measured_arms(latest)?, &query.starts), None)
+    };
+    Ok(TakenCartesian {
+        standing: inside_limits(node, standing, &[query.side])?,
+        query,
+        snapshot,
+    })
+}
+
+/// The request of the Cartesian path `taken`, its states keeping clear of `collisions`.
+fn cartesian_request<'a>(
+    node: &Node,
+    taken: &'a TakenCartesian,
+    collisions: Collisions<'a>,
+    stop: &'a AtomicBool,
+) -> CartesianRequest<'a, ARM_DOF> {
+    CartesianRequest {
+        start: taken.standing[taken.query.side],
+        start_tolerance: start_tolerance(node),
+        frame: taken.query.frame,
+        waypoints: &taken.query.poses,
+        collisions,
+        seed: u64::from(PLAN_SEED),
+        stop: Some(stop),
+    }
+}
+
+/// The result of a Cartesian path, in the order of plan_cartesian_path's: where it starts, its
+/// waypoints, the fraction covered, and the stamp of the map's newest frame it kept clear of.
+type CartesianResult = (
+    Vec<f64>,
+    Vec<plan_cartesian_path::PlanCartesianPathResultWaypointsItem>,
+    f64,
+    Option<SystemTime>,
+);
+
+/// One Cartesian path of a goal the planner took, keeping clear of its snapshot where it
+/// checks collisions: each waypoint with the grasp-point pose there, as limb_state reports
+/// it, and the stamp of the map's newest frame it kept clear of.
+fn cartesian(
+    node: &Node,
+    taken: &TakenCartesian,
+    stop: &AtomicBool,
+) -> std::result::Result<CartesianResult, PlanEnd<plan_cartesian_path::FailureKind>> {
+    use plan_cartesian_path::FailureKind as Kind;
+    let TakenCartesian {
+        query,
+        standing,
+        snapshot,
+    } = taken;
+    let side = query.side;
+    let model = &node.arms[side];
+    let path = match snapshot {
+        Some(snapshot) => {
+            let self_model = HeldOtherArm::new(
+                &snapshot.self_model,
+                NonZeroUsize::MIN,
+                side,
+                standing[side.other()],
+            );
+            snapshot
+                .run::<ARM_DOF, _>(
+                    node,
+                    Group::One(side),
+                    standing,
+                    &self_model,
+                    |arms, scene| {
+                        let collisions = Collisions::Checked {
+                            scene,
+                            min_clearance_m: node.config.min_clearance_m,
+                        };
+                        cartesian_path(arms, &cartesian_request(node, taken, collisions, stop))
+                    },
+                )
+                .map_err(|fault| PlanEnd::Failed(Kind::AttemptFailed, fault.to_string()))?
+        }
+        None => {
+            let arms = Arms::new(vec![Arm::new(model.name, &model.geometry)], None);
+            let unchecked = cartesian_request(node, taken, Collisions::Unchecked, stop);
+            cartesian_path(&arms, &unchecked)
+        }
+    };
+    let path = path.map_err(|failure| {
+        let kind = match &failure {
+            CartesianFailure::Stopped => return PlanEnd::Stopped,
+            CartesianFailure::Request(_) => Kind::Rejected,
+            CartesianFailure::Start(StartFault::OutsideLimits { .. }) => Kind::PreconditionFailed,
+            CartesianFailure::Start(StartFault::InCollision(_)) => Kind::StartInCollision,
+        };
+        PlanEnd::Failed(kind, failure.to_string())
+    })?;
+    let waypoints = path
+        .waypoints
+        .iter()
+        .map(|q| {
+            let (position, orientation) = pose_parts(&model.geometry.chain().world_ee_pose(q));
+            plan_cartesian_path::PlanCartesianPathResultWaypointsItem {
+                joint_positions: q.to_vec(),
+                position,
+                orientation,
+            }
+        })
+        .collect();
+    let stamp = snapshot.as_ref().and_then(|snapshot| snapshot.stamp);
+    Ok((path.start.to_vec(), waypoints, path.fraction, stamp))
 }
 
 /// The copies of the self model a plan of `attempts` attempts keeps: one for each attempt
@@ -2245,6 +2445,31 @@ mod tests {
         let taken = admit(&node, &goal).expect("the goal is taken");
         assert!(matches!(
             plan(&node, &taken, &AtomicBool::new(true)),
+            Err(PlanEnd::Stopped)
+        ));
+    }
+
+    // A stop set before a Cartesian path starts ends it stopped: it answers no path.
+    #[test]
+    fn a_set_stop_ends_the_cartesian_path_stopped() {
+        let node = started(&parameters(), false);
+        measure_at(&node, SystemTime::UNIX_EPOCH, still());
+        let grasp_link = node.arms[Side::Left].grasp_link;
+        let chain = node.arms[Side::Left].geometry.chain();
+        let (position, orientation) = pose_parts(&chain.world_ee_pose(&still().arms[Side::Left]));
+        let goal = plan_cartesian_path::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            start_joint_positions: Vec::new(),
+            link_name: grasp_link.to_string(),
+            waypoints: vec![plan_cartesian_path::GoalWaypointsItem {
+                position: [position[0], position[1], position[2] - 0.05],
+                orientation,
+            }],
+            avoid_collisions: true,
+        };
+        let taken = admit_cartesian(&node, &goal).expect("the goal is taken");
+        assert!(matches!(
+            cartesian(&node, &taken, &AtomicBool::new(true)),
             Err(PlanEnd::Stopped)
         ));
     }
