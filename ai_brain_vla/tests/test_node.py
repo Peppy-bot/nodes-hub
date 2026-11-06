@@ -185,6 +185,9 @@ async def test_a_search_while_sam3_siglip_loads_is_refused_and_then_with_the_rea
         assert refusal.message.startswith(
             "no perception source: perception_model 'sam3_siglip' could not load: the sam3_siglip backend needs torch and transformers"
         )
+        # A load that failed does not become ready: get_model gives no
+        # starting reason for perception, so no caller waits for it.
+        assert (await get_model_fx.poll(h, 5.0)).starting[0] == ""
 
 
 async def test_every_member_completes_over_the_wire_with_models():
