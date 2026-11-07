@@ -37,22 +37,18 @@ use crate::move_slot::MoveSlot;
 use crate::planner::{ArmMoveRequest, Goal, JointReply, PlanCheck};
 use crate::settle::{PoseTolerance, Settle};
 use crate::streams::LeaderActivity;
-use crate::types::pose_from_wire;
+use crate::types::{orientation_from_wire, position_from_wire};
 
-/// Parse the wire pair of the `{field}_position_tolerance_m` and
-/// `{field}_orientation_tolerance_rad` goal fields, each a positive finite
-/// number, or the refusal naming the field.
-fn pose_tolerance_from_wire(
-    field: &str,
+/// Parse the wire pair of the `settle_position_tolerance_m` and
+/// `settle_orientation_tolerance_rad` fields, each a positive finite number, or the
+/// refusal naming the field.
+fn settle_tolerance_from_wire(
     position_m: f64,
     orientation_rad: f64,
 ) -> std::result::Result<PoseTolerance, String> {
     Ok(PoseTolerance {
-        position_m: tolerance_from_wire(&format!("{field}_position_tolerance_m"), position_m)?,
-        orientation_rad: tolerance_from_wire(
-            &format!("{field}_orientation_tolerance_rad"),
-            orientation_rad,
-        )?,
+        position_m: tolerance_from_wire("settle_position_tolerance_m", position_m)?,
+        orientation_rad: tolerance_from_wire("settle_orientation_tolerance_rad", orientation_rad)?,
     })
 }
 
@@ -67,55 +63,43 @@ pub(super) fn joint_tolerances_from_wire(
     Err("each settle_tolerances_rad entry must be a positive number".to_string())
 }
 
-/// Parse the planning fields `move_arm` and `check_arm_move` share into the
+/// Parse the fields `move_arm` and `check_arm_move` share into the
 /// [`ArmMoveRequest`] both take, or the refusal both give.
 fn arm_move_request(
     arm_name: &str,
     position: [f64; 3],
-    orientation: [f64; 4],
+    orientation: Option<[f64; 4]>,
     duration_s: f64,
-    plan_position_tolerance_m: f64,
-    plan_orientation_tolerance_rad: f64,
 ) -> std::result::Result<ArmMoveRequest, String> {
+    let goal_pose_has = |reason| format!("goal pose has {reason}");
     let side = Side::from_arm_name(arm_name).map_err(|e| e.to_string())?;
-    let target = pose_from_wire(position, orientation)
-        .map_err(|reason| format!("goal pose has {reason}"))?;
-    let tolerance = pose_tolerance_from_wire(
-        "plan",
-        plan_position_tolerance_m,
-        plan_orientation_tolerance_rad,
-    )?;
+    let position = position_from_wire(position).map_err(goal_pose_has)?;
+    let orientation = orientation
+        .map(orientation_from_wire)
+        .transpose()
+        .map_err(goal_pose_has)?;
     let duration = move_seconds_from_wire("duration_s", duration_s)?;
     Ok(ArmMoveRequest {
         side,
-        target,
-        tolerance,
+        position,
+        orientation,
         duration,
     })
 }
 
 /// A `move_arm` goal parsed off the wire: the move to plan, and the settle it
-/// asks for, whose slack covers the plan's on each axis.
+/// asks for.
 struct MoveArmGoal {
     request: ArmMoveRequest,
     settle: Settle<PoseTolerance>,
 }
 
 fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGoal, String> {
-    let request = arm_move_request(
-        &d.arm_name,
-        d.position,
-        d.orientation,
-        d.duration_s,
-        d.plan_position_tolerance_m,
-        d.plan_orientation_tolerance_rad,
-    )?;
-    let tolerance = pose_tolerance_from_wire(
-        "settle",
+    let request = arm_move_request(&d.arm_name, d.position, d.orientation, d.duration_s)?;
+    let tolerance = settle_tolerance_from_wire(
         d.settle_position_tolerance_m,
         d.settle_orientation_tolerance_rad,
     )?;
-    tolerance.covers(&request.tolerance)?;
     let timeout = move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?;
     Ok(MoveArmGoal {
         request,
@@ -250,14 +234,13 @@ pub async fn run_move_arm(
     }
 }
 
-/// Expose `check_arm_move`: validate the planning fields as `move_arm` does,
+/// Expose `check_arm_move`: validate its fields as `move_arm` does,
 /// give an error reply where `move_arm` refuses (a value it does not take,
 /// no fresh follower state, a streaming leader, the arm busy), then ask the
 /// coordinator, which asks the arm's planner for a plan from the held
 /// setpoint and moves nothing. The answer is whether a plan exists: the time
-/// the move would take, or the words a `move_arm` failure with `unreachable`
-/// gives. A coordinator that does not answer gives `attempt_failed`. Serves
-/// until `token` cancels.
+/// the move would take, or the words of the `move_arm` failure. A coordinator
+/// that does not answer gives `attempt_failed`. Serves until `token` cancels.
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     token: CancellationToken,
@@ -282,15 +265,8 @@ fn check_plan(
     activity: &ArmPair<LeaderActivity>,
     d: &check_arm_move::RequestData,
 ) -> std::result::Result<check_arm_move::Response, Failure> {
-    let request = arm_move_request(
-        &d.arm_name,
-        d.position,
-        d.orientation,
-        d.duration_s,
-        d.plan_position_tolerance_m,
-        d.plan_orientation_tolerance_rad,
-    )
-    .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
+    let request = arm_move_request(&d.arm_name, d.position, d.orientation, d.duration_s)
+        .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
     let side = request.side;
     check_limb_free(
         fresh[side].load(Ordering::Acquire),
@@ -375,17 +351,17 @@ mod tests {
     }
 
     #[test]
-    fn a_pose_tolerance_names_the_axis_it_refuses() {
+    fn a_settle_tolerance_names_the_axis_it_refuses() {
         assert_eq!(
-            pose_tolerance_from_wire("plan", 0.0, 0.1).unwrap_err(),
-            "plan_position_tolerance_m must be a positive number"
+            settle_tolerance_from_wire(0.0, 0.1).unwrap_err(),
+            "settle_position_tolerance_m must be a positive number"
         );
         assert_eq!(
-            pose_tolerance_from_wire("settle", 0.01, -1.0).unwrap_err(),
+            settle_tolerance_from_wire(0.01, -1.0).unwrap_err(),
             "settle_orientation_tolerance_rad must be a positive number"
         );
         assert_eq!(
-            pose_tolerance_from_wire("plan", 0.005, 0.087),
+            settle_tolerance_from_wire(0.005, 0.087),
             Ok(PoseTolerance {
                 position_m: 0.005,
                 orientation_rad: 0.087,

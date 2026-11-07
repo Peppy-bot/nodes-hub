@@ -34,6 +34,8 @@ const REJECT_WARN_PERIOD: Duration = Duration::from_secs(1);
 pub struct GovernedSetpoint {
     pub q_des: JointVec,
     pub dq_des: JointVec,
+    /// When it arrived, which tells the control loop how long the stream has been silent.
+    pub received: Instant,
 }
 
 /// Measured joint state the control loop publishes each tick, as wire arrays.
@@ -131,7 +133,11 @@ fn parse_setpoint(msg: &backbone::joint_setpoints::Message) -> Result<GovernedSe
     if !q_des.iter().chain(dq_des.iter()).all(|v| v.is_finite()) {
         return Err("non-finite values".to_string());
     }
-    Ok(GovernedSetpoint { q_des, dq_des })
+    Ok(GovernedSetpoint {
+        q_des,
+        dq_des,
+        received: Instant::now(),
+    })
 }
 
 /// Emit the measured joint state at a fixed rate, forever, to the paired

@@ -699,11 +699,6 @@ async fn left_arm_joint_move(
     Ok(goal.get_result(DEADLINE).await?.outcome)
 }
 
-/// The plan slack the Cartesian moves of these tests are planned within: the
-/// guarded servo's own arrival bar.
-const PLAN_POSITION_TOLERANCE_M: f64 = control_core::servo::POSITION_TOLERANCE_M;
-const PLAN_ORIENTATION_TOLERANCE_RAD: f64 = control_core::servo::ORIENTATION_TOLERANCE_RAD;
-
 /// The settle the moves of these tests ask for: a slack the followers'
 /// tracking stays within, and a timeout that keeps a failed settle short.
 const SETTLE_TOLERANCE_RAD: f64 = 0.05;
@@ -908,10 +903,8 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
     let check = check_arm_move::RequestData {
         arm_name: "left_arm".to_string(),
         position: [0.3, 0.2, 0.3],
-        orientation: [0.0, 0.0, 0.0, 1.0],
+        orientation: Some([0.0, 0.0, 0.0, 1.0]),
         duration_s: 0.0,
-        plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
-        plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
     };
     let reply = error_reply(
         check_arm_move::poll(&harness, &check, DEADLINE).await,
@@ -1152,10 +1145,8 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
         &check_arm_move::RequestData {
             arm_name: "left_arm".to_string(),
             position: raised,
-            orientation,
+            orientation: Some(orientation),
             duration_s: 1.0,
-            plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
-            plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
         },
         DEADLINE,
     )
@@ -1166,10 +1157,8 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
     let raise = |duration_s: f64| move_arm::GoalRequestData {
         arm_name: "left_arm".to_string(),
         position: raised,
-        orientation,
+        orientation: Some(orientation),
         duration_s,
-        plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
-        plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
         settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
         settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
         settle_timeout_s: SETTLE_TIMEOUT_S,
@@ -2031,10 +2020,8 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
     let check = |arm_name: &str, position: [f64; 3]| check_arm_move::RequestData {
         arm_name: arm_name.to_string(),
         position,
-        orientation,
+        orientation: Some(orientation),
         duration_s: 0.0,
-        plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
-        plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
     };
 
     let near = check("left_arm", [position[0], position[1], position[2] + 0.02]);
@@ -2048,7 +2035,7 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
     let answer = check_arm_move::poll(&harness, &far, DEADLINE).await?;
     assert!(!answer.reachable);
     assert!(
-        answer.reason.starts_with("goal pose not planned within"),
+        answer.reason.starts_with("goal pose not planned"),
         "{}",
         answer.reason
     );
@@ -2059,10 +2046,8 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
         &move_arm::GoalRequestData {
             arm_name: "left_arm".to_string(),
             position: far_position,
-            orientation,
+            orientation: Some(orientation),
             duration_s: 0.0,
-            plan_position_tolerance_m: PLAN_POSITION_TOLERANCE_M,
-            plan_orientation_tolerance_rad: PLAN_ORIENTATION_TOLERANCE_RAD,
             settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
             settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
             settle_timeout_s: SETTLE_TIMEOUT_S,
@@ -2100,6 +2085,72 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
             "joint {joint} moved to {observed} during the checks"
         );
     }
+    harness.shutdown().await
+}
+
+/// A goal with no orientation is a position alone: it completes there with the hand
+/// at the turn it starts with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_position_goal_completes_at_the_turn_the_hand_starts_with() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
+
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let _followed = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    )
+    .followed;
+    pump_right_arm_and_grippers!(mocks);
+
+    let snapshot = next_snapshot(&mut harness).await?;
+    let start = [
+        snapshot.positions[0],
+        snapshot.positions[1],
+        snapshot.positions[2],
+    ];
+    let orientation = [
+        snapshot.orientations[0],
+        snapshot.orientations[1],
+        snapshot.orientations[2],
+        snapshot.orientations[3],
+    ];
+    let lifted = [start[0], start[1], start[2] + 0.02];
+    let goal = move_arm::send_goal(
+        &harness,
+        &move_arm::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            position: lifted,
+            orientation: None,
+            duration_s: 0.0,
+            settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
+            settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
+            settle_timeout_s: SETTLE_TIMEOUT_S,
+        },
+        peppygen::DEFAULT_FEEDBACK_BOUND,
+        DEADLINE,
+    )
+    .await?;
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    let data = match goal.get_result(DEADLINE).await?.outcome {
+        move_arm::ResultOutcome::Completed(data) => data,
+        other => panic!("a position goal did not complete: {other:?}"),
+    };
+    assert_all_close(
+        "final_position",
+        &data.final_position,
+        &lifted,
+        SETTLE_POSITION_TOLERANCE_M,
+    );
+    assert_all_close(
+        "final_orientation",
+        &data.final_orientation,
+        &orientation,
+        SETTLE_ORIENTATION_TOLERANCE_RAD,
+    );
     harness.shutdown().await
 }
 
@@ -3068,6 +3119,21 @@ async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable(
     let (start, corner, end) = (shift(-0.46, 0.51), shift(-0.09, 0.09), shift(0.33, 0.26));
     complete_joint_path(&harness, &left_joint_path(&[shift(-0.46, 0.0)], 0.0)).await?;
     complete_joint_path(&harness, &left_joint_path(&[start], 0.0)).await?;
+    // The move's last setpoint reaches the follower before the failing path is sent, so
+    // all it receives from here on is that path's.
+    const SAME_RAD: f64 = 1e-9;
+    let mut followed = left.followed.clone();
+    tokio::time::timeout(
+        DEADLINE,
+        followed.wait_for(|q| {
+            q.iter()
+                .zip(&start)
+                .all(|(q, to)| (q - to).abs() < SAME_RAD)
+        }),
+    )
+    .await
+    .expect("the move's last setpoint arrives")
+    .expect("the follower runs");
 
     let before = left.received().len();
     let failure = fail_joint_path(&harness, &left_joint_path(&[corner, end], 0.0)).await?;

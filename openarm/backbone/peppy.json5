@@ -263,8 +263,8 @@
       // contact is fully stopped; at/over d_safe_m it is unthrottled; between, it
       // ramps linearly. Separating motion is never throttled (recovery from a
       // tangle is always allowed). Require 0 < d_stop_m < d_safe_m. The collision
-      // model was validated against d_stop_m=0.005, d_safe_m=0.02, so an approach
-      // throttles within ~2 cm. With these values:
+      // model was validated against the launchers' values, so an approach throttles
+      // within d_safe_m. With those values:
       // - On v1, the home pose sits outside the band, so it is unthrottled.
       // - On v2 with both grippers fully open, the jaws at home sit under d_stop_m
       //   against the torso. Thus the governor holds both arms short of home.
@@ -273,8 +273,8 @@
       d_safe_m: "f64",
       // Governor state at launch, before the first governor_control message.
       collision_governor_enabled: "bool",
-      // Per-joint peak velocity (rad/s) sizing the planned trajectories and the
-      // stream chase. URDF joint velocity limits, identical for both hardware
+      // Per-joint peak velocity (rad/s) sizing every action and chasing every
+      // stream. URDF joint velocity limits, identical for both hardware
       // generations (the v2 URDF states the same values at lower precision); the
       // backbone is the sole owner of motion sizing.
       max_joint_velocity_rad_s_1: { $type: "f64", $default: 16.754666 },
@@ -284,23 +284,17 @@
       max_joint_velocity_rad_s_5: { $type: "f64", $default: 20.943946 },
       max_joint_velocity_rad_s_6: { $type: "f64", $default: 20.943946 },
       max_joint_velocity_rad_s_7: { $type: "f64", $default: 20.943946 },
-      // Per-joint peak acceleration (rad/s²) every planned arm move is timed
-      // within and a streamed pose brakes into a joint limit at: the
-      // max_acceleration of the OpenArm MoveIt configuration (enactic
-      // openarm_ros2, joint_limits.yaml), identical for both hardware
-      // generations.
-      max_joint_acceleration_rad_s2_1: { $type: "f64", $default: 5.0 },
-      max_joint_acceleration_rad_s2_2: { $type: "f64", $default: 5.0 },
-      max_joint_acceleration_rad_s2_3: { $type: "f64", $default: 5.0 },
-      max_joint_acceleration_rad_s2_4: { $type: "f64", $default: 5.0 },
-      max_joint_acceleration_rad_s2_5: { $type: "f64", $default: 5.0 },
-      max_joint_acceleration_rad_s2_6: { $type: "f64", $default: 5.0 },
-      max_joint_acceleration_rad_s2_7: { $type: "f64", $default: 5.0 },
-      // End-effector angular-speed cap (rad/s) for streamed poses and the
-      // servo reference. Require > 0. An operational governor cap like
-      // max_ee_velocity_m_s, so the launcher decides it (0.8 is MoveIt
-      // Servo's scale.rotational).
-      max_ee_angular_velocity_rad_s: "f64",
+      // Per-joint peak acceleration (rad/s²) every action is timed within: the
+      // OpenArm MoveIt configuration's max_acceleration of 5.0 times its
+      // default_acceleration_scaling_factor of 0.1 (enactic openarm_ros2,
+      // joint_limits.yaml), identical for both hardware generations.
+      max_joint_acceleration_rad_s2_1: { $type: "f64", $default: 0.5 },
+      max_joint_acceleration_rad_s2_2: { $type: "f64", $default: 0.5 },
+      max_joint_acceleration_rad_s2_3: { $type: "f64", $default: 0.5 },
+      max_joint_acceleration_rad_s2_4: { $type: "f64", $default: 0.5 },
+      max_joint_acceleration_rad_s2_5: { $type: "f64", $default: 0.5 },
+      max_joint_acceleration_rad_s2_6: { $type: "f64", $default: 0.5 },
+      max_joint_acceleration_rad_s2_7: { $type: "f64", $default: 0.5 },
       // How far (rad, each joint) an arm's measured joints may stand from the
       // start of an execute_joint_path path: from the goal's
       // expected_start_joint_positions when the backbone takes the goal and
@@ -311,11 +305,11 @@
       // Require > 0. The launcher decides it: the most an arm may stand off
       // the start its caller planned from, or move while its path is judged.
       start_tolerance_rad: "f64",
-      // End-effector linear-speed cap (m/s) for the stream chase, used only until
-      // the first governor_control message; after that the commander's streamed cap
-      // (openarm_web_commander) governs. Require > 0. The sim launchers set a
-      // permissive value; the real arm a conservative one.
-      max_ee_velocity_m_s: "f64",
+      // End-effector linear-speed cap (m/s) on every stream, and on nothing else,
+      // used only until the first governor_control message; after that the
+      // commander's streamed cap (openarm_web_commander) governs. Require > 0. The
+      // sim launchers set a permissive value; the real arm a conservative one.
+      max_stream_ee_velocity_m_s: "f64",
       // Largest rate (opening fraction per second) a gripper opening is driven at:
       // 6.0 drives a full open or close in ~1/6 s. Used until the first
       // governor_control message; after that the commander's streamed rate governs.
@@ -326,11 +320,10 @@
       // Cutoff (Hz) for the first-order low-pass on each published desired velocity.
       // Desired velocity is a per-tick position delta scaled by the control rate, so it
       // amplifies setpoint noise; filtering it keeps the arm's Kd term from buzzing on a
-      // noisy stream without touching the desired position. At the 100 Hz control rate
-      // (Nyquist 50 Hz) this must sit well below Nyquist to attenuate; ~15 Hz matches the
-      // enactic reference's one-pole (its 90 rad/s constant is ~14.3 Hz) and adds about one
-      // tick of group delay. A universal control constant (same across generations and
-      // sim/real), so it keeps a node default like the gains.
+      // noisy stream without touching the desired position. It must sit well below the
+      // control rate's Nyquist to attenuate; the default rounds the constant of enactic's
+      // one-pole differentiator, 90 rad/s or about 14.3 Hz. A universal control constant
+      // (same across generations and sim/real), so it keeps a node default.
       velocity_filter_cutoff_hz: { $type: "f64", $default: 15.0 },
     }
   }

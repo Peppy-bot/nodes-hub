@@ -10,6 +10,7 @@ use crate::{health, stream};
 use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 use control_core::time::{RateOutOfRange, period_from_hz};
+use openarm_can::ReceivePass;
 use openarm_description::{HardwareVersion, Side};
 use peppygen::exposed_services::ready::is_ready;
 use peppygen::{NodeRunner, Parameters, Result};
@@ -33,9 +34,6 @@ const ENABLE_FD: bool = true;
 /// minimum 1 s grace window so the disable hook keeps most of the budget.
 const HEALTH_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// Ceiling on the per-cycle CAN read deadline; see its use for the rationale.
-const MAX_RECV_TIMEOUT_US: u32 = 100_000;
-
 /// `gripper_id` values (0 = left, 1 = right), selecting the side whose
 /// opening geometry this instance drives.
 const GRIPPER_ID_LEFT: u8 = 0;
@@ -52,7 +50,7 @@ fn side_for(gripper_id: u8) -> NodeResult<Side> {
 }
 
 /// The fastest this node drives the gripper. The motor shares the arm's
-/// 1 Mbit CAN FD bus and is paced the same way; the stack runs at 100 Hz.
+/// CAN FD bus and is paced the same way.
 const MAX_RATE_HZ: u32 = 1_000;
 
 /// Everything this node refuses to run on, or stops for.
@@ -75,9 +73,6 @@ pub enum NodeError {
 
     #[error(transparent)]
     HardwareVersion(#[from] openarm_description::UnknownHardwareVersion),
-
-    #[error("recv_timeout_us must be in 1..={MAX_RECV_TIMEOUT_US} (100 ms), got {0}")]
-    RecvTimeout(u32),
 
     #[error(transparent)]
     Limits(#[from] crate::hardware::PosForceLimitsError),
@@ -135,7 +130,6 @@ struct Config {
     hardware_version: HardwareVersion,
     cycle_period: Duration,
     state_period: Duration,
-    recv_timeout_us: u32,
     limits: PosForceLimits,
 }
 
@@ -150,15 +144,6 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
     let state_period =
         period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
-    // Bounded above so a config typo cannot park recv_all in a long ppoll
-    // while it holds the CAN mutex the shutdown hooks need: 100 ms keeps
-    // the whole hook sequence inside even the minimum 1 s grace window,
-    // and real configs run around 1 ms. Bounded below because the driver
-    // refuses a zero wait on its other receive passes, and a receive that
-    // never waits turns every quiet tick into a silence pass.
-    if !(1..=MAX_RECV_TIMEOUT_US).contains(&params.recv_timeout_us) {
-        return Err(NodeError::RecvTimeout(params.recv_timeout_us));
-    }
     // Checked whatever the generation: the ranges are properties of the
     // parameters, not of the gripper that reads them. Only the v2
     // POS_FORCE command path puts them on the wire.
@@ -172,7 +157,6 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         hardware_version,
         cycle_period,
         state_period,
-        recv_timeout_us: params.recv_timeout_us,
         limits,
     })
 }
@@ -226,7 +210,6 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         hardware_version,
         cycle_period,
         state_period,
-        recv_timeout_us,
         limits,
     } = parse_config(&params)?;
     let gripper_id = params.gripper_id;
@@ -236,9 +219,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     // The resolved configuration, so a parameter that this generation
     // does not read is visibly absent rather than silently ignored.
     info!(
-        "config: {alert_source} ({hardware_version}) rate={}Hz state_rate={}Hz \
-         recv_timeout={}us",
-        params.control_rate_hz, params.state_rate_hz, recv_timeout_us
+        "config: {alert_source} ({hardware_version}) rate={}Hz state_rate={}Hz",
+        params.control_rate_hz, params.state_rate_hz
     );
     if hardware_version == HardwareVersion::V2 {
         info!(
@@ -247,10 +229,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         );
     }
 
-    let cfg = FollowConfig {
-        cycle_period,
-        recv_timeout_us,
-    };
+    let cfg = FollowConfig { cycle_period };
+    let receive = ReceivePass::new(cycle_period);
 
     // One instance per gripper: two instances sharing a `gripper_id` command one
     // motor id on one bus, each decoding the other's replies. The claim is an
@@ -297,7 +277,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
                 error!("disable motor: {e}");
             }
             std::thread::sleep(POST_DISABLE_SLEEP);
-            if let Err(e) = g.recv_all(BRINGUP_RECV_US) {
+            if let Err(e) = g.recv_all(receive) {
                 warn!("drain disable replies: {e}");
             }
         });
@@ -321,7 +301,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let mut g = lock_ignoring_poison(&gripper);
         info!("returning to zero");
         g.command(0.0, None)?;
-        g.recv_all(BRINGUP_RECV_US)?;
+        g.recv_all(receive)?;
     }
     info!("gripper ready (motor confirmed enabled)");
 
@@ -445,7 +425,6 @@ mod tests {
             gripper_id: GRIPPER_ID_LEFT,
             hardware_version: "v2".to_string(),
             max_effort_nm: 3.0,
-            recv_timeout_us: 1000,
             speed_rad_s: 25.0,
             state_rate_hz: 100,
         }
@@ -470,7 +449,6 @@ mod tests {
         assert_eq!(config.hardware_version, HardwareVersion::V2);
         assert_eq!(config.cycle_period, Duration::from_millis(10));
         assert_eq!(config.state_period, Duration::from_millis(10));
-        assert_eq!(config.recv_timeout_us, 1000);
     }
 
     #[test]
@@ -512,20 +490,6 @@ mod tests {
                 },
             ),
             (
-                "recv_timeout_us",
-                Parameters {
-                    recv_timeout_us: 0,
-                    ..params()
-                },
-            ),
-            (
-                "recv_timeout_us",
-                Parameters {
-                    recv_timeout_us: MAX_RECV_TIMEOUT_US + 1,
-                    ..params()
-                },
-            ),
-            (
                 "speed_rad_s",
                 Parameters {
                     speed_rad_s: 0.0,
@@ -551,12 +515,11 @@ mod tests {
 
     #[test]
     fn a_launch_wrong_in_every_parameter_is_refused_in_parameter_order() {
-        let fixes: [ParameterFix; 6] = [
+        let fixes: [ParameterFix; 5] = [
             ("gripper_id", |p| p.gripper_id = GRIPPER_ID_LEFT),
             ("hardware_version", |p| p.hardware_version = "v2".into()),
             ("control_rate_hz", |p| p.control_rate_hz = 100),
             ("state_rate_hz", |p| p.state_rate_hz = 100),
-            ("recv_timeout_us", |p| p.recv_timeout_us = 1000),
             ("speed_rad_s", |p| p.speed_rad_s = 25.0),
         ];
         let mut launch = Parameters {
@@ -564,7 +527,6 @@ mod tests {
             hardware_version: "v3".into(),
             control_rate_hz: 0,
             state_rate_hz: 0,
-            recv_timeout_us: 0,
             speed_rad_s: 0.0,
             ..params()
         };

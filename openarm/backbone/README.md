@@ -159,7 +159,7 @@ field pose.
 |---|---|---|
 | `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a leader streaming the arm, side busy |
 | `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a leader streaming a named arm, a named arm busy |
-| `move_arm` | `arm_name`, robot-frame pose (position m + quaternion `[x, y, z, w]`), `duration_s`, the plan and settle tolerances (position m, orientation rad), `settle_timeout_s` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a settle tolerance below the plan's on its axis, a leader streaming the arm, side busy |
+| `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a leader streaming the arm, side busy |
 | `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, side busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
 | `move_to_home` | `duration_s` (the postures contract; both arms to the Home rest) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
@@ -181,28 +181,21 @@ the model with it, so the pose solved for, the pose reported, and the point the
 EE speed cap applies to are one frame. One move per side at a time (a
 single-flight move slot whose release rides a drop guard, held by the move,
 or by the coordinator for a goal it ends before the move starts, so every
-terminal frees it). `move_arm` plans the quietest tier that works (`srs_model::plan_cartesian`): a
-line with the elbow held, a line with the elbow swiveled toward the widest
-joint-limit margin or the highest manipulability, the guarded servo
-(`chain_kinematics::plan_servo`, a damped resolved-rate law that can cross
-singular surfaces a discrete IK walk cannot, rolled out offline and played from
-rest to rest), or the joint tier: a straight joint-space path to the exact
-solver's in-limit solution within the plan position tolerance, played as the
-servo's path is. On a move of up to 10 cm, the joint tier is taken only when
-the grasp point stays within 2 cm of the straight line along the whole path,
-so a descent onto an item, its lift and its retreat keep to their line
-whatever tier plays them; on a longer move, such as the approach from Ready,
-the grasp point goes where the joints take it. The orientation on the joint
-tier turns as the joints do. Every plan is timed from rest to rest within the velocity and
-acceleration limits the launcher sets and the hand's speed caps
-(`control_core::path_timing`, the time-optimal timing of a path through
-waypoints), and a line is checked tick by tick for the velocity and the
-acceleration as the runtime will command it before it runs. Planning runs after
-admission (peppy's goal decision is pre-context, so reachability cannot be a
-refusal): an accepted goal whose pose no tier reaches, servo rollout and
-joint tier included, fails at once with `unreachable` and `goal pose not
-planned within ...`, which names a joint path of a short move that leaves
-the 2 cm corridor and how far it swings. From the planned end of its
+terminal frees it). `move_arm` plans a straight line (`srs_model::plan_line`): a
+walk along it in MoveIt's steps and within its Cartesian precision of 1 mm and 0.01 rad,
+each step one descent of the KDL search from the state before. The walk plays as a joint
+trajectory, timed from rest to rest within the joint velocity and acceleration
+limits (`control_core::path_timing`, the time-optimal timing of a path through
+waypoints), as every other planned motion is. It lands on the goal pose. A goal that
+leaves its orientation out is a position alone: the line keeps the turn the hand
+starts with, or the goal has no line. The settle tolerances judge arrival, and no plan
+reads them. Planning runs after admission (peppy's goal decision is pre-context, so
+reachability cannot be a refusal): an accepted goal that no line reaches fails at once
+with `unreachable` and `goal pose not planned: ...`, a message
+that names `plan_joint_path` and `execute_joint_path`, which reach what a line
+cannot; a line, a joint move or a posture move the limits cannot run within 60 s
+fails with `rejected`.
+From the planned end of its
 trajectory on, an arm move keeps commanding the target and judges the
 measured arm against it: a joint move completes once every joint stands
 within its `settle_tolerances_rad` entry of its target, a Cartesian move once
@@ -212,9 +205,7 @@ still stands outside its tolerance `settle_timeout_s` after the planned end
 fails with `timeout` and the remaining error, `still 0.031 rad from the target
 at joint 4, 2.0 s after the planned end` or `still 8.0 mm / 0.02 rad from the
 target, 2.0 s after the planned end`, and the arm holds where it stands: on
-the target, or where the governor held it short. A line that IK or the
-per-tick velocity guard cannot follow fails with `attempt_failed`. A failed
-goal gives no result. A goal that completes or ends cancelled reports the
+the target, or where the governor held it short. A failed goal gives no result. A goal that completes or ends cancelled reports the
 measured state at that moment; a cancel of its caller ends it for the reason
 `cancelled by its caller`. A posture move completes once each arm stands
 within 0.1 rad of the posture in every joint, fails with `timeout` 2 s after
@@ -339,9 +330,9 @@ goal was taken fails it with `precondition_failed` too (`left_arm stands
 than 0.001 rad from the start the path was judged from, in some joint, has
 the path judged again from the run starts, the commands still holding, so
 the path that plays is the path a judgment passed, with its `unreachable`
-and `rejected` refusals; an arm still that far after 20 judgments fails the
-goal with `precondition_failed` (`left_arm still moved 0.008 rad at joint 1
-while its path was judged 20 times; let the arm settle and send the path
+and `rejected` refusals; an arm still that far once the judgments span 0.2 s
+fails the goal with `precondition_failed` (`left_arm still moved 0.008 rad at
+joint 1 while its path was judged N times; let the arm settle and send the path
 again`). All of these come before the path plays. Otherwise each named
 arm's command moves onto the path's start, within 0.001 rad of where the
 arm stands, as a recovered follower's moves onto its measured pose, and
@@ -419,11 +410,11 @@ a goal admitted after it runs. A leader's streamed setpoints are not stopped.
 A coordinator that does not answer cannot carry the stop out: the stop then
 gives an error reply with `attempt_failed`.
 
-`check_arm_move` takes the planning fields of a `move_arm` goal and answers
-whether a plan reaches the pose from the arm's held setpoint, without moving:
-`reachable` and the time the move would take, or `reachable` false and the
-`reason` that the goal's `unreachable` failure gives (`goal pose not planned
-within ...`), with the same validation and the same planner as the goal. A
+`check_arm_move` takes the pose and the duration of a
+`move_arm` goal and answers whether a plan reaches the pose from the arm's held
+setpoint, without moving: `reachable` and the time the move would take, or
+`reachable` false and the `reason` that the goal's failure gives (`goal pose not
+planned: ...`), with the same validation and the same planner as the goal. A
 request the goal would refuse gets an error reply of the same kind and words:
 `rejected` for a value the goal does not take, `resource_unavailable`,
 `leader_streaming`, and `precondition_failed` while the arm executes a move.
@@ -520,8 +511,9 @@ The robot's own body is not checked for hiding a point from the camera.
 | `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move / share of an `execute_joint_path` path) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only, but for the path its share follows; never the collision model |
 | `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
+| `planner/stream_smoothing.rs` | the smoothing of a streamed pose's steps: one Butterworth per joint at MoveIt Servo's default cutoff for the control period | a smoother can overshoot its input, so the planner holds its output to the velocity limit |
 | `path_checks.rs` | the judgments of `execute_joint_path` paths on a blocking thread, and the resumption of their shares on the tick each judgment comes | the loop never waits on a judgment |
-| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move is planned and settled within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
+| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move settles within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
 | `governor/sense.rs` | the pre-projection model read (`Sensed`) | limiters and the projection decide on one snapshot |
 | `governor/model.rs` | `ConfiguredModel`, the only door to the collision model | every query takes the whole configuration; stale-placement reads are unrepresentable |
@@ -539,20 +531,20 @@ The robot's own body is not checked for hiding a point from the camera.
 
 See `peppy.json5` for the full commented list. The operational governor
 parameters (`d_stop_m`, `d_safe_m`, `collision_governor_enabled`,
-`max_ee_velocity_m_s`) are required launcher arguments with no node defaults,
+`max_stream_ee_velocity_m_s`) are required launcher arguments with no node defaults,
 and the commander's `governor_control` stream retunes them live.
 `follower_state_rate_hz` is required too: the rate the followers deliver
 measured state at, of which four silent periods freeze the limb, and under
-three quarters of which draws a warning (100 for the real arms and MuJoCo;
-the Isaac fragment declares its 60 fps frame rate, since that simulation
-reports once per rendered frame).
+three quarters of which draws a warning. A launcher declares what its followers
+deliver: the real arms deliver at their `state_rate_hz`, and Isaac once per rendered
+frame.
 `upstream_mode` is likewise required: `"joints"` follows the joint_link
 leader slots, `"pose"` the pose_link ones, and only the named kind is
 subscribed. Link the leader into the slots that kind names, or nothing it
 streams is read and the arms never move.
-`max_ee_angular_velocity_rad_s`, required like the linear cap, caps the
-rotation of streamed poses and the servo reference; unlike the linear cap it
-is launch-time only, not retuned by the live speed control.
+`max_stream_ee_velocity_m_s` caps the hand on every stream and on nothing else:
+`move_arm`, `move_arm_joints`, the postures and `execute_joint_path` run under
+the joint limits and the goal's duration.
 `start_tolerance_rad`, required too, is how far (rad, each joint) an arm's
 measured joints may stand from the start of an `execute_joint_path` path:
 from the goal's `expected_start_joint_positions` when the coordinator takes
@@ -605,13 +597,11 @@ that proves the published line).
 
 **A tick's cost is proportional to the distance it travels, so it falls as the
 control rate rises.** A segment is `speed * dt` long and is probed once per
-`MAX_PROBE_ARC_RAD`, giving `v_max * dt / MAX_PROBE_ARC_RAD` probes per scan:
-at 100 Hz the 16.75 rad/s J1/J2 limit is 0.168 rad per tick and ~17 probes,
-while at 500 Hz the same jog is 0.034 rad and ~3, floored by
-`SEGMENT_SAMPLES_MIN` at 4. The work per second is about the same either way
-(~1700 vs ~2000 probes); the rate only decides whether it arrives in one
-indivisible lump that must fit inside one period, or spread thin. Sweeping
-the rate against a jog at the J1/J2 limit (Jetson, 20 s per rate):
+`MAX_PROBE_ARC_RAD`, giving `v_max * dt / MAX_PROBE_ARC_RAD` probes per scan,
+floored by `SEGMENT_SAMPLES_MIN`. The work per second is about the same at any
+rate; the rate only decides whether it arrives in one indivisible lump that must
+fit inside one period, or spread thin. Sweeping the rate against a jog at the
+J1/J2 limit (Jetson, 20 s per rate):
 
 | rate    | budget | p50     | p95     | p99     | max      | over budget  |
 | ------- | ------ | ------- | ------- | ------- | -------- | ------------ |
@@ -620,8 +610,8 @@ the rate against a jog at the J1/J2 limit (Jetson, 20 s per rate):
 | 500 Hz  | 2 ms   | 0.31 ms | 0.97 ms | 1.02 ms | 2.53 ms  | 7 / 10000    |
 | 1000 Hz | 1 ms   | 0.31 ms | 0.97 ms | 0.98 ms | 2.40 ms  | 178 / 20000  |
 
-Per-tick cost against jog speed at the shipped rate, stated in rad/s because
-that is the rate-independent quantity (Jetson, 100 Hz, 4000-tick walk):
+Per-tick cost against jog speed, stated in rad/s because that is the
+rate-independent quantity (measured on a Jetson at 100 Hz over a 4000-tick walk):
 
 | jog         | per tick  | p50     | p95     | p99     | max      |
 | ----------- | --------- | ------- | ------- | ------- | -------- |
@@ -629,8 +619,8 @@ that is the rate-independent quantity (Jetson, 100 Hz, 4000-tick walk):
 | 5.0 rad/s   | 0.050 rad | 0.40 ms | 1.01 ms | 1.34 ms | 3.77 ms  |
 | 16.75 rad/s | 0.168 rad | 0.38 ms | 1.05 ms | 2.82 ms | 10.29 ms |
 
-The last row is the J1/J2 velocity limit, the fastest any joint is chased at
-(J3/J4 are clamped lower by `DofSpeed` before the scan sees them). A live 
+The last row is the J1/J2 velocity limit (J3/J4 are clamped lower by `DofSpeed`
+before the scan sees them). A live 
 MuJoCo test of aggressive teleop logs no control-loop overruns at all; the 
 same test against a build whose clip stage refined every breach by bisection 
 logged them at ~37/min, worst 15 ms late. Overruns degrade safely when they 

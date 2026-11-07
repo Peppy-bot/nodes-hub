@@ -15,7 +15,7 @@ kinematics module.
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
 | [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity` and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
-| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending cancelled with the reason `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing, and gives an error reply with the kind of the refusal to a check that `move_arm` would refuse), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream passes through under the end-effector-speed governor, its only limiter; a pose-led stream is reach-clipped, solved, and rate-stepped per joint before that same governor. Joint moves, postures and Cartesian moves run minimum-jerk plans sized by the per-joint velocity caps, and Cartesian moves additionally by the EE speed caps. A joint path (`execute_joint_path`) names the arm, `arm`, once in its `arms`, rounds its corners as `limb_motion` states, begins at the joints the follower measures as the move starts, clamped into the joint limits, where the arm holds while the path is planned, and is timed within the per-joint velocity and acceleration caps, its speed integrated over a grid of at least 1000 cells along the path, slowed evenly to a longer `duration_s`. A goal fails with `precondition_failed`, naming the joint, while a measured joint stands farther than the `start_tolerance_rad` parameter from its `expected_start_joint_positions`, when it names them, or, once the path is planned, while a measured joint, clamped into the joint limits, stands farther than `start_tolerance_rad` from where the arm holds, the arm having moved while the path was planned; and it fails with `rejected`, giving the time, when those caps need longer than 60 s for the path. A goal refused for its expected start moves nothing; a path that fails once the arm holds, before it plays, leaves the arm held at its measured joints, moved inside its joint limits where it stood past one, and runs none of the path; once the path plays, a failure holds the arm where it stands. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails with `timeout` at its settle timeout; a posture once each joint stands within 0.1 rad of the posture, with a settle timeout of 2 s, so an arm that an object stops short of the posture fails it. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state: a goal is refused with `resource_unavailable` without it, and a move fails with `resource_unavailable` when it goes stale. A goal on a limb a leader is streaming is refused with `leader_streaming` until the stream has been silent for the deadman timeout, and a goal on a limb that runs another goal with `precondition_failed`; an admitted goal owns its limb until it ends. |
+| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending cancelled with the reason `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing, and gives an error reply with the kind of the refusal to a check that `move_arm` would refuse), the `limb_state` readout and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream is clamped into the joint limits and rate-stepped per joint at the joint velocity limits, under the end-effector-speed governor; a pose-led stream is reach-clipped and solved first, then treated the same. Joint moves, postures and Cartesian moves are timed within the per-joint velocity and acceleration caps. A joint path (`execute_joint_path`) names the arm, `arm`, once in its `arms`, rounds its corners as `limb_motion` states, begins at the joints the follower measures as the move starts, clamped into the joint limits, where the arm holds while the path is planned, and is timed within the per-joint velocity and acceleration caps, its speed integrated over a grid of at least 1000 cells along the path, slowed evenly to a longer `duration_s`. A goal fails with `precondition_failed`, naming the joint, while a measured joint stands farther than the `start_tolerance_rad` parameter from its `expected_start_joint_positions`, when it names them, or, once the path is planned, while a measured joint, clamped into the joint limits, stands farther than `start_tolerance_rad` from where the arm holds, the arm having moved while the path was planned; and it fails with `rejected`, giving the time, when those caps need longer than 60 s for the path. A goal refused for its expected start moves nothing; a path that fails once the arm holds, before it plays, leaves the arm held at its measured joints, moved inside its joint limits where it stood past one, and runs none of the path; once the path plays, a failure holds the arm where it stands. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails with `timeout` at its settle timeout; a posture once each joint stands within 0.1 rad of the posture, with a settle timeout of 2 s, so an arm that an object stops short of the posture fails it. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state: a goal is refused with `resource_unavailable` without it, and a move fails with `resource_unavailable` when it goes stale. A goal on a limb a leader is streaming is refused with `leader_streaming` until the stream has been silent for the deadman timeout, and a goal on a limb that runs another goal with `precondition_failed`; an admitted goal owns its limb until it ends. |
 
 ```text
 so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper──▶ so101_follower
@@ -92,78 +92,55 @@ The backbone solves with lerobot's placo-based `RobotKinematics`.
 streaming small deltas rather than for reaching a pose from anywhere.
 `so101_description.kinematics` wraps it: a point-to-point solve iterates that
 step up to `IK_MAX_ITERATIONS` and accepts only when forward kinematics puts
-the grasp point within the goal's `plan_position_tolerance_m` and
-`plan_orientation_tolerance_rad` of the target, so a `move_arm` never moves
-the arm to a pose it did not actually reach. A `move_arm` goal whose solve
-finds no solution fails with `unreachable`, and `check_arm_move` answers
-`reachable` false with the same reason.
+the grasp point where the solve asks. A `move_arm` walks the straight line to the
+pose, as the OpenArm does: one verified solve per sample of the line, the grasp
+point within 1 mm of its sample and the last sample within 0.01 rad of a named
+orientation, and plays the configurations as a joint path, so a `move_arm` never moves the arm to a pose it did
+not actually reach. A `move_arm` goal no line reaches fails with `unreachable`, and
+`check_arm_move` answers `reachable` false with the same reason. A line, a joint move
+or a posture move the joint limits cannot run within 60 s fails with `rejected`.
 
 That verification makes refusals honest, not rare. The search stays a local
 descent from the arm's current posture, so it finds solutions on that branch
-and no others. Measured against poses that are reachable by construction (a
-joint vector drawn inside the model's limits, and its forward kinematics taken
-as the target, so a solution provably exists):
+and no others, and a line must solve at each of its samples. Measured on 300
+goals near an arbitrary in-limits posture, each a pose reachable by construction
+(the forward kinematics of a joint vector within 0.6 rad of the posture):
 
-| Seed posture | Refused |
+| Goal | Plans a line |
 |---|---|
-| Every joint at zero (the calibration middle) | 14% (n=400) |
-| An arbitrary in-limits posture, which is what `move_arm` seeds from | 39% (n=300) |
+| The pose, its orientation exactly reachable | 271 of 300 |
+| The pose, its orientation off by 0.05 rad | 52 of 300 |
+| Its position alone, `orientation` left out | 218 of 300 |
 
-Refusals concentrate near the base rather than at the rim: 25% within 0.23 m
-of the base against 7% beyond 0.45 m. The gap between the seed posture and the
-target posture shows no such gradient, so distance from the seed is not what
-predicts a refusal.
+Read a refusal as *this branch did not walk the line*, not as *the arm cannot
+reach it*. The same target frequently solves from a different starting posture.
+A caller that hits a refusal can move the arm somewhere else and ask again, or,
+where the launch runs a motion planner, plan a path with `plan_joint_path` and run
+it with `execute_joint_path`.
 
-Read a refusal as *this branch did not reach the pose*, not as *the arm cannot
-reach it*. The same target frequently solves from a different starting posture,
-which is why the seed posture dominates the table above. A caller that hits a
-refusal can move the arm somewhere else and ask again.
+### The path is a straight line
 
-### The path between the endpoints is not planned
+`move_arm` walks the line to the pose and plays its configurations as a joint path.
+On those goals the grasp point stays under 1 mm off the line. The orientation is
+free along the way and lands within 0.01 rad of a named orientation. A joint step past
+0.35 rad is a jump to another branch and refuses the line.
 
-`move_arm` plans endpoints only. It runs one IK solve for the goal pose and
-then blends from the current joints to the solution with a minimum-jerk
-quintic **in joint space**. Nothing constrains where the end effector goes in
-between, and nothing verifies it. The arm does not walk the straight line
-between start and goal; it walks whatever curve the joint blend traces.
-
-Measured over 200 solved pose moves, the end effector's greatest departure
-from the straight line between the endpoints:
-
-| | Departure |
-|---|---|
-| Median | 91 mm |
-| p90 | 240 mm |
-| Worst seen | 472 mm |
-
-On an arm whose whole reach is about 0.54 m, that is not a small bow. 6% of
-moves dip more than 20 mm below *both* endpoints, so a move between two points
-above the table can pass below the lower of them.
-
-This also makes `max_ee_velocity_m_s` a nominal cap rather than a guarantee.
-`_ee_floor_s` sizes the move's minimum duration from the straight-line chord,
-but the path actually flown is longer than the chord, so the real end-effector
-speed exceeds the cap by that ratio: median 1.20x, p90 1.51x, worst seen 2.88x.
-The same applies to `max_ee_angular_velocity_rad_s`, sized from the relative
-rotation between the endpoints.
-
-Practically: keep the volume clear around more than the straight line, and
-treat the speed cap as nominal. Teleop is unaffected, since the streaming path
-follows the commanded stream tick by tick and never plans between two poses.
+The joint limits and the goal's duration time the move. Teleop follows the commanded
+stream tick by tick and plans no line.
 
 Two further limits worth knowing:
 
 - **Orientation is hard to meet.** Five joints underactuate three rotational
   degrees of freedom, so orientation is a soft, low-weight objective of the QP,
-  and a goal that names a tight `plan_orientation_tolerance_rad` often has no
-  plan. A wide one admits the nearest the arm reaches, and a bar of π or more
-  admits any orientation; the move's settle judges the orientation it did
-  reach against `settle_orientation_tolerance_rad`.
+  and a goal that names an orientation the arm cannot end on within 0.01 rad has no
+  plan. A goal that leaves `orientation` out is a position alone: the solves aim at
+  the turn the line starts with, and on those goals it ends a median 0.17 rad and at
+  most 0.96 rad from it.
 - **The reach ball bounds outward extent only.** Streamed pose targets are
   clamped into a ball fitted to the sampled reachable set
   (`backbone/src/so101_backbone/reach.py`) so the streaming solver is never
   asked for a far-out-of-reach pose. Points near the base sit inside that ball
-  and are not clamped, which is the region where refusals cluster.
+  and are not clamped.
 
 This is accepted for now. Teleop through `xr_commander` drives the streaming
 path, which is best effort and unverified by design, and is unaffected. The

@@ -40,7 +40,7 @@ pub fn test_parameters(port: u16) -> peppygen::Parameters {
         http_port: port,
         joint_jog_acceleration_rad_s2: 10.0,
         joint_jog_velocity_rad_s: 1.0,
-        max_ee_velocity_m_s: 0.5,
+        max_stream_ee_velocity_m_s: 0.5,
         max_gripper_rate_frac_s: 6.0,
     }
 }

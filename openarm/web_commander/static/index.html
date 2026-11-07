@@ -337,9 +337,9 @@
       <input type="number" id="gov_d_safe" step="0.001" min="0.001" style="width:5.5em;" onchange="send_governor_params()">
     </label>
     <span style="opacity:0.5;">|</span>
-    <span style="opacity:0.7; font-size:0.85em;" title="Speed limits are applied on every tick whether or not collision avoidance is on. The toggle and the band above govern the collision barrier only.">always active</span>
+    <span style="opacity:0.7; font-size:0.85em;" title="Speed limits are applied to every stream on every tick whether or not collision avoidance is on. A move runs under the joint limits and its duration. The toggle and the band above govern the collision barrier only.">always active</span>
     <label style="display:flex; align-items:center; gap:6px;">
-      Max EE speed (m/s)
+      Max stream EE speed (m/s)
       <input type="number" id="gov_max_ee" step="0.05" min="0.01" style="width:5.5em;" onchange="send_governor_params()">
     </label>
     <label style="display:flex; align-items:center; gap:6px;">
@@ -1035,8 +1035,8 @@ function knob(id) {
   return Number.isFinite(v) ? v : parseFloat(el.defaultValue);
 }
 
-// Requested duration (s) for this arm's discrete moves; 0 = as fast as the EE-speed
-// cap allows. Read by Home, Ready, and Execute.
+// Requested duration (s) for this arm's discrete moves; 0 = as fast as the joint
+// limits allow. Read by Home, Ready, and Execute.
 function arm_duration(side) {
   return knob(`${side}_dur`);
 }
@@ -1180,7 +1180,7 @@ function apply_snapshot(snap) {
   // Seed the governor inputs from the snapshot unless the operator is editing one.
   reflect_governor_input('gov_d_stop', snap.d_stop);
   reflect_governor_input('gov_d_safe', snap.d_safe);
-  reflect_governor_input('gov_max_ee', snap.max_ee_velocity_m_s);
+  reflect_governor_input('gov_max_ee', snap.max_stream_ee_velocity_m_s);
   reflect_governor_input('gov_grip_rate', snap.max_gripper_rate_frac_s);
   update_proximity(snap);
   update_recorder(snap);
@@ -1451,13 +1451,13 @@ function send_governor_params() {
   if (!ws || ws.readyState !== 1) return;
   const d_stop = parseFloat($('gov_d_stop').value);
   const d_safe = parseFloat($('gov_d_safe').value);
-  const max_ee_velocity_m_s = parseFloat($('gov_max_ee').value);
+  const max_stream_ee_velocity_m_s = parseFloat($('gov_max_ee').value);
   const max_gripper_rate_frac_s = parseFloat($('gov_grip_rate').value);
   // A blur on a half-edited field parses to NaN, which JSON.stringify serializes as
   // null; drop the update rather than send a null the backbone would reject.
-  if (![d_stop, d_safe, max_ee_velocity_m_s, max_gripper_rate_frac_s].every(Number.isFinite)) return;
+  if (![d_stop, d_safe, max_stream_ee_velocity_m_s, max_gripper_rate_frac_s].every(Number.isFinite)) return;
   ws.send(JSON.stringify({
-    cmd: 'set_governor_params', d_stop, d_safe, max_ee_velocity_m_s, max_gripper_rate_frac_s,
+    cmd: 'set_governor_params', d_stop, d_safe, max_stream_ee_velocity_m_s, max_gripper_rate_frac_s,
   }));
 }
 

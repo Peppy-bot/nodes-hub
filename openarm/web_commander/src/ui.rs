@@ -271,7 +271,7 @@ pub(crate) enum Command {
     SetGovernorParams {
         d_stop: f64,
         d_safe: f64,
-        max_ee_velocity_m_s: f64,
+        max_stream_ee_velocity_m_s: f64,
         max_gripper_rate_frac_s: f64,
     },
     // Play a named gesture from the baked library. Refused while its sides
@@ -314,15 +314,13 @@ mod tests {
             .unwrap_or_else(|e| panic!("{id} prefill {value}: {e}"))
     }
 
-    // The backbone refuses a pose goal whose settle tolerance is below the
-    // plan tolerance of its axis, so the panel's prefilled settle must cover
-    // the plan tolerances it sends.
+    // The backbone refuses a tolerance that is not positive, so the panel's prefilled
+    // settle values must each be one.
     #[test]
-    fn the_prefilled_pose_settle_covers_the_plan_tolerances_the_panel_sends() {
-        use crate::pose::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M};
-        assert!(prefilled("settle_pos") >= PLAN_POS_TOL_M);
-        assert!(prefilled("settle_rot") >= PLAN_ANGLE_TOL_RAD);
-        assert!(prefilled("settle_joints") > 0.0);
+    fn the_prefilled_settle_tolerances_are_positive() {
+        for field in ["settle_pos", "settle_rot", "settle_joints"] {
+            assert!(prefilled(field) > 0.0, "{field}");
+        }
     }
 
     /// Every key of each object literal the page sends with `cmd: '<cmd>',`,

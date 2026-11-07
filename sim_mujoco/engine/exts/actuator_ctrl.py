@@ -88,7 +88,7 @@ class MujocoActuatorCtrl:
 
     def _apply_gains(self, inertia: "list[float]") -> None:
         """Overwrite actuator gain/bias from config so the sim servo runs the
-        real driver's MIT gains. Position actuator torque is
+        configured MIT gains. Position actuator torque is
         gainprm[0]*ctrl + biasprm[1]*q + biasprm[2]*dq, so kp/kd map to
         (kp, -kp, -kd). Joints without configured gains keep the MJCF values.
         """
@@ -103,7 +103,7 @@ class MujocoActuatorCtrl:
                 f"{len(kps)} kp, {len(kds)} kd"
             )
         # The real gearbox and motor add damping the sim plant lacks; without
-        # it the real driver's gains ring badly (~0.14 damping ratio). Raise
+        # it these gains ring badly (~0.14 damping ratio). Raise
         # the servo damping to critical: the dq_des feedforward cancels it
         # along the trajectory, so tracking is unaffected while deviations
         # damp.
