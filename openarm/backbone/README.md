@@ -188,10 +188,12 @@ joint-limit margin or the highest manipulability, the guarded servo
 singular surfaces a discrete IK walk cannot, rolled out offline and played from
 rest to rest), or the joint tier: a straight joint-space path to the exact
 solver's in-limit solution within the plan position tolerance, played as the
-servo's path is, taken only when the grasp point stays within 2 cm of the
-straight line along the whole path, so a descent onto an item, its lift and
-its retreat keep to their line whatever tier plays them. The orientation on
-the joint tier turns as the joints do. Every plan is timed from rest to rest within the velocity and
+servo's path is. On a move of up to 10 cm, the joint tier is taken only when
+the grasp point stays within 2 cm of the straight line along the whole path,
+so a descent onto an item, its lift and its retreat keep to their line
+whatever tier plays them; on a longer move, such as the approach from Ready,
+the grasp point goes where the joints take it. The orientation on the joint
+tier turns as the joints do. Every plan is timed from rest to rest within the velocity and
 acceleration limits the launcher sets and the hand's speed caps
 (`control_core::path_timing`, the time-optimal timing of a path through
 waypoints), and a line is checked tick by tick for the velocity and the
@@ -199,8 +201,8 @@ acceleration as the runtime will command it before it runs. Planning runs after
 admission (peppy's goal decision is pre-context, so reachability cannot be a
 refusal): an accepted goal whose pose no tier reaches, servo rollout and
 joint tier included, fails at once with `unreachable` and `goal pose not
-planned within ...`, which names a joint path that leaves the 2 cm corridor
-and how far it swings. From the planned end of its
+planned within ...`, which names a joint path of a short move that leaves
+the 2 cm corridor and how far it swings. From the planned end of its
 trajectory on, an arm move keeps commanding the target and judges the
 measured arm against it: a joint move completes once every joint stands
 within its `settle_tolerances_rad` entry of its target, a Cartesian move once
