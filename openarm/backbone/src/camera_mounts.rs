@@ -269,7 +269,7 @@ pub async fn serve(
 ) {
     info!("camera mounts: {} cameras", mounts.mounts.len());
     serving::serve("get_camera_poses", token.cancelled(), || {
-        get_camera_poses::handle_next_request(&runner, |_request| {
+        get_camera_poses::handle_requests(&runner, |_request| {
             answer(&mounts, measured.borrow().as_ref())
         })
     })

@@ -157,12 +157,17 @@ field pose.
 
 | Action | Goal | Refused when (`rejected`, `leader_streaming`, `precondition_failed` for a busy side) |
 |---|---|---|
-| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, out of joint limits, a tolerance that is not positive or not one per joint, a leader streaming the arm, side busy |
-| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint out of an arm's joint limits, a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a leader streaming a named arm, a named arm busy |
+| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a leader streaming the arm, side busy |
+| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a leader streaming a named arm, a named arm busy |
 | `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a leader streaming the arm, side busy |
 | `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, side busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
 | `move_to_home` | `duration_s` (the postures contract; both arms to the Home rest) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
+
+A refusal for the joint limits names the joint, its position and its limits.
+A target or a waypoint up to 0.001 rad outside a limit runs at that limit: a
+measured pose sent back as a target lies that close, such as the elbow that
+Home holds at its floor and that settles a hair on either side of it.
 
 `arm_name`/`gripper_name`: `left_arm`/`right_arm` and `left_gripper`/`right_gripper`,
 an unknown name refused with `rejected`. Every pose here, commanded or
@@ -202,8 +207,9 @@ at joint 4, 2.0 s after the planned end` or `still 8.0 mm / 0.02 rad from the
 target, 2.0 s after the planned end`, and the arm holds where it stands: on
 the target, or where the governor held it short. A failed goal gives no result. A goal that completes or ends cancelled reports the
 measured state at that moment; a cancel of its caller ends it for the reason
-`cancelled by its caller`. A posture move completes at the planned end and
-reports where each arm stands. When the arm's follower stops reporting, the
+`cancelled by its caller`. A posture move completes once each arm stands
+within 0.1 rad of the posture in every joint, fails with `timeout` 2 s after
+the planned end otherwise, and reports where each arm stands. When the arm's follower stops reporting, the
 move fails with `resource_unavailable` and `the follower stopped reporting`,
 and so does a goal that reaches the loop before every follower reported
 (`the follower has not reported its first state yet`). A goal cancelled while
@@ -359,12 +365,15 @@ arm's joints as its share measured them when it ended, in the order of
 `arms`, and the time since the path started.
 
 `move_to_ready` and `move_to_home` give each arm's planner a joint move to
-the posture. The goal completes when both moves ran their time out, not when
-the arms arrived. The governor can hold an arm short, and the backbone does
-not see an arm that stops against an object. The goal fails with the first
-failure of an arm's move, its message led by the side (`left: the follower
-stopped reporting`), and with `attempt_failed` when an arm's planner does not
-take or answer its move.
+the posture. The goal completes once both arms settled at the posture: each
+measured joint within 0.1 rad of it, by 2 s after the planned end. An arm
+that the governor holds short, or that stops against an object the backbone
+does not see, such as a bench in front of the robot, fails its move with
+`timeout`. The goal fails with the first failure of an arm's move, its
+message led by the side (`left: still 0.470 rad from the target at joint 6,
+2.0 s after the planned end`, `left: the follower stopped reporting`), and
+with `attempt_failed` when an arm's planner does not take or answer its
+move.
 
 A goal that completes or ends cancelled gives the pose of each arm:
 

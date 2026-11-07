@@ -149,6 +149,11 @@ async def test_get_model_and_list_models_name_the_catalog_models_never_a_provide
         answer_the_camera(h)
         current = await get_model_fx.poll(h, 5.0)
         assert (current.roles, current.models) == (["perception", "manipulation"], [ER, "scripted"])
+        # No frame came yet, nor the limbs of the robot: both roles still start.
+        assert current.starting == [
+            "no perception source: no camera frame received",
+            "no limb_states snapshot received from the robot yet",
+        ]
         offered = await list_models_fx.poll(h, 5.0)
         catalog = [ER, "gemini-4-argon", OPUS, "gpt-6-astra"]
         assert offered.roles == ["perception"] * 5 + ["manipulation"] * 6

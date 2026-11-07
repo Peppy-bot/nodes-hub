@@ -484,18 +484,18 @@ fn joint_target<'r>(
         })
         .ok_or_else(|| none_has(named, "joint", &c.joint_name, |arm| &arm.joint_names))?;
     let limit = arm.geometry.chain().limits()[joint];
-    if !(limit.lo..=limit.hi).contains(&c.position) {
+    let Some(position) = limit.take_target(c.position) else {
         return Err(format!(
             "the target {} of {} lies outside its limits {} to {}",
             c.position, c.joint_name, limit.lo, limit.hi
         ));
-    }
+    };
     Ok(Routed {
         side: arm.side,
         name: &c.joint_name,
         target: JointTarget {
             joint,
-            position: c.position,
+            position,
             above: tolerance("tolerance_above", &c.joint_name, c.tolerance_above)?,
             below: tolerance("tolerance_below", &c.joint_name, c.tolerance_below)?,
         },
@@ -825,6 +825,37 @@ mod tests {
                 Vec::new(),
             )
             .expect("a goal")
+        );
+    }
+
+    // A joint target a hair under its floor, as a measured position sent back can lie, is
+    // taken at its floor; one 1.1 mrad under it is refused.
+    #[test]
+    fn a_joint_target_a_hair_outside_its_limit_is_taken_at_the_limit() {
+        let floor = arms()[Side::Left].geometry.chain().limits()[3].lo;
+        assert_eq!(floor, 0.05, "openarm_left_joint4's floor");
+        let query = parse(&joint_goal("openarm_left_joint4", 0.0495)).expect("a query");
+        let ArmGoals::One { goal, .. } = query.arm_goals else {
+            panic!("one arm moves");
+        };
+        assert_eq!(
+            *goal,
+            Goal::new(
+                ARM_DOF,
+                vec![JointTarget {
+                    joint: 3,
+                    position: floor,
+                    above: PositiveFinite::parse(0.01).expect("a tolerance"),
+                    below: PositiveFinite::parse(0.01).expect("a tolerance"),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("a goal")
+        );
+        assert!(
+            refusal(joint_goal("openarm_left_joint4", 0.0489))
+                .starts_with("the target 0.0489 of openarm_left_joint4 lies outside its limits")
         );
     }
 

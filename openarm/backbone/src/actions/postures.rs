@@ -64,8 +64,7 @@ fn admit_posture(
 /// How a posture goal ends.
 #[derive(Debug, PartialEq)]
 enum PostureEnd {
-    /// Both moves ran their time out. The governor can hold an arm short and
-    /// an object can stop it, so it does not mean the arms arrived.
+    /// Both arms settled at the posture ([`crate::planner::POSTURE_SETTLE`]).
     Completed,
     /// Cancelled for this reason: by the goal's caller, or by the stop.
     Cancelled(String),

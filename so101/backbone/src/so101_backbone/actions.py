@@ -45,8 +45,8 @@ from so101_backbone.coordinator import (
     Coordinator,
     GripperPlan,
     JointSettle,
+    POSTURE_SETTLE,
     PoseSettle,
-    PostureEnd,
     joint_past_tolerance,
 )
 from so101_backbone.failures import FailureKind, Refusal
@@ -345,13 +345,15 @@ class ActionLayer:
         if not all(math.isfinite(p) for p in target):
             raise Refusal(FailureKind.REJECTED, "non-finite joint target")
         _require_duration(duration_s, "duration_s")
-        if not self._limits.contains(target):
-            raise Refusal(FailureKind.REJECTED, "target out of joint limits")
+        outside = self._limits.first_outside(target)
+        if outside is not None:
+            raise Refusal(FailureKind.REJECTED, f"the target puts {outside}")
+        target = self._limits.clamp(target)
         settle = _joint_settle(settle_tolerances_rad, settle_timeout_s)
         return self._admit_trajectory(target, duration_s, settle)
 
     def _admit_trajectory(
-        self, target: tuple[float, ...], duration_s: float, settle: JointSettle | PostureEnd
+        self, target: tuple[float, ...], duration_s: float, settle: JointSettle
     ) -> ArmPlan:
         """Claim the arm's busy slot and install the trajectory to `target`
         with `settle`, or raise Refusal. The claim happens last so a
@@ -562,10 +564,10 @@ class ActionLayer:
         )
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
-        """A posture move runs to the planned end of its trajectory and
-        reports the measured grasp point."""
+        """A posture move completes once the arm settles at the posture
+        (POSTURE_SETTLE), and reports the measured grasp point."""
         _require_duration(duration_s, "duration_s")
-        return self._admit_trajectory(target, duration_s, PostureEnd())
+        return self._admit_trajectory(target, duration_s, POSTURE_SETTLE)
 
     # ----------------------------------------------------- decide constructors
 
@@ -1023,23 +1025,27 @@ def _the_arm_entry(
 def _joint_path_goal(
     arm: execute_joint_path.GoalRequestDataArmsItem, duration_s: float, limits: JointLimits
 ) -> _JointPathGoal:
-    """The joint path of the goal entry `arm`, or Refusal with `rejected`: no
-    waypoint, a non-finite joint position, a waypoint outside `limits`, an
-    expected start that _expected_start refuses, or a duration out of its
-    bound."""
-    waypoints = tuple(tuple(w.joint_positions) for w in arm.waypoints)
-    if not waypoints:
+    """The joint path of the goal entry `arm`, each waypoint inside `limits`
+    (a joint at most LIMIT_SLACK_RAD outside its limits runs at the limit), or
+    Refusal with `rejected`: no waypoint, a non-finite joint position, a
+    waypoint joint farther outside `limits`, an expected start that
+    _expected_start refuses, or a duration out of its bound."""
+    sent = tuple(tuple(w.joint_positions) for w in arm.waypoints)
+    if not sent:
         raise Refusal(FailureKind.REJECTED, "waypoints is empty: give at least one waypoint")
-    for number, waypoint in enumerate(waypoints, start=1):
+    waypoints = []
+    for number, waypoint in enumerate(sent, start=1):
         assert len(waypoint) == NUM_JOINTS
         if not all(math.isfinite(p) for p in waypoint):
             raise Refusal(
                 FailureKind.REJECTED, f"waypoint {number} has a non-finite joint position"
             )
-        if not limits.contains(waypoint):
-            raise Refusal(FailureKind.REJECTED, f"waypoint {number} out of joint limits")
+        outside = limits.first_outside(waypoint)
+        if outside is not None:
+            raise Refusal(FailureKind.REJECTED, f"waypoint {number} puts {outside}")
+        waypoints.append(limits.clamp(waypoint))
     return _JointPathGoal(
-        waypoints=waypoints,
+        waypoints=tuple(waypoints),
         expected_start=_expected_start(tuple(arm.expected_start_joint_positions)),
         duration_s=_require_duration(duration_s, "duration_s"),
     )
@@ -1114,8 +1120,9 @@ def _require_within_move_ceiling(profile: JointTrajectory, what: str, remedy: st
 
 def _ceiling_words(settle) -> tuple[str, str]:
     """What a move of `settle` is called and what a caller does about it past the
-    ceiling; a caller cannot split a posture."""
-    if isinstance(settle, PostureEnd):
+    ceiling; a caller cannot split a posture, the move that settles by
+    POSTURE_SETTLE."""
+    if settle is POSTURE_SETTLE:
         return "posture move", _RAISE_THE_JOINT_LIMITS
     return "move", _SPLIT_INTO_SHORTER_MOVES
 

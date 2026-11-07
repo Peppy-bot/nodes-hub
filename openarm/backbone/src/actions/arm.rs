@@ -23,7 +23,7 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
 use peppylib::runtime::CancellationToken;
-use srs_model::{JointVec, Limit};
+use srs_model::{JointVec, Limit, take_targets};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
@@ -87,16 +87,6 @@ fn arm_move_request(
     })
 }
 
-fn target_in_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> bool {
-    joint_outside_limits(q, limits).is_none()
-}
-
-/// The joint, counted from 0, whose position in `q` lies outside `limits`,
-/// if any.
-pub(super) fn joint_outside_limits(q: &JointVec, limits: &[Limit; ARM_DOF]) -> Option<usize> {
-    (0..ARM_DOF).find(|&j| !(limits[j].lo..=limits[j].hi).contains(&q[j]))
-}
-
 /// A `move_arm` goal parsed off the wire: the move to plan, and the settle it
 /// asks for.
 struct MoveArmGoal {
@@ -118,7 +108,8 @@ fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGo
 }
 
 /// A `move_arm_joints` goal parsed off the wire: a finite target inside the
-/// arm's joint limits, the duration, and the settle it asks for.
+/// arm's joint limits ([`take_targets`]), the duration, and the settle it
+/// asks for.
 struct JointMoveRequest {
     side: Side,
     target: JointVec,
@@ -135,16 +126,15 @@ fn joint_move_request(
         return Err("non-finite joint target".to_string());
     }
     let duration = move_seconds_from_wire("duration_s", d.duration_s)?;
-    if !target_in_limits(&d.joint_positions, &limits[side]) {
-        return Err("target out of joint limits".to_string());
-    }
+    let target = take_targets(&limits[side], &d.joint_positions)
+        .map_err(|outside| format!("the target puts {outside}"))?;
     let settle = Settle {
         tolerance: joint_tolerances_from_wire(d.settle_tolerances_rad)?,
         timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
     };
     Ok(JointMoveRequest {
         side,
-        target: d.joint_positions,
+        target,
         duration,
         settle,
     })
@@ -259,7 +249,7 @@ pub async fn run_check_arm_move(
     activity: ArmPair<LeaderActivity>,
 ) {
     serving::serve("check_arm_move", token.cancelled(), || {
-        check_arm_move::handle_next_request(&runner, |req| {
+        check_arm_move::handle_requests(&runner, |req| {
             check_plan(&requests, &fresh, &activity, &req.data)
                 .map_err(|f| check_arm_move::Failure::new(f.kind.into(), f.message))
         })
@@ -327,6 +317,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An elbow measured a hair under its floor, as a world saved at Home
+    /// can hold it, is taken at its floor; one farther under it is refused
+    /// with the joint, its position and its limits.
+    #[test]
+    fn a_joint_target_a_hair_outside_its_limits_is_taken_at_the_limit_and_one_farther_out_refused()
+    {
+        let limits = ArmPair::from_fn(|side| {
+            crate::test_support::bundled_arm(openarm_description::HardwareVersion::V2, side)
+                .limits()
+        });
+        let mut goal = move_arm_joints::GoalRequestData {
+            arm_name: "left_arm".to_string(),
+            joint_positions: openarm_description::home(Side::Left),
+            duration_s: 1.0,
+            settle_tolerances_rad: [0.01; ARM_DOF],
+            settle_timeout_s: 1.0,
+        };
+        goal.joint_positions[3] = 0.0489;
+        assert_eq!(
+            joint_move_request(&goal, &limits).err().as_deref(),
+            Some("the target puts joint 4 at 0.0489 rad, outside its limits [0.05, 2.4435]")
+        );
+        for position in [0.0499925, 0.05, 0.0491] {
+            goal.joint_positions[3] = position;
+            let taken = joint_move_request(&goal, &limits).unwrap().target;
+            assert_eq!(taken[3], 0.05, "{position}");
+        }
+        goal.joint_positions[3] = 0.4;
+        assert_eq!(joint_move_request(&goal, &limits).unwrap().target[3], 0.4);
     }
 
     #[test]

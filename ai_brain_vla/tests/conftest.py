@@ -84,6 +84,9 @@ class FakeDetector:
     def why_unavailable(self) -> str:
         return ""
 
+    def starting(self) -> str:
+        return ""
+
     async def detect(self, image: np.ndarray, phrases: Sequence[str], deadline: Deadline) -> list[Box]:
         self.phrases.append(list(phrases))
         return list(self.boxes)
@@ -105,6 +108,9 @@ class FakeManipulator:
         self._began = asyncio.Event()
 
     def why_unavailable(self) -> str:
+        return ""
+
+    def starting(self) -> str:
         return ""
 
     async def start(self, senses) -> None:

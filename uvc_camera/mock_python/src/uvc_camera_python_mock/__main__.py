@@ -296,7 +296,7 @@ async def listen_for_control_acks(
     while not token.is_cancelled():
         try:
             await wait_unless_cancelled(
-                service.handle_next_request(
+                service.handle_requests(
                     node_runner,
                     lambda request: service.Response(
                         **{response_field: getattr(request.data, request_field)}
@@ -306,9 +306,13 @@ async def listen_for_control_acks(
             )
         except Exception as e:
             print(f"{name} service error: {e}")
-            # Back off: a persistent failure (messenger down) would otherwise
-            # spin this loop as fast as the exception can be raised.
-            await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
+        else:
+            if token.is_cancelled():
+                return
+            print(f"{name} service: its request stream ended")
+        # Back off: a service that stops at once (messenger down) would
+        # otherwise spin this loop as fast as it can stop.
+        await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
 
 
 async def listen_for_video_stream_info_requests(
@@ -318,7 +322,7 @@ async def listen_for_video_stream_info_requests(
     while not token.is_cancelled():
         try:
             await wait_unless_cancelled(
-                video_stream_info.handle_next_request(
+                video_stream_info.handle_requests(
                     node_runner,
                     lambda _request: video_stream_info.Response(
                         width=video_params.resolution.width,
@@ -331,7 +335,11 @@ async def listen_for_video_stream_info_requests(
             )
         except Exception as e:
             print(f"video_stream_info service error: {e}")
-            await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
+        else:
+            if token.is_cancelled():
+                return
+            print("video_stream_info service: its request stream ended")
+        await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
 
 
 def main():

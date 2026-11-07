@@ -498,7 +498,8 @@ async def test_a_joint_path_without_follower_state_is_refused():
 
 async def test_posture_and_gripper_actions():
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = await feeding_measured(h)
+        # The mocked follower stands at Ready, so move_to_ready settles there.
+        feeder = await feeding_measured(h, positions=postures.READY_POSITIONS_RAD)
         try:
             posture = await move_to_ready_fx.send_goal(
                 h,
@@ -543,22 +544,22 @@ async def test_posture_and_gripper_actions():
 async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
     follower_never_stale,
 ):
-    # One scenario for three facts of the result of each posture move:
+    # One scenario for two facts of the result of each posture move:
     # - the result names the arm;
-    # - it gives the grasp point of the measured joints;
-    # - it completes when the arm did not arrive.
-    # The mocked follower always measures MEASURED, so the arm never gets to
-    # a posture. follower_never_stale keeps a pause of the event loop from
-    # making the measured joints stale.
+    # - it gives the grasp point of the measured joints, not of the posture.
+    # The mocked follower measures the arm 0.05 rad off the posture in every
+    # joint, inside the posture's settle. follower_never_stale keeps a pause
+    # of the event loop from making the measured joints stale.
     kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    measured_position, measured_orientation = kinematics.forward_kinematics(MEASURED)
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = await feeding_measured(h)
-        try:
-            for production, fixture, posture in (
-                (move_to_ready_prod, move_to_ready_fx, postures.READY_POSITIONS_RAD),
-                (move_to_home_prod, move_to_home_fx, postures.HOME_POSITIONS_RAD),
-            ):
+        for production, fixture, posture in (
+            (move_to_ready_prod, move_to_ready_fx, postures.READY_POSITIONS_RAD),
+            (move_to_home_prod, move_to_home_fx, postures.HOME_POSITIONS_RAD),
+        ):
+            near = [p + 0.05 for p in posture]
+            measured_position, measured_orientation = kinematics.forward_kinematics(near)
+            feeder = await feeding_measured(h, positions=near)
+            try:
                 goal = await fixture.send_goal(
                     h,
                     production.GoalRequestData(duration_s=0.0),
@@ -571,7 +572,27 @@ async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
                 assert result.data.positions == pytest.approx(list(measured_position))
                 assert result.data.orientations == pytest.approx(list(measured_orientation))
                 posture_position, _orientation = kinematics.forward_kinematics(posture)
-                assert math.dist(result.data.positions, posture_position) > 0.1
+                assert math.dist(result.data.positions, posture_position) > 1e-3
+            finally:
+                feeder.cancel()
+
+
+async def test_a_posture_the_arm_does_not_reach_fails_with_timeout(follower_never_stale):
+    # The mocked follower always measures MEASURED, as an arm that an object
+    # holds where it stands: move_to_ready fails, naming the joint.
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h)
+        try:
+            goal = await move_to_ready_fx.send_goal(
+                h,
+                move_to_ready_prod.GoalRequestData(duration_s=0.0),
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == move_to_ready_fx.ResultStatus.FAILED
+            assert result.failure.kind is move_to_ready_fx.FailureKind.TIMEOUT
+            assert " rad from the target at joint 5, " in result.failure.message
         finally:
             feeder.cancel()
 
@@ -676,7 +697,8 @@ async def test_out_of_limit_goal_is_refused():
             TIMEOUT_S,
         )
         assert goal.refusal == move_arm_joints_fx.Failure(
-            move_arm_joints_fx.FailureKind.REJECTED, "target out of joint limits"
+            move_arm_joints_fx.FailureKind.REJECTED,
+            "the target puts joint 1 at 9.0 rad, outside its limits [-1.91986, 1.91986]",
         )
 
 
@@ -699,7 +721,10 @@ async def test_a_joint_path_goal_this_robot_does_not_take_is_refused():
     async with harness.start(setup, parameters=make_parameters()) as h:
         await publish_measured(h)
         for goal_data, refusal in (
-            (joint_path_goal(MEASURED, [9.0] * 5), "waypoint 2 out of joint limits"),
+            (
+                joint_path_goal(MEASURED, [9.0] * 5),
+                "waypoint 2 puts joint 1 at 9.0 rad, outside its limits [-1.91986, 1.91986]",
+            ),
             (
                 joint_path_goal(MEASURED, arm_names=["left_arm"]),
                 'unknown arm_name: this robot\'s arm is "arm"',

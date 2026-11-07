@@ -358,7 +358,7 @@ fn spawn_stream_infos(runner: Arc<NodeRunner>, color: Size, depth: Size, fps: u8
             "video_stream_info",
             video_runner.cancellation_token().cancelled(),
             || {
-                video_stream_info::handle_next_request(&video_runner, |_req| {
+                video_stream_info::handle_requests(&video_runner, |_req| {
                     Ok(video_stream_info::Response::new(
                         color.width,
                         color.height,
@@ -375,7 +375,7 @@ fn spawn_stream_infos(runner: Arc<NodeRunner>, color: Size, depth: Size, fps: u8
             "depth_stream_info",
             runner.cancellation_token().cancelled(),
             || {
-                depth_stream_info::handle_next_request(&runner, |_req| {
+                depth_stream_info::handle_requests(&runner, |_req| {
                     Ok(depth_stream_info::Response::new(
                         depth.width,
                         depth.height,
@@ -490,7 +490,7 @@ macro_rules! spawn_geometry_service {
                 serving::serve(
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
-                    || $service::handle_next_request(&runner, |_req| $respond(&geometry)),
+                    || $service::handle_requests(&runner, |_req| $respond(&geometry)),
                 )
                 .await;
             });
@@ -554,7 +554,7 @@ fn spawn_set_color_exposure(runner: Arc<NodeRunner>) {
         serving::serve(
             "set_color_exposure",
             runner.cancellation_token().cancelled(),
-            || set_color_exposure::handle_next_request(&runner, color_exposure),
+            || set_color_exposure::handle_requests(&runner, color_exposure),
         )
         .await;
     });
@@ -587,7 +587,7 @@ fn spawn_set_color_white_balance(runner: Arc<NodeRunner>, camera: Camera) {
             "set_color_white_balance",
             runner.cancellation_token().cancelled(),
             || {
-                set_color_white_balance::handle_next_request(&runner, |req| {
+                set_color_white_balance::handle_requests(&runner, |req| {
                     color_white_balance(&camera, &req.data.mode, req.data.temperature)
                         .map(set_color_white_balance::Response::new)
                         .map_err(|failure| {
@@ -609,7 +609,7 @@ macro_rules! spawn_cid_control_service {
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
                     || {
-                        $service::handle_next_request(&runner, |req| {
+                        $service::handle_requests(&runner, |req| {
                             apply_control(&camera, $cid, req.data.value)
                                 .map($service::Response::new)
                                 .map_err(|failure| camera_core::control_failure!($service, failure))

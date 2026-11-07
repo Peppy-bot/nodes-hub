@@ -444,6 +444,13 @@ class Sam3SiglipDetector:
             return f"perception_model '{self.name}' is still loading"
         return f"perception_model '{self.name}' is not loaded"
 
+    def starting(self) -> str:
+        """Why a search is refused while the load runs or is still to run,
+        or "": once the models are loaded, and after a load that failed."""
+        if self._models is not None or self._load_error:
+            return ""
+        return self.why_unavailable()
+
     def start_loading(self, gallery: str) -> asyncio.Task:
         """Begins the load in the background and returns its task. The node
         is healthy at once; a search is refused as still loading until the
