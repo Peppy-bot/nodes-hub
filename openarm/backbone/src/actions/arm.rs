@@ -23,7 +23,7 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
 use peppylib::runtime::CancellationToken;
-use srs_model::{JointVec, Limit};
+use srs_model::{JointVec, Limit, take_targets};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
@@ -94,58 +94,6 @@ fn arm_move_request(
     })
 }
 
-/// How far outside a joint limit a target may lie and still be taken, at
-/// that limit (rad). A measured position sent back as a target lies that
-/// close: an elbow that Home holds at its floor settles a hair on either
-/// side of it.
-pub(super) const LIMIT_SLACK_RAD: f64 = 0.001;
-
-/// A joint position farther outside the limits of its joint than
-/// [`LIMIT_SLACK_RAD`]: the joint counted from 0, its position and its
-/// limits.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct OutsideLimits {
-    pub joint: usize,
-    pub position: f64,
-    pub limits: Limit,
-}
-
-impl std::fmt::Display for OutsideLimits {
-    /// The joint counted from 1, with every digit of its position and its
-    /// limits, so that a position a hair outside a limit reads apart from it.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "joint {} at {} rad, outside its limits [{}, {}]",
-            self.joint + 1,
-            self.position,
-            self.limits.lo,
-            self.limits.hi
-        )
-    }
-}
-
-/// `q` with each joint outside its limits by at most [`LIMIT_SLACK_RAD`]
-/// taken at the limit, or the first joint that lies farther out.
-pub(super) fn within_limits(
-    q: &JointVec,
-    limits: &[Limit; ARM_DOF],
-) -> std::result::Result<JointVec, OutsideLimits> {
-    let mut taken = *q;
-    for (joint, (position, limit)) in taken.iter_mut().zip(limits).enumerate() {
-        let slack = limit.lo - LIMIT_SLACK_RAD..=limit.hi + LIMIT_SLACK_RAD;
-        if !slack.contains(position) {
-            return Err(OutsideLimits {
-                joint,
-                position: *position,
-                limits: *limit,
-            });
-        }
-        *position = position.clamp(limit.lo, limit.hi);
-    }
-    Ok(taken)
-}
-
 /// A `move_arm` goal parsed off the wire: the move to plan, and the settle it
 /// asks for, whose slack covers the plan's on each axis.
 struct MoveArmGoal {
@@ -176,7 +124,7 @@ fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGo
 }
 
 /// A `move_arm_joints` goal parsed off the wire: a finite target inside the
-/// arm's joint limits ([`within_limits`]), the duration, and the settle it
+/// arm's joint limits ([`take_targets`]), the duration, and the settle it
 /// asks for.
 struct JointMoveRequest {
     side: Side,
@@ -194,7 +142,7 @@ fn joint_move_request(
         return Err("non-finite joint target".to_string());
     }
     let duration = move_seconds_from_wire("duration_s", d.duration_s)?;
-    let target = within_limits(&d.joint_positions, &limits[side])
+    let target = take_targets(&limits[side], &d.joint_positions)
         .map_err(|outside| format!("the target puts {outside}"))?;
     let settle = Settle {
         tolerance: joint_tolerances_from_wire(d.settle_tolerances_rad)?,

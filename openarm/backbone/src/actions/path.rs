@@ -22,11 +22,11 @@ use peppygen::exposed_actions::limb_motion::execute_joint_path::{
     self, ExecuteJointPathResultArmsItem,
 };
 use peppygen::{NodeRunner, Result};
-use srs_model::{JointVec, Limit};
+use srs_model::{JointVec, Limit, take_targets};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::arm::{joint_tolerances_from_wire, within_limits};
+use crate::actions::arm::joint_tolerances_from_wire;
 use crate::actions::{
     ARM_WORDS, check_limb_free, claim_arms, collect_ends, move_seconds_from_wire,
 };
@@ -105,7 +105,7 @@ fn execute_joint_path_goal(
 }
 
 /// `q`, waypoint `k` (from 0) of the arm on `side`, inside `limits`
-/// ([`within_limits`]), or its refusal where it is not finite or puts a
+/// ([`take_targets`]), or its refusal where it is not finite or puts a
 /// joint outside `limits`, naming the waypoint and the joint.
 fn waypoint_within_limits(
     side: Side,
@@ -117,7 +117,7 @@ fn waypoint_within_limits(
     if !q.iter().all(|v| v.is_finite()) {
         return Err(format!("{waypoint} holds a non-finite value"));
     }
-    within_limits(q, limits).map_err(|outside| format!("{waypoint} puts {outside}"))
+    take_targets(limits, q).map_err(|outside| format!("{waypoint} puts {outside}"))
 }
 
 /// The expected start of the arm on `side` off the wire: none when
