@@ -376,7 +376,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "camera_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3ca079be1f74ed1ea8679cb2d6fc0c46945c4e55"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#08541f1a88de3d240f2e18c4e6708c497e8122e7"
 dependencies = [
  "libc",
 ]
@@ -579,7 +579,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3ca079be1f74ed1ea8679cb2d6fc0c46945c4e55"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#08541f1a88de3d240f2e18c4e6708c497e8122e7"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
