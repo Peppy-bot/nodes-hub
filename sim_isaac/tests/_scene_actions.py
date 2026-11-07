@@ -18,7 +18,10 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 
 # The generated modules scene_actions.py imports: each action of the scene
 # slot, and each service of the scene and objects slots.
-_ACTIONS = ("apply_force", "clear_scene", "load_scene", "move_object", "move_robot", "remove_object", "spawn_object")
+_ACTIONS = (
+    "apply_force", "clear_scene", "load_scene", "load_template", "move_object", "move_robot", "remove_object",
+    "spawn_object",
+)
 _SERVICES = {
     "scene": (
         "get_assets_list", "get_asset", "get_asset_categories", "get_objects_list", "get_object", "get_robots_list",

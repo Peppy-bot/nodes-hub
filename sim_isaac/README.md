@@ -404,6 +404,8 @@ and a command that Isaac does not carry out fails it with `attempt_failed`.
 Isaac serves `spawn_object` goals one at a time, so a spawn's name is
 checked as its goal arrives, after every earlier spawn has ended.
 
+Isaac holds no template, the kind of asset that scene_manipulation's `load_template` lays out anew at each seed. `get_assets_list` takes the kind `template` and lists no asset for it, `get_asset_categories` counts no category of that kind, and `get_asset` refuses a `template/<id>` with `rejected`, as it refuses each id that names no asset. Each `load_template` goal is refused with `rejected` as it arrives, also before the asset catalogue is discovered, and changes nothing on the stage.
+
 ### Progress of a load or a spawn
 
 A `load_scene` or `spawn_object` goal reports its progress on its feedback
@@ -627,6 +629,7 @@ grep -E \
 - Runtime USD paths must be visible inside the Isaac Sim container.
 - WebRTC requires the correct host IP to be supplied through `PEPPY_ISAAC_PUBLIC_IP`.
 - Isaac Sim can require substantial RAM, swap, disk space and GPU memory.
+- Isaac Sim holds no template, so it refuses each `load_template` goal with `rejected`.
 
 ## Feedback
 
