@@ -96,7 +96,10 @@ async def once_the_brain_has_limbs(h) -> None:
         await publish_limbs(h)
         data = await result_of(grab_fx, h, grab_by_pose([0.5, 0.0, 0.9], [0.0, 1.0, 0.0, 0.0]))
         if data.message != NO_SNAPSHOT:
-            assert data.message.endswith("with gripper 'left_gripper': goal pose not planned"), data.message
+            assert data.message.endswith(
+                "with gripper 'left_gripper': orientation 1 of 1, [0.000, 1.000, 0.000, 0.000], has no plan to "
+                "its pre-grasp point [0.500, 0.000, 0.975]: goal pose not planned"
+            ), data.message
             return
     raise AssertionError("the brain never received the limb_states snapshot")
 

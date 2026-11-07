@@ -71,6 +71,11 @@ class VlmDetector:
     def why_unavailable(self) -> str:
         return ""
 
+    def starting(self) -> str:
+        """Nothing to wait for: the detector loads no model, and asks the
+        hosted one at each search."""
+        return ""
+
     def scan_coverage(self) -> Coverage:
         """A scan asks for every object in the model's own words, so it can
         name any label."""

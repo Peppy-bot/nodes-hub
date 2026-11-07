@@ -57,7 +57,7 @@ async fn serve_describe(
     workspace: Arc<Workspace>,
 ) {
     serving::serve("describe_workspace", token.cancelled(), || {
-        describe_workspace::handle_next_request(&runner, |request| {
+        describe_workspace::handle_requests(&runner, |request| {
             tokio::task::block_in_place(|| {
                 describe(&runner, &workspace, request.data.surface_height)
             })
@@ -68,7 +68,7 @@ async fn serve_describe(
 
 async fn serve_check(runner: Arc<NodeRunner>, token: CancellationToken, workspace: Arc<Workspace>) {
     serving::serve("check_positions", token.cancelled(), || {
-        check_positions::handle_next_request(&runner, |request| {
+        check_positions::handle_requests(&runner, |request| {
             tokio::task::block_in_place(|| check(&runner, &workspace, &request.data.positions))
         })
     })

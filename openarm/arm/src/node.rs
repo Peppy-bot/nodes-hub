@@ -341,7 +341,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
             serving::serve("is_ready", token.cancelled(), || {
-                is_ready::handle_next_request(&runner, |_req| {
+                is_ready::handle_requests(&runner, |_req| {
                     Ok(is_ready::Response::new(reports_ready(
                         ready.load(Ordering::SeqCst),
                         control::HARD_FAULT.load(Ordering::SeqCst),

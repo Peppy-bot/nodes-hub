@@ -1417,15 +1417,16 @@ class SceneActionIO:
 
     async def _serve_service(self, module, handler) -> None:
         """Answers the requests of the service `module` with `handler` for
-        the life of the node, each SceneFailure as an error reply; a round
-        that fails is logged and the next one starts a second later."""
+        the life of the node, each SceneFailure as an error reply. When the
+        service stops, its request stream ended or it could not listen, the
+        log says why and the service listens again a second later."""
 
         name = module.__name__.rsplit(".", 1)[-1]
         answer = _answering(module, handler)
 
         while True:
             try:
-                await module.handle_next_request(
+                await module.handle_requests(
                     self._node_runner,
                     answer,
                 )
@@ -1438,7 +1439,11 @@ class SceneActionIO:
                     "%s service failed",
                     name,
                 )
-                await asyncio.sleep(1.0)
+
+            else:
+                logger.warning("%s service: its request stream ended", name)
+
+            await asyncio.sleep(1.0)
 
     def _decide(self, module: ModuleType, operation: str, request):
         """Admits a goal of `operation` whose command the stage can take

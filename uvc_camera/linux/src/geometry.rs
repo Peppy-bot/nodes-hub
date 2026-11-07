@@ -46,7 +46,7 @@ macro_rules! listen_for_geometry_requests {
             serving::serve(
                 stringify!($service),
                 node_runner.cancellation_token().cancelled(),
-                || $service::handle_next_request(&node_runner, |_request| $respond()),
+                || $service::handle_requests(&node_runner, |_request| $respond()),
             )
             .await;
         }
