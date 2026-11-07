@@ -498,8 +498,9 @@ fn spawn_control_acks(node_runner: &Arc<peppygen::NodeRunner>) {
                             Ok($service::Response::new(request.data.$request_field))
                         }) => result,
                     };
-                    if let Err(e) = result {
-                        tracing::error!("{} service error: {e:?}", stringify!($service));
+                    log_service_stop(stringify!($service), result);
+                    if !wait_out_service_stop(&cancel_token).await {
+                        break;
                     }
                 }
             });
@@ -522,7 +523,7 @@ async fn listen_for_video_stream_info_requests(
     loop {
         let params = video_params.clone();
         let fps = actual_fps;
-        tokio::select! {
+        let result = tokio::select! {
             _ = cancel_token.cancelled() => break,
             result = video_stream_info::handle_requests(&node_runner, move |_request| {
                 Ok(video_stream_info::Response::new(
@@ -531,12 +532,34 @@ async fn listen_for_video_stream_info_requests(
                     fps,
                     params.topic_encoding.clone(),
                 ))
-            }) => {
-                if let Err(e) = result {
-                    tracing::error!("video_stream_info service error: {e:?}");
-                }
-            }
+            }) => result,
+        };
+        log_service_stop("video_stream_info", result);
+        if !wait_out_service_stop(&cancel_token).await {
+            break;
         }
+    }
+}
+
+/// The pause after a service stops before it listens again, so a service
+/// that stops at once (the messenger down) cannot spin its loop.
+const SERVICE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Logs why the service `name` stopped: its request stream ended, or it
+/// could not listen.
+fn log_service_stop(name: &str, result: peppygen::Result<()>) {
+    match result {
+        Ok(()) => tracing::warn!("{name} service: its request stream ended"),
+        Err(e) => tracing::error!("{name} service error: {e:?}"),
+    }
+}
+
+/// Waits [`SERVICE_RETRY_BACKOFF`] after a service stopped; false when the
+/// node stops first.
+async fn wait_out_service_stop(cancel_token: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = cancel_token.cancelled() => false,
+        _ = tokio::time::sleep(SERVICE_RETRY_BACKOFF) => true,
     }
 }
 

@@ -343,8 +343,10 @@ async def setup(
 async def _serve(
     node_runner: NodeRunner, svc, handler, label: str, retry_s: float = _SERVICE_RETRY_S
 ) -> None:
-    """Answer one exposed service until the node shuts down. A handler that
-    raises must not end the loop: the service would then never answer again."""
+    """Answer one exposed service until the node shuts down. When the service
+    stops, its request stream ended or it could not listen, the log says why
+    and the loop listens again `retry_s` later, so a service that stops at
+    once cannot hot-spin it."""
     token = node_runner.cancellation_token()
     while not token.is_cancelled():
         try:
@@ -352,7 +354,9 @@ async def _serve(
         except Exception as e:
             # CancelledError is a BaseException, so shutdown's cancel passes.
             log(f"{label} service error: {e!r}")
-            await asyncio.sleep(retry_s)
+        else:
+            log(f"{label} service: its request stream ended")
+        await asyncio.sleep(retry_s)
 
 
 def _resume_session_handler(node_runner: NodeRunner, recorder: Recorder):

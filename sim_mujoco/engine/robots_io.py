@@ -562,6 +562,10 @@ class RobotsIO:
         self._placements.pop(name, None)
 
     async def _serve_ready(self) -> None:
+        """Answers is_ready for the life of the node. When the service stops,
+        its request stream ended or it could not listen, the log says why and
+        the loop listens again _READY_RETRY_BACKOFF_S later, so a service that
+        stops at once cannot hot-spin it."""
         while True:
             try:
                 await is_ready.handle_requests(self._node_runner, self._ready)
@@ -569,7 +573,9 @@ class RobotsIO:
                 raise
             except Exception:  # pylint: disable=W0718
                 logger.exception("readiness service failed")
-                await asyncio.sleep(_READY_RETRY_BACKOFF_S)
+            else:
+                logger.warning("readiness service: its request stream ended")
+            await asyncio.sleep(_READY_RETRY_BACKOFF_S)
 
     def _ready(self, request: is_ready.Request) -> is_ready.Response:
         """Whether the asking instance's robot is ready to be driven: it

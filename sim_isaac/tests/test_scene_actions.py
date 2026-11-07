@@ -1330,6 +1330,37 @@ def test_a_served_spawn_stands_its_object_under_the_name_its_goal_gives(provider
     assert provider.io.owns(result["object_id"])
 
 
+def test_a_service_that_stops_is_logged_and_waited_out_before_it_listens_again(provider, monkeypatch, caplog):
+    """A request stream that ends and a service that cannot listen are each
+    logged and waited out for a second, so the loop cannot hot-spin."""
+    module = provider.module
+    stops = [None, RuntimeError("the session is closed"), asyncio.CancelledError()]
+    pauses = []
+
+    async def handle_requests(_runner, _handler):
+        raise_or_end = stops.pop(0)
+        if raise_or_end is not None:
+            raise raise_or_end
+
+    async def pause(seconds):
+        pauses.append(seconds)
+
+    module.get_assets_list.handle_requests = handle_requests
+    monkeypatch.setattr(asyncio, "sleep", pause)
+
+    async def serve_until_cancelled():
+        with contextlib.suppress(asyncio.CancelledError):
+            await provider.io._serve_service(module.get_assets_list, provider.io._handle_get_assets)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(serve_until_cancelled())
+
+    assert pauses == [1.0, 1.0]
+    messages = [record.getMessage() for record in caplog.records]
+    assert "get_assets_list service: its request stream ended" in messages
+    assert "get_assets_list service failed" in messages
+
+
 def test_a_service_gives_a_scene_failure_as_an_error_reply_of_its_own_member(provider):
     """Each service answers through the generated handler, which turns the
     Failure of its member into an error reply of that kind."""

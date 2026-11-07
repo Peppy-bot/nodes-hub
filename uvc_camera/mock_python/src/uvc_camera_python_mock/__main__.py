@@ -306,9 +306,13 @@ async def listen_for_control_acks(
             )
         except Exception as e:
             print(f"{name} service error: {e}")
-            # Back off: a persistent failure (messenger down) would otherwise
-            # spin this loop as fast as the exception can be raised.
-            await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
+        else:
+            if token.is_cancelled():
+                return
+            print(f"{name} service: its request stream ended")
+        # Back off: a service that stops at once (messenger down) would
+        # otherwise spin this loop as fast as it can stop.
+        await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
 
 
 async def listen_for_video_stream_info_requests(
@@ -331,7 +335,11 @@ async def listen_for_video_stream_info_requests(
             )
         except Exception as e:
             print(f"video_stream_info service error: {e}")
-            await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
+        else:
+            if token.is_cancelled():
+                return
+            print("video_stream_info service: its request stream ended")
+        await asyncio.sleep(SERVICE_ERROR_BACKOFF_SECONDS)
 
 
 def main():
