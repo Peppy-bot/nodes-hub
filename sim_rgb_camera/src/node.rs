@@ -377,7 +377,7 @@ macro_rules! spawn_service {
             serving::serve(
                 stringify!($service),
                 runner.cancellation_token().cancelled(),
-                || $service::handle_next_request(&runner, &respond),
+                || $service::handle_requests(&runner, &respond),
             )
             .await
         });

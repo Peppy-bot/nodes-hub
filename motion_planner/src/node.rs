@@ -1273,7 +1273,7 @@ fn check_group<const D: usize>(
 async fn serve_descriptions(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("describe_arms", token.cancelled(), || {
-        describe_arms::handle_next_request(&runner, |_request| Ok(description(&node)))
+        describe_arms::handle_requests(&runner, |_request| Ok(description(&node)))
     })
     .await;
 }
@@ -1306,7 +1306,7 @@ fn description(node: &Node) -> describe_arms::Response {
 async fn serve_clear(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("clear_occupancy_map", token.cancelled(), || {
-        clear_occupancy_map::handle_next_request(&runner, |_request| {
+        clear_occupancy_map::handle_requests(&runner, |_request| {
             clear(&node);
             info!("occupancy map cleared");
             Ok(())
@@ -1334,7 +1334,7 @@ fn clear(node: &Node) {
 async fn serve_objects(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("apply_collision_objects", token.cancelled(), || {
-        apply_collision_objects::handle_next_request(&runner, |request| {
+        apply_collision_objects::handle_requests(&runner, |request| {
             tokio::task::block_in_place(|| apply_objects(&node, &request.data))
                 .map_err(apply_collision_objects::Failure::from)
         })
@@ -1359,7 +1359,7 @@ fn apply_objects(
 async fn serve_attachments(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("apply_attached_collision_object", token.cancelled(), || {
-        apply_attached_collision_object::handle_next_request(&runner, |request| {
+        apply_attached_collision_object::handle_requests(&runner, |request| {
             tokio::task::block_in_place(|| apply_attachment(&node, &request.data))
                 .map_err(apply_attached_collision_object::Failure::from)
         })
@@ -1390,7 +1390,7 @@ fn apply_attachment(
 async fn serve_allowed_pairs(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("set_allowed_collision", token.cancelled(), || {
-        set_allowed_collision::handle_next_request(&runner, |request| {
+        set_allowed_collision::handle_requests(&runner, |request| {
             tokio::task::block_in_place(|| allow_pairs(&node, &request.data))
                 .map_err(set_allowed_collision::Failure::from)
         })
@@ -1415,7 +1415,7 @@ fn allow_pairs(
 async fn serve_scene(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("get_planning_scene", token.cancelled(), || {
-        get_planning_scene::handle_next_request(&runner, |_request| {
+        get_planning_scene::handle_requests(&runner, |_request| {
             let snapshot = tokio::task::block_in_place(|| {
                 lock(&node.scene)
                     .snapshot(node.config.min_clearance_m, node.config.voxel_size.get())
@@ -1437,7 +1437,7 @@ fn check_deadline(asked_at: Instant) -> Instant {
 async fn serve_checks(runner: Arc<NodeRunner>, node: Arc<Node>) {
     let token = runner.cancellation_token().clone();
     serving::serve("check_joint_path", token.cancelled(), || {
-        check_joint_path::handle_next_request(&runner, |request| {
+        check_joint_path::handle_requests(&runner, |request| {
             tokio::task::block_in_place(|| {
                 check(&node, &request.data, check_deadline(Instant::now()))
             })

@@ -951,7 +951,7 @@ dependencies = [
 [[package]]
 name = "documents_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f54797ae41cb9473742bee460803ebb126601cc8"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "json5 1.3.7",
  "serde",
@@ -3898,7 +3898,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4853,7 +4853,7 @@ dependencies = [
 [[package]]
 name = "workflow_documents"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f54797ae41cb9473742bee460803ebb126601cc8"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "cel",
  "documents_core",

@@ -48,7 +48,7 @@ async fn run(runner: Arc<NodeRunner>, token: CancellationToken) {
 
     tracing::info!("is_ready service started");
     serving::serve("is_ready", token.cancelled(), || {
-        is_ready::handle_next_request(&runner, |_req| {
+        is_ready::handle_requests(&runner, |_req| {
             Ok(is_ready::Response::new(ready.load(Ordering::SeqCst)))
         })
     })

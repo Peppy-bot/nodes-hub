@@ -154,6 +154,7 @@ def test_the_detector_finds_nothing_and_says_so_until_it_is_loaded():
     assert detector.name == "sam3_siglip"
     assert detector.scan_vocabulary == load_vocabulary()
     assert detector.why_unavailable() == "perception_model 'sam3_siglip' is not loaded"
+    assert detector.starting() == "perception_model 'sam3_siglip' is not loaded", "its load is still to run"
     assert detector.scan_coverage() == Coverage()
     assert detector.find(np.zeros((4, 4, 3), dtype=np.uint8), ["banana"], NEVER) == []
 
