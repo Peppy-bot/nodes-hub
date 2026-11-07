@@ -1,11 +1,12 @@
 """The scene_manipulation and object_state provider: what get_assets_list and
-get_asset answer before and after discovery, what load_scene and clear_scene
-do to spawned objects, what get_object_states answers: an error reply until a
-capture, then the latest capture under its own stamp, every completed edit
-included, what get_object answers for one object of that capture, what a
-load_scene or spawn_object goal reports on its feedback, and the failure kind
-of each goal refused when it arrives, of each goal whose command fails, and of
-each error reply."""
+get_asset answer before and after discovery, the kind template among them,
+what load_scene and clear_scene do to spawned objects, what get_object_states
+answers: an error reply until a capture, then the latest capture under its own
+stamp, every completed edit included, what get_object answers for one object
+of that capture, what a load_scene or spawn_object goal reports on its
+feedback, and the failure kind of each goal refused when it arrives, each
+load_template goal among them, of each goal whose command fails, and of each
+error reply."""
 
 import asyncio
 import contextlib
@@ -14,10 +15,12 @@ import json
 import logging
 import threading
 from concurrent.futures import Future
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import pyjson5
 import pytest
 
 from _scene_actions import scene_actions_module
@@ -190,7 +193,7 @@ def test_the_catalogue_is_narrowed_by_each_filter_and_a_bad_kind_is_refused(prov
     assert _listed(provider, kind="", category="", query="") == _listed(provider)
 
     refused = _refused(provider, lambda: provider.io._handle_get_assets(_assets_request(kind="robot")), "rejected")
-    assert refused == "kind must be scene or object"
+    assert refused == "kind must be scene, object or template"
 
 
 def _asset_request(asset_id):
@@ -254,6 +257,22 @@ def test_the_categories_count_the_catalogue_in_listing_order(provider):
     assert [(c.kind, c.category, c.count) for c in response.categories] == [
         ("object", "Blocks", 2), ("scene", "Scenes", 1),
     ]
+
+
+def test_the_kind_template_is_taken_and_lists_nothing_as_isaac_holds_no_template(provider):
+    """get_assets_list takes the kind template and lists nothing for it, with any other filter too; no category is of
+    that kind, and get_asset refuses a template id as it refuses any id that names no asset."""
+    provider.io.set_assets(_CATALOGUE)
+
+    assert _listed(provider, kind="template") == []
+    assert _listed(provider, kind="template", category="Blocks", query="block") == []
+
+    categories = provider.io._handle_get_asset_categories(None).categories
+    assert {category.kind for category in categories} == {"scene", "object"}
+
+    request = _asset_request("template/kitchen")
+    refused = _refused(provider, lambda: provider.io._handle_get_asset(request), "rejected")
+    assert refused == "Unknown asset_id: template/kitchen"
 
 
 def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(provider):
@@ -1218,6 +1237,48 @@ def test_a_goal_that_arrives_before_the_catalogue_is_refused_until_it_is_discove
     assert "still discovering its asset catalogue" in message
     assert [decision.refusal for decision in after.decisions] == [None]
     assert [event for event in events if event[0] != "progress"] == [("completed", {})]
+
+
+def test_the_engine_serves_each_action_the_node_exposes_on_the_scene_slot(provider):
+    """The manifest exposes each action of scene_manipulation on the scene slot, as peppy asks of a node that
+    implements the contract, and the engine serves each of them, load_template among them."""
+    node = pyjson5.loads((Path(__file__).resolve().parents[1] / "peppy.json5").read_text())
+    exposed = {action["name"] for action in node["interfaces"]["actions"]["exposes"] if action["link_id"] == "scene"}
+
+    assert exposed == set(provider.module._ACTIONS)
+
+
+def _template_goals(events):
+    """load_template goals as their generated context carries them: a seed the simulation draws, a seed given, and
+    an id that names a scene."""
+    return [
+        _Goal(SimpleNamespace(template="template/kitchen", seeded=None), events),
+        _Goal(SimpleNamespace(template="template/kitchen", seeded=SimpleNamespace(seed=7)), events),
+        _Goal(SimpleNamespace(template="scene/full_warehouse", seeded=None), events),
+    ]
+
+
+def test_each_load_template_goal_is_refused_with_rejected_and_changes_nothing(provider):
+    """Isaac holds no template, so it refuses each load_template goal with `rejected` when it arrives, before the
+    catalogue is discovered as after: no command is queued, and the loaded scene and the spawned objects stay."""
+    events = []
+    provider.io._pending = _Commands(events)
+
+    before = _serve_goals(provider, "load_template", *_template_goals(events))
+    provider.io.set_assets(_CATALOGUE)
+    provider.io._execute(provider.launcher, "load_scene", {"asset_id": "scene/full_warehouse", "scale": 1.0})
+    object_id = _spawn(provider)
+    provider.launcher.reset_mock()
+    after = _serve_goals(provider, "load_template", *_template_goals(events))
+
+    no_template = (
+        "rejected", "this simulation holds no template, so it loads none: load a scene with load_scene instead",
+    )
+    assert [_refusal(decision) for decision in (*before.decisions, *after.decisions)] == [no_template] * 6
+    assert events == []
+    assert provider.launcher.mock_calls == []
+    assert provider.io._handle_get_scene(None).asset_id == "scene/full_warehouse"
+    assert _spawned_ids(provider) == [object_id]
 
 
 def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the_same_kind(provider):

@@ -80,11 +80,15 @@
     // ------------------------------------------------------------------
     //
     // Formats and field semantics are defined by scene_manipulation:v1 in
-    // contracts-hub. Each action enqueues its command onto the Isaac
-    // simulation thread through SimLauncher.execute_runtime_command().
+    // contracts-hub. Each action of the scene slot queues its command for
+    // the Isaac main thread, which runs it through
+    // SceneActionIO.process_pending(), apart from load_template: Isaac holds
+    // no template, so it refuses each load_template goal with `rejected`
+    // when it arrives.
     actions: {
       exposes: [
         { link_id: "scene", name: "load_scene" },
+        { link_id: "scene", name: "load_template" },
         { link_id: "scene", name: "clear_scene" },
         { link_id: "scene", name: "spawn_object" },
         { link_id: "scene", name: "move_object" },
