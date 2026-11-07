@@ -279,11 +279,14 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
             "orientation": [0.0, 0.0, 0.0, 1.0],
         },
     ]
-    # Every object of this stage was spawned: the scene places none.
+    # Every object of this stage was spawned: the scene places none, and the
+    # stage places no riser.
     spawned = provider.io._handle_get_objects_list(_objects_request(source="spawned"))
     assert [item.object_id for item in spawned.objects] == [red, blue]
     scene = provider.io._handle_get_objects_list(_objects_request(source="scene"))
     assert scene.objects == []
+    risers = provider.io._handle_get_objects_list(_objects_request(source="riser"))
+    assert risers.objects == []
     blocks = provider.io._handle_get_objects_list(_objects_request(category="Blocks"))
     assert len(blocks.objects) == 2
     none = provider.io._handle_get_objects_list(_objects_request(category="Furniture"))
@@ -295,7 +298,7 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
     refused = _refused(
         provider, lambda: provider.io._handle_get_objects_list(_objects_request(source="placed")), "rejected"
     )
-    assert refused == "source must be spawned or scene"
+    assert refused == "source must be spawned, scene or riser"
 
 
 def test_the_inventory_is_unavailable_with_the_captures_reason_until_a_capture(provider):

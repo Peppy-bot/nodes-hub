@@ -93,8 +93,8 @@ _ASSET_KINDS = ("scene", "object")
 
 # The sources get_objects_list filters by. Every object of this stage was
 # spawned by a caller: the stage places no object of its own when it loads
-# a scene, so "scene" lists nothing.
-_OBJECT_SOURCES = ("spawned", "scene")
+# a scene and places no riser, so "scene" and "riser" list nothing.
+_OBJECT_SOURCES = ("spawned", "scene", "riser")
 
 # How far from 1 the length of an orientation may be before it is refused.
 _UNIT_TOLERANCE = 1e-3
@@ -814,14 +814,14 @@ class SceneActionIO:
         """What stands on the stage and where, from the latest capture: every
         object a caller spawned, in its asset's category, narrowed by the
         request's source and category. The stage places no object of its own
-        when it loads a scene, so a request for the scene's objects lists
-        nothing."""
+        when it loads a scene and places no riser, so a request for the
+        scene's objects or for the risers lists nothing."""
 
         source = _filter(request.data.source)
         category = _filter(request.data.category)
 
         if source is not None and source not in _OBJECT_SOURCES:
-            raise _rejected("source must be spawned or scene")
+            raise _rejected("source must be spawned, scene or riser")
 
         snapshot = self._latest_snapshot()
 
@@ -830,7 +830,7 @@ class SceneActionIO:
 
         objects = []
 
-        if source != "scene":
+        if source in (None, "spawned"):
             for record in snapshot.objects:
                 asset_category = public_by_asset.get(record.asset_id, {}).get(
                     "category", ""

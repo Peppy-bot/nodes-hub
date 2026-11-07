@@ -366,7 +366,8 @@ landmark, work surface or wall of an asset, so it is the entry that
 `get_objects_list` lists every object scene_manipulation spawned with its
 name and its pose as of the latest capture, each in its asset's
 category and with the source `spawned`: an environment places no object of
-its own, so the source `scene` lists nothing. `get_object` answers one of
+its own and places no riser, so the sources `scene` and `riser` list
+nothing. `get_object` answers one of
 those objects from the same capture: its name, its pose and its scale, as
 `get_objects_list` lists them. Isaac keeps no landmark and simulates no
 state of an object, so `landmarks` is empty and no state field is present.
