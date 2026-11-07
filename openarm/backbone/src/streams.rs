@@ -172,7 +172,7 @@ async fn subscribe_pair<L, R>(
 /// headset's release burst, both a quarter second: a refusal lasts as long as
 /// a follower would still follow the stream, and the burst after a grip is
 /// released reads as one unbroken stream. It covers the gaps of a stream at
-/// 4 Hz or faster; the leaders run at 30 Hz and above.
+/// 4 Hz or faster.
 pub const LEADER_STREAMING_WINDOW: Duration = Duration::from_millis(250);
 
 /// When a leader last streamed a well-formed command for one limb. Written by
@@ -414,7 +414,7 @@ pub struct GovernorConfig {
     pub enabled: bool,
     pub d_stop: f64,
     pub d_safe: f64,
-    pub max_ee_velocity_m_s: f64,
+    pub max_stream_ee_velocity_m_s: f64,
     pub max_gripper_rate_frac_s: f64,
 }
 
@@ -438,7 +438,7 @@ pub async fn run_governor_config_listener(
                 enabled: msg.collision_governor_enabled,
                 d_stop: msg.d_stop,
                 d_safe: msg.d_safe,
-                max_ee_velocity_m_s: msg.max_ee_velocity_m_s,
+                max_stream_ee_velocity_m_s: msg.max_stream_ee_velocity_m_s,
                 max_gripper_rate_frac_s: msg.max_gripper_rate_frac_s,
             });
             ControlFlow::Continue(())

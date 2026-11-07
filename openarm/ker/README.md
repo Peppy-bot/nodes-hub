@@ -82,9 +82,9 @@ table (`CH01=.. CH02=..`, degrees) at 1 Hz:
     peppy stack join openarm:echo --with v2,ker_commander \
       --set-arguments 'commander_inst.log_raw=true'
 
-First engaged run: keep the backbone's `max_ee_velocity_m_s` conservative. An
+First engaged run: keep the backbone's `max_stream_ee_velocity_m_s` conservative. An
 arm engaged far from the follower's pose streams that distant target at once,
 and the backbone's rate-limited follow chase moves the follower toward it:
 
     peppy stack join openarm:echo --with v2,ker_commander \
-      --set-arguments 'backbone_inst.max_ee_velocity_m_s=0.1'
+      --set-arguments 'backbone_inst.max_stream_ee_velocity_m_s=0.1'

@@ -13,7 +13,6 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::Feedback;
-use crate::pose::{PLAN_ANGLE_TOL_RAD, PLAN_POS_TOL_M};
 use crate::result_wait::{
     GOAL_TIMEOUT, Waited, limb_goal_handle, preempt_grace_elapsed, summarize, wait_for_end,
 };
@@ -82,10 +81,8 @@ async fn run(
     let goal = limb_motion_move_arm::GoalRequest {
         arm_name: side.arm_name().to_string(),
         position,
-        orientation,
+        orientation: Some(orientation),
         duration_s,
-        plan_position_tolerance_m: PLAN_POS_TOL_M,
-        plan_orientation_tolerance_rad: PLAN_ANGLE_TOL_RAD,
         settle_position_tolerance_m,
         settle_orientation_tolerance_rad,
         settle_timeout_s,

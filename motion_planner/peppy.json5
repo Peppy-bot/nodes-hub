@@ -53,6 +53,7 @@
     actions: {
       exposes: [
         { link_id: "motion_planning", name: "plan_joint_path" },
+        { link_id: "motion_planning", name: "plan_cartesian_path" },
       ],
     },
     services: {

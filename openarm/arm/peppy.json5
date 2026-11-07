@@ -66,28 +66,33 @@
       // built from. Required, not defaulted: running the wrong generation's model on the
       // hardware would mis-compensate gravity/Coriolis, so the launcher must be explicit.
       hardware_version: "string",
-      // Hardware-loop rate (Hz). Required: pick deliberately per deployment. The
-      // stack currently unifies on 100 Hz (backbone stream rate and arm loop rate match);
+      // Hardware-loop rate (Hz). Required: pick deliberately per deployment, and
       // confirm `overruns=0` at the target rate during bring-up.
       control_rate_hz: "u32",
-      // Per-cycle CAN read deadline (μs). Must fit the cycle budget (10 ms at 100 Hz).
-      recv_timeout_us: { $type: "u32", $default: 1000 },
-      // MIT-control gains applied every control tick, one per joint (1-indexed).
-      // Match the openarm teleop config (Kp/Kd).
-      kp1: { $type: "f64", $default: 240.0 },
-      kp2: { $type: "f64", $default: 240.0 },
-      kp3: { $type: "f64", $default: 240.0 },
-      kp4: { $type: "f64", $default: 240.0 },
-      kp5: { $type: "f64", $default: 24.0 },
-      kp6: { $type: "f64", $default: 31.0 },
-      kp7: { $type: "f64", $default: 25.0 },
-      kd1: { $type: "f64", $default: 3.0 },
-      kd2: { $type: "f64", $default: 3.0 },
-      kd3: { $type: "f64", $default: 3.0 },
-      kd4: { $type: "f64", $default: 3.0 },
-      kd5: { $type: "f64", $default: 0.2 },
-      kd6: { $type: "f64", $default: 0.2 },
-      kd7: { $type: "f64", $default: 0.2 },
+      // MIT-control gains applied every control tick, one per joint (1-indexed). Measured on
+      // the real v2 alone at 100 Hz on a 40 s joint path, from kd1 3, kd2 to kd4 4.5, and the
+      // openarm teleop config's kp5 to kp7, 24, 31, 25. kp1 to kp4 at 120, 240 and 360 put
+      // j1's position error at 8.5, 4.9 and 3.5 mrad and the worst stall share at 7.8%, 5.1%
+      // and 2.5%. With kd1 to kd4 at 5.0, the top of the MIT frame's range, kp 360 reads 3.6
+      // mrad and 0.6%, and kp 480 reads 2.7 mrad and 0.9% and raises the speed error of j2 and
+      // j3 at full speed. kp5 to kp7 at twice the config's cut the wrists' speed swing by a
+      // fifth. v2's measured friction then reads 2.1 mrad and 1.9%. kd5 to kd7: at 250 Hz, at
+      // the config's kp5 to kp7, stepping through 0.5, 1.0 and 1.5 cut the stalls with the
+      // same tracking.
+      kp1: { $type: "f64", $default: 360.0 },
+      kp2: { $type: "f64", $default: 360.0 },
+      kp3: { $type: "f64", $default: 360.0 },
+      kp4: { $type: "f64", $default: 360.0 },
+      kp5: { $type: "f64", $default: 48.0 },
+      kp6: { $type: "f64", $default: 62.0 },
+      kp7: { $type: "f64", $default: 50.0 },
+      kd1: { $type: "f64", $default: 5.0 },
+      kd2: { $type: "f64", $default: 5.0 },
+      kd3: { $type: "f64", $default: 5.0 },
+      kd4: { $type: "f64", $default: 5.0 },
+      kd5: { $type: "f64", $default: 1.5 },
+      kd6: { $type: "f64", $default: 1.5 },
+      kd7: { $type: "f64", $default: 1.5 },
       // Rate (Hz) of the always-on measured-state stream (`joint_states`), which the
       // backbone consumes. Required: consumers' needs vary too much for a default.
       state_rate_hz: "u32",

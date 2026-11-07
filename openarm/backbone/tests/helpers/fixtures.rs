@@ -3,34 +3,31 @@
 
 use std::time::{Duration, Instant};
 
-use control_core::servo::{ORIENTATION_TOLERANCE_RAD, POSITION_TOLERANCE_M};
+use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
 use openarm_description::{ARM_DOF, HardwareVersion, Side};
-use srs_model::chain_kinematics::{
-    EeCaps, JointSmoothing, LEASH_M, MAX_SERVO_S, ServoState, ServoTolerances, ServoTrajectory,
-    command_smoothing, rollout,
-};
+use srs_model::chain_kinematics::pose_miss;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
-use srs_model::{Arm, ArmAnglePolicy, CartesianPlan, JointVec, PlanLimits};
+use srs_model::{Arm, ArmAnglePolicy, JointVec};
 
-pub const EPS: f64 = 1e-9;
+/// How far (m, rad) a line's last solve may land from its goal: a descent's
+/// convergence, as KDL's `CartToJnt` judges it.
+const LANDING_SLACK: f64 = 1e-5;
+
+/// The joint whose zero is the wrist's singular surface.
+pub const WRIST_BEND: usize = 5;
 
 /// The launcher-default per-joint acceleration limits (peppy.json5).
-pub const A_MAX: JointVec = [5.0; ARM_DOF];
+pub const A_MAX: JointVec = [0.5; ARM_DOF];
 
 /// The launcher-default per-joint velocity limits (peppy.json5), j1..j7.
 pub const V_MAX_V2: JointVec = [
     16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
 ];
 
-pub const V_MAX_V1: JointVec = [1.0; ARM_DOF];
-
-const TEST_EE_CAP_M_S: f64 = 0.5;
-
-const TEST_EE_CAP_RAD_S: f64 = 0.8;
-
-pub const TEST_DT: Duration = Duration::from_millis(10);
-
 pub const READY: JointVec = [0.1537, 0.39547, -0.4808, 0.95, -0.0008, 0.0046, -0.0008];
+
+/// The left arm's mirror of [`READY`].
+pub const READY_LEFT: JointVec = [-0.1537, -0.39547, 0.4808, 0.95, 0.0008, -0.0046, 0.0008];
 
 /// The logged orientation of the field repro's poses.
 const REPRO_QUAT: [f64; 4] = [
@@ -39,18 +36,6 @@ const REPRO_QUAT: [f64; 4] = [
     0.32535618836337443,
     0.7944156253074012,
 ];
-
-/// The node's own slack, what a goal that states no preference is planned
-/// against.
-pub fn default_tolerance() -> ServoTolerances {
-    ServoTolerances::new(POSITION_TOLERANCE_M, ORIENTATION_TOLERANCE_RAD)
-        .expect("the node's default slack is reachable")
-}
-
-/// What the panel asks for: 5 mm and 5 degrees.
-pub fn panel_tolerance() -> ServoTolerances {
-    ServoTolerances::new(0.005, 5.0_f64.to_radians()).expect("the panel's tolerance is reachable")
-}
 
 pub fn v2_right_arm() -> Arm {
     HardwareVersion::V2
@@ -96,98 +81,28 @@ pub fn tip_world(model: &Arm, q: &JointVec) -> Isometry3<f64> {
     model.world_pose(&model.at(q).tip_pose())
 }
 
-pub fn limits_for(max_joint_velocity_rad_s: JointVec) -> PlanLimits {
-    PlanLimits {
-        max_joint_velocity_rad_s,
-        max_joint_acceleration_rad_s2: A_MAX,
-        ee: EeCaps {
-            linear_m_s: TEST_EE_CAP_M_S,
-            angular_rad_s: TEST_EE_CAP_RAD_S,
-        },
-        control_period: TEST_DT,
-        smoothing: command_smoothing(TEST_DT).expect("a 100 Hz period carries the cutoff"),
-    }
-}
-
-pub fn v2_limits() -> PlanLimits {
-    limits_for(V_MAX_V2)
-}
-
-pub fn v1_limits() -> PlanLimits {
-    limits_for(V_MAX_V1)
+/// The trajectory through `walk` at the launcher's v2 limits, resting at no sample
+/// before the end, as fast as they allow, starting at `now`.
+pub fn played(walk: &[JointVec], now: Instant) -> JointTrajectory<ARM_DOF> {
+    JointTrajectory::through(
+        &distinct_joint_waypoints(walk),
+        &V_MAX_V2,
+        &A_MAX,
+        Duration::ZERO,
+        now,
+    )
 }
 
 pub fn ready_pose(model: &Arm) -> Isometry3<f64> {
     model.world_pose(&model.at(&READY).ee_pose())
 }
 
-/// The configurations the servo law commands from `seed` to the pose `end`
-/// from `start` at the v2 limits, within `tolerance`, or `None` when it does
-/// not converge.
-pub fn servo_rollout(
-    model: &Arm,
-    start: &Isometry3<f64>,
-    end: &Isometry3<f64>,
-    seed: JointVec,
-    tolerance: ServoTolerances,
-) -> Option<Vec<JointVec>> {
-    let limits = v2_limits();
-    let state = ServoState::new(*start, *end, LEASH_M, JointSmoothing::new(limits.smoothing));
-    rollout(
-        model.chain(),
-        state,
-        seed,
-        &limits.servo_at(tolerance),
-        MAX_SERVO_S,
-    )
-}
-
-/// Roll the servo law out to convergence at the v2 limits, asserting every
-/// step of its path stays inside the per-joint velocity budget and that the
-/// pose it lands on honors `tolerance`, and return the converged
-/// configuration.
-pub fn roll_servo_to_convergence(
-    model: &Arm,
-    start: &Isometry3<f64>,
-    end: &Isometry3<f64>,
-    seed: JointVec,
-    tolerance: ServoTolerances,
-) -> JointVec {
-    let configs = servo_rollout(model, start, end, seed, tolerance)
-        .expect("servo did not converge within the ceiling");
-    for step in configs.windows(2) {
-        for i in 0..ARM_DOF {
-            let v = (step[1][i] - step[0][i]).abs() / TEST_DT.as_secs_f64();
-            assert!(
-                v <= V_MAX_V2[i] * 1.0001,
-                "joint {i} at {v:.2} rad/s exceeds its budget"
-            );
-        }
-    }
-    let landed = configs[configs.len() - 1];
-    assert_lands_within(model, &landed, end, tolerance);
-    landed
-}
-
-/// Asserts the hand at `q` lies within `tolerance` of `end` on both axes.
-pub fn assert_lands_within(
-    model: &Arm,
-    q: &JointVec,
-    end: &Isometry3<f64>,
-    tolerance: ServoTolerances,
-) {
-    let got = model.world_pose(&model.at(q).ee_pose());
-    let position_err = (got.translation.vector - end.translation.vector).norm();
-    let orientation_err = got.rotation.angle_to(&end.rotation);
+/// Asserts the hand at `q` lies on `end`, to the solver's rounding, on both axes.
+pub fn assert_lands_on(model: &Arm, q: &JointVec, end: &Isometry3<f64>) {
+    let miss = pose_miss(&model.world_ee_pose(q), end);
     assert!(
-        position_err <= tolerance.position_m(),
-        "landed {position_err:.6} m out, past the {:.6} m it was planned to",
-        tolerance.position_m()
-    );
-    assert!(
-        orientation_err <= tolerance.orientation_rad(),
-        "landed {orientation_err:.6} rad out, past the {:.6} rad it was planned to",
-        tolerance.orientation_rad()
+        miss.position_m <= LANDING_SLACK && miss.orientation_rad <= LANDING_SLACK,
+        "landed {miss:?} from the goal"
     );
 }
 
@@ -210,20 +125,4 @@ pub fn cross_body_pull(model: &Arm) -> (Isometry3<f64>, Isometry3<f64>, JointVec
         .expect("start pose reachable from ready")
         .q;
     (start, end, seed)
-}
-
-/// The duration and the first and last configurations a servo plan plays, read
-/// off its trajectory at its start and a second past its end; panics on a line.
-pub fn played_servo(plan: CartesianPlan) -> (f64, JointVec, JointVec) {
-    let CartesianPlan::Servo(servo) = plan else {
-        panic!("an untrackable line must fall through to the servo");
-    };
-    let duration = servo.duration;
-    let start = Instant::now();
-    let traj = ServoTrajectory::new(servo.path, duration, start);
-    (
-        duration.as_secs_f64(),
-        traj.sample(start),
-        traj.sample(start + duration + Duration::from_secs(1)),
-    )
 }

@@ -42,7 +42,7 @@ async fn every_governor_control_reaches_the_field_it_names() -> peppygen::Result
         "cmd": "set_governor_params",
         "d_stop": D_STOP,
         "d_safe": D_SAFE,
-        "max_ee_velocity_m_s": MAX_EE_VELOCITY_M_S,
+        "max_stream_ee_velocity_m_s": MAX_EE_VELOCITY_M_S,
         "max_gripper_rate_frac_s": MAX_GRIPPER_RATE_FRAC_S,
     });
     ws.send_text(&command.to_string())
@@ -72,8 +72,8 @@ async fn every_governor_control_reaches_the_field_it_names() -> peppygen::Result
     assert_eq!(msg.d_stop, D_STOP, "d_stop");
     assert_eq!(msg.d_safe, D_SAFE, "d_safe");
     assert_eq!(
-        msg.max_ee_velocity_m_s, MAX_EE_VELOCITY_M_S,
-        "max_ee_velocity_m_s"
+        msg.max_stream_ee_velocity_m_s, MAX_EE_VELOCITY_M_S,
+        "max_stream_ee_velocity_m_s"
     );
     assert_eq!(
         msg.max_gripper_rate_frac_s, MAX_GRIPPER_RATE_FRAC_S,

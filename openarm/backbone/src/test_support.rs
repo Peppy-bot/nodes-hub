@@ -14,7 +14,6 @@ use std::time::Duration;
 
 use control_core::path_timing::RoundedPath;
 use openarm_description::{ARM_DOF, ArmOrder, ArmPair, HardwareVersion, Side};
-use srs_model::chain_kinematics::{EeCaps, command_smoothing};
 use srs_model::{Arm, JointVec, Limit};
 
 use tokio::sync::mpsc;
@@ -31,7 +30,8 @@ mod params;
 
 pub(crate) use params::params;
 
-/// The launcher-default per-joint acceleration limits (peppy.json5).
+/// The per-joint acceleration limits of the test planners: above the node's
+/// default (peppy.json5), so a move a test plays takes few ticks.
 const A_MAX: JointVec = [5.0; ARM_DOF];
 
 /// The control period of the test planners.
@@ -46,18 +46,14 @@ pub(crate) fn bundled_arm(version: HardwareVersion, side: Side) -> Arm {
 }
 
 /// The planner config of the tests: a 10 ms period, 10 rad/s on every
-/// joint, the launcher's accelerations, a 1 m/s and 0.8 rad/s hand, joint
-/// limits of +-10 rad, and a start tolerance of 0.01 rad.
+/// joint, [`A_MAX`], a 1 m/s stream cap, joint limits of +-10 rad, and a start
+/// tolerance of 0.01 rad.
 pub(crate) fn plan_config() -> PlanConfig {
     PlanConfig {
         cycle_period: TEST_PERIOD,
-        smoothing: command_smoothing(TEST_PERIOD).unwrap(),
         max_joint_velocity_rad_s: [10.0; ARM_DOF],
         max_joint_acceleration_rad_s2: A_MAX,
-        ee: EeCaps {
-            linear_m_s: 1.0,
-            angular_rad_s: 0.8,
-        },
+        stream_ee_velocity_m_s: 1.0,
         limits: [Limit {
             lo: -10.0,
             hi: 10.0,

@@ -1,10 +1,8 @@
-"""The stream's only limiter: a max end-effector-speed governor.
+"""The stream's end-effector speed cap, as a governor.
 
-Deliberately the only one. The SO-101 teleop stream is meant to match
-lerobot's, so a streamed target that keeps the tool under the caps goes
-downstream as the same object, and the caps are the single stated divergence.
-Per-joint rate limiting belongs to the pose path, where the targets are
-machine-generated, and the coordinator holds it there.
+A streamed target that keeps the tool under the cap goes downstream as the
+same object. The coordinator holds each stream to the joint velocity limits
+ahead of it.
 
 The cap is measured through the Jacobian, following `openarm_backbone`'s
 ee-speed limiter, because that is the quantity a speed cap can actually be
@@ -21,7 +19,7 @@ import numpy as np
 def rate_step(current: float, target: float, max_step: float) -> float:
     """One scalar step toward `target`: the target itself once within the
     cap (exact landing, no float residue), else one cap-sized step. The
-    gripper's ramp and each joint of the pose path step through it."""
+    gripper's ramp and each joint of a stream step through it."""
     delta = target - current
     if abs(delta) <= max_step:
         return target
@@ -29,8 +27,7 @@ def rate_step(current: float, target: float, max_step: float) -> float:
 
 
 class EEGovernor:
-    """Scales one tick's joint step so the tool stays inside the linear and
-    angular speed caps.
+    """Scales one tick's joint step so the tool stays inside the speed cap.
 
     The scale is exact, not searched for. `J @ dq` is the twist a joint step
     produces and is linear in that step, so halving the step halves the speed
@@ -43,12 +40,10 @@ class EEGovernor:
         self,
         kinematics,
         max_linear_m_s: float,
-        max_angular_rad_s: float,
         period_s: float,
     ):
         self._kinematics = kinematics
         self._max_linear_step_m = max_linear_m_s * period_s
-        self._max_angular_step_rad = max_angular_rad_s * period_s
 
     def govern(
         self, current: tuple[float, ...], target: tuple[float, ...]
@@ -61,20 +56,23 @@ class EEGovernor:
         # and `0.0 * inf` would carry it into the result regardless.
         if not np.all(np.isfinite(delta)):
             return current
-        twist = self._kinematics.jacobian(current) @ delta
-        linear = float(np.linalg.norm(twist[:3]))
-        angular = float(np.linalg.norm(twist[3:]))
-        if not (math.isfinite(linear) and math.isfinite(angular)):
+        # A Jacobian at the step's start misses the motion of a large step that barely
+        # moves the hand to first order, and one at its midpoint reads the whole step's
+        # chord to third order. The larger bounds the chord of the step at any fraction,
+        # which is a mix of them, so the scaled step holds the cap.
+        midpoint = tuple(c + 0.5 * d for c, d in zip(current, delta, strict=True))
+        at_start, at_midpoint = (
+            float(np.linalg.norm((self._kinematics.jacobian(at) @ delta)[:3]))
+            for at in (current, midpoint)
+        )
+        linear = max(at_start, at_midpoint)
+        if not (math.isfinite(at_start) and math.isfinite(at_midpoint)):
             # A basis that cannot be evaluated is not a licence to run
             # uncapped.
             return current
-        scale = min(
-            1.0,
-            self._max_linear_step_m / linear if linear > 0.0 else 1.0,
-            self._max_angular_step_rad / angular if angular > 0.0 else 1.0,
-        )
-        if scale >= 1.0:
+        if linear <= self._max_linear_step_m:
             return target
+        scale = self._max_linear_step_m / linear
         return tuple(
             c + scale * (t - c) for c, t in zip(current, target, strict=True)
         )

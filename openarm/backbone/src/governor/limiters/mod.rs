@@ -18,6 +18,7 @@ pub(in crate::governor) mod measured_tripwire;
 pub(in crate::governor) use allowance::{Allowance, Limits};
 pub(in crate::governor) use dof_speed::DofSpeed;
 pub(in crate::governor) use ee_speed::EeSpeed;
+pub use ee_speed::HandBasis;
 pub(in crate::governor) use measured_tripwire::{MeasuredTripwire, Tripwire};
 
 use super::Step;

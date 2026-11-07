@@ -606,13 +606,13 @@ impl Owner {
             Command::SetGovernorParams {
                 d_stop,
                 d_safe,
-                max_ee_velocity_m_s,
+                max_stream_ee_velocity_m_s,
                 max_gripper_rate_frac_s,
             } => {
                 let requested = GovernorSettings {
                     d_stop,
                     d_safe,
-                    max_ee_velocity_m_s,
+                    max_stream_ee_velocity_m_s,
                     max_gripper_rate_frac_s,
                     ..self.state.governor
                 };
@@ -626,7 +626,7 @@ impl Owner {
                 }
                 self.state.governor = requested;
                 self.state.set_status(format!(
-                    "governor: d_stop={d_stop} d_safe={d_safe} max_ee={max_ee_velocity_m_s} m/s \
+                    "governor: d_stop={d_stop} d_safe={d_safe} max_ee={max_stream_ee_velocity_m_s} m/s \
                      gripper opening={max_gripper_rate_frac_s} /s"
                 ));
             }
@@ -767,7 +767,7 @@ impl Owner {
                 ee_speed_floored(
                     sane_duration(requested_s),
                     dist,
-                    self.state.governor.max_ee_velocity_m_s,
+                    self.state.governor.max_stream_ee_velocity_m_s,
                 )
             }
             None => Ok(sane_duration(requested_s)),
@@ -800,12 +800,12 @@ fn sane_duration(duration_s: f64) -> f64 {
 fn ee_speed_floored(
     user_s: f64,
     ee_distance_m: f64,
-    max_ee_velocity_m_s: f64,
+    max_stream_ee_velocity_m_s: f64,
 ) -> Result<f64, String> {
-    let floored = (ee_distance_m / max_ee_velocity_m_s).max(user_s);
+    let floored = (ee_distance_m / max_stream_ee_velocity_m_s).max(user_s);
     if floored > MAX_MOVE_DURATION_S {
         return Err(format!(
-            "this move needs {floored:.0} s at the {max_ee_velocity_m_s} m/s speed cap, past the \
+            "this move needs {floored:.0} s at the {max_stream_ee_velocity_m_s} m/s speed cap, past the \
              {MAX_MOVE_DURATION_S:.0} s a move may take: raise the cap or move in steps"
         ));
     }

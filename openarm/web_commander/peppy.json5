@@ -155,7 +155,7 @@
       // Operator's launch end-effector speed cap (m/s), streamed live to the backbone on
       // governor_control and retunable from the UI. Require > 0. The sim launchers
       // set a permissive value; the real arm a conservative one.
-      max_ee_velocity_m_s: "f64",
+      max_stream_ee_velocity_m_s: "f64",
       // Operator's launch opening rate (fraction per second), streamed live to the
       // backbone on governor_control and retunable from the UI: 6.0 drives a full open
       // or close in ~1/6 s. Require > 0. Kept in step with the backbone's default; the

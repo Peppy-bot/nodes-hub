@@ -227,7 +227,7 @@ pub struct GovernorSettings {
     pub collision_enabled: bool,
     pub d_stop: f64,
     pub d_safe: f64,
-    pub max_ee_velocity_m_s: f64,
+    pub max_stream_ee_velocity_m_s: f64,
     pub max_gripper_rate_frac_s: f64,
 }
 
@@ -236,9 +236,12 @@ impl GovernorSettings {
     /// finite rates. The backbone validates again before applying.
     pub fn is_streamable(&self) -> bool {
         valid_governor_band(self.d_stop, self.d_safe)
-            && [self.max_ee_velocity_m_s, self.max_gripper_rate_frac_s]
-                .iter()
-                .all(|v| v.is_finite() && *v > 0.0)
+            && [
+                self.max_stream_ee_velocity_m_s,
+                self.max_gripper_rate_frac_s,
+            ]
+            .iter()
+            .all(|v| v.is_finite() && *v > 0.0)
     }
 
     /// Whether this is the same setting as `other`, compared on the bits of
@@ -249,7 +252,8 @@ impl GovernorSettings {
         self.collision_enabled == other.collision_enabled
             && self.d_stop.to_bits() == other.d_stop.to_bits()
             && self.d_safe.to_bits() == other.d_safe.to_bits()
-            && self.max_ee_velocity_m_s.to_bits() == other.max_ee_velocity_m_s.to_bits()
+            && self.max_stream_ee_velocity_m_s.to_bits()
+                == other.max_stream_ee_velocity_m_s.to_bits()
             && self.max_gripper_rate_frac_s.to_bits() == other.max_gripper_rate_frac_s.to_bits()
     }
 }
@@ -475,7 +479,7 @@ mod tests {
             collision_enabled: true,
             d_stop: 0.005,
             d_safe: 0.02,
-            max_ee_velocity_m_s: 0.25,
+            max_stream_ee_velocity_m_s: 0.25,
             max_gripper_rate_frac_s: 6.0,
         };
         assert!(setting.same_setting(&setting));
@@ -504,7 +508,7 @@ mod tests {
                 ..setting
             },
             GovernorSettings {
-                max_ee_velocity_m_s: 0.3,
+                max_stream_ee_velocity_m_s: 0.3,
                 ..setting
             },
             GovernorSettings {
@@ -536,13 +540,13 @@ mod tests {
             collision_enabled: true,
             d_stop: 0.005,
             d_safe: 0.02,
-            max_ee_velocity_m_s: 1.0,
+            max_stream_ee_velocity_m_s: 1.0,
             max_gripper_rate_frac_s: 6.0,
         };
         assert!(settings.is_streamable());
         assert!(
             !GovernorSettings {
-                max_ee_velocity_m_s: 0.0,
+                max_stream_ee_velocity_m_s: 0.0,
                 ..settings
             }
             .is_streamable(),

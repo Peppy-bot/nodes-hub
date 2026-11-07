@@ -435,9 +435,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         d = request.data
         try:
             check = await layer.check_arm_move(
-                d.arm_name, tuple(d.position), tuple(d.orientation), d.duration_s,
-                d.plan_position_tolerance_m, d.plan_orientation_tolerance_rad,
-                check_solver, kinematics,
+                d.arm_name, tuple(d.position), d.orientation, d.duration_s, check_solver,
             )
         except Refusal as e:
             # The error reply of a check that move_arm would refuse, with
