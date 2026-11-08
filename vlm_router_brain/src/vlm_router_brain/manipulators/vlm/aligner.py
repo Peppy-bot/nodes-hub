@@ -11,7 +11,9 @@ grab, with the target point alone for a place. The aligner runs a
 centimetres, and a turn about the vertical by roll_deg, counter-clockwise
 seen from above, at the same height), `ready` (centred and turned: go
 down) and `give_up`. Each step the model sees the picture of the wrist
-camera of the gripper's arm, captured after the arm settled, the chest
+camera of the gripper's arm, captured after the arm settled, which the step
+waits for `frame_wait_periods` periods of that camera as the brain measures
+them, at least `min_frame_wait_s`, the chest
 picture, and the state as text: where the grasp point stands against the
 item's seen centre or the target point, how high above the close or the
 release, the line the jaws close along, the jaws' opening, and where the
@@ -65,8 +67,14 @@ MAX_STEPS = 5
 STEP_MAX_M = 0.03
 RADIUS_M = 0.10
 ROLL_MAX_DEG = 90.0
-# How long a step waits for a wrist frame captured after the arm settled.
-FRAME_WAIT_S = 1.0
+# How long a step waits for a wrist frame captured after the arm settled, in
+# periods of the wrist camera as the brain measured it (`WristFrames.period_s`):
+# the first frame to come can be one captured just before the arm settled, and
+# a loaded host sends the next one late.
+FRAME_WAIT_PERIODS = 2.5
+# The least time a step waits for that frame, and its wait for a camera whose
+# period the brain has not measured yet: it has sent one frame alone.
+MIN_FRAME_WAIT_S = 2.5
 NOT_STARTED = "the aligner has not been started"
 WRIST = "wrist"
 CHEST = "chest"
@@ -108,18 +116,29 @@ class ModelAligner:
         step_max_m: float = STEP_MAX_M,
         radius_m: float = RADIUS_M,
         roll_max_deg: float = ROLL_MAX_DEG,
-        frame_wait_s: float = FRAME_WAIT_S,
+        frame_wait_periods: float = FRAME_WAIT_PERIODS,
+        min_frame_wait_s: float = MIN_FRAME_WAIT_S,
     ) -> None:
         self.model = model
         self.max_steps = max_steps
         self.step_max_m = step_max_m
         self.radius_m = radius_m
         self.roll_max_deg = roll_max_deg
-        self.frame_wait_s = frame_wait_s
+        self.frame_wait_periods = frame_wait_periods
+        self.min_frame_wait_s = min_frame_wait_s
         self._senses = None
 
     def start(self, senses) -> None:
         self._senses = senses
+
+    def frame_wait_s(self, period_s: Optional[float]) -> float:
+        """How long a step waits for a wrist frame captured after the arm
+        settled, from the period of the wrist camera: `frame_wait_periods`
+        of it, and at least `min_frame_wait_s`, which is also the wait when
+        the period is not known."""
+        if period_s is None:
+            return self.min_frame_wait_s
+        return max(self.min_frame_wait_s, self.frame_wait_periods * period_s)
 
     def why_unavailable(self, arm: str) -> str:
         """Why `arm` cannot be aligned now, or the empty string: no wrist
@@ -171,7 +190,8 @@ class _Run:
         senses = self.senses
         wrists = senses.wrists
         camera = wrists.camera_of(self.arm)
-        frame = await wrists.newer_than(self.arm, wrists.latest_stamp(self.arm), self.aligner.frame_wait_s)
+        wait_s = self.aligner.frame_wait_s(wrists.period_s(self.arm))
+        frame = await wrists.newer_than(self.arm, wrists.latest_stamp(self.arm), wait_s)
         if frame is None:
             raise AlignmentFailed(f"no frame from wrist camera '{camera}' after the move")
         chest_frame = senses.chest.frames.latest().color

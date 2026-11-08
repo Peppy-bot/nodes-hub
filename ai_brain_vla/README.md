@@ -3,7 +3,7 @@
 A brain whose models run beside the robot, on its GPU. It serves
 `item_perception:v1` (scan_items, identify_item), `item_manipulation:v1`
 (grab_item, drop_item, place_item, abort, get_state) and `brain_model:v1`
-(get_model, list_models, switch_model) above `limb_motion`. The contract
+(get_model, list_models, switch_model, forget) above `limb_motion`. The contract
 rules, the robot, the camera geometry and the goal loops are
 [brain_core](https://github.com/Peppy-bot/public-peppy-libs/tree/main/brain_core)'s;
 this node brings its models, which the launcher names with a parameter per

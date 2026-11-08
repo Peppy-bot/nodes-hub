@@ -1248,8 +1248,8 @@ mod tests {
         // openarm_v2: the right arm's grasp point of each posture, as
         // [x, y, z] in metres and [x, y, z, w].
         let right_ready = (
-            [0.3363, -0.1951, 0.2836],
-            [-0.2897, 0.8363, -0.0870, 0.4573],
+            [0.3996, -0.2830, 0.5662],
+            [-0.2328, 0.6283, -0.2398, 0.7025],
         );
         let right_home = ([0.0174, -0.1535, 0.1024], [0.0, 0.9997, 0.0, 0.0250]);
         // The left arm's grasp point is the mirror of the right arm's across

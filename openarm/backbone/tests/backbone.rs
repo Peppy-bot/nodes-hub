@@ -682,10 +682,43 @@ async fn left_arm_joint_move(
     target: [f64; 7],
     duration_s: f64,
 ) -> peppygen::Result<move_arm_joints::ResultOutcome> {
+    arm_joint_move(harness, "left_arm", target, duration_s).await
+}
+
+/// The right arm folded in front of the chest, its grasp point at about
+/// [0.34, -0.195, 0.28] m, 0.39 m from the left arm's at its mirror image:
+/// where the joint paths of the collision guard start, a small turn of a
+/// shoulder from the other hand.
+const FOLDED_IN_RIGHT: [f64; 7] = [0.15, 0.40, -0.48, 0.95, 0.0, 0.0, 0.0];
+
+/// Move the right arm to [`FOLDED_IN_RIGHT`] and the left arm to its mirror
+/// image, one `move_arm_joints` goal each, and assert that both complete.
+async fn fold_both_arms_in(harness: &Harness) -> peppygen::Result<()> {
+    let folded_in = [
+        ("left_arm", openarm_description::mirror(FOLDED_IN_RIGHT)),
+        ("right_arm", FOLDED_IN_RIGHT),
+    ];
+    for (arm_name, target) in folded_in {
+        match arm_joint_move(harness, arm_name, target, 0.0).await? {
+            move_arm_joints::ResultOutcome::Completed(_) => {}
+            other => panic!("move_arm_joints of {arm_name} did not complete: {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// Send one `move_arm_joints` goal for `arm_name` to `target` over
+/// `duration_s`, assert that the node accepts it, and wait for how it ends.
+async fn arm_joint_move(
+    harness: &Harness,
+    arm_name: &str,
+    target: [f64; 7],
+    duration_s: f64,
+) -> peppygen::Result<move_arm_joints::ResultOutcome> {
     let goal = move_arm_joints::send_goal(
         harness,
         &move_arm_joints::GoalRequestData {
-            arm_name: "left_arm".to_string(),
+            arm_name: arm_name.to_string(),
             joint_positions: target,
             duration_s,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
@@ -3062,8 +3095,6 @@ async fn an_expected_start_off_the_measured_arm_fails_the_path_before_it_moves()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable()
 -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
-
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
@@ -3087,24 +3118,13 @@ async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable(
         peppygen::paired_topics::right_gripper::gripper_states,
         1.0
     );
-    // The first limb_states snapshot says that every limb reported, so the
-    // posture admits both arms.
+    // The first limb_states snapshot says that every limb reported, so a
+    // joint move admits each arm.
     next_snapshot(&mut harness).await?;
-    let ready = move_to_ready::send_goal(
-        &harness,
-        &move_to_ready::GoalRequestData { duration_s: 0.0 },
-        peppygen::DEFAULT_FEEDBACK_BOUND,
-        DEADLINE,
-    )
-    .await?;
-    assert!(ready.accepted, "goal refused: {:?}", ready.refusal);
-    assert!(matches!(
-        ready.get_result(DEADLINE).await?.outcome,
-        move_to_ready::ResultOutcome::Completed(_)
-    ));
-    let ready_left = *left.followed.borrow();
+    fold_both_arms_in(&harness).await?;
+    let folded_left = *left.followed.borrow();
     let shift = |by_j1: f64, by_j2: f64| {
-        let mut to = ready_left;
+        let mut to = folded_left;
         to[0] += by_j1;
         to[1] += by_j2;
         to
@@ -3163,8 +3183,6 @@ async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_last_waypoint()
 -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
-
     let mut wide = params();
     wide.d_stop_m = 0.04;
     wide.d_safe_m = 0.2;
@@ -3191,23 +3209,12 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         peppygen::paired_topics::right_gripper::gripper_states,
         0.5
     );
-    // The first limb_states snapshot says that every limb reported, so the
-    // posture admits both arms.
+    // The first limb_states snapshot says that every limb reported, so a
+    // joint move admits each arm.
     next_snapshot(&mut harness).await?;
-    let ready = move_to_ready::send_goal(
-        &harness,
-        &move_to_ready::GoalRequestData { duration_s: 0.0 },
-        peppygen::DEFAULT_FEEDBACK_BOUND,
-        DEADLINE,
-    )
-    .await?;
-    assert!(ready.accepted, "goal refused: {:?}", ready.refusal);
-    assert!(matches!(
-        ready.get_result(DEADLINE).await?.outcome,
-        move_to_ready::ResultOutcome::Completed(_)
-    ));
+    fold_both_arms_in(&harness).await?;
 
-    let ready_left = *left.followed.borrow();
+    let folded_left = *left.followed.borrow();
     let mut right_in = *right.followed.borrow();
     right_in[1] -= 0.2;
     let shift = |from: [f64; 7], joint: usize, by: f64| {
@@ -3215,7 +3222,7 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         to[joint] += by;
         to
     };
-    let w1 = shift(ready_left, 0, -0.3);
+    let w1 = shift(folded_left, 0, -0.3);
     let w2 = shift(w1, 1, 0.2);
     let w3 = shift(w2, 0, 0.3);
     let waypoints = [w1, w2, w3];
@@ -3238,7 +3245,7 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         SETTLE_TOLERANCE_RAD,
     );
     let trail = &left.received()[before..];
-    let unslowed = unslowed_steps(&fastest_path(&wide, &[ready_left, w1, w2, w3]), &wide);
+    let unslowed = unslowed_steps(&fastest_path(&wide, &[folded_left, w1, w2, w3]), &wide);
     let peak = unslowed.iter().map(|&(_, step)| step).fold(0.0, f64::max);
     let unslowed_at = |arc: f64| {
         unslowed
@@ -3257,12 +3264,12 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         "the guard never held the left arm under half its unslowed step where the path \
          runs at speed: {slowed} of it at the least"
     );
-    let corners: Vec<Vec<f64>> = std::iter::once(ready_left.to_vec())
+    let corners: Vec<Vec<f64>> = std::iter::once(folded_left.to_vec())
         .chain(left_waypoints(&waypoints))
         .collect();
     assert_on_rounded_path(
         &left_waypoints(trail),
-        &rounded_path(&ready_left, &left_waypoints(&waypoints)),
+        &rounded_path(&folded_left, &left_waypoints(&waypoints)),
         &corners,
     );
     assert!(matches!(

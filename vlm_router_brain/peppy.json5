@@ -91,6 +91,7 @@
         { link_id: "item_manipulation", name: "get_state" },
         { link_id: "brain_model", name: "get_model" },
         { link_id: "brain_model", name: "list_models" },
+        { link_id: "brain_model", name: "forget" },
       ],
       consumes: [
         { link_id: "limb_motion", name: "check_arm_move" },
