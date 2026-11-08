@@ -3,8 +3,8 @@
 A brain whose models are hosted vision-language models, reached over the
 network through [any-llm](https://github.com/mozilla-ai/any-llm). It serves
 `item_perception:v1` and `item_manipulation:v1` as every brain does, and
-`brain_model:v1`, which names the model of each role and switches one while
-the brain runs. The contract rules, the robot, the camera geometry and the
+`brain_model:v1`, which names the model of each role, switches one while
+the brain runs, and makes the brain forget the world it knew. The contract rules, the robot, the camera geometry and the
 goal loops are [brain_core](https://github.com/Peppy-bot/public-peppy-libs/tree/main/brain_core)'s;
 this node brings the catalog of models, the detector that asks them, and
 the keys.
