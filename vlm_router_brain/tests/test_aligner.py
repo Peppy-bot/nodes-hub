@@ -21,7 +21,7 @@ from brain_core.perception.camera import CameraPose
 from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal
 from brain_core.robot import MoveEnd, MoveResult
 
-from vlm_router_brain.manipulators.vlm.aligner import NOT_STARTED, ModelAligner
+from vlm_router_brain.manipulators.vlm.aligner import FRAME_WAIT_S, IDLE_CAMERA_HZ, NOT_STARTED, ModelAligner
 
 LEFT = Gripper("left_gripper", "left_arm")
 SEEN = (0.50, 0.10, 0.72)
@@ -285,6 +285,14 @@ async def test_the_step_waits_for_the_frame_as_long_as_the_aligner_says():
     a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists), frame_wait_s=0.25)
     await a.align(request(), FakeMoves(), CancelToken())
     assert wrists.waited == [0.25]
+
+
+async def test_a_step_waits_for_two_periods_of_an_idle_simulated_camera_and_more():
+    wrists = FakeWrists()
+    a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists))
+    await a.align(request(), FakeMoves(), CancelToken())
+    assert wrists.waited == [FRAME_WAIT_S]
+    assert FRAME_WAIT_S > 2.0 / IDLE_CAMERA_HZ
 
 
 async def test_a_cancel_during_the_models_call_raises_cancelled():

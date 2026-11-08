@@ -65,8 +65,13 @@ MAX_STEPS = 5
 STEP_MAX_M = 0.03
 RADIUS_M = 0.10
 ROLL_MAX_DEG = 90.0
-# How long a step waits for a wrist frame captured after the arm settled.
-FRAME_WAIT_S = 1.0
+# The rate at which a simulation streams a camera that no holder holds
+# (sim_sensor_streams), slower than any physical camera.
+IDLE_CAMERA_HZ = 1.0
+# How long a step waits for a wrist frame captured after the arm settled: two
+# and a half periods of an idle simulated camera, which a loaded host renders
+# late. A physical camera, at its own rate, sends one far sooner.
+FRAME_WAIT_S = 2.5 / IDLE_CAMERA_HZ
 NOT_STARTED = "the aligner has not been started"
 WRIST = "wrist"
 CHEST = "chest"
