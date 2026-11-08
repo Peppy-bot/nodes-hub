@@ -21,7 +21,7 @@ from brain_core.perception.camera import CameraPose
 from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal
 from brain_core.robot import MoveEnd, MoveResult
 
-from vlm_router_brain.manipulators.vlm.aligner import FRAME_WAIT_S, IDLE_CAMERA_HZ, NOT_STARTED, ModelAligner
+from vlm_router_brain.manipulators.vlm.aligner import MIN_FRAME_WAIT_S, NOT_STARTED, ModelAligner
 
 LEFT = Gripper("left_gripper", "left_arm")
 SEEN = (0.50, 0.10, 0.72)
@@ -43,9 +43,10 @@ class FakeWrists:
     """The wrist frames a test queues: each `newer_than` takes the next one,
     or gives none when the queue is empty."""
 
-    def __init__(self, camera: Optional[str] = "wrist_left", frames: int = 10) -> None:
+    def __init__(self, camera: Optional[str] = "wrist_left", frames: int = 10, period_s: Optional[float] = None) -> None:
         self.camera = camera
         self.frames: deque = deque(rgb_frame(frame_id=i) for i in range(1, frames + 1))
+        self.period = period_s
         self.waited: list[float] = []
 
     def camera_of(self, arm):
@@ -56,6 +57,9 @@ class FakeWrists:
 
     def latest_stamp(self, arm):
         return 1.0
+
+    def period_s(self, arm):
+        return self.period
 
     async def newer_than(self, arm, timestamp, timeout_s):
         self.waited.append(timeout_s)
@@ -280,19 +284,30 @@ async def test_a_camera_mounts_refusal_fails_the_alignment_with_its_words():
         await a.align(request(), FakeMoves(), CancelToken())
 
 
-async def test_the_step_waits_for_the_frame_as_long_as_the_aligner_says():
-    wrists = FakeWrists()
-    a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists), frame_wait_s=0.25)
+@pytest.mark.parametrize(
+    "period_s, waited",
+    [
+        # A camera the brain measured at 0.4 Hz, as a loaded host renders an
+        # idle simulated one: two and a half of its periods.
+        (2.5, 6.25),
+        # A fast camera: the least wait.
+        (1 / 30, 0.5),
+        # A camera that sent one frame alone: the least wait.
+        (None, 0.5),
+    ],
+)
+async def test_a_step_waits_for_the_frame_periods_of_the_wrist_camera_and_the_least_wait(period_s, waited):
+    wrists = FakeWrists(period_s=period_s)
+    a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists), frame_wait_periods=2.5, min_frame_wait_s=0.5)
     await a.align(request(), FakeMoves(), CancelToken())
-    assert wrists.waited == [0.25]
+    assert wrists.waited == [pytest.approx(waited)]
 
 
-async def test_a_step_waits_for_two_periods_of_an_idle_simulated_camera_and_more():
+async def test_a_step_waits_at_least_the_least_wait_by_default():
     wrists = FakeWrists()
     a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists))
     await a.align(request(), FakeMoves(), CancelToken())
-    assert wrists.waited == [FRAME_WAIT_S]
-    assert FRAME_WAIT_S > 2.0 / IDLE_CAMERA_HZ
+    assert wrists.waited == [MIN_FRAME_WAIT_S]
 
 
 async def test_a_cancel_during_the_models_call_raises_cancelled():
