@@ -397,7 +397,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "camera_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "libc",
 ]
@@ -467,7 +467,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -561,7 +561,7 @@ dependencies = [
 [[package]]
 name = "collision_geometry"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2514,7 +2514,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "srs_model",
  "urdf-rs",
@@ -3538,7 +3538,7 @@ dependencies = [
 [[package]]
 name = "self_collision_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "collision_geometry",
  "openarm_description",
@@ -3885,7 +3885,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
@@ -4998,7 +4998,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workspace_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
 dependencies = [
  "camera_core",
  "thiserror 2.0.21",
