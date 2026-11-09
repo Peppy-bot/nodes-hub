@@ -1,4 +1,4 @@
-mujoco==3.17.0
+mujoco==4.0.0
 mjviser==0.0.16
 numpy==2.5.4
 # PyOpenGL is pulled in by mujoco; the accelerate package must match its
