@@ -248,6 +248,17 @@ The answer is the arm's `start_joint_positions`, where its path starts, and its
 `position` and `orientation` there; and `map_stamp`, the stamp of the newest depth
 frame in the map.
 
+`path_orientation_constraints` lists orientations held along the whole path, such as a
+carried cup kept upright: each names a link of a named arm, with `orientation`, `tolerance_rad`
+and `free_axis` as a goal's. Every state of the path from the plan's start, its rounded corners
+included, holds each, and their order carries no meaning (`motion_planning_core`'s "Path
+orientations"). Run from within `limb_motion`'s start tolerance of that start, a link turns from
+where the path holds it by at most the sum of its joints' differences from the start. A goal that names a
+position of a link and no orientation takes the orientation of that link's constraint. An arm named
+with no goal holds its constraints when its start lies within `tolerance_rad`. A start more than
+0.99 of `tolerance_rad` from an orientation fails with `no_path`, and so does a goal farther from it
+than 0.9 of `tolerance_rad` or the start's own angle from it, whichever is more.
+
 ## A Cartesian path
 
 `plan_cartesian_path` follows a link of one arm along straight lines through `waypoints`,
@@ -377,6 +388,14 @@ geometric_shapes 2.3.4:
 
 Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 
+- Path orientations: MoveIt projects onto one orientation path constraint, and with two or more
+  plans in pose space through inverse kinematics; on a group of two arms its Jacobian is refused
+  (`RobotState::getJacobian`, moveit2 2.15.2 robot_state.cpp:1516). Here every constraint is
+  projected, on one arm and on two. MoveIt judges a rotation vector's components against each
+  tolerance, about the axes of the constraint's frame, at the states along each motion and at the
+  waypoints of its answer. Here `tolerance_rad` bounds the angle itself, or with `free_axis` the
+  angle of the held axis, at every state of the rounded path, and the plan corrects its states to
+  0.9 of it, which leaves the last tenth for what lies between them.
 - A Cartesian path: MoveIt checks each state for collisions, not its start and not the motion
   between two, and each interval's midpoint for the precision. Here the rounded path the
   move runs is checked for both, a start in contact fails with `start_in_collision`, and a
@@ -448,7 +467,7 @@ Each is a choice a caller sees; the launchers' values are OpenArm v2's.
 | `precondition_failed` | The camera is linked and the map has taken in no depth frame since the node started or the map was cleared, the message naming what the map waits on; or no joint positions have been measured; or a plan's start lies outside a joint limit by more than `start_tolerance_rad`, the message naming the joint. |
 | `start_in_collision` | A plan's start touches the map, an object of the planning scene or the robot's own body; the message names the pair. |
 | `unreachable` | No configuration meets the goal before the goal sampling ends (once the samples since the last goal found reach 1000 less the goals found so far, as MoveIt's `max_goal_sampling_attempts` bounds the samples its sampling function makes before it returns a goal, counting from the goals OMPL has taken) or within the time allowed, the message naming in a plan of both arms the first arm that met its goal in no sample; or every configuration, or state of both arms, that the goal sampling tried comes nearer than the plan's clearance, which the message names with the pair that the one falling short least falls short against: two links, a link or a carried object and the map or an object, a carried object and a link, or two objects the two arms carry. The message says so when the deadline ended the sampling, and that more time may find a goal. |
-| `no_path` | The planner finds no path within the time and the iterations allowed, or the start rule leaves no motion from the start; a planned waypoint falls short of the plan's clearance, or a corner's rounding does however near it the added waypoints lie; the planned path fails its check, simplified and as planned; or the time allowed ends before the plan answers. The message names the plan's clearance where it falls short. |
+| `no_path` | The planner finds no path within the time and the iterations allowed, or the start rule leaves no motion from the start; a planned waypoint falls short of the plan's clearance, or a corner's rounding does however near it the added waypoints lie; the planned path fails its check, simplified and as planned; the time allowed ends before the plan answers; or a start or a goal breaks a path orientation, or no configuration that meets the goal keeps them. The message names the plan's clearance where it falls short, and the link where a path orientation breaks. |
 | `timeout` | A check has a walk of a run or an arc left at 10 s. |
 | `attempt_failed` | The planner fails on its own: OMPL reports an error, or the plan's task ends without an answer. |
 

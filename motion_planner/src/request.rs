@@ -15,8 +15,7 @@ use motion_planning_core::{
 use openarm_description::{ARM_DOF, ArmOrder, ArmPair, Side};
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
-    GoalGoalJointConstraintsItem, GoalGoalOrientationConstraintsItem,
-    GoalGoalPositionConstraintsItem, GoalRequestData,
+    GoalGoalJointConstraintsItem, GoalGoalPositionConstraintsItem, GoalRequestData,
 };
 use peppygen::exposed_services::motion_planning::check_joint_path;
 
@@ -39,8 +38,17 @@ pub struct PlanQuery {
     /// The arms the plan moves, each to its goal; every other arm of `order` stays where
     /// it starts.
     pub arm_goals: ArmGoals,
+    /// The orientations each arm's path holds.
+    pub path_orientations: ArmPair<Vec<HeldOrientation>>,
     /// How long the plan may take.
     pub time_limit: Duration,
+}
+
+/// An orientation a path holds of a link of an arm: the link as sent, and the target.
+#[derive(Debug)]
+pub struct HeldOrientation {
+    pub link_name: String,
+    pub target: OrientationTarget,
 }
 
 /// The arms a plan moves, each with its goal.
@@ -127,6 +135,12 @@ pub fn parse_plan(
             .iter()
             .map(|c| c.link_name.as_str()),
     )?;
+    named_once(
+        "path_orientation_constraints",
+        raw.path_orientation_constraints
+            .iter()
+            .map(|c| c.link_name.as_str()),
+    )?;
     let named: Vec<&ArmModel> = order.sides().iter().map(|side| &arms[*side]).collect();
     let joints = raw
         .goal_joint_constraints
@@ -138,10 +152,21 @@ pub fn parse_plan(
         .iter()
         .map(|c| position_target(&named, fingers, c))
         .collect::<Result<Vec<_>, String>>()?;
-    let orientations = raw
-        .goal_orientation_constraints
-        .iter()
-        .map(|c| orientation_target(&named, fingers, c))
+    let target_of = |link_name, orientation, tolerance_rad, free_axis| {
+        orientation_target(
+            &named,
+            fingers,
+            link_name,
+            orientation,
+            tolerance_rad,
+            free_axis,
+        )
+    };
+    let orientations = (raw.goal_orientation_constraints.iter())
+        .map(|c| target_of(&c.link_name, c.orientation, c.tolerance_rad, &c.free_axis))
+        .collect::<Result<Vec<_>, String>>()?;
+    let path_orientations = (raw.path_orientation_constraints.iter())
+        .map(|c| target_of(&c.link_name, c.orientation, c.tolerance_rad, &c.free_axis))
         .collect::<Result<Vec<_>, String>>()?;
     let goals = ArmPair::from_fn(|side| {
         let (joints, positions, orientations) = (
@@ -190,6 +215,15 @@ pub fn parse_plan(
         order,
         starts,
         arm_goals,
+        path_orientations: ArmPair::from_fn(|side| {
+            of_the_arm(&path_orientations, side)
+                .into_iter()
+                .map(|routed| HeldOrientation {
+                    link_name: routed.name.to_string(),
+                    target: routed.target,
+                })
+                .collect()
+        }),
         time_limit: Duration::from_secs_f64(time),
     })
 }
@@ -565,28 +599,21 @@ fn position_target<'r>(
 fn orientation_target<'r>(
     named: &[&ArmModel],
     fingers: &ArmPair<Vec<Rider>>,
-    c: &'r GoalGoalOrientationConstraintsItem,
+    link_name: &'r str,
+    orientation: [f64; 4],
+    tolerance_rad: f64,
+    free_axis: &str,
 ) -> Result<Routed<'r, OrientationTarget>, String> {
-    let (side, frame) = frame(named, fingers, &c.link_name)?;
-    let orientation = orientation_from_parts(c.orientation)?;
-    let free_axis = match c.free_axis.as_str() {
-        "none" => None,
-        "x" => Some(Axis::X),
-        "y" => Some(Axis::Y),
-        "z" => Some(Axis::Z),
-        other => {
-            return Err(format!(
-                "free_axis is \"none\", \"x\", \"y\" or \"z\", not {other:?}"
-            ));
-        }
-    };
+    let (side, frame) = frame(named, fingers, link_name)?;
+    let orientation = orientation_from_parts(orientation)?;
+    let free_axis = Axis::free_named(free_axis)?;
     Ok(Routed {
         side,
-        name: &c.link_name,
+        name: link_name,
         target: OrientationTarget {
             frame,
             orientation,
-            tolerance_rad: tolerance("tolerance_rad", &c.link_name, c.tolerance_rad)?,
+            tolerance_rad: tolerance("tolerance_rad", link_name, tolerance_rad)?,
             free_axis,
         },
     })
@@ -596,7 +623,9 @@ fn orientation_target<'r>(
 mod tests {
     use super::*;
 
-    use peppygen::exposed_actions::motion_planning::plan_joint_path::GoalArmsItem;
+    use peppygen::exposed_actions::motion_planning::plan_joint_path::{
+        GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalPathOrientationConstraintsItem,
+    };
     use peppygen::exposed_services::motion_planning::check_joint_path::{
         CheckJointPathArmsItem, CheckJointPathArmsItemWaypointsItem,
     };
@@ -625,6 +654,7 @@ mod tests {
                 position: [0.4, 0.2, 0.5],
                 tolerance_m: 0.01,
             }],
+            path_orientation_constraints: Vec::new(),
             goal_orientation_constraints: vec![GoalGoalOrientationConstraintsItem {
                 link_name: "openarm_left_tcp".to_string(),
                 orientation: [0.0, 0.0, 0.0, 1.0005],
@@ -649,6 +679,7 @@ mod tests {
         GoalRequestData {
             goal_joint_constraints: vec![joint_constraint(name, position)],
             goal_position_constraints: Vec::new(),
+            path_orientation_constraints: Vec::new(),
             goal_orientation_constraints: Vec::new(),
             ..goal()
         }
@@ -777,6 +808,80 @@ mod tests {
         assert_eq!(
             parse(&started).expect("a query").starts,
             ArmPair::new(Some([0.1; ARM_DOF]), None)
+        );
+    }
+
+    /// A path orientation of `link`, within 0.1 rad of the identity, free about `free_axis`.
+    fn held(link: &str, free_axis: &str) -> GoalPathOrientationConstraintsItem {
+        GoalPathOrientationConstraintsItem {
+            link_name: link.to_string(),
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            tolerance_rad: 0.1,
+            free_axis: free_axis.to_string(),
+        }
+    }
+
+    // Each path orientation goes to the arm whose link it names, as sent; an arm that holds one
+    // and has no goal stays where it starts.
+    #[test]
+    fn a_path_orientation_goes_to_the_arm_of_its_link() {
+        let mut both = goal();
+        both.arms.push(arm("right_arm"));
+        both.path_orientation_constraints = vec![
+            held("openarm_right_tcp", "none"),
+            held("openarm_left_tcp", "z"),
+        ];
+        let query = parse(&both).expect("a query");
+        assert!(matches!(
+            query.arm_goals,
+            ArmGoals::One {
+                side: Side::Left,
+                ..
+            }
+        ));
+        let [left] = query.path_orientations[Side::Left].as_slice() else {
+            panic!("one orientation of the left arm");
+        };
+        assert_eq!(left.link_name, "openarm_left_tcp");
+        assert_eq!(left.target.free_axis, Some(Axis::Z));
+        let [right] = query.path_orientations[Side::Right].as_slice() else {
+            panic!("one orientation of the right arm");
+        };
+        assert_eq!(right.link_name, "openarm_right_tcp");
+        assert_eq!(right.target.free_axis, None);
+    }
+
+    // A path orientation of a link outside the named arms, a link named twice, a tolerance of 0
+    // and an unknown free axis are refused, and the message says what to send instead.
+    #[test]
+    fn a_path_orientation_it_cannot_take_is_refused_with_what_to_send() {
+        let refused = |constraints: Vec<GoalPathOrientationConstraintsItem>| {
+            refusal(GoalRequestData {
+                path_orientation_constraints: constraints,
+                ..goal()
+            })
+        };
+        assert!(
+            refused(vec![held("openarm_right_tcp", "none")]).contains("openarm_right_tcp"),
+            "a link of an arm the goal does not name"
+        );
+        assert_eq!(
+            refused(vec![
+                held("openarm_left_tcp", "none"),
+                held("openarm_left_tcp", "z")
+            ]),
+            "openarm_left_tcp is named twice in path_orientation_constraints"
+        );
+        assert!(
+            refused(vec![GoalPathOrientationConstraintsItem {
+                tolerance_rad: 0.0,
+                ..held("openarm_left_tcp", "none")
+            }])
+            .contains("tolerance_rad")
+        );
+        assert_eq!(
+            refused(vec![held("openarm_left_tcp", "w")]),
+            "free_axis is \"none\", \"x\", \"y\" or \"z\", not \"w\""
         );
     }
 
@@ -1005,6 +1110,7 @@ mod tests {
         );
         let empty = GoalRequestData {
             goal_position_constraints: Vec::new(),
+            path_orientation_constraints: Vec::new(),
             goal_orientation_constraints: Vec::new(),
             ..goal()
         };
