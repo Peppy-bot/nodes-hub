@@ -12,6 +12,7 @@ use motion_planning_core::{Arm, RiderOffTheArm};
 use occupancy_map::{Frame, FrameError};
 use openarm_description::{ARM_DOF, ARMS, DUAL_DOF, HardwareVersion, Side};
 use self_collision_model::CollisionError;
+use so101_description::{ARM_DOF as SO101_DOF, ARM_LIMB, BASE_LINK, GRIPPER_LIMB, TCP_LINK, URDF};
 
 use crate::arm_set::{ArmId, PerArm};
 use crate::fingers::{FingerFault, riders_of_the_arms};
@@ -22,15 +23,18 @@ use crate::own_body::OwnBody;
 pub enum Robot {
     /// OpenArm v2: two seven-joint arms, each with a pinch gripper, on a torso.
     OpenArmV2,
+    /// SO-101: one five-joint arm with a one-jawed gripper on a base.
+    So101,
 }
 
 impl Robot {
-    const ALL: [Self; 1] = [Self::OpenArmV2];
+    const ALL: [Self; 2] = [Self::OpenArmV2, Self::So101];
 
     /// The name robot_identity gives it.
     const fn name(self) -> &'static str {
         match self {
             Self::OpenArmV2 => "openarm_v2",
+            Self::So101 => "so101",
         }
     }
 }
@@ -170,6 +174,42 @@ pub fn openarm_v2() -> Result<RobotModel<ARM_DOF, DUAL_DOF, ARMS>, ModelError> {
     built(arms, body, own)
 }
 
+/// SO-101's model. Its arm's chain runs from the base link, the robot frame, to its grasp
+/// point, and its one jaw rides the gripper link on a joint the chain does not drive.
+pub fn so101() -> Result<RobotModel<SO101_DOF, SO101_DOF, 1>, ModelError> {
+    let meshes = tempfile::tempdir()?;
+    so101_description::write_meshes_to(meshes.path())?;
+    let meshes_dir = meshes.path().to_str().ok_or(ModelError::MeshesPath)?;
+    let geometry = ChainGeometry::<SO101_DOF>::from_urdf(
+        URDF,
+        meshes_dir,
+        &ChainSpec {
+            base_link: Some(BASE_LINK),
+            tip_link: TCP_LINK,
+            joints: JointSelection::PathOrder,
+        },
+    )?;
+    let arm = ArmModel {
+        id: ArmId::new(0),
+        name: ARM_LIMB,
+        gripper_name: GRIPPER_LIMB,
+        joint_names: joint_names(&geometry),
+        link_names: moved_by(&geometry, 0),
+        grasp_link: TCP_LINK,
+        // The URDF's grasp frame turns the gripper link's half a turn about y, so +z points
+        // out of the gripper, and the jaw's joint turns it across +x.
+        approach_axis: "+z",
+        closing_axis: "+x",
+        gripper_links: with_pieces(&geometry, moved_by(&geometry, SO101_DOF - 1)),
+        geometry,
+    };
+    let body = BodyGeometry::from_urdf(URDF, meshes_dir, &[])?;
+    let own = OwnBody {
+        model: self_collision_model::so101(meshes_dir)?,
+    };
+    built(PerArm::new(vec![arm]), body, own)
+}
+
 /// The robot of `arms`, `body` and `own`, its frame the root of the first arm's URDF. A
 /// finger of `own` that does not fit its arm stops the model.
 fn built<const N: usize, const D: usize, const K: usize>(
@@ -256,15 +296,19 @@ pub(crate) mod tests {
     /// OpenArm v2's model, built once for the unit tests.
     pub(crate) static OPENARM_V2: LazyLock<RobotModel<ARM_DOF, DUAL_DOF, 2>> =
         LazyLock::new(|| openarm_v2().expect("OpenArm v2's model"));
+    /// SO-101's model, built once for the unit tests.
+    static SO101: LazyLock<RobotModel<SO101_DOF, SO101_DOF, 1>> =
+        LazyLock::new(|| so101().expect("SO-101's model"));
 
     // Each robot parses from the model name robot_identity gives it, and a name of none
     // is refused with the names.
     #[test]
     fn a_model_name_names_a_robot() {
         assert_eq!("openarm_v2".parse(), Ok(Robot::OpenArmV2));
+        assert_eq!("so101".parse(), Ok(Robot::So101));
         assert_eq!(
             "openarm_v1".parse::<Robot>().unwrap_err().to_string(),
-            "no robot is named \"openarm_v1\"; the robots are \"openarm_v2\""
+            "no robot is named \"openarm_v1\"; the robots are \"openarm_v2\", \"so101\""
         );
     }
 
@@ -379,5 +423,150 @@ pub(crate) mod tests {
                 "{planned} against {reported}"
             );
         }
+    }
+
+    // SO-101's one arm names its five joints in limb_state's order, its links from the
+    // shoulder's down to the grasp point, and its gripper's links, the gripper link and the
+    // jaw; the base is its body.
+    #[test]
+    fn so101s_arm_names_its_joints_and_links() {
+        let [arm] = &SO101.arms.iter().collect::<Vec<_>>()[..] else {
+            panic!("SO-101 has one arm");
+        };
+        assert_eq!((arm.name, arm.gripper_name), ("arm", "gripper"));
+        assert_eq!(
+            arm.joint_names,
+            [
+                "shoulder_pan",
+                "shoulder_lift",
+                "elbow_flex",
+                "wrist_flex",
+                "wrist_roll"
+            ]
+        );
+        let mut links = arm.link_names.clone();
+        links.sort_unstable();
+        assert_eq!(
+            links,
+            [
+                "gripper_frame_link",
+                "gripper_link",
+                "lower_arm_link",
+                "moving_jaw_so101_v1_link",
+                "shoulder_link",
+                "upper_arm_link",
+                "wrist_link"
+            ]
+        );
+        let mut gripper = arm.gripper_links.clone();
+        gripper.sort_unstable();
+        assert_eq!(gripper, ["gripper_link", "moving_jaw_so101_v1_link"]);
+        assert_eq!(arm.grasp_link, "gripper_frame_link");
+        assert_eq!(SO101.body.link_names().collect::<Vec<_>>(), ["base_link"]);
+    }
+
+    // At the opening that puts the jaw's joint at 0, the jaw hangs where the URDF's joint origin
+    // puts it, as the chain carries it.
+    #[test]
+    fn so101s_jaw_hangs_off_the_gripper_link_at_its_joints_origin() {
+        let arm = &SO101.arms[ArmId::new(0)];
+        let [part] = arm.geometry.carried() else {
+            panic!("SO-101's arm carries its jaw");
+        };
+        let mut own = SO101.own.clone();
+        own.set_openings(&PerArm::new(vec![so101_description::jaw_opening(0.0)]));
+        let fingers = own.fingers(arm.id, &arm.geometry).expect("the jaw");
+        let at_zero = part.rider().offset;
+        assert_eq!(fingers[0].segment, part.rider().segment);
+        assert!(
+            (fingers[0].offset.translation.vector - at_zero.translation.vector).norm() < 1e-12
+                && fingers[0].offset.rotation.angle_to(&at_zero.rotation) < 1e-9,
+            "{} against {at_zero}",
+            fingers[0].offset
+        );
+    }
+
+    // A part the arm carries beside its jaw, which the self model does not hold, stops the
+    // model, the message naming the part.
+    #[test]
+    fn a_part_beside_the_jaw_stops_the_model() {
+        let urdf = URDF.replace(
+            "</robot>",
+            r#"<link name="beside_the_jaw">
+                 <collision><geometry><box size="0.01 0.01 0.01"/></geometry></collision>
+               </link>
+               <joint name="beside_the_jaw_joint" type="revolute">
+                 <parent link="gripper_link"/>
+                 <child link="beside_the_jaw"/>
+                 <axis xyz="0 0 1"/>
+                 <limit lower="-1" upper="1" effort="1" velocity="1"/>
+               </joint>
+             </robot>"#,
+        );
+        let meshes = tempfile::tempdir().expect("a temporary directory");
+        so101_description::write_meshes_to(meshes.path()).expect("the meshes write");
+        let geometry = ChainGeometry::<SO101_DOF>::from_urdf(
+            &urdf,
+            meshes.path().to_str().expect("the directory is UTF-8"),
+            &ChainSpec {
+                base_link: Some(BASE_LINK),
+                tip_link: TCP_LINK,
+                joints: JointSelection::PathOrder,
+            },
+        )
+        .expect("the arm fits");
+        assert_eq!(
+            ModelError::from(
+                SO101
+                    .own
+                    .fingers(ArmId::new(0), &geometry)
+                    .expect_err("a part beside the jaw")
+            )
+            .to_string(),
+            "a finger of the robot's own body: the self model holds no body 'beside_the_jaw'; \
+             give the parts of this robot's chain"
+        );
+    }
+
+    // The jaw swings with the gripper's opening: its piece stands farther from the grasp point
+    // open than shut, and shuts along the grasp frame's +x, the closing axis. The grasp frame's
+    // +z leads away from the gripper link, the approach axis.
+    #[test]
+    fn so101s_grasp_axes_are_the_ones_its_jaw_and_gripper_turn_on() {
+        use chain_kinematics::nalgebra::{Isometry3, Point3, Vector3};
+
+        let arm = &SO101.arms[ArmId::new(0)];
+        let tree = arm.geometry.chain().tree();
+        let gripper = tree.link_index("gripper_link").expect("the gripper link");
+        let tool: Isometry3<f64> = tree
+            .fixed_path_to(gripper, TCP_LINK)
+            .expect("the grasp point is fixed to the gripper link");
+        let center_at = |opening: f64| {
+            let mut own = SO101.own.clone();
+            own.set_openings(&PerArm::new(vec![opening]));
+            let fingers = own.fingers(arm.id, &arm.geometry).expect("the jaw");
+            let [jaw] = &fingers[..] else {
+                panic!("SO-101 has one jaw");
+            };
+            assert_eq!(jaw.name, so101_description::JAW_LINK);
+            let RiderBody::Pieces([piece, ..]) = jaw.body else {
+                panic!("the jaw is a part of the robot");
+            };
+            let corners = piece.vertices();
+            let sum = corners
+                .iter()
+                .fold(Vector3::zeros(), |sum, c| sum + c.coords);
+            tool.inverse() * jaw.offset * Point3::from(sum / corners.len() as f64)
+        };
+        let (shut, open) = (center_at(0.0), center_at(1.0));
+        assert!(
+            shut.coords.norm() < open.coords.norm(),
+            "{shut} against {open}"
+        );
+        assert_eq!(arm.closing_axis, "+x");
+        assert!(shut.x > open.x, "{shut} against {open}");
+        assert_eq!(arm.approach_axis, "+z");
+        let gripper_origin = tool.inverse() * Point3::origin();
+        assert!(gripper_origin.z < 0.0, "{gripper_origin}");
     }
 }

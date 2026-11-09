@@ -17,7 +17,7 @@ use control_core::latched_log::LatchedLog;
 use control_core::{receiving, serving};
 use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
-    DepthCamera, Goal, IkGoalSampler, PathCheck, PathOrientation, PlanFailure,
+    Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathOrientation, PlanFailure,
     PlanRequest, PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault,
     cartesian_path, check_path, insert_cut_out, plan_path, pose_parts, start_inside_limits,
 };
@@ -53,7 +53,7 @@ use crate::request::{
     ArmGoals, ArmStarts, CartesianQuery, CheckQuery, PlanQuery, parse_cartesian, parse_check,
     parse_plan,
 };
-use crate::robot::{ArmModel, ModelError, Robot, RobotModel, openarm_v2};
+use crate::robot::{ArmModel, ModelError, Robot, RobotModel, openarm_v2, so101};
 use crate::scene::{attach_request, object_requests, scene_response};
 
 /// Bounds every call to another node.
@@ -84,8 +84,11 @@ const NO_JOINTS: &str = "no joint positions of the arms have been measured yet; 
                          once limb_state publishes every arm's joints and every gripper's opening";
 /// What the node logs on a robot whose launcher linked no depth camera.
 const NO_CAMERA: &str = "no depth camera is linked to the planner: plans and checks keep \
-                         the clearance from the planning scene's objects and, on a robot with a \
-                         self model, from its own body, alone";
+                         the clearance from the planning scene's objects and from the robot's \
+                         own body alone";
+/// What a plan refused for a start where the robot's own bodies touch tells the caller to do.
+const OWN_CONTACT_WAY_OUT: &str = "move the arms to the ready posture with move_to_ready and \
+                                   plan from there";
 
 /// The links of the perception camera the map reads.
 struct CameraLinks {
@@ -321,6 +324,7 @@ async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config, fault: F
     };
     match robot {
         Robot::OpenArmV2 => serve_robot(runner, config, fault, robot, openarm_v2()),
+        Robot::So101 => serve_robot(runner, config, fault, robot, so101()),
     }
 }
 
@@ -1861,8 +1865,23 @@ fn plan<const N: usize, const D: usize, const K: usize>(
                 PlanFailure::NoPath(_) => FailureKind::NoPath,
                 PlanFailure::Planner(_) => FailureKind::AttemptFailed,
             };
-            PlanEnd::Failed(kind, failure.to_string())
+            let start = match &failure {
+                PlanFailure::Start(fault) => Some(fault),
+                _ => None,
+            };
+            PlanEnd::Failed(kind, with_way_out(failure.to_string(), start))
         })
+}
+
+/// `message`, the words of a plan's failure, and after them, for a start where the robot's
+/// own bodies touch, `start`, what the caller does to leave it.
+fn with_way_out(message: String, start: Option<&StartFault>) -> String {
+    match start {
+        Some(StartFault::InCollision(Contact::Own { .. })) => {
+            format!("{message}; {OWN_CONTACT_WAY_OUT}")
+        }
+        _ => message,
+    }
 }
 
 /// Why an arm the plan leaves where it starts, every arm but `moving`, breaks a path
@@ -2099,7 +2118,11 @@ fn cartesian<const N: usize, const D: usize, const K: usize>(
             CartesianFailure::Start(StartFault::OutsideLimits { .. }) => Kind::PreconditionFailed,
             CartesianFailure::Start(StartFault::InCollision(_)) => Kind::StartInCollision,
         };
-        PlanEnd::Failed(kind, failure.to_string())
+        let start = match &failure {
+            CartesianFailure::Start(fault) => Some(fault),
+            _ => None,
+        };
+        PlanEnd::Failed(kind, with_way_out(failure.to_string(), start))
     })?;
     let waypoints = path
         .waypoints

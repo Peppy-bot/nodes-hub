@@ -253,7 +253,7 @@ pub async fn start_without_the_rig(
 }
 
 /// The harness's configuration with the camera and geometry slots vacant.
-fn vacant_camera() -> Config {
+pub fn vacant_camera() -> Config {
     Config {
         parameters: Some(parameters()),
         camera_vacant: true,

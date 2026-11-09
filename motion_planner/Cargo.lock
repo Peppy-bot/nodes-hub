@@ -2312,11 +2312,13 @@ dependencies = [
  "peppygen",
  "peppylib",
  "self_collision_model",
+ "so101_description",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "urdf-rs",
 ]
 
 [[package]]

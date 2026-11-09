@@ -158,10 +158,11 @@ impl<const N: usize, const K: usize, const D: usize> SelfModel<D> for EveryArm<N
 #[cfg(test)]
 mod tests {
     use openarm_description::{ARM_DOF, DUAL_DOF, Side, home, ready};
+    use so101_description::ARM_DOF as SO101_DOF;
 
     use super::*;
     use crate::arm_set::PerArm;
-    use crate::robot::openarm_v2;
+    use crate::robot::{openarm_v2, so101};
 
     // A turn of the left arm, first in the state, reads its pairs without the right arm,
     // and a turn of the right arm its pairs with the left: the left arm at Ready and the
@@ -202,5 +203,21 @@ mod tests {
             .expect("a measured state")
             .distance;
         assert_eq!(held.clearance(&at[1], Moving::All), of_right);
+    }
+
+    // SO-101's one arm reads every checked pair, planned alone or as every arm.
+    #[test]
+    fn a_plan_of_so101s_arm_reads_every_pair() {
+        let robot = so101().expect("SO-101's model");
+        let q = [0.3, -0.4, 0.9, 0.2, -0.1];
+        let mut model = robot.own.model.clone();
+        let of_all = model.min_distance(&[q]).expect("a measured state").distance;
+        let alone = robot
+            .own
+            .of_one_arm(NonZeroUsize::MIN, ArmId::new(0), &PerArm::new(vec![q]));
+        let every = robot.own.of_every_arm::<SO101_DOF>(NonZeroUsize::MIN);
+        assert_eq!(alone.clearance(&q, Moving::All), of_all);
+        assert_eq!(every.clearance(&q, Moving::Arm(0)), of_all);
+        assert_eq!(every.clearance(&q, Moving::All), of_all);
     }
 }

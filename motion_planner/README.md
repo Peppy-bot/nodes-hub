@@ -1,6 +1,6 @@
 # motion_planner
 
-Plans joint paths for one or both arms of a robot around what its perception camera sees
+Plans joint paths for the arms of a robot, one or together, around what its perception camera sees
 and the objects of its planning scene. The node keeps a voxel map of the camera's depth
 frames in the robot frame and a planning scene of collision objects, objects attached to
 an arm's grasp link and pairs allowed to touch, as MoveIt's planning scene holds them; it
@@ -30,8 +30,9 @@ limb_motion's `execute_joint_path`, passing every arm of the answer and each arm
 The node plans for the model the robot's identity names: it asks
 `robot_identity.get_identity` of the instance its `identity` slot binds until it answers,
 each ask waiting up to 5 s and the next a second after, since the robot's initializer may
-start after it, and then starts and serves. `openarm_v2` is the model it knows: another
-ends the node with an error that names the model and the ones it knows. The model gives:
+start after it, and then starts and serves. `openarm_v2` and `so101` are the models it
+knows: another ends the node with an error that names the model and the ones it knows. The
+model `openarm_v2` gives:
 
 - each arm by its limb name (`left_arm`, `right_arm`), its gripper's (`left_gripper`,
   `right_gripper`), and its joints in limb_state's order, with the limits
@@ -54,6 +55,37 @@ At home (`openarm_description::home`) with the grippers closed, the robot's bodi
 stands 0.050 m from the torso there, and at 0.5 or more within the self clearance (0.039 m
 at 0.5), so a plan to home is `unreachable`, the message naming the finger and the torso,
 until the gripper closes.
+
+The model `so101` gives one arm, `arm`, its gripper `gripper`, and five joints from
+`shoulder_pan` to `wrist_roll`, with the URDF's limits; its grasp link `gripper_frame_link`,
+approach `+z` and closing `+x`; and its gripper's links, `gripper_link` and the jaw,
+`moving_jaw_so101_v1_link`, which swings with the gripper's opening. `base_link` is its body.
+Its self model is `self_collision_model`'s SO-101 model: a state keeps its clearance from
+the objects of the planning scene and between the pairs of its own links that the model
+checks, and an object the hand holds keeps it from the base and from the links it may not
+touch. Its home posture folds the arm onto itself, its links touching in the model, so a plan
+from home is refused, `start_in_collision`, the message saying to move the arms to the ready
+posture with `move_to_ready` and plan from there. With no depth camera its launchers leave
+the four camera slots vacant.
+
+Five joints hold few orientations at a position, so a goal of the grasp point, or of a link
+every joint moves, on an arm of fewer than six joints is sampled by these options:
+
+- A goal of a position alone descends on the position alone, as MoveIt's KDL solver does under
+  its `position_only_ik` option.
+- A goal of an orientation alone descends on the orientation alone, and the goal's
+  constraints decide on each end it offers.
+- A goal of a position and an orientation departs from MoveIt, whose sampler offers converged
+  ends alone: a descent weighs the orientation's rows at 0.01, and the goal's constraints
+  decide on each end it offers. Of 100 goals at 1 mm, tilted 0.05 rad and held within 0.1 rad, or
+  held at 0.02 rad, it meets 100, where `position_only_ik` with converged ends meets 94 and
+  45. Of 100 goals turned 0.8 rad about an axis held within 0.1 rad, the frame free about it,
+  it meets 96, and 4 with no axis free.
+- A Cartesian path solves each step as on any chain: it ends where five joints cannot keep
+  the precision, a line across the arm's plane holding an orientation among them.
+
+A pose `move_arm` refuses for its orientation plans here, with the slack named in
+`tolerance_rad` or `free_axis`.
 
 `describe_arms` answers all of it.
 
@@ -118,9 +150,9 @@ until the gripper closes.
   the camera, and `camera_mounts` and `workspace` are bound too. With `camera` and
   `geometry` vacant the map stays empty, whether `camera_mounts` and `workspace` are
   bound or not, as on a robot without a camera rig: plans and checks keep the clearance
-  from the robot's own body, and answer no `map_stamp`. Any other binding leaves the map
-  waiting on a camera it cannot read, and every plan and check is refused, the message
-  naming the slots to bind or leave vacant.
+  from the objects and the robot's own body, and answer no `map_stamp`. Any other
+  binding leaves the map waiting on a camera it cannot read, and every plan and check is
+  refused, the message naming the slots to bind or leave vacant.
 - While the map holds no frame, a refused plan or check names what the map waits on:
   the camera's description and the call that failed or the answer that gives no lens,
   depth model or pose, a frame skipped and why, or a fault in the robot's description,
@@ -129,7 +161,7 @@ until the gripper closes.
 
 ## A plan
 
-- `arms` holds one arm or each of them, each once, as the backbone refuses them. Each arm's path starts at its `start_joint_positions`, or, when
+- `arms` holds one arm or each of them, each once. Each arm's path starts at its `start_joint_positions`, or, when
   that is empty, at the arm's last measured joint positions. An arm `arms` does not name
   stands where it was last measured, and the grippers at their measured openings: a
   planned arm's fingers move with its hand.
@@ -385,7 +417,8 @@ geometric_shapes 2.3.4:
 
 ## Departures from MoveIt
 
-Each is a choice a caller sees; the launchers' values are OpenArm v2's.
+Each is a choice a caller sees; the launchers' values are OpenArm v2's. SO-101's goal
+sampling, which departs too, is in "The robot".
 
 - Path orientations: MoveIt projects onto one orientation path constraint, and with two or more
   plans in pose space through inverse kinematics; on a group of two arms its Jacobian is refused
