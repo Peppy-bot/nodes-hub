@@ -12,13 +12,14 @@ use motion_planning_core::{
     Axis, FollowedFrame, Frame, Goal, GoalError, JointTarget, OrientationTarget, PositionTarget,
     orientation_from_parts, pose_from_parts, poses_in_range,
 };
-use openarm_description::{ARM_DOF, ArmOrder, ArmPair, Side};
+use openarm_description::{common_waypoint_count, no_such_arm, places_in_order};
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalGoalJointConstraintsItem, GoalGoalPositionConstraintsItem, GoalRequestData,
 };
 use peppygen::exposed_services::motion_planning::check_joint_path;
 
+use crate::arm_set::{ArmId, PerArm};
 use crate::robot::ArmModel;
 
 /// The longest a plan may plan, in seconds.
@@ -30,16 +31,16 @@ pub const OBJECTIVE: &str = "any";
 
 /// A plan_joint_path goal that parses.
 #[derive(Debug)]
-pub struct PlanQuery {
+pub struct PlanQuery<const N: usize> {
     /// The goal's arms, in its order: the order of the answer.
-    pub order: ArmOrder,
+    pub order: Vec<ArmId>,
     /// Where each arm's path starts.
-    pub starts: ArmStarts,
+    pub starts: ArmStarts<N>,
     /// The arms the plan moves, each to its goal; every other arm of `order` stays where
     /// it starts.
     pub arm_goals: ArmGoals,
     /// The orientations each arm's path holds.
-    pub path_orientations: ArmPair<Vec<HeldOrientation>>,
+    pub path_orientations: PerArm<Vec<HeldOrientation>>,
     /// How long the plan may take.
     pub time_limit: Duration,
 }
@@ -51,29 +52,29 @@ pub struct HeldOrientation {
     pub target: OrientationTarget,
 }
 
-/// The arms a plan moves, each with its goal.
+/// The arms a plan moves, each with its goal: one, or every arm of a robot of more than one.
 #[derive(Debug)]
 pub enum ArmGoals {
-    One { side: Side, goal: Box<Goal> },
-    Both(Box<ArmPair<Goal>>),
+    One { arm: ArmId, goal: Box<Goal> },
+    Every(Box<PerArm<Goal>>),
 }
 
 /// A check_joint_path request that parses.
 #[derive(Debug)]
-pub struct CheckQuery {
+pub struct CheckQuery<const N: usize> {
     /// Where each arm's path starts.
-    pub starts: ArmStarts,
+    pub starts: ArmStarts<N>,
     /// The waypoints after the start of the arms the request names, at least one.
-    pub waypoints: Checked,
+    pub waypoints: Checked<N>,
 }
 
 /// A plan_cartesian_path goal that parses.
 #[derive(Debug)]
-pub struct CartesianQuery {
+pub struct CartesianQuery<const N: usize> {
     /// The arm the path moves.
-    pub side: Side,
+    pub arm: ArmId,
     /// Where its path starts.
-    pub starts: ArmStarts,
+    pub starts: ArmStarts<N>,
     /// What follows the lines.
     pub frame: FollowedFrame,
     /// The poses it passes through.
@@ -81,36 +82,37 @@ pub struct CartesianQuery {
     pub avoid_collisions: bool,
 }
 
-/// The waypoints of a check: one arm's, or both arms' together, as many for each.
+/// The waypoints of a check: one arm's, or every arm's of a robot of more than one, as many
+/// for each.
 #[derive(Debug, PartialEq)]
-pub enum Checked {
+pub enum Checked<const N: usize> {
     One {
-        side: Side,
-        waypoints: Vec<[f64; ARM_DOF]>,
+        arm: ArmId,
+        waypoints: Vec<[f64; N]>,
     },
-    Both(Vec<ArmPair<[f64; ARM_DOF]>>),
+    Every(Vec<PerArm<[f64; N]>>),
 }
 
-impl Checked {
-    /// The waypoints of the arm on `side`; none for an arm the check does not name.
-    pub fn of(&self, side: Side) -> Option<Vec<[f64; ARM_DOF]>> {
+impl<const N: usize> Checked<N> {
+    /// The waypoints of `arm`; none for an arm the check does not name.
+    pub fn of(&self, arm: ArmId) -> Option<Vec<[f64; N]>> {
         match self {
             Self::One {
-                side: named,
+                arm: named,
                 waypoints,
-            } => (*named == side).then(|| waypoints.clone()),
-            Self::Both(waypoints) => Some(waypoints.iter().map(|pair| pair[side]).collect()),
+            } => (*named == arm).then(|| waypoints.clone()),
+            Self::Every(waypoints) => Some(waypoints.iter().map(|all| all[arm]).collect()),
         }
     }
 }
 
 /// Parses a plan_joint_path goal against `arms`, whose fingers hang as `fingers` hold
 /// them.
-pub fn parse_plan(
+pub fn parse_plan<const N: usize>(
     raw: &GoalRequestData,
-    arms: &ArmPair<ArmModel>,
-    fingers: &ArmPair<Vec<Rider>>,
-) -> Result<PlanQuery, String> {
+    arms: &PerArm<ArmModel<N>>,
+    fingers: &PerArm<Vec<Rider>>,
+) -> Result<PlanQuery<N>, String> {
     let (order, starts) = named_arms(
         arms,
         raw.arms
@@ -141,7 +143,7 @@ pub fn parse_plan(
             .iter()
             .map(|c| c.link_name.as_str()),
     )?;
-    let named: Vec<&ArmModel> = order.sides().iter().map(|side| &arms[*side]).collect();
+    let named: Vec<&ArmModel<N>> = order.iter().map(|arm| &arms[*arm]).collect();
     let joints = raw
         .goal_joint_constraints
         .iter()
@@ -168,36 +170,30 @@ pub fn parse_plan(
     let path_orientations = (raw.path_orientation_constraints.iter())
         .map(|c| target_of(&c.link_name, c.orientation, c.tolerance_rad, &c.free_axis))
         .collect::<Result<Vec<_>, String>>()?;
-    let goals = ArmPair::from_fn(|side| {
-        let (joints, positions, orientations) = (
-            of_the_arm(&joints, side),
-            of_the_arm(&positions, side),
-            of_the_arm(&orientations, side),
-        );
-        let constrained = !(joints.is_empty() && positions.is_empty() && orientations.is_empty());
-        constrained.then(|| {
-            let links = (names(&positions), names(&orientations));
-            Goal::new(
-                ARM_DOF,
-                targets(joints),
-                targets(positions),
-                targets(orientations),
-            )
-            .map_err(|e| goal_refusal(&arms[side], e, links))
+    let goals = arms
+        .each(|arm, model| {
+            let (joints, positions, orientations) = (
+                of_the_arm(&joints, arm),
+                of_the_arm(&positions, arm),
+                of_the_arm(&orientations, arm),
+            );
+            let constrained =
+                !(joints.is_empty() && positions.is_empty() && orientations.is_empty());
+            constrained
+                .then(|| {
+                    let links = (names(&positions), names(&orientations));
+                    Goal::new(
+                        N,
+                        targets(joints),
+                        targets(positions),
+                        targets(orientations),
+                    )
+                    .map_err(|e| goal_refusal(model, e, links))
+                })
+                .transpose()
         })
-    });
-    let arm_goals = match (goals.left.transpose()?, goals.right.transpose()?) {
-        (None, None) => return Err(GoalError::Empty.to_string()),
-        (Some(goal), None) => ArmGoals::One {
-            side: Side::Left,
-            goal: Box::new(goal),
-        },
-        (None, Some(goal)) => ArmGoals::One {
-            side: Side::Right,
-            goal: Box::new(goal),
-        },
-        (Some(left), Some(right)) => ArmGoals::Both(Box::new(ArmPair::new(left, right))),
-    };
+        .transpose()?;
+    let arm_goals = arm_goals(goals).ok_or_else(|| GoalError::Empty.to_string())?;
     if raw.objective != OBJECTIVE {
         return Err(format!(
             "objective is {OBJECTIVE:?}, not {:?}",
@@ -215,8 +211,8 @@ pub fn parse_plan(
         order,
         starts,
         arm_goals,
-        path_orientations: ArmPair::from_fn(|side| {
-            of_the_arm(&path_orientations, side)
+        path_orientations: arms.each(|arm, _| {
+            of_the_arm(&path_orientations, arm)
                 .into_iter()
                 .map(|routed| HeldOrientation {
                     link_name: routed.name.to_string(),
@@ -228,28 +224,43 @@ pub fn parse_plan(
     })
 }
 
+/// The goal of the arms that goals constrain: one, or every arm, or none when no arm has a
+/// goal. An arm of a robot of more than one that a goal leaves out stays where it starts.
+fn arm_goals(goals: PerArm<Option<Goal>>) -> Option<ArmGoals> {
+    let named: Vec<ArmId> = goals.ids().filter(|arm| goals[*arm].is_some()).collect();
+    match named[..] {
+        [] => None,
+        [arm] => {
+            let goal = goals.into_iter().flatten().next()?;
+            Some(ArmGoals::One {
+                arm,
+                goal: Box::new(goal),
+            })
+        }
+        _ => Some(ArmGoals::Every(Box::new(goals.transpose()?))),
+    }
+}
+
+/// The robot's arm names.
+fn robot_arms<const N: usize>(arms: &PerArm<ArmModel<N>>) -> Vec<&'static str> {
+    arms.iter().map(|arm| arm.name).collect()
+}
+
 /// Parses a plan_cartesian_path goal against `arms`, whose fingers hang as `fingers` hold
 /// them.
-pub fn parse_cartesian(
+pub fn parse_cartesian<const N: usize>(
     raw: &plan_cartesian_path::GoalRequestData,
-    arms: &ArmPair<ArmModel>,
-    fingers: &ArmPair<Vec<Rider>>,
-) -> Result<CartesianQuery, String> {
-    let side = Side::BOTH
-        .into_iter()
-        .find(|side| arms[*side].name == raw.arm_name)
-        .ok_or_else(|| {
-            format!(
-                "arm_name names \"{}\", no arm of this robot: its arms are \"{}\" and \"{}\"",
-                raw.arm_name,
-                arms[Side::Left].name,
-                arms[Side::Right].name
-            )
-        })?;
-    let arm = &arms[side];
-    let mut starts = ArmPair::new(None, None);
-    starts[side] = start_of(arm, &raw.start_joint_positions)?;
-    let frame = frame_of(arm, &fingers[side], &raw.link_name)
+    arms: &PerArm<ArmModel<N>>,
+    fingers: &PerArm<Vec<Rider>>,
+) -> Result<CartesianQuery<N>, String> {
+    let id = arms
+        .ids()
+        .find(|arm| arms[*arm].name == raw.arm_name)
+        .ok_or_else(|| no_such_arm("arm_name", &raw.arm_name, &robot_arms(arms)))?;
+    let arm = &arms[id];
+    let mut starts = arms.each(|_, _| None);
+    starts[id] = start_of(arm, &raw.start_joint_positions)?;
+    let frame = frame_of(arm, &fingers[id], &raw.link_name)
         .ok_or_else(|| none_has(&[arm], "link", &raw.link_name, |arm| &arm.link_names))?;
     let frame = FollowedFrame::of(arm.geometry.chain(), frame).ok_or_else(|| {
         format!(
@@ -268,7 +279,7 @@ pub fn parse_cartesian(
         .collect::<Result<Vec<_>, String>>()?;
     poses_in_range(&poses)?;
     Ok(CartesianQuery {
-        side,
+        arm: id,
         starts,
         frame,
         poses,
@@ -277,60 +288,56 @@ pub fn parse_cartesian(
 }
 
 /// Parses a check_joint_path request against `arms`.
-pub fn parse_check(
+pub fn parse_check<const N: usize>(
     raw: &check_joint_path::RequestData,
-    arms: &ArmPair<ArmModel>,
-) -> Result<CheckQuery, String> {
+    arms: &PerArm<ArmModel<N>>,
+) -> Result<CheckQuery<N>, String> {
     let (order, starts) = named_arms(
         arms,
         raw.arms
             .iter()
             .map(|a| (a.arm_name.as_str(), a.start_joint_positions.as_slice())),
     )?;
-    order.waypoint_count(
+    waypoint_count(
+        arms,
+        &order,
         &raw.arms
             .iter()
             .map(|a| a.waypoints.len())
             .collect::<Vec<_>>(),
     )?;
     let parsed = order
-        .sides()
         .iter()
         .zip(&raw.arms)
-        .map(|(side, path)| {
+        .map(|(arm, path)| {
             path.waypoints
                 .iter()
                 .enumerate()
                 .map(|(k, w)| {
                     joint_positions(
-                        &arms[*side],
+                        &arms[*arm],
                         &format!("waypoint {}", k + 1),
                         &w.joint_positions,
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()
-                .map(|waypoints| (*side, waypoints))
+                .map(|waypoints| (*arm, waypoints))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let waypoints = match parsed.as_slice() {
-        [(side, waypoints)] => Checked::One {
-            side: *side,
+        [(arm, waypoints)] => Checked::One {
+            arm: *arm,
             waypoints: waypoints.clone(),
         },
         _ => {
-            let of = |side: Side| {
+            let of = |id: ArmId| {
                 parsed
                     .iter()
-                    .find_map(|(named, waypoints)| (*named == side).then_some(waypoints))
-                    .expect("both arms are named")
+                    .find_map(|(named, waypoints)| (*named == id).then_some(waypoints))
+                    .expect("every arm is named")
             };
-            Checked::Both(
-                of(Side::Left)
-                    .iter()
-                    .zip(of(Side::Right))
-                    .map(|(left, right)| ArmPair::new(*left, *right))
-                    .collect(),
-            )
+            let count = parsed[0].1.len();
+            Checked::Every((0..count).map(|k| arms.each(|id, _| of(id)[k])).collect())
         }
     };
     Ok(CheckQuery { starts, waypoints })
@@ -339,14 +346,14 @@ pub fn parse_check(
 /// A target of a goal, the joint or link it names as sent, and the arm it constrains.
 #[derive(Clone, Copy)]
 struct Routed<'r, T> {
-    side: Side,
+    arm: ArmId,
     name: &'r str,
     target: T,
 }
 
-/// The targets of `routed` that constrain the arm on `side`.
-fn of_the_arm<'r, T: Copy>(routed: &[Routed<'r, T>], side: Side) -> Vec<Routed<'r, T>> {
-    routed.iter().filter(|r| r.side == side).copied().collect()
+/// The targets of `routed` that constrain `arm`.
+fn of_the_arm<'r, T: Copy>(routed: &[Routed<'r, T>], arm: ArmId) -> Vec<Routed<'r, T>> {
+    routed.iter().filter(|r| r.arm == arm).copied().collect()
 }
 
 /// The names of `routed`, as sent.
@@ -362,7 +369,11 @@ fn targets<T>(routed: Vec<Routed<'_, T>>) -> Vec<T> {
 /// The refusal of `error`, `arm`'s goal, whose position and orientation constraints name
 /// `links`: a mix of joints and poses, or a pose of more than one of its links, says what
 /// to send.
-fn goal_refusal(arm: &ArmModel, error: GoalError, links: (Vec<&str>, Vec<&str>)) -> String {
+fn goal_refusal<const N: usize>(
+    arm: &ArmModel<N>,
+    error: GoalError,
+    links: (Vec<&str>, Vec<&str>),
+) -> String {
     match error {
         GoalError::Mixed => format!(
             "the goal names joints and links of {}; an arm's goal holds its joints, or the \
@@ -377,7 +388,10 @@ fn goal_refusal(arm: &ArmModel, error: GoalError, links: (Vec<&str>, Vec<&str>))
 /// The refusal of a goal whose position and orientation constraints name more than one
 /// link of `arm`, `positions` and `orientations`: it names the lists and the links sent,
 /// and what to send.
-fn one_link(arm: &ArmModel, (positions, orientations): (Vec<&str>, Vec<&str>)) -> String {
+fn one_link<const N: usize>(
+    arm: &ArmModel<N>,
+    (positions, orientations): (Vec<&str>, Vec<&str>),
+) -> String {
     let named = positions
         .iter()
         .chain(&orientations)
@@ -408,49 +422,73 @@ fn one_link(arm: &ArmModel, (positions, orientations): (Vec<&str>, Vec<&str>)) -
 
 /// Where each arm's path starts: `None` where the arm stands, for an empty
 /// start_joint_positions, and for an arm the request does not name.
-pub type ArmStarts = ArmPair<Option<[f64; ARM_DOF]>>;
+pub type ArmStarts<const N: usize> = PerArm<Option<[f64; N]>>;
 
 /// The arms a request names, by each named arm's name and its start_joint_positions in
-/// the request's order, and where the path of each starts.
-fn named_arms<'v>(
-    arms: &ArmPair<ArmModel>,
+/// the request's order, each once, and where the path of each starts.
+fn named_arms<'v, const N: usize>(
+    arms: &PerArm<ArmModel<N>>,
     named: impl Iterator<Item = (&'v str, &'v [f64])>,
-) -> Result<(ArmOrder, ArmStarts), String> {
+) -> Result<(Vec<ArmId>, ArmStarts<N>), String> {
     let (names, values): (Vec<&str>, Vec<&[f64]>) = named.unzip();
-    let order = ArmOrder::parse(&names)?;
-    let starts = order.sides().iter().zip(values).try_fold(
-        ArmPair::new(None, None),
-        |mut starts, (side, values)| {
-            starts[*side] = start_of(&arms[*side], values)?;
+    let order: Vec<ArmId> = places_in_order(&names, &robot_arms(arms))?
+        .into_iter()
+        .map(ArmId::new)
+        .collect();
+    let starts = order.iter().zip(values).try_fold(
+        arms.each(|_, _| None),
+        |mut starts, (arm, values)| {
+            starts[*arm] = start_of(&arms[*arm], values)?;
             Ok::<_, String>(starts)
         },
     )?;
     Ok((order, starts))
 }
 
+/// Refuses `counts`, each arm's waypoints in `order`, unless the first holds one or more and
+/// every other as many.
+fn waypoint_count<const N: usize>(
+    arms: &PerArm<ArmModel<N>>,
+    order: &[ArmId],
+    counts: &[usize],
+) -> Result<(), String> {
+    let named: Vec<(&str, usize)> = order
+        .iter()
+        .map(|arm| arms[*arm].name)
+        .zip(counts.iter().copied())
+        .collect();
+    common_waypoint_count(&named).map(|_| ())
+}
+
 /// Where `arm`'s path starts: `None` for an empty list, where the arm stands.
-fn start_of(arm: &ArmModel, values: &[f64]) -> Result<Option<[f64; ARM_DOF]>, String> {
-    match values.len() {
-        0 => Ok(None),
-        ARM_DOF => joint_positions(arm, "start_joint_positions", values).map(Some),
-        count => Err(format!(
-            "{}, or none to start where the arm stands",
-            miscounted(arm, "start_joint_positions", count)
-        )),
+fn start_of<const N: usize>(arm: &ArmModel<N>, values: &[f64]) -> Result<Option<[f64; N]>, String> {
+    if values.is_empty() {
+        return Ok(None);
     }
+    if values.len() != N {
+        return Err(format!(
+            "{}, or none to start where the arm stands",
+            miscounted(arm, "start_joint_positions", values.len())
+        ));
+    }
+    joint_positions(arm, "start_joint_positions", values).map(Some)
 }
 
 /// The refusal of `count` values in `what` of `arm`, which holds one for each joint.
-fn miscounted(arm: &ArmModel, what: &str, count: usize) -> String {
+fn miscounted<const N: usize>(arm: &ArmModel<N>, what: &str, count: usize) -> String {
     format!(
-        "{what} of {} has {count} values; send one for each of its {ARM_DOF} joints",
+        "{what} of {} has {count} values; send one for each of its {N} joints",
         arm.name
     )
 }
 
 /// One position for each joint of `arm`, each finite.
-fn joint_positions(arm: &ArmModel, what: &str, values: &[f64]) -> Result<[f64; ARM_DOF], String> {
-    let q: [f64; ARM_DOF] = values
+fn joint_positions<const N: usize>(
+    arm: &ArmModel<N>,
+    what: &str,
+    values: &[f64],
+) -> Result<[f64; N], String> {
+    let q: [f64; N] = values
         .try_into()
         .map_err(|_| miscounted(arm, what, values.len()))?;
     match q.iter().position(|v| !v.is_finite()) {
@@ -476,11 +514,11 @@ fn named_once<'a>(list: &str, names: impl Iterator<Item = &'a str>) -> Result<()
 
 /// The refusal of `name`, a `what` that no arm of `named` has: the arm's own list of its
 /// `what`s for one arm, and each arm's for several.
-fn none_has(
-    named: &[&ArmModel],
+fn none_has<const N: usize>(
+    named: &[&ArmModel<N>],
     what: &str,
     name: &str,
-    listed: impl Fn(&ArmModel) -> &[String],
+    listed: impl Fn(&ArmModel<N>) -> &[String],
 ) -> String {
     match named {
         [arm] => format!(
@@ -506,8 +544,8 @@ fn tolerance(field: &str, named: &str, value: f64) -> Result<PositiveFinite, Str
         .map_err(|_| format!("{field} of {named} is {value}; send a finite number above 0"))
 }
 
-fn joint_target<'r>(
-    named: &[&ArmModel],
+fn joint_target<'r, const N: usize>(
+    named: &[&ArmModel<N>],
     c: &'r GoalGoalJointConstraintsItem,
 ) -> Result<Routed<'r, JointTarget>, String> {
     let (arm, joint) = named
@@ -525,7 +563,7 @@ fn joint_target<'r>(
         ));
     };
     Ok(Routed {
-        side: arm.side,
+        arm: arm.id,
         name: &c.joint_name,
         target: JointTarget {
             joint,
@@ -539,20 +577,20 @@ fn joint_target<'r>(
 /// The arm of `named` that has the link `link`, and the frame of the link: the grasp
 /// point; a finger of the arm's `fingers`, where it hangs off the hand; or the link of a
 /// joint of the arm, or a link fixed below it.
-fn frame(
-    named: &[&ArmModel],
-    fingers: &ArmPair<Vec<Rider>>,
+fn frame<const N: usize>(
+    named: &[&ArmModel<N>],
+    fingers: &PerArm<Vec<Rider>>,
     link: &str,
-) -> Result<(Side, Frame), String> {
+) -> Result<(ArmId, Frame), String> {
     named
         .iter()
-        .find_map(|arm| frame_of(arm, &fingers[arm.side], link).map(|frame| (arm.side, frame)))
+        .find_map(|arm| frame_of(arm, &fingers[arm.id], link).map(|frame| (arm.id, frame)))
         .ok_or_else(|| none_has(named, "link", link, |arm| &arm.link_names))
 }
 
 /// The frame of the link `link` of `arm`, whose fingers are `fingers`; none for a link
 /// the arm does not have.
-fn frame_of(arm: &ArmModel, fingers: &[Rider], link: &str) -> Option<Frame> {
+fn frame_of<const N: usize>(arm: &ArmModel<N>, fingers: &[Rider], link: &str) -> Option<Frame> {
     if link == arm.grasp_link {
         return Some(Frame::GraspPoint);
     }
@@ -561,8 +599,8 @@ fn frame_of(arm: &ArmModel, fingers: &[Rider], link: &str) -> Option<Frame> {
     }
     let chain = arm.geometry.chain();
     let tree = chain.tree();
-    let posed = chain.at(&[0.0; ARM_DOF]);
-    (0..ARM_DOF).find_map(|segment| {
+    let posed = chain.at(&[0.0; N]);
+    (0..N).find_map(|segment| {
         let carrier = posed.link_name(segment);
         let offset = if carrier == link {
             Isometry3::identity()
@@ -573,12 +611,12 @@ fn frame_of(arm: &ArmModel, fingers: &[Rider], link: &str) -> Option<Frame> {
     })
 }
 
-fn position_target<'r>(
-    named: &[&ArmModel],
-    fingers: &ArmPair<Vec<Rider>>,
+fn position_target<'r, const N: usize>(
+    named: &[&ArmModel<N>],
+    fingers: &PerArm<Vec<Rider>>,
     c: &'r GoalGoalPositionConstraintsItem,
 ) -> Result<Routed<'r, PositionTarget>, String> {
-    let (side, frame) = frame(named, fingers, &c.link_name)?;
+    let (arm, frame) = frame(named, fingers, &c.link_name)?;
     if !c.position.iter().all(|v| v.is_finite()) {
         return Err(format!(
             "the position {:?} of {} is not finite; send three finite numbers (m)",
@@ -586,7 +624,7 @@ fn position_target<'r>(
         ));
     }
     Ok(Routed {
-        side,
+        arm,
         name: &c.link_name,
         target: PositionTarget {
             frame,
@@ -596,19 +634,19 @@ fn position_target<'r>(
     })
 }
 
-fn orientation_target<'r>(
-    named: &[&ArmModel],
-    fingers: &ArmPair<Vec<Rider>>,
+fn orientation_target<'r, const N: usize>(
+    named: &[&ArmModel<N>],
+    fingers: &PerArm<Vec<Rider>>,
     link_name: &'r str,
     orientation: [f64; 4],
     tolerance_rad: f64,
     free_axis: &str,
 ) -> Result<Routed<'r, OrientationTarget>, String> {
-    let (side, frame) = frame(named, fingers, link_name)?;
+    let (arm, frame) = frame(named, fingers, link_name)?;
     let orientation = orientation_from_parts(orientation)?;
     let free_axis = Axis::free_named(free_axis)?;
     Ok(Routed {
-        side,
+        arm,
         name: link_name,
         target: OrientationTarget {
             frame,
@@ -630,10 +668,12 @@ mod tests {
         CheckJointPathArmsItem, CheckJointPathArmsItemWaypointsItem,
     };
 
-    use crate::fingers::{riders, riders_of_both_arms};
+    use openarm_description::{ARM_DOF, Side};
+
+    use crate::fingers::riders_of_the_arms;
     use crate::robot::tests::OPENARM_V2;
 
-    fn arms() -> &'static ArmPair<ArmModel> {
+    fn arms() -> &'static PerArm<ArmModel<ARM_DOF>> {
         &OPENARM_V2.arms
     }
 
@@ -685,9 +725,8 @@ mod tests {
         }
     }
 
-    fn parse(goal: &GoalRequestData) -> Result<PlanQuery, String> {
-        let fingers =
-            riders_of_both_arms(&OPENARM_V2.self_model, arms()).expect("the arms' fingers");
+    fn parse(goal: &GoalRequestData) -> Result<PlanQuery<ARM_DOF>, String> {
+        let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
         parse_plan(goal, arms(), &fingers)
     }
 
@@ -707,9 +746,8 @@ mod tests {
 
     fn parse_cartesian_goal(
         goal: &plan_cartesian_path::GoalRequestData,
-    ) -> Result<CartesianQuery, String> {
-        let fingers =
-            riders_of_both_arms(&OPENARM_V2.self_model, arms()).expect("the arms' fingers");
+    ) -> Result<CartesianQuery<ARM_DOF>, String> {
+        let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
         parse_cartesian(goal, arms(), &fingers)
     }
 
@@ -718,7 +756,7 @@ mod tests {
     #[test]
     fn a_cartesian_goal_parses_into_its_arm_frame_and_poses() {
         let query = parse_cartesian_goal(&cartesian_goal()).expect("a query");
-        assert_eq!(query.side, Side::Left);
+        assert_eq!(query.arm, Side::Left.into());
         assert_eq!(query.starts[Side::Left], None);
         assert!(query.avoid_collisions);
         assert_eq!(
@@ -789,13 +827,10 @@ mod tests {
         let query = parse(&goal()).expect("a query");
         assert!(matches!(
             query.arm_goals,
-            ArmGoals::One {
-                side: Side::Left,
-                ..
-            }
+            ArmGoals::One { arm, .. } if arm == Side::Left.into()
         ));
-        assert_eq!(query.order.sides(), [Side::Left]);
-        assert_eq!(query.starts, ArmPair::new(None, None));
+        assert_eq!(query.order, [ArmId::from(Side::Left)]);
+        assert_eq!(query.starts, PerArm::both(None, None));
         assert_eq!(query.time_limit, Duration::from_secs(1));
         let longer = GoalRequestData {
             allowed_planning_time_s: 2.5,
@@ -807,7 +842,7 @@ mod tests {
         started.arms[0].start_joint_positions = vec![0.1; ARM_DOF];
         assert_eq!(
             parse(&started).expect("a query").starts,
-            ArmPair::new(Some([0.1; ARM_DOF]), None)
+            PerArm::both(Some([0.1; ARM_DOF]), None)
         );
     }
 
@@ -834,10 +869,7 @@ mod tests {
         let query = parse(&both).expect("a query");
         assert!(matches!(
             query.arm_goals,
-            ArmGoals::One {
-                side: Side::Left,
-                ..
-            }
+            ArmGoals::One { arm, .. } if arm == Side::Left.into()
         ));
         let [left] = query.path_orientations[Side::Left].as_slice() else {
             panic!("one orientation of the left arm");
@@ -893,15 +925,12 @@ mod tests {
         both.arms = vec![arm("right_arm"), arm("left_arm")];
         both.arms[0].start_joint_positions = vec![0.2; ARM_DOF];
         let query = parse(&both).expect("a query");
-        assert_eq!(query.order.sides(), [Side::Right, Side::Left]);
+        assert_eq!(query.order, [ArmId::from(Side::Right), Side::Left.into()]);
         assert!(matches!(
             query.arm_goals,
-            ArmGoals::One {
-                side: Side::Left,
-                ..
-            }
+            ArmGoals::One { arm, .. } if arm == Side::Left.into()
         ));
-        assert_eq!(query.starts, ArmPair::new(None, Some([0.2; ARM_DOF])));
+        assert_eq!(query.starts, PerArm::both(None, Some([0.2; ARM_DOF])));
     }
 
     // Each constraint goes to the named arm whose joint or link it names, and arms may
@@ -912,12 +941,12 @@ mod tests {
         both.arms.push(arm("right_arm"));
         both.goal_joint_constraints = vec![joint_constraint("openarm_right_joint4", 1.0)];
         let query = parse(&both).expect("a query");
-        let ArmGoals::Both(goals) = query.arm_goals else {
+        let ArmGoals::Every(goals) = query.arm_goals else {
             panic!("both arms move");
         };
-        assert_eq!(goals.left, goal_of_the_left_grasp_point());
+        assert_eq!(goals[Side::Left], goal_of_the_left_grasp_point());
         assert_eq!(
-            goals.right,
+            goals[Side::Right],
             Goal::new(
                 ARM_DOF,
                 vec![JointTarget {
@@ -1174,7 +1203,7 @@ mod tests {
         assert_eq!(
             query.waypoints,
             Checked::One {
-                side: Side::Right,
+                arm: Side::Right.into(),
                 waypoints: vec![[0.2; ARM_DOF], [9.0; ARM_DOF]],
             }
         );
@@ -1203,7 +1232,7 @@ mod tests {
         let query = parse_check(&both, arms()).expect("a query");
         assert_eq!(
             query.waypoints,
-            Checked::Both(vec![ArmPair::new([0.1; ARM_DOF], [0.2; ARM_DOF])])
+            Checked::Every(vec![PerArm::both([0.1; ARM_DOF], [0.2; ARM_DOF])])
         );
         let uneven = check_joint_path::RequestData {
             arms: vec![
@@ -1231,7 +1260,7 @@ mod tests {
                 .arm_goals
             {
                 ArmGoals::One { goal, .. } => *goal,
-                ArmGoals::Both(_) => panic!("{link}: one arm moves"),
+                ArmGoals::Every(_) => panic!("{link}: one arm moves"),
             }
         };
         let held = |frame: Frame| {
@@ -1256,7 +1285,9 @@ mod tests {
             })
         );
         let left = &arms()[Side::Left];
-        let fingers = riders(&OPENARM_V2.self_model, &left.geometry, Side::Left)
+        let fingers = OPENARM_V2
+            .own
+            .fingers(left.id, &left.geometry)
             .expect("the left arm's fingers");
         let finger = fingers.first().expect("a left finger");
         assert_eq!(

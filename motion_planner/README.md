@@ -129,8 +129,7 @@ until the gripper closes.
 
 ## A plan
 
-- `arms` holds one arm or both, each once (`openarm_description::ArmOrder`, the
-  backbone's refusals). Each arm's path starts at its `start_joint_positions`, or, when
+- `arms` holds one arm or each of them, each once, as the backbone refuses them. Each arm's path starts at its `start_joint_positions`, or, when
   that is empty, at the arm's last measured joint positions. An arm `arms` does not name
   stands where it was last measured, and the grippers at their measured openings: a
   planned arm's fingers move with its hand.

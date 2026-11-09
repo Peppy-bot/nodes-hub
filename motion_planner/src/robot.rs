@@ -1,7 +1,7 @@
 //! The robots the planner plans for, named by the robot_identity of its initializer, and
 //! the model each gives: its arms with the limits limb_motion enforces, as a plan checks
-//! them, the links describe_arms names, the body fixed around the arms, and the
-//! self-collision model.
+//! them, the links describe_arms names, the body fixed around the arms, and the robot's own
+//! body.
 
 use std::fmt;
 use std::str::FromStr;
@@ -10,10 +10,12 @@ use chain_kinematics::{ChainSpec, JointSelection};
 use collision_geometry::chain::{BodyGeometry, CarriedPart, ChainGeometry, Rider, RiderBody};
 use motion_planning_core::{Arm, RiderOffTheArm};
 use occupancy_map::{Frame, FrameError};
-use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
-use self_collision_model::{CollisionError, SelfCollisionModel};
+use openarm_description::{ARM_DOF, ARMS, DUAL_DOF, HardwareVersion, Side};
+use self_collision_model::CollisionError;
 
-use crate::fingers::{FingerFault, riders};
+use crate::arm_set::{ArmId, PerArm};
+use crate::fingers::{FingerFault, riders_of_the_arms};
+use crate::own_body::OwnBody;
 
 /// A robot the planner plans for.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,13 +31,6 @@ impl Robot {
     const fn name(self) -> &'static str {
         match self {
             Self::OpenArmV2 => "openarm_v2",
-        }
-    }
-
-    /// The robot's model, its collision pieces fitted to its meshes.
-    pub fn model(self) -> Result<RobotModel, ModelError> {
-        match self {
-            Self::OpenArmV2 => openarm(HardwareVersion::V2),
         }
     }
 }
@@ -73,15 +68,16 @@ impl FromStr for Robot {
 }
 
 /// One arm of a robot.
-pub struct ArmModel {
-    pub side: Side,
+pub struct ArmModel<const N: usize> {
+    /// The arm's place in the robot's model.
+    pub id: ArmId,
     /// The arm's limb name, and its gripper's.
     pub name: &'static str,
     pub gripper_name: &'static str,
     /// The arm's chain from its base link to its grasp point, with the joint limits
     /// limb_motion enforces, and the collision pieces of its links. Its chain gives the
     /// grasp-point pose limb_state reports.
-    pub geometry: ChainGeometry<ARM_DOF>,
+    pub geometry: ChainGeometry<N>,
     /// The arm's joints, in limb_state's order.
     pub joint_names: Vec<String>,
     /// Every link the arm's first joint moves, its gripper's included.
@@ -97,14 +93,14 @@ pub struct ArmModel {
     pub gripper_links: Vec<String>,
 }
 
-/// A robot's model.
-pub struct RobotModel {
+/// A robot's model, of `K` arms of `N` joints, `D` in all.
+pub struct RobotModel<const N: usize, const D: usize, const K: usize> {
     /// The robot frame: the URDF's root link, where the arms and the body are placed.
     pub frame: Frame,
-    pub arms: ArmPair<ArmModel>,
+    pub arms: PerArm<ArmModel<N>>,
     /// The links fixed around the arms.
     pub body: BodyGeometry,
-    pub self_model: SelfCollisionModel,
+    pub own: OwnBody<N, K>,
 }
 
 /// Why a robot's model cannot be built.
@@ -120,19 +116,20 @@ pub enum ModelError {
     Frame(#[from] FrameError),
     #[error(transparent)]
     SelfModel(#[from] CollisionError),
-    #[error("a finger of the self-collision model: {0}")]
+    #[error("a finger of the robot's own body: {0}")]
     Finger(#[from] FingerFault),
 }
 
-/// OpenArm `version`'s model. Each arm's chain runs from its base link to its grasp point,
-/// with the URDF's joint limits, the elbow's lower limit raised to its singularity floor as
+/// OpenArm v2's model. Each arm's chain runs from its base link to its grasp point, with the
+/// URDF's joint limits, the elbow's lower limit raised to its singularity floor as
 /// `HardwareVersion::arm_model` raises it. A finger of the self-collision model that rides
 /// no joint of its arm stops the model.
-fn openarm(version: HardwareVersion) -> Result<RobotModel, ModelError> {
+pub fn openarm_v2() -> Result<RobotModel<ARM_DOF, DUAL_DOF, ARMS>, ModelError> {
+    let version = HardwareVersion::V2;
     let meshes = tempfile::tempdir()?;
     version.write_meshes_to(meshes.path())?;
     let meshes_dir = meshes.path().to_str().ok_or(ModelError::MeshesPath)?;
-    let arm = |side: Side| -> Result<ArmModel, ModelError> {
+    let arm = |side: Side| -> Result<ArmModel<ARM_DOF>, ModelError> {
         let geometry = ChainGeometry::<ARM_DOF>::from_urdf(
             version.urdf(),
             meshes_dir,
@@ -146,14 +143,11 @@ fn openarm(version: HardwareVersion) -> Result<RobotModel, ModelError> {
             version.elbow_joint_index(),
             version.elbow_singularity_floor_rad(),
         );
-        let joint_names = (0..ARM_DOF)
-            .map(|i| geometry.chain().joint_name(i).to_string())
-            .collect();
         Ok(ArmModel {
-            side,
+            id: side.into(),
             name: side.arm_name(),
             gripper_name: side.gripper_name(),
-            joint_names,
+            joint_names: joint_names(&geometry),
             link_names: moved_by(&geometry, 0),
             grasp_link: version.tcp_link(side),
             // The grasp frame of both generations: +z out of the gripper, y on the jaw
@@ -169,30 +163,48 @@ fn openarm(version: HardwareVersion) -> Result<RobotModel, ModelError> {
         meshes_dir,
         &[(version.torso_body(), version.torso_regions())],
     )?;
-    let arms = ArmPair::new(arm(Side::Left)?, arm(Side::Right)?);
-    let tree = arms[Side::Left].geometry.chain().tree();
-    let self_model = self_collision_model::openarm(version, meshes_dir)?;
-    for arm in arms.iter() {
-        fingers_fit(&self_model, arm)?;
+    let arms = PerArm::both(arm(Side::Left)?, arm(Side::Right)?);
+    let own = OwnBody {
+        model: self_collision_model::openarm(version, meshes_dir)?,
+    };
+    built(arms, body, own)
+}
+
+/// The robot of `arms`, `body` and `own`, its frame the root of the first arm's URDF. A
+/// finger of `own` that does not fit its arm stops the model.
+fn built<const N: usize, const D: usize, const K: usize>(
+    arms: PerArm<ArmModel<N>>,
+    body: BodyGeometry,
+    own: OwnBody<N, K>,
+) -> Result<RobotModel<N, D, K>, ModelError> {
+    for (id, arm) in arms.ids().zip(arms.iter()) {
+        assert_eq!(arm.id, id, "{} stands at its id's place", arm.name);
     }
+    let fingers = riders_of_the_arms(&own, &arms)?;
+    for (arm, fingers) in arms.iter().zip(fingers.iter()) {
+        on_the_arm(arm, fingers).map_err(FingerFault::from)?;
+    }
+    let frame = {
+        let tree = arms[ArmId::new(0)].geometry.chain().tree();
+        Frame::parse(&tree.link(tree.root()).name)?
+    };
     Ok(RobotModel {
-        frame: Frame::parse(&tree.link(tree.root()).name)?,
+        frame,
         arms,
         body,
-        self_model,
+        own,
     })
 }
 
-/// Refuses a finger of `model` that does not fit `arm`: one the model does not hang off
-/// the link of the arm that carries it, or one that rides no joint of the arm, naming
-/// the finger.
-fn fingers_fit(model: &SelfCollisionModel, arm: &ArmModel) -> Result<(), FingerFault> {
-    on_the_arm(arm, &riders(model, &arm.geometry, arm.side)?)?;
-    Ok(())
+/// The joints of `geometry`'s chain, in limb_state's order.
+fn joint_names<const N: usize>(geometry: &ChainGeometry<N>) -> Vec<String> {
+    (0..N)
+        .map(|i| geometry.chain().joint_name(i).to_string())
+        .collect()
 }
 
 /// Refuses a finger of `fingers` that rides no joint of `arm`, naming the finger.
-fn on_the_arm(arm: &ArmModel, fingers: &[Rider]) -> Result<(), RiderOffTheArm> {
+fn on_the_arm<const N: usize>(arm: &ArmModel<N>, fingers: &[Rider]) -> Result<(), RiderOffTheArm> {
     Arm::new(arm.name, &arm.geometry)
         .riding(fingers)
         .map(|_| ())
@@ -200,7 +212,7 @@ fn on_the_arm(arm: &ArmModel, fingers: &[Rider]) -> Result<(), RiderOffTheArm> {
 
 /// The links of `links` that have collision pieces in `geometry`, on its chain or carried
 /// by it.
-fn with_pieces(geometry: &ChainGeometry<ARM_DOF>, links: Vec<String>) -> Vec<String> {
+fn with_pieces<const N: usize>(geometry: &ChainGeometry<N>, links: Vec<String>) -> Vec<String> {
     let has_pieces = |link: &str| {
         geometry
             .links()
@@ -219,10 +231,10 @@ fn with_pieces(geometry: &ChainGeometry<ARM_DOF>, links: Vec<String>) -> Vec<Str
 }
 
 /// The link that joint `joint` of `geometry`'s chain moves, then every link below it.
-fn moved_by(geometry: &ChainGeometry<ARM_DOF>, joint: usize) -> Vec<String> {
+fn moved_by<const N: usize>(geometry: &ChainGeometry<N>, joint: usize) -> Vec<String> {
     let chain = geometry.chain();
     let tree = chain.tree();
-    let link = chain.at(&[0.0; ARM_DOF]).link_name(joint).to_string();
+    let link = chain.at(&[0.0; N]).link_name(joint).to_string();
     let index = tree
         .link_index(&link)
         .expect("a link of the chain is a link of its tree");
@@ -242,8 +254,8 @@ pub(crate) mod tests {
     use std::sync::LazyLock;
 
     /// OpenArm v2's model, built once for the unit tests.
-    pub(crate) static OPENARM_V2: LazyLock<RobotModel> =
-        LazyLock::new(|| Robot::OpenArmV2.model().expect("OpenArm v2's model"));
+    pub(crate) static OPENARM_V2: LazyLock<RobotModel<ARM_DOF, DUAL_DOF, 2>> =
+        LazyLock::new(|| openarm_v2().expect("OpenArm v2's model"));
 
     // Each robot parses from the model name robot_identity gives it, and a name of none
     // is refused with the names.
@@ -304,19 +316,23 @@ pub(crate) mod tests {
     // one past the arm's last joint, stops the model, the message naming it.
     #[test]
     fn a_finger_off_its_arm_stops_the_model() {
-        let model = &OPENARM_V2.self_model;
+        let own = &OPENARM_V2.own;
         for arm in OPENARM_V2.arms.iter() {
-            assert_eq!(fingers_fit(model, arm), Ok(()));
-            let fingers = riders(model, &arm.geometry, arm.side).expect("the arm's fingers");
-            assert_eq!(fingers.len(), 2, "{:?}", arm.side);
+            let side = arm.id.side();
+            let fingers = own
+                .fingers(arm.id, &arm.geometry)
+                .expect("the arm's fingers");
+            assert_eq!(on_the_arm(arm, &fingers), Ok(()));
+            assert_eq!(fingers.len(), 2, "{side:?}");
             let finger = fingers[0].name;
-            let crossed = ModelError::from(FingerFault::from(
-                riders(model, &arm.geometry, arm.side.other()).expect_err("the other arm's fault"),
-            ));
+            let crossed = ModelError::from(
+                own.fingers(side.other().into(), &arm.geometry)
+                    .expect_err("the other arm's fault"),
+            );
             assert!(
                 crossed.to_string().starts_with(&format!(
-                    "a finger of the self-collision model: the self model holds '{finger}' as \
-                     no finger of the "
+                    "a finger of the robot's own body: the self model holds '{finger}' as \
+                     no finger of chain "
                 )),
                 "{crossed}"
             );
@@ -328,7 +344,7 @@ pub(crate) mod tests {
                 ModelError::from(FingerFault::from(on_the_arm(arm, &[off]).unwrap_err()))
                     .to_string(),
                 format!(
-                    "a finger of the self-collision model: {finger} rides the child link of \
+                    "a finger of the robot's own body: {finger} rides the child link of \
                      joint {ARM_DOF}, and the arm's joints run from 0 to {}",
                     ARM_DOF - 1
                 )
@@ -343,7 +359,7 @@ pub(crate) mod tests {
     fn a_plan_keeps_the_backbones_limits_and_grasp_point() {
         for arm in OPENARM_V2.arms.iter() {
             let backbones = HardwareVersion::V2
-                .arm_model(arm.side)
+                .arm_model(arm.id.side())
                 .expect("the backbone's arm model builds");
             let planned = arm.geometry.chain().limits();
             let enforced = backbones.limits();

@@ -19,7 +19,6 @@ use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
 use collision_geometry::chain::RiderBody;
-use motion_planner::fingers::riders;
 use motion_planning_core::{pose_from_parts, pose_parts};
 use openarm_description::{ARM_DOF, Side};
 use peppygen::exposed_services::motion_planning::apply_collision_objects::{
@@ -341,7 +340,9 @@ fn left_gripper(q: &[f64; ARM_DOF]) -> Gripper {
     let arm = &OPENARM_V2.arms[Side::Left];
     let posed = arm.geometry.chain().at(q);
     let to_grasp = grasp_pose(q).inverse();
-    let fingers: Vec<Vec<Point3<f64>>> = riders(&OPENARM_V2.self_model, &arm.geometry, Side::Left)
+    let fingers: Vec<Vec<Point3<f64>>> = OPENARM_V2
+        .own
+        .fingers(arm.id, &arm.geometry)
         .expect("the left arm's fingers")
         .into_iter()
         .map(|finger| {
@@ -556,9 +557,9 @@ async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
 async fn a_held_item_keeps_clear_of_the_other_arm_and_the_body() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
     let grasp = grasp_pose(&UNDER_THE_TABLE);
-    let mut model = OPENARM_V2.self_model.clone();
+    let mut model = OPENARM_V2.own.model.clone();
     let bodies = model
-        .world_pieces(&UNDER_THE_TABLE, &RIGHT_READY)
+        .world_pieces(&[UNDER_THE_TABLE, RIGHT_READY])
         .expect("the bodies where the arms stand");
     let center_of = |body: &str| {
         let (_, pieces) = bodies
