@@ -13,7 +13,8 @@
 //! their *order* no longer matters.
 
 use control_core::throttle::Throttle;
-use self_collision_model::{CollisionError, DistanceGradient, SelfCollisionModel};
+use openarm_description::{ARM_DOF, ARMS};
+use self_collision_model::{CollisionError, DistanceGradient, OpenArmModel};
 use tracing::warn;
 
 use crate::streams::THROTTLED_WARN_PERIOD;
@@ -21,7 +22,7 @@ use crate::streams::THROTTLED_WARN_PERIOD;
 use super::{GOV_DOF, GovState, NearestPair, split};
 
 pub(super) struct ConfiguredModel {
-    inner: SelfCollisionModel,
+    inner: OpenArmModel,
     /// Throttles the failed-query log. A failed query stays fail-safe (`None`
     /// reads as a breach in the scan and as "no pair" in the readout), but a
     /// persistently failing model must be visible in the log, not
@@ -30,7 +31,7 @@ pub(super) struct ConfiguredModel {
 }
 
 impl ConfiguredModel {
-    pub fn new(inner: SelfCollisionModel) -> Self {
+    pub fn new(inner: OpenArmModel) -> Self {
         Self {
             inner,
             query_error_log: Throttle::new(THROTTLED_WARN_PERIOD),
@@ -48,9 +49,8 @@ impl ConfiguredModel {
         q: &[f64; GOV_DOF],
     ) -> Option<self_collision_model::Proximity<'_>> {
         let s = split(q);
-        self.inner
-            .set_gripper_openings(s.grippers.left, s.grippers.right);
-        match self.inner.min_distance(&s.arms.left, &s.arms.right) {
+        self.inner.set_gripper_openings(&s.grippers.into_array());
+        match self.inner.min_distance(&s.arms.into_array()) {
             Ok(p) => Some(p),
             Err(e) => {
                 if self.query_error_log.admit() {
@@ -78,11 +78,13 @@ impl ConfiguredModel {
 
     /// `d(clearance)/d(dof)` at a governed configuration, with the proximity
     /// it was taken at.
-    pub fn gradient(&mut self, q: &[f64; GOV_DOF]) -> Result<DistanceGradient<'_>, CollisionError> {
+    pub fn gradient(
+        &mut self,
+        q: &[f64; GOV_DOF],
+    ) -> Result<DistanceGradient<'_, ARM_DOF, ARMS>, CollisionError> {
         let s = split(q);
-        self.inner
-            .set_gripper_openings(s.grippers.left, s.grippers.right);
-        self.inner.distance_gradient(&s.arms.left, &s.arms.right)
+        self.inner.set_gripper_openings(&s.grippers.into_array());
+        self.inner.distance_gradient(&s.arms.into_array())
     }
 
     /// Every pair of bodies the model checks, by link name.
@@ -95,10 +97,7 @@ impl ConfiguredModel {
     /// change of every governed DOF. Placement-free by the library's
     /// construction (precomputed levers), so it takes only the step.
     pub fn step_bound(&self, step: &GovState) -> f64 {
-        self.inner.clearance_step_bound(
-            &step.arms.left,
-            &step.arms.right,
-            &[step.grippers.left, step.grippers.right],
-        )
+        self.inner
+            .clearance_step_bound(&step.arms.into_array(), &step.grippers.into_array())
     }
 }

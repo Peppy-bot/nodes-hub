@@ -42,7 +42,7 @@
 //! governor's collision model.
 
 use control_core::positive_finite::PositiveFinite;
-use openarm_description::{ARM_DOF, ArmPair, DUAL_DOF, HardwareVersion, Side};
+use openarm_description::{ARM_DOF, ARMS, ArmPair, DUAL_DOF, HardwareVersion, Side};
 use self_collision_model::DistanceGradient;
 use srs_model::JointVec;
 use tracing::{info, warn};
@@ -661,10 +661,10 @@ fn step_change(prev: &[f64; GOV_DOF], target: &[f64; GOV_DOF]) -> GovState {
 
 /// Pack the collision model's distance gradient into one governed vector, in
 /// the layout [`concat`] packs a configuration in.
-fn governed_gradient(g: &DistanceGradient<'_>) -> [f64; GOV_DOF] {
+fn governed_gradient(g: &DistanceGradient<'_, ARM_DOF, ARMS>) -> [f64; GOV_DOF] {
     concat(&GovState::new(
-        ArmPair::new(g.grad_left, g.grad_right),
-        ArmPair::new(g.grad_openings[0], g.grad_openings[1]),
+        ArmPair::from_fn(|side| g.joints[side.index()]),
+        ArmPair::from_fn(|side| g.openings[side.index()]),
     ))
 }
 
