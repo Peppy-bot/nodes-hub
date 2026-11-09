@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
-use openarm_description::{ARM_DOF, HardwareVersion, Side};
+use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
 use srs_model::chain_kinematics::pose_miss;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use srs_model::{Arm, ArmAnglePolicy, JointVec};
@@ -24,10 +24,20 @@ pub const V_MAX_V2: JointVec = [
     16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
 ];
 
-pub const READY: JointVec = [0.1537, 0.39547, -0.4808, 0.95, -0.0008, 0.0046, -0.0008];
+/// The right arm's Ready posture, where the backbone's move_to_ready puts it.
+pub const READY: JointVec = ready(Side::Right);
 
-/// The left arm's mirror of [`READY`].
-pub const READY_LEFT: JointVec = [-0.1537, -0.39547, 0.4808, 0.95, 0.0008, -0.0046, 0.0008];
+/// The left arm's Ready posture.
+pub const READY_LEFT: JointVec = ready(Side::Left);
+
+/// The posture of the right arm, as measured in the field, that the field reports
+/// start from: the reported pull and the cross-body repro.
+pub const REPORTED_START: JointVec = [0.1537, 0.39547, -0.4808, 0.95, -0.0008, 0.0046, -0.0008];
+
+/// The left arm's mirror of [`REPORTED_START`]: the field-recorded grasp posture of
+/// the reported lift.
+pub const REPORTED_START_LEFT: JointVec =
+    [-0.1537, -0.39547, 0.4808, 0.95, 0.0008, -0.0046, 0.0008];
 
 /// The logged orientation of the field repro's poses.
 const REPRO_QUAT: [f64; 4] = [
@@ -121,8 +131,12 @@ pub fn cross_body_pull(model: &Arm) -> (Isometry3<f64>, Isometry3<f64>, JointVec
         REPRO_QUAT,
     );
     let seed = model
-        .solve_ik(&model.base_pose(&start), ArmAnglePolicy::FromSeed, &READY)
-        .expect("start pose reachable from ready")
+        .solve_ik(
+            &model.base_pose(&start),
+            ArmAnglePolicy::FromSeed,
+            &REPORTED_START,
+        )
+        .expect("start pose reachable from the reported start")
         .q;
     (start, end, seed)
 }

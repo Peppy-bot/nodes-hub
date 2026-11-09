@@ -27,7 +27,7 @@ pub async fn listen_for_video_stream_info_requests(
         "video_stream_info",
         node_runner.cancellation_token().cancelled(),
         || {
-            video_stream_info::handle_next_request(&node_runner, |_request| {
+            video_stream_info::handle_requests(&node_runner, |_request| {
                 Ok(video_stream_info::Response::new(
                     stream.width,
                     stream.height,
@@ -64,7 +64,7 @@ macro_rules! listen_for_control_requests {
                 stringify!($service),
                 node_runner.cancellation_token().cancelled(),
                 || {
-                    $service::handle_next_request(&node_runner, |request| {
+                    $service::handle_requests(&node_runner, |request| {
                         control_of(&request.data)
                             .and_then(|control| send_control(&controls, control))
                             .map($service::Response::new)

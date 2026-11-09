@@ -36,8 +36,8 @@ use crate::trial::{EndingJudged, Next, TrialCommand, TrialRecord, TrialStep, tri
 
 /// How often a goal that follows a run gives its progress, in wall time.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
-/// The pause after an error of the transport before a member serves
-/// again, so a broken transport cannot spin a loop or flood the log.
+/// The pause after a member stops before it serves again, so a broken
+/// transport cannot spin a loop or flood the log.
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Starts every member of the director but `run_events`, which `publish_run_events` gives from the start.
@@ -89,23 +89,32 @@ pub async fn publish_run_events(director: &Arc<Director>) -> peppygen::Result<()
     Ok(())
 }
 
-/// Answers each request of a service with `handler`, for the life of the
-/// node.
+/// Answers each request of a service with `handler`, until the node stops.
+/// When the service stops, its request stream ended or it could not listen,
+/// the log says why and the service listens again after [`RETRY_BACKOFF`],
+/// so a service that stops at once cannot spin the loop.
 macro_rules! serve_service {
     ($director:expr, $service:ident, $handler:expr) => {{
         let director = Arc::clone($director);
         tokio::spawn(async move {
             let runner = Arc::clone(&director.runner);
+            let stopping = runner.cancellation_token().clone();
             loop {
                 let director = Arc::clone(&director);
-                if let Err(error) = $service::handle_next_request(&runner, move |request| {
-                    $handler(&director, request)
-                })
-                .await
-                {
-                    tracing::warn!(concat!(stringify!($service), ": {}"), error);
-                    tokio::time::sleep(RETRY_BACKOFF).await;
+                let served = tokio::select! {
+                    biased;
+                    _ = stopping.cancelled() => return,
+                    served = $service::handle_requests(&runner, move |request| {
+                        $handler(&director, request)
+                    }) => served,
+                };
+                match served {
+                    Ok(()) => {
+                        tracing::warn!(concat!(stringify!($service), ": its request stream ended"))
+                    }
+                    Err(error) => tracing::warn!(concat!(stringify!($service), ": {}"), error),
                 }
+                tokio::time::sleep(RETRY_BACKOFF).await;
             }
         });
     }};

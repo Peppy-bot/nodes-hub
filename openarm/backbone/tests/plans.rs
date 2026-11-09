@@ -91,17 +91,17 @@ fn the_cross_body_pull_is_a_line() {
     );
 }
 
-// The user-reported pull: x back to -0.2 from Ready, which a stream carries out live,
-// fired as an action.
+// The user-reported pull: x back to -0.2 from the posture it was reported from, which a
+// stream carries out live, fired as an action.
 #[test]
-fn pull_from_ready_to_x_minus_02_plans_a_line() {
+fn the_reported_pull_to_x_minus_02_plans_a_line() {
     let model = v2_right_arm();
     // The recorded pull is a tip coordinate, so -0.2 is placed there and carried to the
     // tool: the same physical motion, in the frame commanded.
-    let mut end_tip = tip_world(&model, &READY);
+    let mut end_tip = tip_world(&model, &REPORTED_START);
     end_tip.translation.vector.x = -0.2;
     let end = end_tip * model.tool();
-    let walk = plan_line(&model, &end, READY).expect("the pull tracks as a line");
+    let walk = plan_line(&model, &end, REPORTED_START).expect("the pull tracks as a line");
     assert_lands_on(&model, &walk[walk.len() - 1], &end);
 }
 
@@ -136,9 +136,9 @@ fn an_easy_move_sweeps_no_joint() {
 #[test]
 fn the_field_lift_stays_on_the_line_inside_the_limits() {
     let model = v2_left_arm();
-    let mut end = model.world_ee_pose(&READY_LEFT);
+    let mut end = model.world_ee_pose(&REPORTED_START_LEFT);
     end.translation.vector.z += 0.25;
-    let walk = plan_line(&model, &end, READY_LEFT).expect("the lift must stay a line");
+    let walk = plan_line(&model, &end, REPORTED_START_LEFT).expect("the lift must stay a line");
     let limits = model.limits();
     for (k, q) in walk.iter().enumerate().skip(1) {
         for (i, (&v, limit)) in q.iter().zip(&limits).enumerate() {
@@ -148,7 +148,12 @@ fn the_field_lift_stays_on_the_line_inside_the_limits() {
             );
         }
     }
-    let (off_m, off_rad) = strays(&model, &walk, &model.world_ee_pose(&READY_LEFT), &end);
+    let (off_m, off_rad) = strays(
+        &model,
+        &walk,
+        &model.world_ee_pose(&REPORTED_START_LEFT),
+        &end,
+    );
     assert!(
         off_m <= STRAY_M && off_rad <= STRAY_RAD,
         "{off_m} m, {off_rad} rad"
@@ -156,8 +161,7 @@ fn the_field_lift_stays_on_the_line_inside_the_limits() {
 }
 
 // A turn in place about the grasp point has a line too: the wrist orbits the point and the
-// line lands on the orientation. From Ready the elbow reaches its singularity floor beyond
-// ~0.8 rad, so this turns as far as that posture allows.
+// line lands on the orientation.
 #[test]
 fn a_pure_reorientation_plans_a_line() {
     let model = v2_right_arm();

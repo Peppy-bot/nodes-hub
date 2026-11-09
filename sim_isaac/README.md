@@ -366,7 +366,8 @@ landmark, work surface or wall of an asset, so it is the entry that
 `get_objects_list` lists every object scene_manipulation spawned with its
 name and its pose as of the latest capture, each in its asset's
 category and with the source `spawned`: an environment places no object of
-its own, so the source `scene` lists nothing. `get_object` answers one of
+its own and places no riser, so the sources `scene` and `riser` list
+nothing. `get_object` answers one of
 those objects from the same capture: its name, its pose and its scale, as
 `get_objects_list` lists them. Isaac keeps no landmark and simulates no
 state of an object, so `landmarks` is empty and no state field is present.
@@ -402,6 +403,8 @@ stage meanwhile: a check that fails there fails the goal with the same kind,
 and a command that Isaac does not carry out fails it with `attempt_failed`.
 Isaac serves `spawn_object` goals one at a time, so a spawn's name is
 checked as its goal arrives, after every earlier spawn has ended.
+
+Isaac holds no template, the kind of asset that scene_manipulation's `load_template` lays out anew at each seed. `get_assets_list` takes the kind `template` and lists no asset for it, `get_asset_categories` counts no category of that kind, and `get_asset` refuses a `template/<id>` with `rejected`, as it refuses each id that names no asset. Each `load_template` goal is refused with `rejected` as it arrives, also before the asset catalogue is discovered, and changes nothing on the stage.
 
 ### Progress of a load or a spawn
 
@@ -626,6 +629,7 @@ grep -E \
 - Runtime USD paths must be visible inside the Isaac Sim container.
 - WebRTC requires the correct host IP to be supplied through `PEPPY_ISAAC_PUBLIC_IP`.
 - Isaac Sim can require substantial RAM, swap, disk space and GPU memory.
+- Isaac Sim holds no template, so it refuses each `load_template` goal with `rejected`.
 
 ## Feedback
 

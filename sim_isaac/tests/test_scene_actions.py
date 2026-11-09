@@ -1,11 +1,12 @@
 """The scene_manipulation and object_state provider: what get_assets_list and
-get_asset answer before and after discovery, what load_scene and clear_scene
-do to spawned objects, what get_object_states answers: an error reply until a
-capture, then the latest capture under its own stamp, every completed edit
-included, what get_object answers for one object of that capture, what a
-load_scene or spawn_object goal reports on its feedback, and the failure kind
-of each goal refused when it arrives, of each goal whose command fails, and of
-each error reply."""
+get_asset answer before and after discovery, the kind template among them,
+what load_scene and clear_scene do to spawned objects, what get_object_states
+answers: an error reply until a capture, then the latest capture under its own
+stamp, every completed edit included, what get_object answers for one object
+of that capture, what a load_scene or spawn_object goal reports on its
+feedback, and the failure kind of each goal refused when it arrives, each
+load_template goal among them, of each goal whose command fails, and of each
+error reply."""
 
 import asyncio
 import contextlib
@@ -14,10 +15,12 @@ import json
 import logging
 import threading
 from concurrent.futures import Future
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import Mock, call
 
+import pyjson5
 import pytest
 
 from _scene_actions import scene_actions_module
@@ -190,7 +193,7 @@ def test_the_catalogue_is_narrowed_by_each_filter_and_a_bad_kind_is_refused(prov
     assert _listed(provider, kind="", category="", query="") == _listed(provider)
 
     refused = _refused(provider, lambda: provider.io._handle_get_assets(_assets_request(kind="robot")), "rejected")
-    assert refused == "kind must be scene or object"
+    assert refused == "kind must be scene, object or template"
 
 
 def _asset_request(asset_id):
@@ -256,6 +259,22 @@ def test_the_categories_count_the_catalogue_in_listing_order(provider):
     ]
 
 
+def test_the_kind_template_is_taken_and_lists_nothing_as_isaac_holds_no_template(provider):
+    """get_assets_list takes the kind template and lists nothing for it, with any other filter too; no category is of
+    that kind, and get_asset refuses a template id as it refuses any id that names no asset."""
+    provider.io.set_assets(_CATALOGUE)
+
+    assert _listed(provider, kind="template") == []
+    assert _listed(provider, kind="template", category="Blocks", query="block") == []
+
+    categories = provider.io._handle_get_asset_categories(None).categories
+    assert {category.kind for category in categories} == {"scene", "object"}
+
+    request = _asset_request("template/kitchen")
+    refused = _refused(provider, lambda: provider.io._handle_get_asset(request), "rejected")
+    assert refused == "Unknown asset_id: template/kitchen"
+
+
 def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(provider):
     provider.io.set_assets(_CATALOGUE)
     red, blue = _spawn(provider), _spawn(provider, "props/blocks/blue_block")
@@ -279,11 +298,14 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
             "orientation": [0.0, 0.0, 0.0, 1.0],
         },
     ]
-    # Every object of this stage was spawned: the scene places none.
+    # Every object of this stage was spawned: the scene places none, and the
+    # stage places no riser.
     spawned = provider.io._handle_get_objects_list(_objects_request(source="spawned"))
     assert [item.object_id for item in spawned.objects] == [red, blue]
     scene = provider.io._handle_get_objects_list(_objects_request(source="scene"))
     assert scene.objects == []
+    risers = provider.io._handle_get_objects_list(_objects_request(source="riser"))
+    assert risers.objects == []
     blocks = provider.io._handle_get_objects_list(_objects_request(category="Blocks"))
     assert len(blocks.objects) == 2
     none = provider.io._handle_get_objects_list(_objects_request(category="Furniture"))
@@ -295,7 +317,7 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
     refused = _refused(
         provider, lambda: provider.io._handle_get_objects_list(_objects_request(source="placed")), "rejected"
     )
-    assert refused == "source must be spawned or scene"
+    assert refused == "source must be spawned, scene or riser"
 
 
 def test_the_inventory_is_unavailable_with_the_captures_reason_until_a_capture(provider):
@@ -1220,6 +1242,48 @@ def test_a_goal_that_arrives_before_the_catalogue_is_refused_until_it_is_discove
     assert [event for event in events if event[0] != "progress"] == [("completed", {})]
 
 
+def test_the_engine_serves_each_action_the_node_exposes_on_the_scene_slot(provider):
+    """The manifest exposes each action of scene_manipulation on the scene slot, as peppy asks of a node that
+    implements the contract, and the engine serves each of them, load_template among them."""
+    node = pyjson5.loads((Path(__file__).resolve().parents[1] / "peppy.json5").read_text())
+    exposed = {action["name"] for action in node["interfaces"]["actions"]["exposes"] if action["link_id"] == "scene"}
+
+    assert exposed == set(provider.module._ACTIONS)
+
+
+def _template_goals(events):
+    """load_template goals as their generated context carries them: a seed the simulation draws, a seed given, and
+    an id that names a scene."""
+    return [
+        _Goal(SimpleNamespace(template="template/kitchen", seeded=None), events),
+        _Goal(SimpleNamespace(template="template/kitchen", seeded=SimpleNamespace(seed=7)), events),
+        _Goal(SimpleNamespace(template="scene/full_warehouse", seeded=None), events),
+    ]
+
+
+def test_each_load_template_goal_is_refused_with_rejected_and_changes_nothing(provider):
+    """Isaac holds no template, so it refuses each load_template goal with `rejected` when it arrives, before the
+    catalogue is discovered as after: no command is queued, and the loaded scene and the spawned objects stay."""
+    events = []
+    provider.io._pending = _Commands(events)
+
+    before = _serve_goals(provider, "load_template", *_template_goals(events))
+    provider.io.set_assets(_CATALOGUE)
+    provider.io._execute(provider.launcher, "load_scene", {"asset_id": "scene/full_warehouse", "scale": 1.0})
+    object_id = _spawn(provider)
+    provider.launcher.reset_mock()
+    after = _serve_goals(provider, "load_template", *_template_goals(events))
+
+    no_template = (
+        "rejected", "this simulation holds no template, so it loads none: load a scene with load_scene instead",
+    )
+    assert [_refusal(decision) for decision in (*before.decisions, *after.decisions)] == [no_template] * 6
+    assert events == []
+    assert provider.launcher.mock_calls == []
+    assert provider.io._handle_get_scene(None).asset_id == "scene/full_warehouse"
+    assert _spawned_ids(provider) == [object_id]
+
+
 def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the_same_kind(provider):
     """A push is admitted while its object stands, and a remove runs before
     the push's command reaches the main thread: the check there finds no
@@ -1330,20 +1394,51 @@ def test_a_served_spawn_stands_its_object_under_the_name_its_goal_gives(provider
     assert provider.io.owns(result["object_id"])
 
 
+def test_a_service_that_stops_is_logged_and_waited_out_before_it_listens_again(provider, monkeypatch, caplog):
+    """A request stream that ends and a service that cannot listen are each
+    logged and waited out for a second, so the loop cannot hot-spin."""
+    module = provider.module
+    stops = [None, RuntimeError("the session is closed"), asyncio.CancelledError()]
+    pauses = []
+
+    async def handle_requests(_runner, _handler):
+        raise_or_end = stops.pop(0)
+        if raise_or_end is not None:
+            raise raise_or_end
+
+    async def pause(seconds):
+        pauses.append(seconds)
+
+    module.get_assets_list.handle_requests = handle_requests
+    monkeypatch.setattr(asyncio, "sleep", pause)
+
+    async def serve_until_cancelled():
+        with contextlib.suppress(asyncio.CancelledError):
+            await provider.io._serve_service(module.get_assets_list, provider.io._handle_get_assets)
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(serve_until_cancelled())
+
+    assert pauses == [1.0, 1.0]
+    messages = [record.getMessage() for record in caplog.records]
+    assert "get_assets_list service: its request stream ended" in messages
+    assert "get_assets_list service failed" in messages
+
+
 def test_a_service_gives_a_scene_failure_as_an_error_reply_of_its_own_member(provider):
     """Each service answers through the generated handler, which turns the
     Failure of its member into an error reply of that kind."""
     module = provider.module
     replies = []
 
-    async def handle_next_request(_runner, handler):
+    async def handle_requests(_runner, handler):
         try:
             replies.append(handler(_assets_request()))
         except module.get_assets_list.Failure as failure:
             replies.append(failure)
         raise asyncio.CancelledError
 
-    module.get_assets_list.handle_next_request = handle_next_request
+    module.get_assets_list.handle_requests = handle_requests
 
     async def serve_once():
         with contextlib.suppress(asyncio.CancelledError):

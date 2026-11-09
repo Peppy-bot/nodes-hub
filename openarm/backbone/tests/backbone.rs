@@ -523,6 +523,38 @@ async fn start_with_left_followers(object_at: f64) -> peppygen::Result<(Harness,
     Ok((harness, LeftFollowers { arm, gripper }))
 }
 
+/// The first limb_states snapshot the node emits with each arm at `posture`
+/// of its side, within 1e-9 rad in every joint.
+async fn snapshot_with_both_arms_at(
+    harness: &mut Harness,
+    posture: fn(openarm_description::Side) -> [f64; 7],
+) -> peppygen::Result<peppygen::fixtures::emitted_topics::limb_state::limb_states::Message> {
+    let joints: Vec<f64> = [
+        openarm_description::Side::Left,
+        openarm_description::Side::Right,
+    ]
+    .into_iter()
+    .flat_map(posture)
+    .collect();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let snapshot = next_snapshot(harness).await?;
+        let at_posture = snapshot.joint_positions.len() == joints.len()
+            && snapshot
+                .joint_positions
+                .iter()
+                .zip(&joints)
+                .all(|(measured, posture)| (measured - posture).abs() <= 1e-9);
+        if at_posture {
+            return Ok(snapshot);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the robot never measured both arms at {joints:?}"
+        );
+    }
+}
+
 /// The next limb_states snapshot the node emits. The node emits one only
 /// once it has seeded every limb, so the first one also says that streaming
 /// began.
@@ -650,10 +682,43 @@ async fn left_arm_joint_move(
     target: [f64; 7],
     duration_s: f64,
 ) -> peppygen::Result<move_arm_joints::ResultOutcome> {
+    arm_joint_move(harness, "left_arm", target, duration_s).await
+}
+
+/// The right arm folded in front of the chest, its grasp point at about
+/// [0.34, -0.195, 0.28] m, 0.39 m from the left arm's at its mirror image:
+/// where the joint paths of the collision guard start, a small turn of a
+/// shoulder from the other hand.
+const FOLDED_IN_RIGHT: [f64; 7] = [0.15, 0.40, -0.48, 0.95, 0.0, 0.0, 0.0];
+
+/// Move the right arm to [`FOLDED_IN_RIGHT`] and the left arm to its mirror
+/// image, one `move_arm_joints` goal each, and assert that both complete.
+async fn fold_both_arms_in(harness: &Harness) -> peppygen::Result<()> {
+    let folded_in = [
+        ("left_arm", openarm_description::mirror(FOLDED_IN_RIGHT)),
+        ("right_arm", FOLDED_IN_RIGHT),
+    ];
+    for (arm_name, target) in folded_in {
+        match arm_joint_move(harness, arm_name, target, 0.0).await? {
+            move_arm_joints::ResultOutcome::Completed(_) => {}
+            other => panic!("move_arm_joints of {arm_name} did not complete: {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// Send one `move_arm_joints` goal for `arm_name` to `target` over
+/// `duration_s`, assert that the node accepts it, and wait for how it ends.
+async fn arm_joint_move(
+    harness: &Harness,
+    arm_name: &str,
+    target: [f64; 7],
+    duration_s: f64,
+) -> peppygen::Result<move_arm_joints::ResultOutcome> {
     let goal = move_arm_joints::send_goal(
         harness,
         &move_arm_joints::GoalRequestData {
-            arm_name: "left_arm".to_string(),
+            arm_name: arm_name.to_string(),
             joint_positions: target,
             duration_s,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
@@ -1696,10 +1761,8 @@ async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
 
 /// A posture result gives arm_names and, in that order, the grasp pose of
 /// each arm measured when the goal completes. limb_state gives the same
-/// pose for the same joints. A posture completes when the move's time ran
-/// out, not when the arms arrived. Here both arms stand still at HOME, so
-/// move_to_ready completes with neither arm at Ready. move_to_home gives
-/// its result the same way.
+/// pose for the same joints. Here both arms follow their setpoints, so each
+/// posture completes once both arms stand at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::Result<()> {
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
@@ -1707,16 +1770,29 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
         mocks.deps.robot_init.is_ready,
         Arc::new(AtomicBool::new(true)),
     );
-    pump_arm_at_home!(
+    let _left = spawn_left_arm_follower(
         mocks.pairings.left_arm.joint_states,
-        peppygen::paired_topics::left_arm::joint_states
+        mocks.pairings.left_arm.joint_setpoints,
     );
-    pump_right_arm_and_grippers!(mocks);
-    let snapshot = next_snapshot(&mut harness).await?;
+    let _right = spawn_right_arm_follower(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.left_gripper.gripper_states,
+        peppygen::paired_topics::left_gripper::gripper_states
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    next_snapshot(&mut harness).await?;
 
     let ready = complete_posture!(harness, move_to_ready, 0.0);
+    let at_ready = snapshot_with_both_arms_at(&mut harness, openarm_description::ready).await?;
     let home = complete_posture!(harness, move_to_home, 0.0);
-    for result in [ready, home] {
+    let at_home = snapshot_with_both_arms_at(&mut harness, openarm_description::home).await?;
+    for (result, snapshot) in [(ready, at_ready), (home, at_home)] {
         assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
         assert_all_close("positions", &result.positions, &snapshot.positions, 1e-9);
         assert_all_close(
@@ -1726,6 +1802,50 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
             1e-9,
         );
     }
+    harness.shutdown().await
+}
+
+/// A posture that an arm does not reach fails with `timeout`, its message
+/// led by the side of that arm and naming the joint and how far it stands,
+/// no sooner than 2 s after the planned end. Here the right arm stands still
+/// at HOME, as an arm that a bench in front of the robot stops does: the
+/// robot does not see the bench. move_to_home, where both arms already
+/// stand, completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_posture_an_arm_stops_short_of_fails_with_timeout() -> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
+
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let _left = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_right_arm_and_grippers!(mocks);
+    next_snapshot(&mut harness).await?;
+
+    let goal = send_posture_goal!(harness, move_to_ready, 0.0);
+    assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+    let failure = match goal.get_result(DEADLINE).await?.outcome {
+        move_to_ready::ResultOutcome::Failed(failure) => failure,
+        other => panic!("a right arm held at HOME cannot reach Ready: {other:?}"),
+    };
+    assert_eq!(failure.kind, move_to_ready::FailureKind::Timeout);
+    assert!(
+        failure.message.starts_with("right: still ")
+            && failure.message.contains(" rad from the target at joint "),
+        "the failure names the arm and its joint: {}",
+        failure.message
+    );
+    assert!(
+        seconds_after_planned_end(&failure.message) >= 2.0,
+        "the failure came no sooner than the posture's settle timeout: {}",
+        failure.message
+    );
+    complete_posture!(harness, move_to_home, 0.0);
     harness.shutdown().await
 }
 
@@ -1852,7 +1972,29 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
 /// move_to_home. It gets no opening other than that one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_posture_move_leaves_the_grippers_alone() -> peppygen::Result<()> {
-    let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
+    let (mut harness, mocks) = start_ready_vacant(params()).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let _left = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    let _right = spawn_right_arm_follower(
+        mocks.pairings.right_arm.joint_states,
+        mocks.pairings.right_arm.joint_setpoints,
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+    let gripper = spawn_left_gripper_follower(
+        mocks.pairings.left_gripper.gripper_states,
+        mocks.pairings.left_gripper.gripper_setpoints,
+        0.0,
+    );
+    next_snapshot(&mut harness).await?;
 
     let data = complete_left_gripper_move(&harness, 0.2, 0.0).await?;
     assert!(data.settled, "{data:?}");
@@ -2953,8 +3095,6 @@ async fn an_expected_start_off_the_measured_arm_fails_the_path_before_it_moves()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable()
 -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
-
     let (mut harness, mocks) = start_ready_vacant(params()).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
@@ -2978,24 +3118,13 @@ async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable(
         peppygen::paired_topics::right_gripper::gripper_states,
         1.0
     );
-    // The first limb_states snapshot says that every limb reported, so the
-    // posture admits both arms.
+    // The first limb_states snapshot says that every limb reported, so a
+    // joint move admits each arm.
     next_snapshot(&mut harness).await?;
-    let ready = move_to_ready::send_goal(
-        &harness,
-        &move_to_ready::GoalRequestData { duration_s: 0.0 },
-        peppygen::DEFAULT_FEEDBACK_BOUND,
-        DEADLINE,
-    )
-    .await?;
-    assert!(ready.accepted, "goal refused: {:?}", ready.refusal);
-    assert!(matches!(
-        ready.get_result(DEADLINE).await?.outcome,
-        move_to_ready::ResultOutcome::Completed(_)
-    ));
-    let ready_left = *left.followed.borrow();
+    fold_both_arms_in(&harness).await?;
+    let folded_left = *left.followed.borrow();
     let shift = |by_j1: f64, by_j2: f64| {
-        let mut to = ready_left;
+        let mut to = folded_left;
         to[0] += by_j1;
         to[1] += by_j2;
         to
@@ -3054,8 +3183,6 @@ async fn a_joint_path_whose_rounded_corner_cuts_the_other_arm_fails_unreachable(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_last_waypoint()
 -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_actions::postures::move_to_ready;
-
     let mut wide = params();
     wide.d_stop_m = 0.04;
     wide.d_safe_m = 0.2;
@@ -3082,23 +3209,12 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         peppygen::paired_topics::right_gripper::gripper_states,
         0.5
     );
-    // The first limb_states snapshot says that every limb reported, so the
-    // posture admits both arms.
+    // The first limb_states snapshot says that every limb reported, so a
+    // joint move admits each arm.
     next_snapshot(&mut harness).await?;
-    let ready = move_to_ready::send_goal(
-        &harness,
-        &move_to_ready::GoalRequestData { duration_s: 0.0 },
-        peppygen::DEFAULT_FEEDBACK_BOUND,
-        DEADLINE,
-    )
-    .await?;
-    assert!(ready.accepted, "goal refused: {:?}", ready.refusal);
-    assert!(matches!(
-        ready.get_result(DEADLINE).await?.outcome,
-        move_to_ready::ResultOutcome::Completed(_)
-    ));
+    fold_both_arms_in(&harness).await?;
 
-    let ready_left = *left.followed.borrow();
+    let folded_left = *left.followed.borrow();
     let mut right_in = *right.followed.borrow();
     right_in[1] -= 0.2;
     let shift = |from: [f64; 7], joint: usize, by: f64| {
@@ -3106,7 +3222,7 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         to[joint] += by;
         to
     };
-    let w1 = shift(ready_left, 0, -0.3);
+    let w1 = shift(folded_left, 0, -0.3);
     let w2 = shift(w1, 1, 0.2);
     let w3 = shift(w2, 0, 0.3);
     let waypoints = [w1, w2, w3];
@@ -3129,7 +3245,7 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         SETTLE_TOLERANCE_RAD,
     );
     let trail = &left.received()[before..];
-    let unslowed = unslowed_steps(&fastest_path(&wide, &[ready_left, w1, w2, w3]), &wide);
+    let unslowed = unslowed_steps(&fastest_path(&wide, &[folded_left, w1, w2, w3]), &wide);
     let peak = unslowed.iter().map(|&(_, step)| step).fold(0.0, f64::max);
     let unslowed_at = |arc: f64| {
         unslowed
@@ -3148,12 +3264,12 @@ async fn a_joint_path_the_guard_slows_stays_on_its_rounded_path_and_ends_at_its_
         "the guard never held the left arm under half its unslowed step where the path \
          runs at speed: {slowed} of it at the least"
     );
-    let corners: Vec<Vec<f64>> = std::iter::once(ready_left.to_vec())
+    let corners: Vec<Vec<f64>> = std::iter::once(folded_left.to_vec())
         .chain(left_waypoints(&waypoints))
         .collect();
     assert_on_rounded_path(
         &left_waypoints(trail),
-        &rounded_path(&ready_left, &left_waypoints(&waypoints)),
+        &rounded_path(&folded_left, &left_waypoints(&waypoints)),
         &corners,
     );
     assert!(matches!(
@@ -3375,7 +3491,7 @@ async fn a_joint_path_goal_the_backbone_does_not_take_is_refused_at_admission()
     assert!(
         refusal
             .message
-            .starts_with("waypoint 1 of left_arm puts joint 2 at 1.0000 rad"),
+            .starts_with("waypoint 1 of left_arm puts joint 2 at 1 rad, outside its limits ["),
         "{}",
         refusal.message
     );

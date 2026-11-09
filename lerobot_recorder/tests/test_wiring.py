@@ -191,7 +191,7 @@ def test_a_service_handler_error_does_not_end_the_loop():
 
     class Svc:
         @staticmethod
-        async def handle_next_request(_node_runner, _handler):
+        async def handle_requests(_node_runner, _handler):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RuntimeError("handler blew up")
@@ -201,6 +201,31 @@ def test_a_service_handler_error_does_not_end_the_loop():
     )
     asyncio.run(main_mod._serve(node_runner, Svc, handler=None, label="svc", retry_s=0))
     assert calls["n"] == 3
+
+
+def test_a_service_that_stops_is_logged_and_waited_out_before_its_loop_listens_again(monkeypatch, capsys):
+    """A request stream that ends and a service that cannot listen are
+    each logged and waited out for `retry_s`, so the loop cannot hot-spin."""
+    stops = [None, RuntimeError("the session is closed")]
+    pauses = []
+
+    class Svc:
+        @staticmethod
+        async def handle_requests(_node_runner, _handler):
+            stop = stops.pop(0)
+            if stop is not None:
+                raise stop
+
+    async def pause(seconds):
+        pauses.append(seconds)
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", pause)
+    node_runner = SimpleNamespace(cancellation_token=lambda: SimpleNamespace(is_cancelled=lambda: not stops))
+    asyncio.run(main_mod._serve(node_runner, Svc, handler=None, label="svc", retry_s=0.5))
+    assert pauses == [0.5, 0.5]
+    out = capsys.readouterr().out
+    assert "svc service: its request stream ended" in out
+    assert "svc service error: RuntimeError('the session is closed')" in out
 
 
 def test_cache_covers_state_and_action_sources_alike():

@@ -3,13 +3,14 @@
 
 A goal this bridge cannot run is refused when it arrives, with a failure kind
 of peppy: `rejected` for a request that names an asset or an object the stage
-does not hold or a value it does not take, `resource_unavailable` for a robot
-that does not stand on the stage, and `precondition_failed` while the asset
-catalogue is not discovered yet. A goal it accepted runs its command on the
-Isaac main thread, which checks the request again against the stage as it is
-then: a command that cannot run fails its goal with the same kinds, and one
-that Isaac does not carry out fails it with `attempt_failed`. A service gives
-its response, or an error reply with the same kinds.
+does not hold or a value it does not take, and for each load_template, as the
+stage holds no template; `resource_unavailable` for a robot that does not
+stand on the stage; and `precondition_failed` while the asset catalogue is not
+discovered yet. A goal it accepted runs its command on the Isaac main thread,
+which checks the request again against the stage as it is then: a command that
+cannot run fails its goal with the same kinds, and one that Isaac does not
+carry out fails it with `attempt_failed`. A service gives its response, or an
+error reply with the same kinds.
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from peppygen.exposed_actions.scene import (
     apply_force,
     clear_scene,
     load_scene,
+    load_template,
     move_object,
     move_robot,
     remove_object,
@@ -62,16 +64,29 @@ PRECONDITION_FAILED = "precondition_failed"
 RESOURCE_UNAVAILABLE = "resource_unavailable"
 ATTEMPT_FAILED = "attempt_failed"
 
-# The actions of scene_manipulation, by the name of the command each goal
-# runs on the Isaac main thread.
+# The actions of scene_manipulation that the stage serves, by name. A goal of
+# each one runs its command on the Isaac main thread, apart from a goal of an
+# action of _REFUSED_ACTIONS.
 _ACTIONS: dict[str, ModuleType] = {
     "apply_force": apply_force,
     "load_scene": load_scene,
+    "load_template": load_template,
     "clear_scene": clear_scene,
     "spawn_object": spawn_object,
     "move_object": move_object,
     "remove_object": remove_object,
     "move_robot": move_robot,
+}
+
+# The actions of scene_manipulation whose every goal the stage refuses with
+# `rejected` when it arrives, by name, with the reason each refusal gives. A
+# goal of one runs no command. Isaac holds no template, so it loads none, as
+# scene_manipulation:v1 asks of an implementer that holds no template.
+_REFUSED_ACTIONS: dict[str, str] = {
+    "load_template": (
+        "this simulation holds no template, so it loads none: "
+        "load a scene with load_scene instead"
+    ),
 }
 
 # The actions whose goals report their progress on their feedback.
@@ -88,13 +103,14 @@ _NOT_CAPTURED = (
 # its action serves after it.
 _REPORT_TIMEOUT_S = 5.0
 
-# The kinds an asset has, as get_assets_list filters them.
-_ASSET_KINDS = ("scene", "object")
+# The kinds of asset that get_assets_list filters by. Isaac holds no
+# template, so the kind template lists nothing.
+_ASSET_KINDS = ("scene", "object", "template")
 
 # The sources get_objects_list filters by. Every object of this stage was
 # spawned by a caller: the stage places no object of its own when it loads
-# a scene, so "scene" lists nothing.
-_OBJECT_SOURCES = ("spawned", "scene")
+# a scene and places no riser, so "scene" and "riser" list nothing.
+_OBJECT_SOURCES = ("spawned", "scene", "riser")
 
 # How far from 1 the length of an orientation may be before it is refused.
 _UNIT_TOLERANCE = 1e-3
@@ -562,7 +578,8 @@ class SceneActionIO:
         self._action_handles = {}
 
         # How each command is checked against the stage, and how it runs
-        # on the Isaac main thread once it is.
+        # on the Isaac main thread once it is. An action of _REFUSED_ACTIONS
+        # has no command.
         self._commands = {
             "load_scene": (self._scene_to_load, self._load_scene),
             "clear_scene": (lambda _payload: None, self._clear_scene),
@@ -730,9 +747,10 @@ class SceneActionIO:
         request,
     ) -> get_assets_list.Response:
         """The catalogue, narrowed by every filter the request sets: a
-        kind that is neither scene nor object is refused, and the text is
-        looked for in an entry's id, name and description whatever the
-        case."""
+        kind other than scene, object and template is refused, and the text
+        is looked for in an entry's id, name and description whatever the
+        case. The catalogue holds no template, so the kind template lists
+        nothing."""
 
         self._require_catalogue()
 
@@ -741,7 +759,7 @@ class SceneActionIO:
         query = _filter(request.data.query)
 
         if kind is not None and kind not in _ASSET_KINDS:
-            raise _rejected("kind must be scene or object")
+            raise _rejected("kind must be scene, object or template")
 
         assets = [
             asset
@@ -784,7 +802,8 @@ class SceneActionIO:
         _request,
     ) -> get_asset_categories.Response:
         """Every category of the catalogue with its count, in the order the
-        catalogue lists them."""
+        catalogue lists them. The catalogue holds no template, so no
+        category is of the kind template."""
 
         self._require_catalogue()
 
@@ -814,14 +833,14 @@ class SceneActionIO:
         """What stands on the stage and where, from the latest capture: every
         object a caller spawned, in its asset's category, narrowed by the
         request's source and category. The stage places no object of its own
-        when it loads a scene, so a request for the scene's objects lists
-        nothing."""
+        when it loads a scene and places no riser, so a request for the
+        scene's objects or for the risers lists nothing."""
 
         source = _filter(request.data.source)
         category = _filter(request.data.category)
 
         if source is not None and source not in _OBJECT_SOURCES:
-            raise _rejected("source must be spawned or scene")
+            raise _rejected("source must be spawned, scene or riser")
 
         snapshot = self._latest_snapshot()
 
@@ -830,7 +849,7 @@ class SceneActionIO:
 
         objects = []
 
-        if source != "scene":
+        if source in (None, "spawned"):
             for record in snapshot.objects:
                 asset_category = public_by_asset.get(record.asset_id, {}).get(
                     "category", ""
@@ -1136,7 +1155,13 @@ class SceneActionIO:
     def _check(self, operation: str, payload: dict):
         """The command a goal of `operation` names, checked against the
         catalogue, the spawned objects and the robots as they are now.
-        Raises SceneFailure for a command the stage cannot take."""
+        Raises SceneFailure for a command the stage cannot take, and
+        `rejected` for each goal of an action of _REFUSED_ACTIONS."""
+
+        refusal = _REFUSED_ACTIONS.get(operation)
+
+        if refusal is not None:
+            raise _rejected(refusal)
 
         check, _run = self._commands[operation]
 
@@ -1392,15 +1417,16 @@ class SceneActionIO:
 
     async def _serve_service(self, module, handler) -> None:
         """Answers the requests of the service `module` with `handler` for
-        the life of the node, each SceneFailure as an error reply; a round
-        that fails is logged and the next one starts a second later."""
+        the life of the node, each SceneFailure as an error reply. When the
+        service stops, its request stream ended or it could not listen, the
+        log says why and the service listens again a second later."""
 
         name = module.__name__.rsplit(".", 1)[-1]
         answer = _answering(module, handler)
 
         while True:
             try:
-                await module.handle_next_request(
+                await module.handle_requests(
                     self._node_runner,
                     answer,
                 )
@@ -1413,7 +1439,11 @@ class SceneActionIO:
                     "%s service failed",
                     name,
                 )
-                await asyncio.sleep(1.0)
+
+            else:
+                logger.warning("%s service: its request stream ended", name)
+
+            await asyncio.sleep(1.0)
 
     def _decide(self, module: ModuleType, operation: str, request):
         """Admits a goal of `operation` whose command the stage can take

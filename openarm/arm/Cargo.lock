@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -562,7 +562,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "instance_lock"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2511,7 +2511,7 @@ dependencies = [
 [[package]]
 name = "openarm_can"
 version = "0.2.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "control_core",
  "nix 0.31.3",
@@ -2523,7 +2523,7 @@ dependencies = [
 [[package]]
 name = "openarm_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "srs_model",
  "urdf-rs",
@@ -3866,7 +3866,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#06566181d37da7d4e34539c2df02367281cbdb23"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5"
 dependencies = [
  "chain_kinematics",
  "nalgebra",

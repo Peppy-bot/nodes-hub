@@ -286,7 +286,7 @@ fn spawn_video_stream_info(
             "video_stream_info",
             runner.cancellation_token().cancelled(),
             || {
-                video_stream_info::handle_next_request(&runner, |_req| {
+                video_stream_info::handle_requests(&runner, |_req| {
                     let (width, height) = handle.align_mode().published(configured).color;
                     Ok(video_stream_info::Response::new(
                         width,
@@ -316,7 +316,7 @@ fn spawn_depth_stream_info(
             "depth_stream_info",
             runner.cancellation_token().cancelled(),
             || {
-                depth_stream_info::handle_next_request(&runner, |_req| {
+                depth_stream_info::handle_requests(&runner, |_req| {
                     let (width, height) = handle.align_mode().published(configured).depth;
                     Ok(depth_stream_info::Response::new(
                         width,
@@ -449,7 +449,7 @@ macro_rules! spawn_geometry_service {
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
                     || {
-                        $service::handle_next_request(&runner, |_req| {
+                        $service::handle_requests(&runner, |_req| {
                             $respond(&handle.published_geometry())
                         })
                     },
@@ -488,7 +488,7 @@ macro_rules! spawn_mode_control_service {
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
                     || {
-                        $service::handle_next_request(&runner, |req| {
+                        $service::handle_requests(&runner, |req| {
                             let mode = parse_mode(&req.data.mode, $label).map_err(|reason| {
                                 $service::Failure::new($service::FailureKind::Rejected, reason)
                             })?;
@@ -530,7 +530,7 @@ macro_rules! spawn_value_control_service {
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
                     || {
-                        $service::handle_next_request(&runner, |req| {
+                        $service::handle_requests(&runner, |req| {
                             handle
                                 .$set(req.data.value)
                                 .map(|()| $service::Response::new(req.data.value))
@@ -570,7 +570,7 @@ fn spawn_set_align_mode(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
             "set_align_mode",
             runner.cancellation_token().cancelled(),
             || {
-                set_align_mode::handle_next_request(&runner, |req| {
+                set_align_mode::handle_requests(&runner, |req| {
                     let mode = AlignMode::try_from(req.data.mode.as_str()).map_err(|reason| {
                         set_align_mode::Failure::new(set_align_mode::FailureKind::Rejected, reason)
                     })?;
