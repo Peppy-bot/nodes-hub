@@ -31,7 +31,7 @@ set -euo pipefail
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
 MUJOCO_VERSION="4.0.0"   # mirrors mujoco PyPI version (requirements.mujoco.txt)
-ISAAC_IMAGE_REV="7"      # bump when Isaac image content changes without an upstream version bump
+ISAAC_IMAGE_REV="8"      # bump when Isaac image content changes without an upstream version bump
 MUJOCO_IMAGE_REV="1"     # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
 
