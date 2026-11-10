@@ -29,7 +29,10 @@ dependencies = [
 dev = [
     "pytest>=8",
     "pycollada==0.9.3",
-    # What scripts/build_so101.py compiles the SO-101's upstream MJCF with.
+    # What scripts/build_so101.py compiles the SO-101's upstream MJCF with:
+    # the mujoco the MuJoCo node's base image installs
+    # (sim_base_images/requirements.mujoco.txt). test_so101_stage.py holds
+    # the stage this mujoco builds to the stage the Isaac base image bakes.
     "mujoco==4.0.0",
     # PyPI provides no USD wheel or source distribution for Linux ARM64.
     # That platform runs the runtime suites without the USD-specific tests.

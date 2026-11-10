@@ -569,27 +569,51 @@ joint per hinge with a position drive, the base fixed to the world by the
 articulation's root joint, and the `gripper_frame_link` tool frame. Where
 upstream and the description differ the description wins: each joint's
 limits are the URDF's, and `tests/test_so101_stage.py` holds the stage to it,
-tool frame included. CPU only, no Isaac Sim. From the repository root, with
-the upstream staged by `sim_base_images/so101_model.py fetch <directory>`:
+tool frame included. CPU only, no Isaac Sim. From the repository root, on
+Linux x86_64 (the platform of the Isaac image), with the upstream staged by
+`sim_base_images/so101_model.py fetch <directory>`:
 
 ```bash
-uv run --no-project --python 3.11 --with mujoco==4.0.0 --with usd-core==26.11 --with numpy \
+uv run --project sim_isaac/tests --locked --group dev \
   python sim_isaac/scripts/build_so101.py \
   --model /tmp/so101-upstream/so101 \
   --urdf <so101_description>/urdf/so101_kinematics.urdf \
   --lock sim_base_images/so101_model.lock.json \
   --output /tmp/so101-isaac-assets \
   --archive /tmp/so101-isaac-assets.tar.gz
-SO101_KINEMATICS_URDF=<so101_description>/urdf/so101_kinematics.urdf \
-SO101_UPSTREAM_MODEL=/tmp/so101-upstream/so101 \
-  uv run --project sim_isaac/tests --locked --group dev pytest sim_isaac/tests/test_so101_stage.py
 ```
 
-The same stage packs to the same bytes, so the archive is published under
-its own SHA-256, as the OpenArm bundle is, at `so101/<version>/<sha256>.tar.gz`,
-and pinned as `SO101_ASSETS_KEY` and `SO101_ASSETS_SHA256` in
-`isaac_assets.env`; the image build then follows the OpenArm recipe above.
-Inside the image the suite reads the baked stage from
+The command runs the builder on the `mujoco`, `usd-core` and `numpy` that
+`sim_isaac/tests/uv.lock` pins, the tools `tests/test_so101_stage.py` builds
+the stage with. `<so101_description>` is the package at the public-peppy-libs
+commit that `sim_isaac/tests/pyproject.toml` pins.
+
+The archive is published under its own SHA-256, as the OpenArm bundle is, at
+`so101/<version>/<sha256>.tar.gz`, and pinned as `SO101_ASSETS_KEY` and
+`SO101_ASSETS_SHA256` in `isaac_assets.env`, with the SHA-256 of its
+`so101.usd` as `SO101_STAGE_SHA256`; the image build then follows the OpenArm
+recipe above. The archive holds the stage and `bundle_manifest.json`, which
+records the digests of the builder, of the URDF and of the lock, and the
+versions of the tools. An archive built again thus differs from the pinned one
+when one of those differs, also when its stage is the same. The stage is what
+the tree is held to: on Linux x86_64 the same upstream, limits, tool frame,
+builder and tools give the same `so101.usd` byte for byte, and MuJoCo rounds
+what it compiles differently on another architecture.
+
+`tests/test_so101_stage.py` builds the stage from the pinned upstream and the
+pinned URDF, both of which it stages itself over the network, and on Linux
+x86_64 holds its SHA-256 to `SO101_STAGE_SHA256`. `download_assets.sh` refuses
+a bundle whose stage is another. So a change of the builder, of the lock, of
+the description or of the `mujoco` pin that moves the stage fails the suite
+until the bundle is built and pinned again:
+
+```bash
+uv run --project sim_isaac/tests --locked --group dev pytest sim_isaac/tests/test_so101_stage.py
+```
+
+`SO101_UPSTREAM_MODEL` names a directory the upstream is staged in, and
+`SO101_KINEMATICS_URDF` a URDF to hold the stage to in place of the pinned
+one. Inside the image the suite reads the baked stage from
 `PEPPY_ROBOT_ASSETS_DIR` instead of building it.
 
 ## Tests
