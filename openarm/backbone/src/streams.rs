@@ -185,6 +185,17 @@ pub struct LeaderActivity {
 }
 
 impl LeaderActivity {
+    /// A leader that streams however long a test takes: its last command is
+    /// stamped an hour ahead, so no test host is slow enough to end the
+    /// stream.
+    #[cfg(test)]
+    pub fn streaming_always() -> Self {
+        let ahead = Instant::now() + Duration::from_secs(3600);
+        Self {
+            last: Arc::new(Mutex::new(Some(ahead))),
+        }
+    }
+
     /// A leader command arrived now.
     pub fn note(&self) {
         *self.last.lock().expect("stamp lock poisoned") = Some(Instant::now());

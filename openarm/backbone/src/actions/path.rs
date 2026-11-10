@@ -28,7 +28,7 @@ use tracing::error;
 
 use crate::actions::arm::joint_tolerances_from_wire;
 use crate::actions::{
-    ARM_WORDS, check_limb_free, claim_arms, collect_ends, move_seconds_from_wire,
+    ARM_WORDS, check_limb_free, claim_slots, collect_ends, move_seconds_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
@@ -142,7 +142,7 @@ fn expected_start(side: Side, joints: &[f64]) -> std::result::Result<Option<Join
 }
 
 /// Admit a goal on the arms `arms` names: each free in the goal's order
-/// ([`check_limb_free`]), then each claimed ([`claim_arms`]), or refused
+/// ([`check_limb_free`]), then each claimed ([`claim_slots`]), or refused
 /// with `precondition_failed` for the first busy arm. On a goal of both arms
 /// a refusal names the arm ([`PathOrder::failure_of`]).
 fn admit_arms(
@@ -159,7 +159,7 @@ fn admit_arms(
         )
         .map_err(|refusal| arms.failure_of(side, refusal))?;
     }
-    claim_arms(arms.sides(), move_slots).map_err(|busy| {
+    claim_slots(arms.sides(), move_slots).map_err(|busy| {
         let refusal = Failure::new(FailureKind::PreconditionFailed, ARM_WORDS.busy);
         arms.failure_of(busy, refusal)
     })

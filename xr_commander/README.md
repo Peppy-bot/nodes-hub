@@ -161,8 +161,10 @@ whatever camera you bind.
   is held, so releasing the grip freezes the grasp; match the trigger to the
   held opening before re-engaging, or the gripper springs back open.
 - **Face buttons** (right controller): **A** (the lower button) fires the
-  chosen robot's whole-robot `move_to_home` action, **B** fires
-  `move_to_ready`; each is a planned move that runs to completion on its own.
+  chosen robot's whole-robot `move_to_home` action, which closes the
+  grippers before the arms move, **B** fires `move_to_ready`, which sends
+  the grippers no command; each is a planned move that runs to completion on
+  its own.
   A press takes the robot as a squeeze does and keeps it for the move. A
   squeeze stops the move in flight and takes manual control back. A press
   does nothing while a grip is held, just after a grip is released, while a

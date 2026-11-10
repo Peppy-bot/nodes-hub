@@ -489,20 +489,31 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
             fresh.clone(),
             arm_activity.clone(),
         ));
+        // The limbs the posture moves claim and command: move_to_ready the
+        // arms alone, and move_to_home the grippers, which it closes, then
+        // the arms.
+        let posture_arms = actions::postures::Limbs {
+            goal_txs,
+            move_slots,
+            activity: arm_activity.clone(),
+        };
+        let posture_grippers = actions::postures::Limbs {
+            goal_txs: gripper_goal_txs.clone(),
+            move_slots: gripper_move_slots.clone(),
+            activity: gripper_activity.clone(),
+        };
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
-            goal_txs.clone(),
-            move_slots.clone(),
+            posture_arms.clone(),
             fresh.clone(),
-            arm_activity.clone(),
+            None,
             request_tx.clone(),
         ));
         set.spawn(actions::postures::run_move_to_home(
             runner.clone(),
-            goal_txs,
-            move_slots,
+            posture_arms,
             fresh.clone(),
-            arm_activity.clone(),
+            Some(posture_grippers),
             request_tx.clone(),
         ));
         set.spawn(actions::gripper::run_move_gripper(

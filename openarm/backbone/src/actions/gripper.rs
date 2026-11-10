@@ -24,7 +24,7 @@ use tracing::error;
 
 use crate::actions::{GRIPPER_WORDS, admit_limb, move_seconds_from_wire};
 use crate::failure::{Failure, FailureKind};
-use crate::gripper_move::GripperGoal;
+use crate::gripper_move::{EffortCap, GripperGoal, GripperReply};
 use crate::move_slot::MoveSlot;
 use crate::streams::LeaderActivity;
 
@@ -102,9 +102,10 @@ pub async fn run_move_gripper(
         if goal_txs[side]
             .send(GripperGoal {
                 opening,
-                max_effort,
+                effort: EffortCap::Named(max_effort),
                 settle_timeout,
-                ctx,
+                travel_timeout: None,
+                reply: GripperReply::MoveGripper(Box::new(ctx)),
             })
             .await
             .is_err()

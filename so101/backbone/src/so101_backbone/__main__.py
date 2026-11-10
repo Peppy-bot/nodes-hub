@@ -401,6 +401,9 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     def drive_posture(ctx, plan):
         return layer.drive_posture(ctx, plan, kinematics)
 
+    def drive_home(ctx, move):
+        return layer.drive_home(ctx, move, kinematics)
+
     action_servers = [
         server(move_arm_joints,
                lambda p: layer.decide_arm_joints(move_arm_joints, p),
@@ -411,8 +414,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                lambda p: layer.decide_posture(move_to_ready, postures.READY_POSITIONS_RAD, p),
                drive_posture, "move_to_ready"),
         server(move_to_home,
-               lambda p: layer.decide_posture(move_to_home, postures.HOME_POSITIONS_RAD, p),
-               drive_posture, "move_to_home"),
+               lambda p: layer.decide_home(move_to_home, postures.HOME_POSITIONS_RAD, p),
+               drive_home, "move_to_home"),
         server(move_arm,
                lambda p: layer.decide_pose(move_arm, p),
                lambda ctx, goal: layer.drive_pose(ctx, goal, point_solver, kinematics),
