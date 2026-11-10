@@ -208,7 +208,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#d4684fa1fd853cfa7e4812472035ae57fad266a0" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#15292894f5b22a50fb8c825decc60f0b4587bafd" }
 
 [[package]]
 name = "eigenpy"
@@ -446,7 +446,7 @@ wheels = [
 [[package]]
 name = "path-timing-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=path_timing_py#d4684fa1fd853cfa7e4812472035ae57fad266a0" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=path_timing_py#15292894f5b22a50fb8c825decc60f0b4587bafd" }
 
 [[package]]
 name = "peppygen"
@@ -733,7 +733,7 @@ dev = [
 [[package]]
 name = "so101-description"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#d4684fa1fd853cfa7e4812472035ae57fad266a0" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#15292894f5b22a50fb8c825decc60f0b4587bafd" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -862,7 +862,7 @@ wheels = [
 [[package]]
 name = "workspace-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py#d4684fa1fd853cfa7e4812472035ae57fad266a0" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py#15292894f5b22a50fb8c825decc60f0b4587bafd" }
 
 [[package]]
 name = "zstandard"
