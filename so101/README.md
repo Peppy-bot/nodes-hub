@@ -116,7 +116,8 @@ Read a refusal as *this branch did not walk the line*, not as *the arm cannot
 reach it*. The same target frequently solves from a different starting posture.
 A caller that hits a refusal can move the arm somewhere else and ask again, or,
 where the launch runs a motion planner, plan a path with `plan_joint_path` and run
-it with `execute_joint_path`.
+it with `execute_joint_path`. A goal refused for its orientation names the slack it
+takes in the orientation constraint's `tolerance_rad` or `free_axis`.
 
 ### The path is a straight line
 

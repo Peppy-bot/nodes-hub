@@ -196,11 +196,11 @@ impl Publisher<LimbStateBuild> {
                 timestamp,
                 names.arm_names,
                 names.joints_per_arm,
-                Side::BOTH.map(|side| s.joints[side]).concat(),
+                s.joints.into_array().concat(),
                 positions,
                 orientations,
                 names.gripper_names,
-                Side::BOTH.map(|side| s.openings[side]).to_vec(),
+                s.openings.into_array().to_vec(),
             )
         })
         .await

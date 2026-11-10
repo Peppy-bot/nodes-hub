@@ -557,8 +557,9 @@ then restage the node with `peppy node add sim_isaac -sb --force`.
 
 ### The SO-101 stage
 
-`so101_description` carries a kinematics-only URDF, so the SO-101's stage is
-built from its upstream geometry: MuJoCo Menagerie's `robotstudio_so101`
+`so101_description` carries a URDF of the arm's joints and its links' collision
+meshes, with no visual mesh and no inertia, so the SO-101's stage is built from
+its upstream geometry: MuJoCo Menagerie's `robotstudio_so101`
 (Apache-2.0) at the commit `sim_base_images/so101_model.lock.json` pins, the
 same files the MuJoCo node bakes and Waldo's catalogue names, so the three
 engines stand the same robot. `scripts/build_so101.py` compiles the upstream MJCF

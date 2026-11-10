@@ -17,12 +17,12 @@ use chain_kinematics::nalgebra::{
     Isometry3, Matrix3, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
 };
 use collision_geometry::chain::{BodyMask, Padding, PlacedMask, RiderBody};
-use motion_planner::fingers::riders;
+use motion_planner::arm_set::PerArm;
 use motion_planner::history::ArmJoints;
 use motion_planner::node::Fault;
 use motion_planner::request::OBJECTIVE;
-use motion_planner::robot::{Robot, RobotModel};
-use openarm_description::{ARM_DOF, ArmPair, Side, ready};
+use motion_planner::robot::{Robot, RobotModel, openarm_v2};
+use openarm_description::{ARM_DOF, DUAL_DOF, Side, ready};
 use peppygen::Parameters;
 use peppygen::consumed_topics::camera::depth_stream::{Message as DepthFrame, MessageHeader};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
@@ -59,8 +59,8 @@ pub use parameters::parameters;
 pub const PLANNING_TIME_S: f64 = 20.0;
 
 /// OpenArm v2's model, its grippers open, as the node fits it.
-pub static OPENARM_V2: LazyLock<RobotModel> =
-    LazyLock::new(|| Robot::OpenArmV2.model().expect("OpenArm v2's model"));
+pub static OPENARM_V2: LazyLock<RobotModel<ARM_DOF, DUAL_DOF, 2>> =
+    LazyLock::new(|| openarm_v2().expect("OpenArm v2's model"));
 
 /// A camera at `eye` whose optical axis looks at `target`, image right across the
 /// optical axis and the robot's +z, so image down points down where it can.
@@ -91,14 +91,14 @@ pub type Solid = ([f64; 3], [f64; 3]);
 /// renderer places the robot from its pieces itself.
 pub fn render(
     camera: &Isometry3<f64>,
-    arms: Option<&ArmJoints>,
+    arms: Option<&ArmJoints<ARM_DOF>>,
     boxes: &[Solid],
 ) -> Vec<Option<[f64; 3]>> {
     let none = Padding::new(1.0, 0.0).expect("the padding that grows nothing");
     let chains: Vec<_> = OPENARM_V2
         .arms
         .iter()
-        .map(|arm| (arm.side, arm.geometry.mask(none)))
+        .map(|arm| (arm.id.side(), arm.geometry.mask(none)))
         .collect();
     let body = OPENARM_V2.body.mask(none);
     let fingers = arms.map(|arms| {
@@ -106,7 +106,9 @@ pub fn render(
             Side::BOTH.into_iter().flat_map(|side| {
                 let arm = &OPENARM_V2.arms[side].geometry;
                 let posed = arm.chain().at(&arms[side]);
-                riders(&OPENARM_V2.self_model, arm, side)
+                OPENARM_V2
+                    .own
+                    .fingers(side.into(), arm)
                     .expect("the arm's fingers")
                     .into_iter()
                     .map(move |finger| {
@@ -165,8 +167,8 @@ pub fn at_ms(ms: u64) -> SystemTime {
 }
 
 /// Both arms where `left` and `right` put them.
-pub fn arms(left: [f64; ARM_DOF], right: [f64; ARM_DOF]) -> ArmJoints {
-    ArmPair::new(left, right)
+pub fn arms(left: [f64; ARM_DOF], right: [f64; ARM_DOF]) -> ArmJoints<ARM_DOF> {
+    PerArm::both(left, right)
 }
 
 /// Each arm's Ready posture: elbows bent, hands forward.
@@ -221,14 +223,14 @@ pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f6
 /// The node over the harness with the four camera slots vacant, once the arms' joint
 /// positions at `arms` have arrived: a check of the left arm standing still stops being
 /// refused, and answers with no map stamp.
-pub async fn start_without_camera(arms: &ArmJoints) -> peppygen::Result<(Harness, Mocks)> {
+pub async fn start_without_camera(arms: &ArmJoints<ARM_DOF>) -> peppygen::Result<(Harness, Mocks)> {
     start_without_camera_with(parameters(), arms).await
 }
 
 /// `start_without_camera` with the node's parameters `params`.
 pub async fn start_without_camera_with(
     params: Parameters,
-    arms: &ArmJoints,
+    arms: &ArmJoints<ARM_DOF>,
 ) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(
         Config {
@@ -244,12 +246,14 @@ pub async fn start_without_camera_with(
 
 /// `start_without_camera` with only the camera and geometry slots vacant, as on a robot
 /// without a camera rig whose backbone answers camera_mounts and workspace.
-pub async fn start_without_the_rig(arms: &ArmJoints) -> peppygen::Result<(Harness, Mocks)> {
+pub async fn start_without_the_rig(
+    arms: &ArmJoints<ARM_DOF>,
+) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(vacant_camera(), arms).await
 }
 
 /// The harness's configuration with the camera and geometry slots vacant.
-fn vacant_camera() -> Config {
+pub fn vacant_camera() -> Config {
     Config {
         parameters: Some(parameters()),
         camera_vacant: true,
@@ -296,7 +300,10 @@ pub async fn start_identified_as(
 /// The node over the harness as `config` binds it, with no camera to read, once the arms'
 /// joint positions at `arms` have arrived: a check of the left arm standing still stops
 /// being refused, and answers with no map stamp.
-async fn start_vacant(config: Config, arms: &ArmJoints) -> peppygen::Result<(Harness, Mocks)> {
+async fn start_vacant(
+    config: Config,
+    arms: &ArmJoints<ARM_DOF>,
+) -> peppygen::Result<(Harness, Mocks)> {
     let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), arms).await?;
     let answer = wait_for_the_arms(&harness, arms[Side::Left]).await;
@@ -439,7 +446,11 @@ pub fn describe_camera(
 }
 
 /// Publishes the arms at `arms` measured at `at`, both grippers open.
-pub async fn publish_arms(mocks: &Mocks, at: SystemTime, arms: &ArmJoints) -> peppygen::Result<()> {
+pub async fn publish_arms(
+    mocks: &Mocks,
+    at: SystemTime,
+    arms: &ArmJoints<ARM_DOF>,
+) -> peppygen::Result<()> {
     let rest = |side: Side| arms[side].to_vec();
     mocks
         .deps

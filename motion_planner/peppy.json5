@@ -1,5 +1,5 @@
-// motion_planner: plans joint paths for one or both arms of the robot its initializer's
-// robot_identity names, around what the robot's perception camera sees and the
+// motion_planner: plans joint paths for the arms, one or together, of the robot its
+// initializer's robot_identity names, around what the robot's perception camera sees and the
 // objects of its planning scene. It keeps a voxel map of the camera's depth
 // frames in the robot frame, the robot and the scene's objects cut out of each
 // frame where they stood, and plans with OMPL, keeping a clearance from the
@@ -16,8 +16,8 @@
     name: "motion_planner",
     tag: "v1",
     description: [
-      "Plans joint paths for one or both arms of the robot together around what the robot's depth camera has seen and the objects of its planning scene, keeping the arms apart, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
-      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot and the planning scene's objects cut out of each frame, and plans with OMPL, each state keeping a clearance from the map, the objects and between the pairs of the robot's own links its self-collision model checks. It holds the planning scene: the collision objects, the objects attached to an arm's grasp link, and the pairs allowed to touch. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the robot's own body and the scene's objects alone.",
+      "Plans joint paths for the robot's arms, one or together, around what the robot's depth camera has seen and the objects of its planning scene, keeping the arms apart, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
+      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot and the planning scene's objects cut out of each frame, and plans with OMPL, each state keeping a clearance from the map, the objects and between the pairs of the robot's own links its self-collision model checks. It holds the planning scene: the collision objects, the objects attached to an arm's grasp link, and the pairs allowed to touch. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from camera_mounts, workspace, camera and geometry; without a camera, a plan keeps clear of the scene's objects and the robot's own body alone.",
     ],
     implements: [
       { name: "motion_planning", tag: "v1", link_id: "motion_planning" },
