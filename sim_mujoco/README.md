@@ -54,6 +54,8 @@ With `cameras_enabled`, the engine renders the cameras of every standing robot's
 
 The node builds on `peppybot/sim-mujoco`, which `sim_base_images/build_base_images.sh` produces for `linux/amd64` and `linux/arm64` with MuJoCo, `sim_robot_core` and every model's files baked in. The script stamps the tag into `apptainer.def`.
 
+`sim_base_images/requirements.mujoco.txt` pins the MuJoCo the image installs, and the script reads the version in the tag out of that file. To move the node to another MuJoCo, change the pin there and in `tests/pyproject.toml`, write the lock of the suites again and run the script. `tests/test_base_image.py` holds the tag, `apptainer.def` and the pins of the suites to that file.
+
 ## Tests
 
 ```sh
