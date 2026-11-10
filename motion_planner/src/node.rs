@@ -17,7 +17,7 @@ use control_core::latched_log::LatchedLog;
 use control_core::{receiving, serving};
 use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
-    Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathOrientation, PlanFailure,
+    Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathFault, PathOrientation, PlanFailure,
     PlanRequest, PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault,
     cartesian_path, check_path, insert_cut_out, plan_path, pose_parts, start_inside_limits,
 };
@@ -86,9 +86,14 @@ const NO_JOINTS: &str = "no joint positions of the arms have been measured yet; 
 const NO_CAMERA: &str = "no depth camera is linked to the planner: plans and checks keep \
                          the clearance from the planning scene's objects and from the robot's \
                          own body alone";
-/// What a plan refused for a start where the robot's own bodies touch tells the caller to do.
-const OWN_CONTACT_WAY_OUT: &str = "move the arms to the ready posture with move_to_ready and \
-                                   plan from there";
+/// What a refusal of a start where a pair of the robot's own bodies touches tells the
+/// caller to do.
+const OWN_BODY_WAY_OUT: &str = "move the arms to the home posture with move_to_home and \
+                                plan from there";
+/// What a refusal of a start where a body touches the map or an object, or stands inside
+/// the clearance from it, tells the caller to do.
+const CLEAR_OR_ALLOW_WAY_OUT: &str = "move the arms clear first, or allow the pair with \
+                                      set_allowed_collision";
 
 /// The links of the perception camera the map reads.
 struct CameraLinks {
@@ -1584,7 +1589,10 @@ fn check<const N: usize, const D: usize, const K: usize>(
         u32::try_from(checked.clear_waypoints).expect("as many waypoints as a request carries"),
         checked
             .fault
-            .map_or_else(String::new, |fault| fault.to_string()),
+            .map_or_else(String::new, |fault| match &fault {
+                PathFault::Start(start) => with_way_out(fault.to_string(), Some(start)),
+                _ => fault.to_string(),
+            }),
         snapshot.stamp,
     ))
 }
@@ -1860,7 +1868,9 @@ fn plan<const N: usize, const D: usize, const K: usize>(
                 PlanFailure::Start(StartFault::OutsideLimits { .. }) => {
                     FailureKind::PreconditionFailed
                 }
-                PlanFailure::Start(StartFault::InCollision(_)) => FailureKind::StartInCollision,
+                PlanFailure::Start(
+                    StartFault::InCollision(_) | StartFault::InsideClearance { .. },
+                ) => FailureKind::StartInCollision,
                 PlanFailure::Unreachable(_) => FailureKind::Unreachable,
                 PlanFailure::NoPath(_) => FailureKind::NoPath,
                 PlanFailure::Planner(_) => FailureKind::AttemptFailed,
@@ -1873,15 +1883,19 @@ fn plan<const N: usize, const D: usize, const K: usize>(
         })
 }
 
-/// `message`, the words of a plan's failure, and after them, for a start where the robot's
-/// own bodies touch, `start`, what the caller does to leave it.
+/// `message`, the words of a failure, and after them, for a start refused for its pair
+/// `start` names, in contact or inside the clearance, what the caller does to leave it.
 fn with_way_out(message: String, start: Option<&StartFault>) -> String {
-    match start {
-        Some(StartFault::InCollision(Contact::Own { .. })) => {
-            format!("{message}; {OWN_CONTACT_WAY_OUT}")
-        }
-        _ => message,
-    }
+    let pair = match start {
+        Some(StartFault::InCollision(contact)) => contact,
+        Some(StartFault::InsideClearance { reading, .. }) => &reading.pair,
+        Some(StartFault::OutsideLimits { .. }) | None => return message,
+    };
+    let way_out = match pair {
+        Contact::Own { .. } => OWN_BODY_WAY_OUT,
+        Contact::Map { .. } | Contact::Object { .. } => CLEAR_OR_ALLOW_WAY_OUT,
+    };
+    format!("{message}; {way_out}")
 }
 
 /// Why an arm the plan leaves where it starts, every arm but `moving`, breaks a path
@@ -2116,7 +2130,9 @@ fn cartesian<const N: usize, const D: usize, const K: usize>(
             CartesianFailure::Stopped => return PlanEnd::Stopped,
             CartesianFailure::Request(_) => Kind::Rejected,
             CartesianFailure::Start(StartFault::OutsideLimits { .. }) => Kind::PreconditionFailed,
-            CartesianFailure::Start(StartFault::InCollision(_)) => Kind::StartInCollision,
+            CartesianFailure::Start(
+                StartFault::InCollision(_) | StartFault::InsideClearance { .. },
+            ) => Kind::StartInCollision,
         };
         let start = match &failure {
             CartesianFailure::Start(fault) => Some(fault),

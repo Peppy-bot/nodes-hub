@@ -1,8 +1,9 @@
-//! What the node's tests share: the parameters the launchers give the planner and the
-//! planning time each plan asks for, OpenArm v2's model, a depth camera and the frames it
-//! renders of the robot and of boxes, a table across the left arm's motion, the node over
-//! the generated harness with that camera linked or vacant, and the plans and checks of
-//! the left arm.
+//! What the node's tests share: the parameters the launchers give the planner, the planning
+//! time each plan asks for and what a refused start says to do, OpenArm v2's model, a depth
+//! camera and the frames it renders of the robot and of boxes, a table across the left arm's
+//! motion and the node with the arm under it once the camera has seen it, the node over the
+//! generated harness with that camera linked or vacant, and the plans and checks of the left
+//! arm.
 //!
 //! Each integration test is its own crate, so items unused by one suite are expected;
 //! the allow keeps clippy's -D warnings gate meaningful for the rest.
@@ -57,6 +58,14 @@ pub use parameters::parameters;
 
 /// The planning time every test's plan asks for (s).
 pub const PLANNING_TIME_S: f64 = 20.0;
+
+/// What a refused start in contact within the robot's own body says to do.
+pub const OWN_BODY_WAY_OUT: &str =
+    "; move the arms to the home posture with move_to_home and plan from there";
+/// What a refused start in contact with, or inside the clearance of, the map or an object
+/// says to do.
+pub const CLEAR_OR_ALLOW_WAY_OUT: &str =
+    "; move the arms clear first, or allow the pair with set_allowed_collision";
 
 /// OpenArm v2's model, its grippers open, as the node fits it.
 pub static OPENARM_V2: LazyLock<RobotModel<ARM_DOF, DUAL_DOF, 2>> =
@@ -218,6 +227,26 @@ pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f6
         [crossing.x + 0.1, crossing.y + 0.1, height],
     );
     (table, crossing_t)
+}
+
+/// The node with the left arm under `table_across`'s table, which the camera has seen, and
+/// the share of the motion from under the table to over it where the hand crosses its top.
+pub async fn under_a_seen_table() -> peppygen::Result<(Harness, Mocks, f64)> {
+    let (table, crossing_t) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
+    let ([x0, y0, _], [x1, y1, top]) = table;
+    let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let camera = looking_at(Vector3::new(x + 0.5, y, top + 0.7), Vector3::new(x, y, top));
+    let (harness, mocks) = start_with_camera(&camera).await?;
+    publish_arms(&mocks, at_ms(0), &arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
+    take_frame(
+        &harness,
+        &mocks,
+        at_ms(0),
+        &render(&camera, None, &[table]),
+        UNDER_THE_TABLE,
+    )
+    .await?;
+    Ok((harness, mocks, crossing_t))
 }
 
 /// The node over the harness with the four camera slots vacant, once the arms' joint

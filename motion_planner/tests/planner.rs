@@ -29,11 +29,11 @@ use peppygen::fixtures::exposed_services::motion_planning::{
 use peppygen::fixtures::harness::{Config, Harness};
 
 use common::{
-    Ended, LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, TIMEOUT, UNDER_THE_TABLE, along,
-    arms, at_ms, check, describe_camera, facing_the_robot, left_elbow, left_path, looking_at,
-    parameters, plan, plan_from, plan_to, planned_waypoints, publish_arms, render, start,
-    start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
-    start_without_the_rig, table_across, take_frame, take_frame_aligned,
+    CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, TIMEOUT,
+    UNDER_THE_TABLE, along, arms, at_ms, check, describe_camera, facing_the_robot, left_elbow,
+    left_path, parameters, plan, plan_from, plan_to, planned_waypoints, publish_arms, render,
+    start, start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
+    start_without_the_rig, take_frame, take_frame_aligned, under_a_seen_table,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -193,20 +193,7 @@ async fn the_arms_own_points_mark_nothing_while_they_move() -> peppygen::Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen::Result<()> {
     let (under_q, over_q) = (UNDER_THE_TABLE, OVER_THE_TABLE);
-    let (table, crossing_t) = table_across(&under_q, &over_q);
-    let ([x0, y0, _], [x1, y1, top]) = table;
-    let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    let camera = looking_at(Vector3::new(x + 0.5, y, top + 0.7), Vector3::new(x, y, top));
-    let (harness, mocks) = start_with_camera(&camera).await?;
-    publish_arms(&mocks, at_ms(0), &arms(under_q, RIGHT_READY)).await?;
-    take_frame(
-        &harness,
-        &mocks,
-        at_ms(0),
-        &render(&camera, None, &[table]),
-        under_q,
-    )
-    .await?;
+    let (harness, _mocks, crossing_t) = under_a_seen_table().await?;
 
     let through = check(&harness, &left_path(&[], &[over_q]))
         .await
@@ -256,7 +243,8 @@ async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen:
     assert!(
         !in_contact.clear
             && in_contact.clear_waypoints == 0
-            && in_contact.reason.contains("touches the occupancy map"),
+            && in_contact.reason.contains("touches the occupancy map")
+            && in_contact.reason.ends_with(CLEAR_OR_ALLOW_WAY_OUT),
         "a start in contact with the table: {in_contact:?}"
     );
     let Err(Ended::Failed(collided)) = plan(&harness, &plan_from(&crossing_q, &over_q)).await
@@ -265,7 +253,8 @@ async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen:
     };
     assert_eq!(collided.kind, FailureKind::StartInCollision, "{collided}");
     assert!(
-        collided.message.contains("touches the occupancy map"),
+        collided.message.contains("touches the occupancy map")
+            && collided.message.ends_with(CLEAR_OR_ALLOW_WAY_OUT),
         "{collided}"
     );
 
