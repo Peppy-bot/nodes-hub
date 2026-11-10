@@ -50,6 +50,8 @@ To add a model: ship its entry in `sim_robot_core`, bake its files into the base
 
 With `cameras_enabled`, the engine renders the cameras of every standing robot's own model, each on the pair of the relay named after it, and a model with no camera renders none. Rendering is selected at launch: a launcher's rendered camera rig sets the parameter.
 
+The cameras render through EGL, on the first device MuJoCo can open. Where the NVIDIA driver names the CUDA device behind each EGL device, MuJoCo tries those devices first: in the order of `CUDA_VISIBLE_DEVICES` when the node's environment holds it, and in the order of their CUDA ids otherwise. `MUJOCO_EGL_DEVICE_ID` selects one device and no other is tried: its place in `CUDA_VISIBLE_DEVICES` or its CUDA id, and where the driver names no CUDA device, its place in EGL's own order. Both variables reach the node from the environment of the `peppy` command that launches it, when the node runs on the machine of that command.
+
 ## Base image
 
 The node builds on `peppybot/sim-mujoco`, which `sim_base_images/build_base_images.sh` produces for `linux/amd64` and `linux/arm64` with MuJoCo, `sim_robot_core` and every model's files baked in. The script stamps the tag into `apptainer.def`.
