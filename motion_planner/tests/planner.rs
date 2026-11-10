@@ -14,7 +14,7 @@ mod common;
 
 use chain_kinematics::nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use motion_planner::node::NO_DEPTH_FRAME;
-use motion_planner::request::MAX_PLANNING_TIME_S;
+use motion_planner::request::{MAX_PLANNING_TIME_S, Named, Planner, Refiner};
 use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalGoalPositionConstraintsItem,
@@ -691,6 +691,44 @@ async fn assert_plans_without_a_map(harness: &Harness) {
         .await
         .expect("a path");
     assert_eq!(planned.map_stamp, None);
+}
+
+/// The planning time of each plan of `each_planner_and_refiner_answers_a_path_to_the_goal`:
+/// an `rrt_star` plan plans all of it.
+const EACH_PLANNER_TIME_S: f64 = 1.0;
+
+// Each planner, its path refined by each refiner, answers a path of the left arm that ends
+// within its goal: on a robot without a camera, a goal of the left elbow planned by
+// rrt_connect and by rrt_star, each refined by none and by chomp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_planner_and_refiner_answers_a_path_to_the_goal() -> peppygen::Result<()> {
+    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    for planner in Planner::ALL {
+        for refiner in Refiner::ALL {
+            let request = GoalRequestData {
+                planner: planner.name().to_string(),
+                refiner: refiner.name().to_string(),
+                allowed_planning_time_s: EACH_PLANNER_TIME_S,
+                ..plan_to(&left_elbow(1.3))
+            };
+            let planned = plan(&harness, &request)
+                .await
+                .unwrap_or_else(|ended| panic!("{planner:?} and {refiner:?}: {ended:?}"));
+            let end = *planned_waypoints(&planned).last().expect("a waypoint");
+            assert!(
+                request
+                    .goal_joint_constraints
+                    .iter()
+                    .zip(&end)
+                    .all(|(goal, &at)| {
+                        goal.position - goal.tolerance_below <= at
+                            && at <= goal.position + goal.tolerance_above
+                    }),
+                "{planner:?} and {refiner:?} end at {end:?}"
+            );
+        }
+    }
+    harness.shutdown().await
 }
 
 // With the camera and geometry bound and camera_mounts vacant, the map cannot place the

@@ -355,10 +355,10 @@ fn left_gripper(q: &[f64; ARM_DOF]) -> Gripper {
         .into_iter()
         .map(|finger| {
             let pose = to_grasp * posed.link_pose_world(finger.segment) * finger.offset;
-            let RiderBody::Pieces(pieces) = finger.body else {
+            let RiderBody::Part(part) = finger.body else {
                 panic!("a finger is a part of the robot");
             };
-            pieces
+            part.pieces()
                 .iter()
                 .flat_map(|piece| piece.vertices().iter().map(move |v| pose * v))
                 .collect()
