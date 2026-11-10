@@ -25,8 +25,11 @@ CPU only: it needs the `mujoco`, `usd-core` and `numpy` wheels, no Isaac Sim.
         --output <directory> [--archive <bundle.tar.gz>]
 
 `--archive` packs the output directory into the bundle the Isaac base image
-downloads: entries sorted, owners and times zeroed, so the same stage packs
-to the same bytes and the bundle is published under its own SHA-256.
+downloads: entries sorted, owners and times zeroed, so the same directory
+packs to the same bytes and the bundle is published under its own SHA-256.
+The directory holds the stage and a manifest of what built it: the digests of
+this script, of the URDF and of the lock, and the versions of the tools. So
+the bundle's bytes change with any of them, also when the stage's do not.
 """
 
 from __future__ import annotations

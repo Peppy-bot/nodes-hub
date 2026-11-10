@@ -59,7 +59,9 @@ if [[ "$VARIANT" == "isaac" ]]; then
     # name under the output: what the image bakes as /opt/robot_assets/<robot>/,
     # where the node's model entries look their stages up. Every pin is
     # checked and every archive downloaded and verified before the output is
-    # touched, so a failure leaves nothing half staged.
+    # touched, so a failure leaves nothing half staged. The SO-101 bundle is
+    # pinned a second time, by the checksum of the stage it holds, which
+    # sim_isaac/tests/test_so101_stage.py holds to the stage the tree builds.
     ROBOTS=(openarm so101)
     KEYS=(
         "${ISAAC_ASSETS_KEY:?ISAAC_ASSETS_KEY must be set}"
@@ -75,6 +77,11 @@ if [[ "$VARIANT" == "isaac" ]]; then
             exit 1
         fi
     done
+    SO101_STAGE_CHECKSUM="${SO101_STAGE_SHA256:?SO101_STAGE_SHA256 must be set}"
+    if [[ ! "$SO101_STAGE_CHECKSUM" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "ERROR: the so101 bundle needs the pinned SHA-256 checksum of its stage" >&2
+        exit 1
+    fi
     SCRATCH="$(mktemp -d)"
     trap 'rm -rf "$SCRATCH"' EXIT
     for i in "${!ROBOTS[@]}"; do
@@ -82,6 +89,11 @@ if [[ "$VARIANT" == "isaac" ]]; then
         _rclone copyto "r2:${BUCKET}/${KEYS[$i]}" "$ARCHIVE" --progress
         printf '%s  %s\n' "${CHECKSUMS[$i]}" "$ARCHIVE" | sha256sum -c -
     done
+    SO101_STAGE="$(tar -xzOf "${SCRATCH}/so101.tar.gz" so101.usd | sha256sum | cut -d' ' -f1)"
+    if [[ "$SO101_STAGE" != "$SO101_STAGE_CHECKSUM" ]]; then
+        echo "ERROR: the so101 bundle holds the stage ${SO101_STAGE}, and the pinned stage is ${SO101_STAGE_CHECKSUM}" >&2
+        exit 1
+    fi
 
     rm -rf "$OUTPUT_DIR"
     for i in "${!ROBOTS[@]}"; do

@@ -14,23 +14,19 @@ from pathlib import Path
 
 import pytest
 
+from _base_images import IMAGES_DIR, shell_value
+
 _NODE_DIR = Path(__file__).resolve().parents[1]
-# Where the base images of both simulation nodes are built from.
-_IMAGES_DIR = _NODE_DIR.parent / "sim_base_images"
 _R2_ENDPOINT = "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
-
-
-def _shell_value(script: str, name: str) -> str:
-    return re.search(rf'^{name}="([^"]*)"', script, re.MULTILINE).group(1)
 
 
 def test_node_builds_on_the_image_revision_the_build_script_publishes():
     # build_base_images.sh owns the tag and restamps the def when it publishes;
     # a def that drifts from it builds the node on a stale image.
-    script = (_IMAGES_DIR / "build_base_images.sh").read_text()
+    script = (IMAGES_DIR / "build_base_images.sh").read_text()
     image = (
-        f'{_shell_value(script, "IMAGE_NAMESPACE")}/sim-isaac:'
-        f'{_shell_value(script, "ISAAC_VERSION")}-{_shell_value(script, "ISAAC_IMAGE_REV")}'
+        f'{shell_value(script, "IMAGE_NAMESPACE")}/sim-isaac:'
+        f'{shell_value(script, "ISAAC_VERSION")}-{shell_value(script, "ISAAC_IMAGE_REV")}'
     )
     definition = (_NODE_DIR / "apptainer.def").read_text()
     assert re.findall(r"^From:\s+(.*)$", definition, re.MULTILINE) == [image]
@@ -40,7 +36,7 @@ def test_base_image_carries_the_ngx_core_library_dlss_runs_on():
     # Kit opens libnvidia-ngx.so.1 by soname; Peppy's `--nv` binding does not
     # bring the host's copy in, so the image ships one pinned by checksum, and
     # the README states the driver version it came from as the host minimum.
-    dockerfile = (_IMAGES_DIR / "Dockerfile.isaac").read_text()
+    dockerfile = (IMAGES_DIR / "Dockerfile.isaac").read_text()
     version = re.search(r"^ARG NGX_DRIVER_VERSION=(\S+)$", dockerfile, re.MULTILINE).group(1)
     url = re.search(r"^ARG NGX_DEB_URL=(https://\S+\.deb)$", dockerfile, re.MULTILINE).group(1)
     assert version in url
@@ -55,21 +51,21 @@ def test_base_image_carries_the_ngx_core_library_dlss_runs_on():
 
 
 def test_base_image_copies_asset_pin_before_the_download_layer():
-    dockerfile = (_IMAGES_DIR / "Dockerfile.isaac").read_text()
+    dockerfile = (IMAGES_DIR / "Dockerfile.isaac").read_text()
     copy = "COPY download_assets.sh isaac_assets.env /tmp/"
     assert dockerfile.index(copy) < dockerfile.index(
         "bash /tmp/download_assets.sh --variant isaac"
     )
-    pins = (_IMAGES_DIR / "isaac_assets.env").read_text()
-    assert _shell_value(pins, "ISAAC_ASSETS_BUCKET") == "isaac-sim-assets"
-    assert _shell_value(pins, "ISAAC_ASSETS_ENDPOINT") == (
+    pins = (IMAGES_DIR / "isaac_assets.env").read_text()
+    assert shell_value(pins, "ISAAC_ASSETS_BUCKET") == "isaac-sim-assets"
+    assert shell_value(pins, "ISAAC_ASSETS_ENDPOINT") == (
         "https://b9abcee11c090aef5279f874ff078826.r2.cloudflarestorage.com"
     )
-    checksum = _shell_value(pins, "ISAAC_ASSETS_SHA256")
+    checksum = shell_value(pins, "ISAAC_ASSETS_SHA256")
     assert re.fullmatch(r"[0-9a-f]{64}", checksum)
     assert re.fullmatch(
         rf"openarm/[1-9][0-9]*/{checksum}\.tar\.gz",
-        _shell_value(pins, "ISAAC_ASSETS_KEY"),
+        shell_value(pins, "ISAAC_ASSETS_KEY"),
     )
 
 
@@ -78,16 +74,16 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
     # directory per robot under it: the download stages each robot's pinned
     # bundle into a directory of its name, the image bakes them all under
     # /opt/robot_assets, and the node's default points there.
-    dockerfile = (_IMAGES_DIR / "Dockerfile.isaac").read_text()
+    dockerfile = (IMAGES_DIR / "Dockerfile.isaac").read_text()
     assert "&& cp -r /tmp/.peppy_openarm_assets_isaac/. /opt/robot_assets/ \\\n" in dockerfile
-    download = (_IMAGES_DIR / "download_assets.sh").read_text()
+    download = (IMAGES_DIR / "download_assets.sh").read_text()
     assert "ROBOTS=(openarm so101)" in download
-    pins = (_IMAGES_DIR / "isaac_assets.env").read_text()
+    pins = (IMAGES_DIR / "isaac_assets.env").read_text()
     for robot, key in (("openarm", "ISAAC_ASSETS_KEY"), ("so101", "SO101_ASSETS_KEY")):
         assert f'"${{{key}:?{key} must be set}}"' in download, robot
         # Each bundle is published under its robot and its own checksum.
-        assert _shell_value(pins, key).startswith(f"{robot}/"), robot
-        assert _shell_value(pins, key).endswith(f"/{_shell_value(pins, key.replace('_KEY', '_SHA256'))}.tar.gz")
+        assert shell_value(pins, key).startswith(f"{robot}/"), robot
+        assert shell_value(pins, key).endswith(f"/{shell_value(pins, key.replace('_KEY', '_SHA256'))}.tar.gz")
     definition = (_NODE_DIR / "apptainer.def").read_text()
     assert (
         "export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets}\n"
@@ -101,12 +97,25 @@ def test_base_image_installs_the_package_the_engines_share():
     # suites run the engine against.
     pinned = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
     rev = pinned["tool"]["uv"]["sources"]["sim_robot_core"]["rev"]
-    requirements = (_IMAGES_DIR / "requirements.isaac.txt").read_text().splitlines()
+    requirements = (IMAGES_DIR / "requirements.isaac.txt").read_text().splitlines()
     assert [line for line in requirements if line.startswith("sim_")] == [
         "sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
         f"@{rev}"
         "#subdirectory=sim_robot_core"
     ]
+
+
+def test_so101_stage_is_built_with_the_mujoco_the_mujoco_node_runs_on():
+    # scripts/build_so101.py writes the SO-101's stage from the model as
+    # MuJoCo compiles it, so the suites pin the mujoco the MuJoCo base image
+    # installs: one bump moves both engines.
+    project = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
+    [pin] = [
+        dependency
+        for dependency in project["dependency-groups"]["dev"]
+        if dependency.startswith("mujoco==")
+    ]
+    assert pin in (IMAGES_DIR / "requirements.mujoco.txt").read_text().splitlines()
 
 
 def test_node_installs_runtime_dependencies_without_asset_conversion():
@@ -208,6 +217,7 @@ def _run_installer(
     corrupt=False,
     download_fails=False,
     checksum=None,
+    stage_checksum=None,
     credential_variants=("isaac", "mujoco"),
 ):
     # The two bundles the installer fetches: what the output holds after a
@@ -224,14 +234,20 @@ def _run_installer(
     script_dir = tmp_path / "sim_base_images"
     script_dir.mkdir()
     script = script_dir / "download_assets.sh"
-    shutil.copyfile(_IMAGES_DIR / script.name, script)
+    shutil.copyfile(IMAGES_DIR / script.name, script)
     if variant == "isaac":
-        pins = (_IMAGES_DIR / "isaac_assets.env").read_text()
+        pins = (IMAGES_DIR / "isaac_assets.env").read_text()
         for name, value in (
             ("ISAAC_ASSETS_KEY", _BUNDLE_KEY),
             ("ISAAC_ASSETS_SHA256", digest if checksum is None else checksum),
             ("SO101_ASSETS_KEY", _SO101_BUNDLE_KEY),
             ("SO101_ASSETS_SHA256", so101_digest),
+            (
+                "SO101_STAGE_SHA256",
+                hashlib.sha256(_SO101_FILES["so101.usd"]).hexdigest()
+                if stage_checksum is None
+                else stage_checksum,
+            ),
         ):
             pins = re.sub(rf"^{name}=.*$", f'{name}="{value}"', pins, flags=re.MULTILINE)
         (script_dir / "isaac_assets.env").write_text(pins)
@@ -315,6 +331,10 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
     return result, calls, files
 
 
+def _tar_calls(tmp_path) -> list[list[str]]:
+    return [json.loads(line) for line in (tmp_path / "tar.jsonl").read_text().splitlines()]
+
+
 def _assert_reaches_r2_with_the_credentials_of(variant, call):
     assert call["endpoint"] == _R2_ENDPOINT
     assert call["access_key_id"] == f"{variant}-key"
@@ -338,7 +358,9 @@ def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under
         for path in output.rglob("*")
         if path.is_file()
     } == files
-    assert len((tmp_path / "tar.jsonl").read_text().splitlines()) == 2
+    # The SO-101's stage is read out of its archive to be checked, then each
+    # bundle is extracted.
+    assert [call[0] for call in _tar_calls(tmp_path)] == ["-xzOf", "-xzf", "-xzf"]
     assert list((tmp_path / "scratch").iterdir()) == []
 
 
@@ -364,13 +386,31 @@ def test_isaac_installer_failure_does_not_extract_or_fall_back(tmp_path, failure
     assert (output / "stale.usd").read_bytes() == b"existing staging contents"
 
 
-@pytest.mark.parametrize("checksum", ["", "REPLACE_WITH_PREPARED_BUNDLE_SHA256"])
-def test_isaac_installer_refuses_missing_or_placeholder_checksum(tmp_path, checksum):
-    result, calls, _ = _run_installer(tmp_path, checksum=checksum)
+@pytest.mark.parametrize("pin", ["checksum", "stage_checksum"])
+@pytest.mark.parametrize("value", ["", "REPLACE_WITH_PREPARED_BUNDLE_SHA256"])
+def test_isaac_installer_refuses_missing_or_placeholder_checksum(tmp_path, pin, value):
+    result, calls, _ = _run_installer(tmp_path, **{pin: value})
     assert result.returncode != 0
     assert calls == []
     assert not (tmp_path / "tar.jsonl").exists()
     assert (tmp_path / "output" / "stale.usd").exists()
+
+
+def test_isaac_installer_refuses_a_bundle_whose_stage_is_not_the_pinned_one(tmp_path):
+    # The archive is the pinned one and its stage is not the pinned stage:
+    # the state a new bundle leaves when the pin of its stage does not move
+    # with it.
+    pinned = "0" * 64
+    result, calls, _ = _run_installer(tmp_path, stage_checksum=pinned)
+    assert result.returncode != 0
+    held = hashlib.sha256(_SO101_FILES["so101.usd"]).hexdigest()
+    assert f"holds the stage {held}, and the pinned stage is {pinned}" in result.stderr
+    # Both archives arrive and pass their own checksum; nothing is extracted.
+    assert len(calls) == 2
+    assert [call[0] for call in _tar_calls(tmp_path)] == ["-xzOf"]
+    assert list((tmp_path / "scratch").iterdir()) == []
+    output = tmp_path / "output"
+    assert list(output.iterdir()) == [output / "stale.usd"]
 
 
 def test_mujoco_installer_keeps_its_directory_copy_without_isaac_pin(tmp_path):

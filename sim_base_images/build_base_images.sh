@@ -9,7 +9,9 @@
 # PyOpenGL-accelerate, is x86_64 only and is left out on arm64. It is an
 # optional accelerator; see requirements.mujoco.txt.
 #
-# To bump a sim version: update the version variable below and rerun. This
+# To bump Isaac Sim: update ISAAC_VERSION below and rerun. To bump MuJoCo:
+# update the mujoco pin of requirements.mujoco.txt and rerun. The image
+# installs that file, and its tag names the version the file pins. This
 # manifest is the single source of truth for the base image tags; the script
 # rebuilds, pushes, and rewrites the sibling sim nodes' apptainer.def From:
 # tags to match, so the tag is never edited by hand in two places.
@@ -28,12 +30,23 @@
 #   bash sim_base_images/build_base_images.sh [--isaac-only|--mujoco-only]
 set -euo pipefail
 
+IMAGES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
+
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
-MUJOCO_VERSION="3.17.0"  # mirrors mujoco PyPI version (requirements.mujoco.txt)
-ISAAC_IMAGE_REV="7"      # bump when Isaac image content changes without an upstream version bump
+ISAAC_IMAGE_REV="8"      # bump when Isaac image content changes without an upstream version bump
 MUJOCO_IMAGE_REV="1"     # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
+# The mujoco PyPI version that the MuJoCo image installs: the pin of
+# requirements.mujoco.txt, read here so that the tag of the image cannot name
+# another version than the image holds.
+MUJOCO_VERSION="$(sed -nE 's/^mujoco==([^[:space:]]+)$/\1/p' "${IMAGES_DIR}/requirements.mujoco.txt")"
+if [[ ! "${MUJOCO_VERSION}" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+    echo "ERROR: requirements.mujoco.txt must pin one mujoco version as 'mujoco==<version>'" >&2
+    echo "       (found '${MUJOCO_VERSION}')." >&2
+    exit 1
+fi
 
 # Target platforms. MuJoCo ships wheels for both arches; Isaac Sim is amd64 only.
 MUJOCO_PLATFORMS="linux/amd64,linux/arm64"
@@ -67,9 +80,6 @@ if (( BUILD_MUJOCO )); then
     export PEPPY_R2_DATA01_ACCESS_KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set to build the MuJoCo image}"
     export PEPPY_R2_DATA01_SECRET_ACCESS_KEY="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set to build the MuJoCo image}"
 fi
-
-IMAGES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
 
 ISAAC_IMAGE="${IMAGE_NAMESPACE}/sim-isaac:${ISAAC_VERSION}-${ISAAC_IMAGE_REV}"
 MUJOCO_IMAGE="${IMAGE_NAMESPACE}/sim-mujoco:${MUJOCO_VERSION}-${MUJOCO_IMAGE_REV}"

@@ -1,32 +1,48 @@
-"""The SO-101 stage scripts/build_so101.py writes, held to so101_description:
-link and joint names, joint limits, and the tool frame's pose through the
-chain.
+"""The SO-101 stage scripts/build_so101.py writes, held to so101_description
+(link and joint names, joint limits, and the tool frame's pose through the
+chain) and to the bundle the base image bakes.
 
-The stage is built here from the staged upstream model when
-SO101_UPSTREAM_MODEL names it, and read as baked under PEPPY_ROBOT_ASSETS_DIR
-otherwise (the base image's suite). The description's URDF comes from
-SO101_KINEMATICS_URDF: so101_description needs a newer python than Isaac
-Sim's, so it is not a dependency of this project. Without the URDF or a
-stage the suite is skipped, and needs mujoco, which the builder runs on.
+The stage is read as baked where PEPPY_ROBOT_ASSETS_DIR holds one (the base
+image's suite), and built here otherwise, from MuJoCo Menagerie's model at
+the commit sim_base_images/so101_model.lock.json pins. SO101_UPSTREAM_MODEL
+names the directory that model is staged in; without it the suite stages the
+model in a directory of its own. Either way every file of the model is
+checked against the lock.
+
+The description's URDF is the file SO101_KINEMATICS_URDF names, or
+so101_description's at the public-peppy-libs commit this project pins:
+so101_description needs a newer python than Isaac Sim's, so it is not a
+dependency of this project. The suite reads that file alone, and none of the
+meshes its links name. Staging the model or the URDF needs the network. The
+suite needs mujoco, which the builder runs on, and USD.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import platform
 import sys
+import tomllib
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Optional
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pytest
+
+from _base_images import IMAGES_DIR, shell_value
 
 mujoco = pytest.importorskip("mujoco")
 pytest.importorskip("pxr")
 from pxr import Usd, UsdGeom, UsdPhysics  # noqa: E402  pylint: disable=C0413
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(IMAGES_DIR))
 
 import build_so101  # noqa: E402  pylint: disable=C0413
+import so101_model  # noqa: E402  pylint: disable=C0413
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 LINKS = (
@@ -39,27 +55,65 @@ LINKS = (
     "moving_jaw_so101_v1_link",
 )
 
+# so101_description's URDF in public-peppy-libs, the repository this project
+# pins sim_robot_core in.
+_LIBS_URL = "https://raw.githubusercontent.com/Peppy-bot/public-peppy-libs"
+_URDF_IN_LIBS = "so101_description/src/so101_description/urdf/so101_kinematics.urdf"
+_USER_AGENT = "sim_isaac/tests/test_so101_stage.py"
+
+# The bundle is built on Linux x86_64, the platform of the Isaac image. MuJoCo
+# rounds what it compiles differently on another architecture, so only there
+# is the stage built here the bundle's byte for byte.
+_BUILDS_THE_BUNDLES_BYTES = sys.platform == "linux" and platform.machine() == "x86_64"
+
+
+def _fetch_pinned_urdf(directory: Path) -> Path:
+    """Stages so101_description's URDF at the public-peppy-libs commit this
+    project pins."""
+    project = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
+    commit = project["tool"]["uv"]["sources"]["sim_robot_core"]["rev"]
+    request = Request(
+        f"{_LIBS_URL}/{commit}/{_URDF_IN_LIBS}", headers={"User-Agent": _USER_AGENT}
+    )
+    with urlopen(request, timeout=120) as response:
+        data = response.read()
+    path = directory / Path(_URDF_IN_LIBS).name
+    path.write_bytes(data)
+    return path
+
+
+def _baked_stage() -> Optional[Path]:
+    """The stage the base image bakes, where the assets directory holds one."""
+    assets = os.environ.get("PEPPY_ROBOT_ASSETS_DIR")
+    if not assets:
+        return None
+    path = Path(assets) / "so101" / build_so101.STAGE_FILENAME
+    return path if path.is_file() else None
+
 
 @pytest.fixture(scope="module")
-def urdf() -> Path:
-    value = os.environ.get("SO101_KINEMATICS_URDF")
-    if not value:
-        pytest.skip("SO101_KINEMATICS_URDF names so101_description's URDF (README, the SO-101 stage)")
-    return Path(value)
+def urdf(tmp_path_factory) -> Path:
+    named = os.environ.get("SO101_KINEMATICS_URDF")
+    if named:
+        return Path(named)
+    return _fetch_pinned_urdf(tmp_path_factory.mktemp("so101_description"))
 
 
 @pytest.fixture(scope="module")
-def stage(tmp_path_factory, urdf) -> Usd.Stage:
-    upstream = os.environ.get("SO101_UPSTREAM_MODEL")
-    if upstream:
-        output = tmp_path_factory.mktemp("so101_stage")
-        path = build_so101.build_stage(Path(upstream), urdf, output)
-    else:
-        assets = os.environ.get("PEPPY_ROBOT_ASSETS_DIR")
-        path = Path(assets) / "so101" / build_so101.STAGE_FILENAME if assets else None
-        if path is None or not path.is_file():
-            pytest.skip("SO101_UPSTREAM_MODEL names the staged upstream to build from, or PEPPY_ROBOT_ASSETS_DIR a baked stage")
-    return Usd.Stage.Open(str(path))
+def stage_path(tmp_path_factory, urdf) -> Path:
+    baked = _baked_stage()
+    if baked is not None:
+        return baked
+    staged = os.environ.get("SO101_UPSTREAM_MODEL")
+    model = Path(staged) if staged else tmp_path_factory.mktemp("so101_upstream") / "so101"
+    # Stages the model, or checks the one staged there against the lock.
+    so101_model.fetch(model)
+    return build_so101.build_stage(model, urdf, tmp_path_factory.mktemp("so101_stage"))
+
+
+@pytest.fixture(scope="module")
+def stage(stage_path) -> Usd.Stage:
+    return Usd.Stage.Open(str(stage_path))
 
 
 def _matrix(pos, quat_wxyz) -> np.ndarray:
@@ -101,11 +155,22 @@ def tool_frame_in_world(stage: Usd.Stage, positions: dict[str, float]) -> np.nda
     return world["gripper_link"] @ _local(tool)
 
 
+def urdf_chain(urdf: Path) -> mujoco.MjModel:
+    """The URDF's links and joints as MuJoCo compiles them, without the
+    shapes of its links: a shape names a mesh file beside the URDF, and this
+    suite reads the URDF alone."""
+    robot = ET.parse(urdf).getroot()
+    for link in robot.findall("link"):
+        for shape in link.findall("collision") + link.findall("visual"):
+            link.remove(shape)
+    return mujoco.MjModel.from_xml_string(ET.tostring(robot, encoding="unicode"))
+
+
 def urdf_tool_frame_in_world(urdf: Path, positions: dict[str, float]) -> np.ndarray:
     """The URDF's gripper_frame_link for the same joint positions. MuJoCo
     fuses the fixed link into gripper_link, so its fixed joint is composed
     onto that body's pose."""
-    model = mujoco.MjModel.from_xml_path(str(urdf))
+    model = urdf_chain(urdf)
     data = mujoco.MjData(model)
     for name, position in positions.items():
         data.qpos[model.joint(name).qposadr[0]] = position
@@ -114,6 +179,20 @@ def urdf_tool_frame_in_world(urdf: Path, positions: dict[str, float]) -> np.ndar
     _, tool = build_so101.read_urdf(urdf)
     fixed = _matrix(tool.xyz, build_so101.quat_from_rpy(tool.rpy))
     return _matrix(data.xpos[body], data.xquat[body]) @ fixed
+
+
+@pytest.mark.skipif(
+    not _BUILDS_THE_BUNDLES_BYTES,
+    reason="the bundle is built on Linux x86_64, and MuJoCo rounds differently elsewhere",
+)
+def test_the_stage_is_the_one_the_pinned_bundle_holds(stage_path):
+    """isaac_assets.env pins the bundle the image bakes and the digest of the
+    stage in it, and download_assets.sh refuses a bundle whose stage is
+    another. A change of the builder, of the model's lock, of the description
+    or of the mujoco pin that moves the stage fails here until the bundle is
+    built and pinned again (README, the SO-101 stage)."""
+    pins = (IMAGES_DIR / "isaac_assets.env").read_text()
+    assert build_so101.sha256(stage_path) == shell_value(pins, "SO101_STAGE_SHA256")
 
 
 def test_the_links_are_the_urdfs(stage):
