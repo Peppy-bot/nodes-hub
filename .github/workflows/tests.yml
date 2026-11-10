@@ -201,8 +201,10 @@ jobs:
     # lerobot's, torch included. The sticky disk keeps warm runs far under
     # this, but a run that starts from an empty disk is legitimately slow.
     # So is the first run after a base image moves: each test image names its
-    # base image by digest, so that run builds all of them again (19 images
-    # took 35 minutes on 2026-11-10, on top of a 93-minute warm run).
+    # base image by digest, so that run builds all of them again. On
+    # 2026-11-10 that run built 19 test images in 42 minutes on top of a
+    # 93-minute warm run; one image took 23 of those minutes, as its packages
+    # came from a slow archive.ubuntu.com host.
     timeout-minutes: 180
     permissions:
       contents: read
