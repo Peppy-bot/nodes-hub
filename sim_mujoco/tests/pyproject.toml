@@ -39,5 +39,5 @@ dev = ["pytest>=8"]
 package = false
 
 [tool.uv.sources]
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "cf7ba6cd87f46cc941aeeb876f8af23f73e90336" }
-so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", rev = "cf7ba6cd87f46cc941aeeb876f8af23f73e90336" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "e4222a3bf8e48d6dac01b8b6a3f693a823ce6626" }
+so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", rev = "e4222a3bf8e48d6dac01b8b6a3f693a823ce6626" }
