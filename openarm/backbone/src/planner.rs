@@ -489,6 +489,9 @@ impl Planner {
 
     /// Produce this tick's candidate setpoint: admit a pending goal, advance the
     /// active mode to a joint target, then chase it under the velocity limits.
+    /// A pending goal that a stop came before, after its admission
+    /// ([`MoveSlot::take_stop`]), does not start: it ends cancelled for the
+    /// stop's reason, reporting `measured_q`, and frees its move slot.
     ///
     /// A streamed tick also carries the end-effector Jacobians of its step: the
     /// governor's EE-speed limiter caps a streamed hand, and this is the one place
@@ -505,7 +508,10 @@ impl Planner {
         let mut mode = std::mem::replace(&mut self.mode, Mode::Follow);
         // Drain fully: every queued goal is answered, never left parked.
         while let Ok(goal) = goals.try_recv() {
-            if matches!(mode, Mode::Follow) {
+            if let Some(reason) = move_slot.take_stop() {
+                let _release = move_slot.release_on_drop();
+                goal.stop(&reason, Ok(measured_q), self).await;
+            } else if matches!(mode, Mode::Follow) {
                 mode = self
                     .start_goal(goal, move_slot.release_on_drop(), now)
                     .await;
@@ -1019,6 +1025,29 @@ mod tests {
         assert!(!move_slot.is_claimed(), "the failure releases the slot");
         // With nothing active the failure is a no-op.
         planner.fail_active(stale).await;
+    }
+
+    /// A goal that a stop came before, after its admission, does not start:
+    /// it ends cancelled for the stop's reason, the arm holds its setpoint,
+    /// and the goal frees the slot.
+    #[tokio::test]
+    async fn a_stop_since_its_admission_ends_a_goal_before_it_starts() {
+        let held = [0.0; ARM_DOF];
+        let mut planner = test_planner(held);
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        let (goal_tx, mut goals) = mpsc::channel(1);
+        let move_slot = claimed_move_slot();
+        move_slot.stop_unstarted("stopped: operator");
+        goal_tx
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .await
+            .expect("queue the goal");
+        let now = Instant::now();
+        let tick = planner.tick(held, None, &mut goals, &move_slot, now).await;
+        let outcome = done_rx.recv().await.expect("the stopped goal reports");
+        assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
+        assert_eq!(tick.candidate, held, "no move starts");
+        assert!(!move_slot.is_claimed(), "the stopped goal frees the slot");
     }
 
     /// A stop ends the move cancelled for its reason. The arm holds the

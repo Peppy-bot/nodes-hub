@@ -332,9 +332,11 @@ fn spawn_right_arm_follower_off_by(
 const LAGGING_GRIPPER_STEP: f64 = 0.01;
 
 /// Jaw travel per [`STATE_PUMP_PERIOD`] of a gripper follower whose jaws
-/// take 0.2 s from fully open to closed: a close of such a gripper ends
-/// well inside its settle timeout.
-const BRISK_GRIPPER_STEP: f64 = 0.05;
+/// stand on the latest setpoint at each state it publishes: the whole jaw
+/// travel. The jaws of such a gripper stand where the backbone commanded
+/// them as its commanded travel ends, so where a close leaves them does not
+/// depend on how fast the host runs.
+const PROMPT_GRIPPER_STEP: f64 = 1.0;
 
 /// One gripper setpoint as the follower receives it: the opening fraction
 /// and the effort cap.
@@ -345,15 +347,22 @@ struct GripperSetpoint {
 }
 
 /// A gripper played by [`spawn_gripper_follower`]: the opening it publishes,
-/// the opening of the last setpoint it received, and every setpoint it
-/// received, in order.
+/// the opening of the last setpoint it received, every setpoint it
+/// received, in order, and whether it stopped reporting.
 struct GripperFollower {
     jaws: watch::Receiver<f64>,
     commanded: watch::Receiver<f64>,
     received: Arc<Mutex<Vec<GripperSetpoint>>>,
+    silent: Arc<AtomicBool>,
 }
 
 impl GripperFollower {
+    /// Stop reporting: from now on the gripper publishes no state, as a
+    /// gripper whose motor faulted. It still records the setpoints it gets.
+    fn stop_reporting(&self) {
+        self.silent.store(true, Ordering::SeqCst);
+    }
+
     /// How many setpoints the gripper received so far.
     fn received_count(&self) -> usize {
         self.received
@@ -402,7 +411,8 @@ impl GripperFollower {
 /// is published on `$states` as the measured state, a `$message`. An object
 /// between the jaws stops them at `$object_at`, the opening they cannot
 /// close past (0.0 for no object). It starts half open like the static
-/// gripper pumps, and records every setpoint it receives.
+/// gripper pumps, and records every setpoint it receives. It publishes no
+/// state once the test makes it stop reporting.
 macro_rules! spawn_gripper_follower {
     ($states:expr, $setpoints:expr, $message:path, $step:expr, $object_at:expr) => {{
         let states = $states;
@@ -414,6 +424,8 @@ macro_rules! spawn_gripper_follower {
         let (commanded_tx, commanded_opening) = watch::channel(opening);
         let received = Arc::new(Mutex::new(Vec::new()));
         let record = received.clone();
+        let silent = Arc::new(AtomicBool::new(false));
+        let silenced = silent.clone();
         tokio::spawn(async move {
             if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
                 return;
@@ -423,6 +435,9 @@ macro_rules! spawn_gripper_follower {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        if silenced.load(Ordering::SeqCst) {
+                            continue;
+                        }
                         use $message as message;
                         let remaining: f64 = commanded - opening;
                         let next = if remaining.abs() <= step {
@@ -461,6 +476,7 @@ macro_rules! spawn_gripper_follower {
             jaws,
             commanded: commanded_opening,
             received,
+            silent,
         }
     }};
 }
@@ -2161,7 +2177,7 @@ async fn move_to_ready_sends_the_grippers_no_command() -> peppygen::Result<()> {
 /// of both grippers are closed.
 async fn home_closes_fully_open_grippers(parameters: peppygen::Parameters) -> peppygen::Result<()> {
     let (mut harness, followers) =
-        start_with_every_follower(parameters, BRISK_GRIPPER_STEP, 0.0).await?;
+        start_with_every_follower(parameters, PROMPT_GRIPPER_STEP, 0.0).await?;
 
     complete_posture!(harness, move_to_ready, 0.0);
     for (gripper_name, gripper) in followers.grippers() {
@@ -2201,28 +2217,129 @@ async fn move_to_home_closes_fully_open_grippers_on_an_openarm_v2() -> peppygen:
     home_closes_fully_open_grippers(v2_params()).await
 }
 
-/// A gripper that holds an item closes on it, and the arms go home with it.
-/// Here an object stops the left jaws at 0.3 on their way to closed:
+/// A gripper that holds an item closes on it, and the arms go home with it,
+/// on the robot that `parameters` name. Here a grasp under an effort cap of
+/// 0.4 holds an object that stops the left jaws at 0.3:
 /// - move_to_home completes with both arms at Home;
-/// - the left jaws stand on the object, and the last opening that the
-///   gripper got is closed, so it keeps squeezing the object.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn move_to_home_closes_on_an_item_and_the_arms_go_home_with_it() -> peppygen::Result<()> {
+/// - the left jaws stand on the object, and the last setpoint that the
+///   gripper got is closed under the cap of the grasp, so it keeps squeezing
+///   the object as the grasp did;
+/// - every setpoint of the close of the left gripper carries that cap.
+async fn home_closes_on_an_item(parameters: peppygen::Parameters) -> peppygen::Result<()> {
+    const GRASP_EFFORT: f64 = 0.4;
+    const OBJECT_AT: f64 = 0.3;
     let (mut harness, followers) =
-        start_with_every_follower(params(), BRISK_GRIPPER_STEP, 0.3).await?;
+        start_with_every_follower(parameters, PROMPT_GRIPPER_STEP, OBJECT_AT).await?;
+    let held = &followers.left_gripper;
 
     complete_posture!(harness, move_to_ready, 0.0);
+    let grasp = complete_gripper_move_within(
+        &harness,
+        "left_gripper",
+        0.0,
+        GRASP_EFFORT,
+        GRIPPER_SETTLE_TIMEOUT_S,
+    )
+    .await?;
+    assert!(grasp.settled, "{grasp:?}");
+    assert_eq!(grasp.final_opening, OBJECT_AT);
+    let after_grasp = held.received_count();
+
     complete_posture!(harness, move_to_home, 0.0);
     snapshot_with_both_arms_at(&mut harness, openarm_description::home).await?;
     followers.right_gripper.jaws_at(0.0).await;
-    assert_eq!(*followers.left_gripper.jaws.borrow(), 0.3);
+    assert_eq!(*held.jaws.borrow(), OBJECT_AT);
+    let close = held.received_since(after_grasp);
+    assert!(!close.is_empty(), "the close sent the gripper no setpoint");
+    for setpoint in &close {
+        assert_eq!(setpoint.max_effort, GRASP_EFFORT, "{setpoint:?}");
+    }
     assert_eq!(
-        followers
-            .left_gripper
-            .last_received()
-            .map(|setpoint| setpoint.opening),
-        Some(0.0)
+        held.last_received(),
+        Some(GripperSetpoint {
+            opening: 0.0,
+            max_effort: GRASP_EFFORT,
+        })
     );
+    harness.shutdown().await
+}
+
+/// See [`home_closes_on_an_item`], on an openarm_v1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_to_home_closes_on_an_item_and_the_arms_go_home_with_it() -> peppygen::Result<()> {
+    home_closes_on_an_item(params()).await
+}
+
+/// See [`home_closes_on_an_item`], on an openarm_v2, whose governor holds
+/// the arms short of Home while the jaws are fully open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_to_home_closes_on_an_item_on_an_openarm_v2() -> peppygen::Result<()> {
+    home_closes_on_an_item(v2_params()).await
+}
+
+/// move_to_home parks the arms of a robot whose gripper stopped reporting.
+/// Here the right gripper goes silent, half open, with both arms at Ready:
+/// - once the backbone refuses a move of that gripper for its missing
+///   state, move_to_home completes with both arms at Home;
+/// - the silent gripper gets no setpoint, and the left gripper is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn move_to_home_parks_the_arms_of_a_robot_whose_gripper_stopped_reporting()
+-> peppygen::Result<()> {
+    let (harness, followers) =
+        start_with_every_follower(params(), PROMPT_GRIPPER_STEP, 0.0).await?;
+    complete_posture!(harness, move_to_ready, 0.0);
+
+    let silent = &followers.right_gripper;
+    silent.stop_reporting();
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let goal = move_gripper::send_goal(
+            &harness,
+            &move_gripper::GoalRequestData {
+                gripper_name: "right_gripper".to_string(),
+                opening: 0.5,
+                max_effort: 0.0,
+                settle_timeout_s: GRIPPER_SETTLE_TIMEOUT_S,
+            },
+            peppygen::DEFAULT_FEEDBACK_BOUND,
+            DEADLINE,
+        )
+        .await?;
+        if let Some(refusal) = &goal.refusal {
+            assert_eq!(
+                refusal.message, "no fresh gripper state to anchor the move from",
+                "{refusal:?}"
+            );
+            break;
+        }
+        goal.get_result(DEADLINE).await?;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the backbone never missed the state of the silent gripper"
+        );
+    }
+    let before_home = silent.received_count();
+
+    let home = complete_posture!(harness, move_to_home, 0.0);
+    assert_eq!(home.arm_names, ["left_arm", "right_arm"]);
+    for (arm, side) in followers.arms().into_iter().zip([
+        openarm_description::Side::Left,
+        openarm_description::Side::Right,
+    ]) {
+        let last = arm.received().pop().expect("the arm got a setpoint");
+        assert_all_close(
+            "the last arm setpoint",
+            &last,
+            &openarm_description::home(side),
+            1e-9,
+        );
+    }
+    assert_eq!(
+        silent.received_since(before_home),
+        [],
+        "the silent gripper got a setpoint"
+    );
+    followers.left_gripper.jaws_at(0.0).await;
     harness.shutdown().await
 }
 

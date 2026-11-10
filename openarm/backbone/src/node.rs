@@ -495,24 +495,24 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let posture_arms = actions::postures::Limbs {
             goal_txs,
             move_slots,
-            fresh: fresh.clone(),
             activity: arm_activity.clone(),
         };
         let posture_grippers = actions::postures::Limbs {
             goal_txs: gripper_goal_txs.clone(),
             move_slots: gripper_move_slots.clone(),
-            fresh: gripper_fresh.clone(),
             activity: gripper_activity.clone(),
         };
         set.spawn(actions::postures::run_move_to_ready(
             runner.clone(),
             posture_arms.clone(),
+            fresh.clone(),
             None,
             request_tx.clone(),
         ));
         set.spawn(actions::postures::run_move_to_home(
             runner.clone(),
             posture_arms,
+            fresh.clone(),
             Some(posture_grippers),
             request_tx.clone(),
         ));

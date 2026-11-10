@@ -3,6 +3,7 @@ covering the teleop path, the relays, the action surface and the workspace
 services end to end."""
 
 import asyncio
+import contextlib
 import math
 import re
 import time
@@ -577,13 +578,52 @@ async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
                 feeder.cancel()
 
 
+@contextlib.asynccontextmanager
+async def obedient_follower(h, positions, opening):
+    """Play a follower that stands on each setpoint it takes, from
+    `positions` and `opening`, and measures the arm and the gripper there.
+    Gives the setpoints it took, in the order it took them, each as
+    ("arm", positions) or ("gripper", opening). The node holds the
+    follower's state once this is entered."""
+    stands = {"positions": list(positions), "opening": opening}
+    taken = []
+
+    async def measure():
+        while True:
+            await publish_measured(h, stands["positions"], stands["opening"])
+            await asyncio.sleep(0.01)
+
+    async def take_arm_setpoints():
+        while True:
+            setpoint = await h.mocks.pairings.arm.joint_setpoints.next()
+            stands["positions"] = list(setpoint.positions)
+            taken.append(("arm", stands["positions"]))
+
+    async def take_gripper_setpoints():
+        while True:
+            setpoint = await h.mocks.pairings.gripper.gripper_setpoints.next()
+            stands["opening"] = setpoint.opening
+            taken.append(("gripper", setpoint.opening))
+
+    tasks = [
+        asyncio.create_task(play())
+        for play in (measure, take_arm_setpoints, take_gripper_setpoints)
+    ]
+    try:
+        await asyncio.wait_for(h.mocks.pairings.leader_arm.joint_states.next(), TIMEOUT_S)
+        await asyncio.wait_for(h.mocks.pairings.leader_gripper.gripper_states.next(), TIMEOUT_S)
+        yield taken
+    finally:
+        for task in tasks:
+            task.cancel()
+
+
 async def test_move_to_home_closes_the_gripper_before_the_arm_moves(follower_never_stale):
-    # The mocked follower measures the arm at Home and the gripper fully
-    # open, and never moves its jaws, as jaws that hold an item do: the close
-    # ends where they stand, and move_to_home completes.
+    # The mocked follower stands on each setpoint, from Ready with the
+    # gripper fully open. The goal completes once the arm stands at Home, so
+    # every setpoint that counts is taken when its result comes.
     async with harness.start(setup, parameters=make_parameters()) as h:
-        feeder = await feeding_measured(h, positions=postures.HOME_POSITIONS_RAD, opening=1.0)
-        try:
+        async with obedient_follower(h, postures.READY_POSITIONS_RAD, 1.0) as taken:
             goal = await move_to_home_fx.send_goal(
                 h,
                 move_to_home_prod.GoalRequestData(duration_s=0.0),
@@ -593,22 +633,20 @@ async def test_move_to_home_closes_the_gripper_before_the_arm_moves(follower_nev
             result = await goal.get_result(TIMEOUT_S)
             assert result.status == move_to_home_fx.ResultStatus.COMPLETED
             assert result.data.arm_names == ["arm"]
-            # The close ramps the gripper down from fully open: the last
-            # opening that went downstream is the closed one.
-            openings = []
-            while True:
-                try:
-                    setpoint = await asyncio.wait_for(
-                        h.mocks.pairings.gripper.gripper_setpoints.next(), 0.5
-                    )
-                except TimeoutError:
-                    break
-                openings.append(setpoint.opening)
+
+            limbs = [limb for limb, _setpoint in taken]
+            assert "arm" in limbs, "move_to_home sent the arm no setpoint"
+            arm_starts = limbs.index("arm")
+            assert "gripper" not in limbs[arm_starts:], "the arm moved before the close ended"
+            # The close ramps the gripper down from fully open to closed.
+            openings = [setpoint for limb, setpoint in taken if limb == "gripper"]
             assert openings, "move_to_home sent the gripper no opening"
             assert openings == sorted(openings, reverse=True)
             assert openings[-1] == 0.0
-        finally:
-            feeder.cancel()
+            # The arm then leaves Ready and stands at Home, within the
+            # tolerance of a posture move.
+            arm_setpoints = [setpoint for limb, setpoint in taken if limb == "arm"]
+            assert arm_setpoints[-1] == pytest.approx(postures.HOME_POSITIONS_RAD, abs=0.1)
 
 
 async def test_a_posture_the_arm_does_not_reach_fails_with_timeout(follower_never_stale):

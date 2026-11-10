@@ -4,17 +4,18 @@
 //! other DOF. Each tick the coordinator services each side here: a queued
 //! goal is admitted into a free side, and the move in flight ends once the
 //! jaws stand still from the planned end of the commanded travel on, at its
-//! settle timeout, on a cancel, or on a follower gone stale. The coordinator
-//! hands in the opening the governor published last tick
-//! ([`CommandedOpening`]) and the opening the follower measured
-//! ([`MeasuredOpening`]). The move holds its side's move slot until it ends.
+//! settle timeout, at its travel timeout when it has one, on a cancel, or on
+//! a follower gone stale. The coordinator hands in the opening the governor
+//! published last tick ([`CommandedOpening`]) and the opening the follower
+//! measured ([`MeasuredOpening`]). The move holds its side's move slot until
+//! it ends.
 
 use std::time::{Duration, Instant};
 
 use openarm_description::Side;
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::liveness::Admission;
@@ -29,29 +30,67 @@ const CLOSED_OPENING: f64 = 0.0;
 /// settle timeout of an arm's share of a posture goal.
 const CLOSE_SETTLE_TIMEOUT: Duration = POSTURE_SETTLE.timeout;
 
+/// The longest the commanded travel of the close of a gripper for a
+/// `move_to_home` goal may take. The operator sets the opening rate while the
+/// robot runs, down to a rate at which the jaws take 100 s to close. With
+/// [`CLOSE_SETTLE_TIMEOUT`] this bounds the close at 10 s, the time the
+/// postures contract gives it, so a caller that waits for the longest arm
+/// move and the close waits long enough.
+const CLOSE_TRAVEL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The effort cap a gripper goal relays to the follower.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EffortCap {
+    /// The cap the goal names, validated non-negative, or `None` when the
+    /// goal carried no preference, which leaves the follower's configured
+    /// ceiling in charge.
+    Named(Option<f64>),
+    /// The cap of the last setpoint the gripper got, from a move or from a
+    /// leader: the goal changes the opening and keeps the effort, so a grasp
+    /// keeps the effort its caller gave it.
+    Kept,
+}
+
+impl EffortCap {
+    /// The cap to relay, `kept` being the cap of the last setpoint the
+    /// gripper got.
+    pub fn relayed(self, kept: Option<f64>) -> Option<f64> {
+        match self {
+            Self::Named(cap) => cap,
+            Self::Kept => kept,
+        }
+    }
+}
+
 /// An accepted gripper goal handed to the coordinator, which executes it
 /// through the same per-tick governing as everything else (the gripper analog of
 /// [`Goal`](crate::planner::Goal) for the arms). The opening is the validated
-/// goal fraction; the effort cap is validated non-negative, `None` when the
-/// goal carried no preference.
+/// goal fraction.
 pub struct GripperGoal {
     pub opening: f64,
-    pub max_effort: Option<f64>,
+    pub effort: EffortCap,
     /// The longest the move waits, after the planned end of the commanded
     /// travel, for the jaws to stand still.
     pub settle_timeout: Duration,
+    /// The longest the commanded travel may take from the admission of the
+    /// move, or `None` for a move that travels as long as the opening rate
+    /// makes it.
+    pub travel_timeout: Option<Duration>,
     pub reply: GripperReply,
 }
 
 impl GripperGoal {
     /// The close of the gripper on `side` for a `move_to_home` goal, which
-    /// `share` reports to: to [`CLOSED_OPENING`] under the follower's
-    /// configured effort ceiling, settling within [`CLOSE_SETTLE_TIMEOUT`].
+    /// `share` reports to: to [`CLOSED_OPENING`] under the effort cap of the
+    /// last setpoint the gripper got, its travel ending within
+    /// [`CLOSE_TRAVEL_TIMEOUT`] and its jaws settling within
+    /// [`CLOSE_SETTLE_TIMEOUT`].
     pub fn close(side: Side, share: PostureShare) -> Self {
         Self {
             opening: CLOSED_OPENING,
-            max_effort: None,
+            effort: EffortCap::Kept,
             settle_timeout: CLOSE_SETTLE_TIMEOUT,
+            travel_timeout: Some(CLOSE_TRAVEL_TIMEOUT),
             reply: GripperReply::Close { side, share },
         }
     }
@@ -60,6 +99,22 @@ impl GripperGoal {
     /// caller's concern.
     pub async fn fail(self, failure: Failure) {
         self.reply.fail(failure).await;
+    }
+
+    /// End unstarted on a follower that delivers no fresh state. A
+    /// `move_gripper` goal fails with the failure of a stale limb. The close
+    /// of a `move_to_home` goal completes with no command sent: the goal
+    /// leaves a gripper it cannot see as it stands, so a robot with a silent
+    /// gripper still parks its arms. The move slot is the caller's concern.
+    pub async fn end_on_stale_follower(self) {
+        match self.reply {
+            GripperReply::MoveGripper(ctx) => fail_gripper_goal(&ctx, stale_failure()).await,
+            GripperReply::Close { side, share } => {
+                let gripper = side.gripper_name();
+                warn!("move_to_home: {gripper} reports no state and gets no close");
+                share.report(gripper, Outcome::Complete).await;
+            }
+        }
     }
 
     /// End unstarted as cancelled by the stop service, for `reason`, which
@@ -94,9 +149,9 @@ impl GripperReply {
     /// gripper measured then, and `elapsed_s`, the time since its admission.
     /// A `move_gripper` goal that completes or ends cancelled reports them
     /// as `final_opening` and `action_time`, and `settled` true only when
-    /// the jaws stood still; a follower gone stale fails it with no result.
-    /// A close reports its [`Outcome`] to its `move_to_home` goal, and no
-    /// opening.
+    /// the jaws stood still; a follower gone stale, or a travel that ran out
+    /// of its timeout, fails it with no result. A close reports its
+    /// [`Outcome`] to its `move_to_home` goal, and no opening.
     async fn finish(self, terminal: GripperTerminal, measured_frac: f64, elapsed_s: f64) {
         let ctx = match self {
             Self::MoveGripper(ctx) => ctx,
@@ -111,6 +166,9 @@ impl GripperReply {
             GripperTerminal::SettleTimedOut => ctx.complete(false, measured_frac, elapsed_s).await,
             GripperTerminal::FollowerStale => {
                 return fail_gripper_goal(&ctx, stale_failure()).await;
+            }
+            GripperTerminal::TravelTimedOut(timeout) => {
+                return fail_gripper_goal(&ctx, travel_timeout_failure(timeout)).await;
             }
             GripperTerminal::Cancelled(reason) => {
                 ctx.complete_cancelled(reason, false, measured_frac, elapsed_s)
@@ -138,15 +196,33 @@ impl GripperReply {
 /// How the close of a gripper ends for its `move_to_home` goal. The close
 /// completes as a gripper move of limb_motion completes: once the jaws stand
 /// still, closed or on an item that they hold, and at the settle timeout,
-/// where they stand.
+/// where they stand. It fails when its follower goes stale, and when its
+/// commanded travel runs out of its timeout.
 impl From<GripperTerminal> for Outcome {
     fn from(terminal: GripperTerminal) -> Self {
         match terminal {
             GripperTerminal::Settled | GripperTerminal::SettleTimedOut => Self::Complete,
             GripperTerminal::FollowerStale => Self::Failed(stale_failure()),
+            GripperTerminal::TravelTimedOut(timeout) => {
+                Self::Failed(travel_timeout_failure(timeout))
+            }
             GripperTerminal::Cancelled(reason) => Self::Cancelled(reason),
         }
     }
+}
+
+/// The failure of a gripper move whose commanded travel did not end within
+/// `timeout`, its travel timeout.
+fn travel_timeout_failure(timeout: Duration) -> Failure {
+    Failure::new(
+        FailureKind::Timeout,
+        format!(
+            "the commanded travel of the jaws did not end within {} s: the opening rate \
+             (max_gripper_rate_frac_s) is too low for the move, or the collision guard slows \
+             the jaws",
+            timeout.as_secs_f64()
+        ),
+    )
 }
 
 /// Fail a `move_gripper` goal with `failure`, with no result.
@@ -163,7 +239,7 @@ async fn fail_gripper_goal(ctx: &move_gripper::GoalContext, failure: Failure) {
 /// the slot on any exit.
 pub struct GripperMove {
     motion: GripperMotion,
-    max_effort: Option<f64>,
+    effort: EffortCap,
     reply: GripperReply,
     _move_slot: SlotRelease,
 }
@@ -174,18 +250,18 @@ impl GripperMove {
         self.motion.target_frac
     }
 
-    /// The effort cap the move relays, `None` for no preference.
-    pub fn max_effort(&self) -> Option<f64> {
-        self.max_effort
+    /// The effort cap the move relays.
+    pub fn effort(&self) -> EffortCap {
+        self.effort
     }
 }
 
 /// What a gripper move's terminal is decided from (see
 /// [`gripper_move_terminal`]): the target, when it was admitted, the planned
-/// end of the commanded travel, the goal's settle timeout, and the run of
-/// openings the jaws are judged still on. The commanded opening ramps to the
-/// target through the governor at the opening rate the operator sets, re-read
-/// every tick, and holds it while the jaws follow.
+/// end of the commanded travel, the goal's settle and travel timeouts, and
+/// the run of openings the jaws are judged still on. The commanded opening
+/// ramps to the target through the governor at the opening rate the operator
+/// sets, re-read every tick, and holds it while the jaws follow.
 #[derive(Clone, Copy, Debug)]
 struct GripperMotion {
     target_frac: f64,
@@ -194,6 +270,9 @@ struct GripperMotion {
     /// or held by the collision guard. `None` while it travels.
     planned_end: Option<Instant>,
     settle_timeout: Duration,
+    /// The longest the commanded travel may take from the admission, or
+    /// `None` for no bound.
+    travel_timeout: Option<Duration>,
     /// The latest run of openings the follower delivered since admission
     /// that lie within [`GRIPPER_STILL_BAND`] of one another. `None` before
     /// the first.
@@ -241,15 +320,24 @@ const GRIPPER_STILL_BAND: f64 = 0.01;
 const GRIPPER_STILL_WINDOW: Duration = Duration::from_millis(250);
 
 impl GripperMotion {
-    /// A move to `target_frac` admitted at `now`.
+    /// A move to `target_frac` admitted at `now`, whose commanded travel no
+    /// timeout bounds.
     fn new(target_frac: f64, settle_timeout: Duration, now: Instant) -> Self {
         Self {
             target_frac,
             admitted: now,
             planned_end: None,
             settle_timeout,
+            travel_timeout: None,
             still: None,
         }
+    }
+
+    /// Whether the commanded travel, which still runs at `now`, ran out of
+    /// the move's travel timeout, and that timeout.
+    fn travel_timed_out(&self, now: Instant) -> Option<Duration> {
+        self.travel_timeout
+            .filter(|timeout| now.duration_since(self.admitted) >= *timeout)
     }
 
     /// Note the opening the governor published last tick, and return the
@@ -335,6 +423,9 @@ pub enum GripperTerminal {
     /// The follower stopped reporting; the move fails with
     /// `resource_unavailable`.
     FollowerStale,
+    /// The commanded travel did not end within the move's travel timeout,
+    /// this long; the move fails with `timeout`.
+    TravelTimedOut(Duration),
     /// The goal was cancelled, for this reason: by its caller, or by the
     /// stop service, whose reason names the stop.
     Cancelled(String),
@@ -346,9 +437,11 @@ pub enum GripperTerminal {
 ///
 /// A cancel, `cancel` giving its reason, ends the move ahead of any other
 /// verdict of the same tick, and a follower gone stale fails it: the move
-/// can neither progress nor be verified. Nothing else is judged while the commanded travel runs
+/// can neither progress nor be verified. While the commanded travel runs
 /// ([`GripperMotion::travel_end`], fed `commanded`, the opening the governor
-/// published last tick). From the planned end on the move completes as soon
+/// published last tick), only the travel timeout of the move is judged, and
+/// a travel that ran out of it fails the move
+/// ([`GripperMotion::travel_timed_out`]). From the planned end on the move completes as soon
 /// as the openings delivered since it stand still, and at the latest once its
 /// settle timeout has passed, where the jaws stand: a gripper move never fails
 /// on its settle, since a grasp is expected to stop short of the target. An
@@ -368,7 +461,11 @@ fn gripper_move_terminal(
     if admission == Admission::Stale {
         return Some(GripperTerminal::FollowerStale);
     }
-    let planned_end = motion.travel_end(commanded, now)?;
+    let Some(planned_end) = motion.travel_end(commanded, now) else {
+        return motion
+            .travel_timed_out(now)
+            .map(GripperTerminal::TravelTimedOut);
+    };
     if measured.fresh && motion.stands_still(measured.frac, now) {
         return Some(GripperTerminal::Settled);
     }
@@ -376,14 +473,18 @@ fn gripper_move_terminal(
     (since_end >= motion.settle_timeout).then_some(GripperTerminal::SettleTimedOut)
 }
 
-/// Admit a queued gripper goal into a free side, failing it while the
-/// follower is stale or another gripper move is in flight, and end an
-/// in-flight move on the terminal [`gripper_move_terminal`] decides.
-/// `commanded` is the opening the governor published last tick and whether
-/// the guard held it. A terminal with a result reports the opening measured
-/// that tick as `final_opening` and the time since admission as
-/// `action_time`. A goal failed on a stale follower releases the move slot
-/// its admission claimed, and the move releases it on every end.
+/// Admit a queued gripper goal into a free side, and end an in-flight move
+/// on the terminal [`gripper_move_terminal`] decides. A queued goal does not
+/// start, and frees the move slot its admission claimed:
+/// - after a stop that came since its admission ([`MoveSlot::take_stop`]):
+///   it ends cancelled for the stop's reason;
+/// - while the follower is stale ([`GripperGoal::end_on_stale_follower`]).
+///
+/// A goal that finds another gripper move in flight fails. `commanded` is
+/// the opening the governor published last tick and whether the guard held
+/// it. A terminal with a result reports the opening measured that tick as
+/// `final_opening` and the time since admission as `action_time`. The move
+/// releases the move slot on every end.
 pub async fn service_gripper_move(
     mv: &mut Option<GripperMove>,
     goals: &mut mpsc::Receiver<GripperGoal>,
@@ -395,13 +496,19 @@ pub async fn service_gripper_move(
 ) {
     // Drain fully: every queued goal is answered, never left parked.
     while let Ok(goal) = goals.try_recv() {
-        if admission == Admission::Stale {
+        if let Some(reason) = move_slot.take_stop() {
             let _release = move_slot.release_on_drop();
-            goal.fail(stale_failure()).await;
+            goal.stop(&reason, measured.frac).await;
+        } else if admission == Admission::Stale {
+            let _release = move_slot.release_on_drop();
+            goal.end_on_stale_follower().await;
         } else if mv.is_none() {
             *mv = Some(GripperMove {
-                motion: GripperMotion::new(goal.opening, goal.settle_timeout, now),
-                max_effort: goal.max_effort,
+                motion: GripperMotion {
+                    travel_timeout: goal.travel_timeout,
+                    ..GripperMotion::new(goal.opening, goal.settle_timeout, now)
+                },
+                effort: goal.effort,
                 reply: goal.reply,
                 _move_slot: move_slot.release_on_drop(),
             });
@@ -860,11 +967,92 @@ mod tests {
         .await;
     }
 
+    /// A close keeps the effort cap of the last setpoint its gripper got,
+    /// and the whole of it takes at most 10 s: 8 s of commanded travel and
+    /// 2 s for the jaws to stand still.
     #[test]
-    fn a_close_goes_to_a_closed_gripper_under_no_effort_cap() {
+    fn a_close_goes_to_a_closed_gripper_and_keeps_its_effort_cap() {
         let (goal, _ends, _cancelled) = left_close();
-        assert_eq!((goal.opening, goal.max_effort), (0.0, None));
+        assert_eq!((goal.opening, goal.effort), (0.0, EffortCap::Kept));
         assert_eq!(goal.settle_timeout, Duration::from_secs(2));
+        assert_eq!(goal.travel_timeout, Some(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn a_kept_effort_cap_relays_the_cap_of_the_last_setpoint() {
+        for kept in [None, Some(0.4)] {
+            assert_eq!(EffortCap::Kept.relayed(kept), kept);
+            assert_eq!(EffortCap::Named(Some(1.5)).relayed(kept), Some(1.5));
+            assert_eq!(EffortCap::Named(None).relayed(kept), None);
+        }
+    }
+
+    #[test]
+    fn a_travel_that_runs_out_of_its_timeout_fails_the_move() {
+        // The operator set an opening rate at which the jaws need 50 s: the
+        // commanded opening still travels when the timeout runs out.
+        let start = Instant::now();
+        let timeout = Duration::from_secs(8);
+        let mut motion = GripperMotion {
+            travel_timeout: Some(timeout),
+            ..GripperMotion::new(0.0, MOVE_TIMEOUT, start)
+        };
+        let ends = |m: &mut GripperMotion, commanded, now| {
+            gripper_move_terminal(m, commanded, fresh(0.5), Admission::Live, None, now)
+        };
+        assert_eq!(ends(&mut motion, free(0.49), start + ms(1000)), None);
+        assert_eq!(
+            ends(&mut motion, free(0.43), start + timeout - ms(1)),
+            None,
+            "the travel has its whole timeout"
+        );
+        assert_eq!(
+            ends(&mut motion, free(0.42), start + timeout),
+            Some(GripperTerminal::TravelTimedOut(timeout))
+        );
+    }
+
+    #[test]
+    fn a_travel_that_ends_within_its_timeout_is_judged_on_its_settle_alone() {
+        // The commanded opening lands just inside the travel timeout, and the
+        // jaws then have the whole settle timeout to stand still.
+        let start = Instant::now();
+        let timeout = Duration::from_secs(8);
+        let mut motion = GripperMotion {
+            travel_timeout: Some(timeout),
+            ..GripperMotion::new(0.0, MOVE_TIMEOUT, start)
+        };
+        let ends = |m: &mut GripperMotion, measured: f64, now| {
+            gripper_move_terminal(m, free(0.0), fresh(measured), Admission::Live, None, now)
+        };
+        let landed = start + timeout - ms(10);
+        assert_eq!(ends(&mut motion, 0.3, landed), None);
+        assert_eq!(
+            ends(&mut motion, 0.2, start + timeout + ms(500)),
+            None,
+            "past the travel timeout, the jaws still settle"
+        );
+        assert_eq!(
+            ends(&mut motion, 0.1, landed + MOVE_TIMEOUT),
+            Some(GripperTerminal::SettleTimedOut)
+        );
+    }
+
+    #[test]
+    fn a_move_with_no_travel_timeout_travels_as_long_as_its_rate_makes_it() {
+        let start = Instant::now();
+        let mut motion = GripperMotion::new(MOVE_TARGET, MOVE_TIMEOUT, start);
+        assert_eq!(
+            gripper_move_terminal(
+                &mut motion,
+                free(0.9),
+                fresh(0.9),
+                Admission::Live,
+                None,
+                start + Duration::from_secs(3600)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -877,6 +1065,15 @@ mod tests {
         assert_eq!(
             Outcome::from(GripperTerminal::FollowerStale),
             Outcome::Failed(stale_failure())
+        );
+        assert_eq!(
+            Outcome::from(GripperTerminal::TravelTimedOut(Duration::from_secs(8))),
+            Outcome::Failed(Failure::new(
+                FailureKind::Timeout,
+                "the commanded travel of the jaws did not end within 8 s: the opening rate \
+                 (max_gripper_rate_frac_s) is too low for the move, or the collision guard \
+                 slows the jaws"
+            ))
         );
         assert_eq!(
             Outcome::from(GripperTerminal::Cancelled("stopped".to_string())),
@@ -898,7 +1095,10 @@ mod tests {
         let idle = CommandedOpening::idle(1.0);
         tick_close(&mut mv, &mut goals, &move_slot, idle, fresh(1.0), start).await;
         let closing = mv.as_ref().expect("the close starts");
-        assert_eq!((closing.target_frac(), closing.max_effort()), (0.0, None));
+        assert_eq!(
+            (closing.target_frac(), closing.effort()),
+            (0.0, EffortCap::Kept)
+        );
 
         let landed = start + ms(10);
         tick_close(
@@ -962,10 +1162,11 @@ mod tests {
         assert!(mv.is_none() && !move_slot.is_claimed());
     }
 
-    /// A close that reaches a stale follower fails with the failure of a
-    /// stale limb, led by the name of its gripper, and frees its gripper.
+    /// A close that reaches a stale follower starts no move and completes:
+    /// its goal leaves the gripper as it stands and goes on to the arms. It
+    /// frees its gripper.
     #[tokio::test]
-    async fn a_close_on_a_stale_follower_fails_naming_its_gripper() {
+    async fn a_close_that_reaches_a_stale_follower_completes_with_no_move() {
         let move_slot = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
         let (goal, mut ends, _cancelled) = left_close();
@@ -982,9 +1183,92 @@ mod tests {
             Instant::now(),
         )
         .await;
+        assert_eq!(ends.try_recv(), Ok(Outcome::Complete));
+        assert!(mv.is_none() && !move_slot.is_claimed());
+    }
+
+    /// A follower that goes stale during a close fails it with the failure
+    /// of a stale limb, led by the name of its gripper, and frees its
+    /// gripper.
+    #[tokio::test]
+    async fn a_follower_gone_stale_during_a_close_fails_it_naming_its_gripper() {
+        let move_slot = claimed_move_slot();
+        let (queue, mut goals) = mpsc::channel(1);
+        let (goal, mut ends, _cancelled) = left_close();
+        queue.try_send(goal).expect("queue the close");
+        let mut mv = None;
+        let start = Instant::now();
+
+        let idle = CommandedOpening::idle(1.0);
+        tick_close(&mut mv, &mut goals, &move_slot, idle, fresh(1.0), start).await;
+        assert!(mv.is_some(), "the close starts");
+        service_gripper_move(
+            &mut mv,
+            &mut goals,
+            &move_slot,
+            free(0.94),
+            stale_cached(1.0),
+            Admission::Stale,
+            start + ms(10),
+        )
+        .await;
         assert_eq!(
             ends.try_recv(),
             Ok(Outcome::Failed(stale_failure().labelled("left_gripper")))
+        );
+        assert!(mv.is_none() && !move_slot.is_claimed());
+    }
+
+    /// A close whose commanded travel runs out of its timeout fails with
+    /// `timeout`, led by the name of its gripper, and frees its gripper.
+    #[tokio::test]
+    async fn a_close_whose_travel_runs_out_of_its_timeout_fails_naming_its_gripper() {
+        let move_slot = claimed_move_slot();
+        let (queue, mut goals) = mpsc::channel(1);
+        let (goal, mut ends, _cancelled) = left_close();
+        queue.try_send(goal).expect("queue the close");
+        let mut mv = None;
+        let start = Instant::now();
+
+        let idle = CommandedOpening::idle(1.0);
+        tick_close(&mut mv, &mut goals, &move_slot, idle, fresh(1.0), start).await;
+        let travelling = free(0.92);
+        let timed_out = start + CLOSE_TRAVEL_TIMEOUT;
+        tick_close(
+            &mut mv,
+            &mut goals,
+            &move_slot,
+            travelling,
+            fresh(0.93),
+            timed_out,
+        )
+        .await;
+        let failure = travel_timeout_failure(CLOSE_TRAVEL_TIMEOUT).labelled("left_gripper");
+        assert_eq!(failure.kind, FailureKind::Timeout);
+        assert_eq!(ends.try_recv(), Ok(Outcome::Failed(failure)));
+        assert!(mv.is_none() && !move_slot.is_claimed());
+    }
+
+    /// A stop that came after the admission of a close, and before the
+    /// coordinator took it, ends the close cancelled for the stop's reason:
+    /// no move starts, and the close frees its gripper.
+    #[tokio::test]
+    async fn a_stop_since_its_admission_ends_a_close_before_it_starts() {
+        let move_slot = claimed_move_slot();
+        move_slot.stop_unstarted("stopped: the operator asked");
+        let (queue, mut goals) = mpsc::channel(1);
+        let (goal, mut ends, _cancelled) = left_close();
+        queue.try_send(goal).expect("queue the close");
+        let mut mv = None;
+
+        let idle = CommandedOpening::idle(1.0);
+        let now = Instant::now();
+        tick_close(&mut mv, &mut goals, &move_slot, idle, fresh(1.0), now).await;
+        assert_eq!(
+            ends.try_recv(),
+            Ok(Outcome::Cancelled(
+                "stopped: the operator asked".to_string()
+            ))
         );
         assert!(mv.is_none() && !move_slot.is_claimed());
     }
@@ -1061,8 +1345,9 @@ mod tests {
         let ctx = accepted.recv().await.expect("the node accepts the goal");
         let goal = GripperGoal {
             opening: MOVE_TARGET,
-            max_effort: None,
+            effort: EffortCap::Named(None),
             settle_timeout: MOVE_TIMEOUT,
+            travel_timeout: None,
             reply: GripperReply::MoveGripper(Box::new(ctx)),
         };
         (handle, goal)

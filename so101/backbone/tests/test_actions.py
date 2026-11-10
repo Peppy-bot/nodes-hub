@@ -844,13 +844,114 @@ def test_move_to_home_is_refused_as_a_gripper_goal_is_and_claims_nothing(followe
     )
     assert coordinator.try_claim_arm(), "the refusal claimed the arm"
 
-    # The gripper's follower delivers no state.
-    coordinator, layer = make_layer()
+    # The jaws ramp at 0.1 of their travel per second: from fully open the
+    # close travels for 10 s, past the 8 s its travel may take.
+    coordinator, layer = make_layer(max_gripper_rate_frac_s=0.1)
     coordinator.measured_joints.set(MEASURED)
+    coordinator.measured_gripper.set(1.0)
     with pytest.raises(Refusal) as raised:
         admit_home(layer)
-    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, GRIPPER_WORDS.no_fresh_state)
-    assert coordinator.try_claim_arm(), "the refusal claimed the arm"
+    assert refusal_of(raised) == (
+        FailureKind.REJECTED,
+        "the gripper takes 10.0 s to close at 0.1 of its travel per second, past the 8 s the "
+        "close of move_to_home may travel; raise max_gripper_rate_frac_s",
+    )
+    assert coordinator._gripper.plan is None
+    assert both_limbs_free(coordinator)
+
+    # The same jaws stand at 0.8: the close travels for 8 s, and runs.
+    coordinator, layer = make_layer(max_gripper_rate_frac_s=0.1)
+    coordinator.measured_joints.set(MEASURED)
+    coordinator.measured_gripper.set(0.8)
+    assert admit_home(layer).close is not None
+
+
+async def test_move_to_home_gives_a_gripper_with_no_fresh_state_no_close(follower_never_stale):
+    # The gripper's follower delivers no state: the goal claims the arm
+    # alone, sends the gripper no command, and moves the arm home.
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    coordinator.measured_joints.set(MEASURED)
+    move = admit_home(layer)
+    assert move.close is None
+    assert coordinator._gripper.plan is None
+    assert coordinator.try_claim_gripper(), "the goal claimed a gripper it does not close"
+    coordinator.release_gripper()
+    assert not coordinator.try_claim_arm()
+
+    ctx = FakeGoalContext()
+    drive = asyncio.create_task(layer.drive_home(ctx, move, kinematics))
+    plan = await installed_plan(coordinator)
+    assert plan.profile.end == HOME_POSITIONS_RAD
+    assert coordinator.gripper_tick(0.0) is None
+    coordinator.measured_joints.set(HOME_POSITIONS_RAD)
+    run_arm_plan_to_its_end(coordinator, plan)
+    await drive
+
+    position, orientation = kinematics.forward_kinematics(HOME_POSITIONS_RAD)
+    assert ctx.completed == (["arm"], list(position), list(orientation))
+    assert both_limbs_free(coordinator)
+
+
+def raising(error):
+    """A callable that raises `error` whatever it is called with."""
+
+    def call(*_args, **_kwargs):
+        raise error
+
+    return call
+
+
+@pytest.mark.parametrize(
+    ("broken", "message"),
+    [
+        ("_move_within_ceiling", "home move planning failed: ValueError('no trajectory')"),
+        ("adopt_arm_plan", "move_to_home goal failed: ValueError('no trajectory')"),
+    ],
+    ids=["planning", "install"],
+)
+async def test_a_surprise_in_the_arm_move_of_move_to_home_fails_the_goal(
+    broken, message, follower_never_stale, monkeypatch
+):
+    # Past the close, the planning of the arm move, or the install of its
+    # plan, raises what no admission foresees: the goal fails, and frees
+    # both limbs.
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    move = admit_home(layer)
+    run_gripper_plan_to_its_end(coordinator, move.close, 0.0)
+    owner = layer if broken == "_move_within_ceiling" else coordinator
+    monkeypatch.setattr(owner, broken, raising(ValueError("no trajectory")))
+    ctx = FakeGoalContext()
+    await layer.drive_home(ctx, move, kinematics)
+
+    assert ctx.failed == (FailureKind.ATTEMPT_FAILED, message)
+    assert ctx.completed is None and ctx.cancelled is None
+    assert coordinator._arm.plan is None
+    assert both_limbs_free(coordinator)
+
+
+async def test_a_wait_that_ends_with_no_cancel_fails_move_to_home_before_the_arm_moves(
+    follower_never_stale,
+):
+    # The cancel signal of the goal ends, and the goal has no cancel to
+    # give: the close is cut, the goal fails, and the arm does not move.
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    move = admit_home(layer)
+    gripper_step(coordinator, 1.0, 0.0)
+    ctx = FakeGoalContext()
+    ctx.request_cancel(cause="a cause with no reason")
+    await layer.drive_home(ctx, move, kinematics)
+
+    assert ctx.failed == (
+        FailureKind.ATTEMPT_FAILED,
+        "the cancel signal of the goal ended with no cancel",
+    )
+    assert ctx.completed is None and ctx.cancelled is None
+    assert move.close.aborted
+    assert coordinator._arm.plan is None and coordinator.commanded_arm is None
+    assert both_limbs_free(coordinator)
 
 
 def test_move_to_home_is_refused_as_an_arm_goal_is_and_claims_nothing(follower_never_stale):
@@ -889,6 +990,13 @@ def test_a_walked_back_move_to_home_frees_the_gripper_and_the_arm(follower_never
     close = pending.plan.close
     layer.abandon(pending)
     assert close.aborted and coordinator._gripper.plan is None
+    assert both_limbs_free(coordinator)
+
+    # A goal with no close, its gripper silent, claimed the arm alone.
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set(MEASURED)
+    pending.plan = admit_home(layer)
+    layer.abandon(pending)
     assert both_limbs_free(coordinator)
 
 

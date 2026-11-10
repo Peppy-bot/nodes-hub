@@ -219,6 +219,10 @@ pub async fn run(
         ArmPair::from_fn(|side| CommandedOpening::idle(gripper_fraction(&channels[side].gripper)));
     // In-flight backbone-executed gripper moves, at most one per side.
     let mut gripper_moves: ArmPair<Option<GripperMove>> = ArmPair::from_fn(|_| None);
+    // The effort cap of the last setpoint each gripper got, `None` for no
+    // preference and before the first setpoint: what a move that keeps the
+    // effort of its gripper relays.
+    let mut sent_efforts: ArmPair<Option<f64>> = ArmPair::from_fn(|_| None);
 
     let dt = cycle_period.as_secs_f64();
     // One low-pass per joint per arm, smoothing the published desired velocity. `node`
@@ -322,8 +326,9 @@ pub async fn run(
         // opening; otherwise the latest leader command drives it; otherwise the
         // side idles (never commanded, or unpaired), silent on the wire with the
         // governed opening re-anchored on the measured grippers.
-        let targets =
-            ArmPair::from_fn(|side| gripper_target(&gripper_moves[side], &channels[side]));
+        let targets = ArmPair::from_fn(|side| {
+            gripper_target(&gripper_moves[side], &channels[side], sent_efforts[side])
+        });
         for side in Side::BOTH {
             if targets[side].is_none() {
                 commanded_grippers[side] = CommandedOpening::idle(measured_grippers[side]);
@@ -377,6 +382,7 @@ pub async fn run(
                 publishers.gripper_setpoints[side]
                     .send(commanded_grippers[side].frac, target.max_effort)
                     .await;
+                sent_efforts[side] = target.max_effort;
             }
         }
 
@@ -506,8 +512,9 @@ async fn admit_and_serve(
 /// the judgments of the paths that start and still wait for them, for the
 /// loop to judge: a stop ends the paths started before it among these
 /// requests before they are judged. A stop also ends each
-/// execute_joint_path goal queued behind it before its path starts
-/// ([`stop_unstarted_path`]), as it ends the goals queued for an arm.
+/// execute_joint_path goal admitted before it whose path has not started,
+/// when the loop takes that goal ([`stop_before_path`],
+/// [`stop_unstarted_path`]), as it ends the goals admitted for a limb.
 async fn serve_queued(
     requests: &mut mpsc::Receiver<CoordinatorRequest>,
     channels: &mut ArmPair<ArmChannels>,
@@ -518,18 +525,15 @@ async fn serve_queued(
     now: Instant,
 ) -> Vec<PathJudgment> {
     let mut judgments = Vec::new();
-    let mut stopped: Option<String> = None;
     while let Ok(request) = requests.try_recv() {
-        let request = match (request, &stopped) {
+        let stop = stop_before_path(&request, channels);
+        let request = match (request, stop) {
             (CoordinatorRequest::StartPath { goal, started }, Some(reason)) => {
-                stop_unstarted_path(goal, started, reason, channels, planners, arm_admission);
+                stop_unstarted_path(goal, started, &reason, channels, planners, arm_admission);
                 continue;
             }
             (request, _) => request,
         };
-        if let CoordinatorRequest::Stop { reason, .. } = &request {
-            stopped = Some(stop_reason(reason));
-        }
         let judgment = serve_request(
             request,
             channels,
@@ -549,7 +553,10 @@ async fn serve_queued(
 /// Answer one request:
 /// - A stop ends the moves in flight on both sides and the goals admitted
 ///   but not started. The planner ends an arm's move; the gripper's
-///   terminal ends a gripper's move.
+///   terminal ends a gripper's move. A goal that holds a limb and that the
+///   loop has not taken yet is marked on its move slot
+///   ([`MoveSlot::stop_unstarted`](crate::move_slot::MoveSlot::stop_unstarted)),
+///   and ends when the loop takes it.
 /// - Each goal the stop ends is cancelled, for a reason that names the
 ///   stop. The answer names the limbs whose move was in flight. The
 ///   setpoints hold where they were last governed.
@@ -602,6 +609,10 @@ async fn serve_request(
                     let _release = arm.gripper_move_slot.release_on_drop();
                     goal.stop(&reason, measured_frac).await;
                 }
+                // Every goal the loop held is ended and its slot freed, so a
+                // slot still claimed holds a goal the loop has not taken.
+                arm.move_slot.stop_unstarted(&reason);
+                arm.gripper_move_slot.stop_unstarted(&reason);
             }
             let _ = reply.send(stopped);
             None
@@ -638,6 +649,24 @@ async fn serve_request(
             }
         }
     }
+}
+
+/// The reason of the stop that came after the admission of the
+/// execute_joint_path goal of `request` and before the loop took it: the
+/// mark the stop left on the move slot of an arm of the path. `None` for a
+/// path that no stop came before, and for a request that starts no path.
+fn stop_before_path(
+    request: &CoordinatorRequest,
+    channels: &ArmPair<ArmChannels>,
+) -> Option<String> {
+    let CoordinatorRequest::StartPath { goal, .. } = request else {
+        return None;
+    };
+    goal.path
+        .arms
+        .sides()
+        .iter()
+        .find_map(|&side| channels[side].move_slot.take_stop())
 }
 
 /// End the path of an execute_joint_path goal that a stop came before, for
@@ -1180,12 +1209,17 @@ struct GripperTarget {
 /// move owns it, through its chase and its settle alike, so a settling gripper
 /// keeps being commanded to the move's target; otherwise the leading node's
 /// streamed command drives it; otherwise `None` (idle: before any command, or
-/// on an unpaired side).
-fn gripper_target(mv: &Option<GripperMove>, channels: &ArmChannels) -> Option<GripperTarget> {
+/// on an unpaired side). `sent_effort` is the effort cap of the last setpoint
+/// the gripper got, which a move that keeps the effort of its gripper relays.
+fn gripper_target(
+    mv: &Option<GripperMove>,
+    channels: &ArmChannels,
+    sent_effort: Option<f64>,
+) -> Option<GripperTarget> {
     if let Some(m) = mv {
         return Some(GripperTarget {
             frac: m.target_frac(),
-            max_effort: m.max_effort(),
+            max_effort: m.effort().relayed(sent_effort),
         });
     }
     channels
@@ -1831,6 +1865,107 @@ mod tests {
             .expect("queue the start");
         let mut judgments = serve_all(&mut requests, channels, planners, admission, now).await;
         (answer.await.expect("the loop answers"), judgments.pop())
+    }
+
+    /// Ask the loop to stop for "the operator asked" at `now`, alone on its
+    /// tick: the limbs whose move the stop ended.
+    async fn stop_alone(
+        channels: &mut ArmPair<ArmChannels>,
+        planners: &mut ArmPair<Planner>,
+        now: Instant,
+    ) -> Vec<String> {
+        let (requests_tx, mut requests) = mpsc::channel(1);
+        let (reply, stopped) = oneshot::channel();
+        requests_tx
+            .try_send(CoordinatorRequest::Stop {
+                reason: "the operator asked".to_string(),
+                reply,
+            })
+            .expect("queue the stop");
+        serve_all(&mut requests, channels, planners, LIVE, now).await;
+        stopped.await.expect("the loop answers the stop")
+    }
+
+    /// A stop marks each goal that holds a limb and that the loop has not
+    /// taken, on the move slot of the limb, and no free limb.
+    #[tokio::test]
+    async fn a_stop_marks_the_goals_that_the_loop_has_not_taken() {
+        let (mut channels, mut planners) = both_arms();
+        assert!(channels.left.move_slot.claim(), "the arm is free");
+        assert!(
+            channels.right.gripper_move_slot.claim(),
+            "the gripper is free"
+        );
+        let stopped = stop_alone(&mut channels, &mut planners, Instant::now()).await;
+        assert!(stopped.is_empty(), "no move was in flight");
+
+        let reason = Some("stopped: the operator asked".to_string());
+        assert_eq!(channels.left.move_slot.take_stop(), reason);
+        assert_eq!(channels.right.gripper_move_slot.take_stop(), reason);
+        assert_eq!(channels.right.move_slot.take_stop(), None);
+        assert!(
+            !channels.right.move_slot.is_claimed(),
+            "a stop claims no limb"
+        );
+        assert!(!channels.left.gripper_move_slot.is_claimed());
+    }
+
+    /// A stop that came on an earlier tick than the goal of an arm, after
+    /// the admission of the goal, ends the goal when the arm's tick takes
+    /// it: cancelled for the stop's reason, the arm held and freed.
+    #[tokio::test]
+    async fn a_stop_before_the_tick_that_takes_an_arm_goal_ends_the_goal() {
+        let (mut channels, mut planners) = both_arms();
+        assert!(channels.left.move_slot.claim(), "the arm is free");
+        let now = Instant::now();
+        stop_alone(&mut channels, &mut planners, now).await;
+
+        let (goal_tx, goals) = mpsc::channel(1);
+        channels.left.goals = goals;
+        let (done_tx, mut done_rx) = mpsc::channel(1);
+        goal_tx
+            .try_send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .expect("queue the goal");
+        let tick = tick_arm(
+            &mut channels.left,
+            &mut planners.left,
+            Admission::Live,
+            now + Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(
+            done_rx.try_recv().expect("the goal ends"),
+            Outcome::Cancelled("stopped: the operator asked".to_string())
+        );
+        assert_eq!(tick.candidate, BOTH_HELD.left, "the arm holds");
+        assert!(!channels.left.move_slot.is_claimed(), "the arm is freed");
+    }
+
+    /// A stop that came on an earlier tick than the start of a path, after
+    /// the admission of its goal, ends the path before it starts, each arm
+    /// cancelled for the stop's reason, and frees its arms.
+    #[tokio::test]
+    async fn a_stop_before_the_tick_that_takes_a_path_ends_the_path() {
+        let (mut channels, mut planners) = both_arms();
+        let (goal, mut done_rx) = path_goal(&channels, &["left_arm", "right_arm"]);
+        let now = Instant::now();
+        let stopped = stop_alone(&mut channels, &mut planners, now).await;
+        assert!(stopped.is_empty(), "no move was in flight");
+
+        let later = now + Duration::from_millis(10);
+        let (started, judgment) =
+            start_path_of(goal, &mut channels, &mut planners, LIVE, later).await;
+        assert_eq!(started, Ok(()));
+        assert!(judgment.is_none(), "no path starts");
+        for side in Side::BOTH {
+            let report = done_rx.try_recv().expect("each arm reports");
+            assert_eq!(report.side, side);
+            assert_eq!(
+                report.outcome,
+                Outcome::Cancelled("stopped: the operator asked".to_string())
+            );
+        }
+        assert!(channels.iter().all(|arm| !arm.move_slot.is_claimed()));
     }
 
     /// A path on an arm whose follower is stale fails before any arm moves,

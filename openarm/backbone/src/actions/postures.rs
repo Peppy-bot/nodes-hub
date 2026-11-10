@@ -3,19 +3,25 @@
 //! action goal from their terminals:
 //! - move_to_ready claims both arms and hands each planner an ordinary joint
 //!   goal to the posture. It sends no command to the grippers.
-//! - move_to_home claims both grippers and both arms. It closes both
+//! - move_to_home claims both arms and both grippers. It closes both
 //!   grippers, a gripper move each that the coordinator runs, then hands each
 //!   planner its joint goal to the posture. The arms keep their claims
 //!   through the close, and they move only once both closes completed: jaws
-//!   that an item stops close on it, and the arms go home with it.
+//!   that an item stops close on it, under the effort cap of the last
+//!   setpoint of their gripper, and the arms go home with it. A gripper whose
+//!   follower delivers no fresh state when the coordinator takes its close
+//!   gets no command, and the goal goes on.
 //!
 //! Cancel flips a shared flag the shares poll, so each limb stops the way a
 //! cancelled move of its own stops; the stop service ends the shares in
 //! flight the same way, and the goal ends cancelled for the stop's reason.
 //! A cancel, a stop or a failure during the close ends the goal before the
-//! arms move. The two actions share the arms' move slots, so a posture goal
-//! arriving while the other posture runs is refused with
-//! `precondition_failed`.
+//! arms move. A stop that comes while the goal holds a limb and the
+//! coordinator holds no share of it, as between the end of the close and the
+//! arms' moves, marks the move slot of the limb, and the coordinator ends the
+//! share cancelled when it takes it ([`MoveSlot::stop_unstarted`]). The two
+//! actions share the arms' move slots, so a posture goal arriving while the
+//! other posture runs is refused with `precondition_failed`.
 //!
 //! A goal that completes or ends cancelled gives the grasp pose of each arm,
 //! in limb_state's arm order. The coordinator measures both arms then, after
@@ -47,12 +53,11 @@ use crate::streams::LeaderActivity;
 use crate::types::{arm_pose_arrays, limb_names};
 
 /// What a posture action needs of one kind of limb, the arms or the
-/// grippers, by side: the queue that takes its goals, its move slots,
-/// whether its followers deliver fresh state, and its leaders.
+/// grippers, by side: the queue that takes its goals, its move slots, and
+/// its leaders.
 pub struct Limbs<G> {
     pub goal_txs: ArmPair<mpsc::Sender<G>>,
     pub move_slots: ArmPair<MoveSlot>,
-    pub fresh: ArmPair<Arc<AtomicBool>>,
     pub activity: ArmPair<LeaderActivity>,
 }
 
@@ -63,21 +68,15 @@ impl<G> Clone for Limbs<G> {
         Self {
             goal_txs: self.goal_txs.clone(),
             move_slots: self.move_slots.clone(),
-            fresh: self.fresh.clone(),
             activity: self.activity.clone(),
         }
     }
 }
 
 impl<G> Limbs<G> {
-    /// Whether both limbs can take a move now ([`check_limb_free`] over
-    /// both), in `words`.
-    fn check_free(&self, words: &LimbWords) -> std::result::Result<(), Failure> {
-        check_limb_free(
-            self.fresh.iter().all(|fresh| fresh.load(Ordering::Acquire)),
-            self.activity.iter().any(LeaderActivity::streaming),
-            words,
-        )
+    /// Whether a leader streams one of the limbs.
+    fn leader_streams(&self) -> bool {
+        self.activity.iter().any(LeaderActivity::streaming)
     }
 
     /// Claim the move slots of both limbs, or refuse with
@@ -100,25 +99,44 @@ impl<G> Limbs<G> {
 }
 
 /// Admit a posture goal of `duration_s` that moves both arms and first
-/// closes `grippers`, when it has some: a duration the robot takes
-/// (`rejected` otherwise), every limb that the goal moves free
-/// ([`Limbs::check_free`]), then every one of them claimed, the grippers
-/// ahead of the arms. A refusal leaves no slot held.
+/// closes `grippers`, when it has some: the goal then holds the move slot of
+/// every limb it moves. The refusals, in their order, the arms ahead of the
+/// grippers in each, so both postures refuse a robot whose arms cannot move
+/// in the same words:
+/// - a duration the robot does not take: `rejected`;
+/// - an arm that cannot take a move ([`check_limb_free`] over both arms,
+///   `arms_fresh` telling whether their followers deliver fresh state);
+/// - a leader that streams a gripper the goal closes: `leader_streaming`.
+///   A gripper whose follower delivers no fresh state refuses nothing: the
+///   coordinator gives it no command
+///   ([`GripperGoal::end_on_stale_follower`]), so a robot with a silent
+///   gripper still parks its arms;
+/// - a limb that executes another move: `precondition_failed`.
+///
+/// A refusal leaves no slot held.
 fn admit_posture(
     duration_s: f64,
     arms: &Limbs<Goal>,
+    arms_fresh: &ArmPair<Arc<AtomicBool>>,
     grippers: Option<&Limbs<GripperGoal>>,
 ) -> std::result::Result<(), Failure> {
     move_seconds_from_wire("duration_s", duration_s)
         .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
-    arms.check_free(&ARM_WORDS)?;
+    let fresh = arms_fresh.iter().all(|fresh| fresh.load(Ordering::Acquire));
+    check_limb_free(fresh, arms.leader_streams(), &ARM_WORDS)?;
     let Some(grippers) = grippers else {
         return arms.claim_both(&ARM_WORDS);
     };
-    grippers.check_free(&GRIPPER_WORDS)?;
-    grippers.claim_both(&GRIPPER_WORDS)?;
-    arms.claim_both(&ARM_WORDS)
-        .inspect_err(|_| grippers.release_both())
+    if grippers.leader_streams() {
+        return Err(Failure::new(
+            FailureKind::LeaderStreaming,
+            GRIPPER_WORDS.leader_streaming,
+        ));
+    }
+    arms.claim_both(&ARM_WORDS)?;
+    grippers
+        .claim_both(&GRIPPER_WORDS)
+        .inspect_err(|_| arms.release_both())
 }
 
 /// How a posture goal, or its close, ends.
@@ -249,7 +267,9 @@ async fn run_shares<G>(
 /// - close `grippers`, when the goal has some. A close that does not
 ///   complete ends the goal there, and the arms, which no planner took, are
 ///   freed;
-/// - move both arms to `posture` over `duration`.
+/// - move both arms to `posture` over `duration`. A stop that came since the
+///   admission of the goal, the time of the close included, marked the arms'
+///   move slots, and each planner ends its share cancelled when it takes it.
 async fn run_posture(
     action: &str,
     ctx: &impl PostureGoal,
@@ -345,8 +365,9 @@ fn arm_poses(answer: GraspAnswer, action: &str) -> ArmPoses {
 /// Expand one posture action's run loop: expose it, admit each goal
 /// ([`admit_posture`]), run it ([`run_posture`]) and end it: a goal that
 /// completes or ends cancelled gives the grasp poses that the coordinator
-/// measures then. `grippers` are the grippers that the action closes ahead
-/// of the arms, or `None` for an action that sends them no command.
+/// measures then. `arms_fresh` tells whether the followers of the arms
+/// deliver fresh state. `grippers` are the grippers that the action closes
+/// ahead of the arms, or `None` for an action that sends them no command.
 /// One goal at a time; a goal arriving mid-move waits unread until this one
 /// ends, then claims the freed limbs. Written once here because the two
 /// generated action modules carry distinct types with an identical surface.
@@ -365,6 +386,7 @@ macro_rules! posture_runner {
         pub async fn $fn_name(
             runner: Arc<NodeRunner>,
             arms: Limbs<Goal>,
+            arms_fresh: ArmPair<Arc<AtomicBool>>,
             grippers: Option<Limbs<GripperGoal>>,
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
@@ -372,12 +394,16 @@ macro_rules! posture_runner {
             loop {
                 let accepted = handle
                     .handle_goal_next_request(|req| {
-                        Ok(
-                            match admit_posture(req.data.duration_s, &arms, grippers.as_ref()) {
-                                Ok(()) => $action::GoalDecision::accept(),
-                                Err(f) => $action::GoalDecision::refuse(f.kind.into(), f.message),
-                            },
-                        )
+                        let admitted = admit_posture(
+                            req.data.duration_s,
+                            &arms,
+                            &arms_fresh,
+                            grippers.as_ref(),
+                        );
+                        Ok(match admitted {
+                            Ok(()) => $action::GoalDecision::accept(),
+                            Err(f) => $action::GoalDecision::refuse(f.kind.into(), f.message),
+                        })
                     })
                     .await?;
                 let Some(ctx) = accepted else { return Ok(()) };
@@ -433,20 +459,33 @@ mod tests {
 
     use srs_model::nalgebra::Vector3;
 
-    use crate::gripper_move::GripperReply;
+    use crate::gripper_move::{EffortCap, GripperReply};
     use crate::test_support::bundled_arm;
 
-    /// The limbs of one kind, each with a fresh follower, no leader and a
-    /// free move slot, and the queues that take their goals.
+    /// The limbs of one kind, each with no leader and a free move slot, and
+    /// the queues that take their goals.
     fn limbs<G>() -> (Limbs<G>, ArmPair<mpsc::Receiver<G>>) {
         let (goal_txs, queues) = ArmPair::from_fn(|_| mpsc::channel(1)).unzip();
         let limbs = Limbs {
             goal_txs,
             move_slots: ArmPair::from_fn(|_| MoveSlot::default()),
-            fresh: ArmPair::from_fn(|_| Arc::new(AtomicBool::new(true))),
             activity: ArmPair::from_fn(|_| LeaderActivity::default()),
         };
         (limbs, queues)
+    }
+
+    /// The followers of both arms, each delivering fresh state.
+    fn fresh_arms() -> ArmPair<Arc<AtomicBool>> {
+        ArmPair::from_fn(|_| Arc::new(AtomicBool::new(true)))
+    }
+
+    /// [`admit_posture`] on a robot whose arms deliver fresh state.
+    fn admit(
+        duration_s: f64,
+        arms: &Limbs<Goal>,
+        grippers: Option<&Limbs<GripperGoal>>,
+    ) -> std::result::Result<(), Failure> {
+        admit_posture(duration_s, arms, &fresh_arms(), grippers)
     }
 
     /// The limbs of one kind as [`limbs`] gives them, with no queue: for a
@@ -470,14 +509,14 @@ mod tests {
     #[test]
     fn a_goal_that_closes_no_gripper_claims_both_arms_alone() {
         let arms = admitted_limbs();
-        assert_eq!(admit_posture(1.0, &arms, None), Ok(()));
+        assert_eq!(admit(1.0, &arms, None), Ok(()));
         assert_eq!(held(&arms), BOTH_HELD);
     }
 
     #[test]
     fn a_goal_that_closes_the_grippers_claims_both_grippers_and_both_arms() {
         let (arms, grippers) = (admitted_limbs(), admitted_limbs());
-        assert_eq!(admit_posture(1.0, &arms, Some(&grippers)), Ok(()));
+        assert_eq!(admit(1.0, &arms, Some(&grippers)), Ok(()));
         assert_eq!(held(&grippers), BOTH_HELD);
         assert_eq!(held(&arms), BOTH_HELD);
     }
@@ -491,7 +530,7 @@ mod tests {
             let (arms, grippers) = (admitted_limbs(), admitted_limbs());
             assert!(arms.move_slots[busy].claim());
             assert_eq!(
-                admit_posture(1.0, &arms, Some(&grippers)),
+                admit(1.0, &arms, Some(&grippers)),
                 refused(FailureKind::PreconditionFailed, message)
             );
             let other_move = ArmPair::from_fn(|side| side == busy);
@@ -509,7 +548,7 @@ mod tests {
             let (arms, grippers) = (admitted_limbs(), admitted_limbs());
             assert!(grippers.move_slots[busy].claim());
             assert_eq!(
-                admit_posture(1.0, &arms, Some(&grippers)),
+                admit(1.0, &arms, Some(&grippers)),
                 refused(FailureKind::PreconditionFailed, message)
             );
             let other_move = ArmPair::from_fn(|side| side == busy);
@@ -526,31 +565,34 @@ mod tests {
         let mut grippers = admitted_limbs::<GripperGoal>();
         grippers.activity[Side::Right] = LeaderActivity::streaming_always();
         assert_eq!(
-            admit_posture(1.0, &arms, Some(&grippers)),
+            admit(1.0, &arms, Some(&grippers)),
             refused(FailureKind::LeaderStreaming, GRIPPER_WORDS.leader_streaming)
         );
         assert_eq!(held(&grippers), NONE_HELD);
         assert_eq!(held(&arms), NONE_HELD);
-        assert_eq!(admit_posture(1.0, &arms, None), Ok(()));
+        assert_eq!(admit(1.0, &arms, None), Ok(()));
     }
 
+    /// An arm whose follower delivers no fresh state refuses the goal, with
+    /// or without a close of the grippers.
     #[test]
-    fn a_gripper_with_no_fresh_state_refuses_the_goal_that_closes_it() {
-        let (arms, grippers) = (admitted_limbs(), admitted_limbs::<GripperGoal>());
-        grippers.fresh[Side::Left].store(false, Ordering::Release);
-        assert_eq!(
-            admit_posture(1.0, &arms, Some(&grippers)),
-            refused(
-                FailureKind::ResourceUnavailable,
-                GRIPPER_WORDS.no_fresh_state
-            )
-        );
-        assert_eq!(held(&grippers), NONE_HELD);
-        assert_eq!(held(&arms), NONE_HELD);
+    fn an_arm_with_no_fresh_state_refuses_the_goal() {
+        let arms_fresh = fresh_arms();
+        arms_fresh[Side::Right].store(false, Ordering::Release);
+        for grippers in [None, Some(admitted_limbs::<GripperGoal>())] {
+            let arms = admitted_limbs();
+            assert_eq!(
+                admit_posture(1.0, &arms, &arms_fresh, grippers.as_ref()),
+                refused(FailureKind::ResourceUnavailable, ARM_WORDS.no_fresh_state)
+            );
+            assert_eq!(held(&arms), NONE_HELD);
+            assert!(grippers.is_none_or(|grippers| held(&grippers) == NONE_HELD));
+        }
     }
 
     /// An arm refuses ahead of a gripper, so both postures refuse a robot
-    /// whose arms cannot move in the same words.
+    /// whose arms cannot move in the same words: with a leader on an arm and
+    /// on a gripper, and with an arm and a gripper that each execute a move.
     #[test]
     fn an_arm_refuses_the_goal_ahead_of_a_gripper() {
         let mut arms = admitted_limbs();
@@ -558,9 +600,25 @@ mod tests {
         arms.activity[Side::Left] = LeaderActivity::streaming_always();
         grippers.activity[Side::Left] = LeaderActivity::streaming_always();
         assert_eq!(
-            admit_posture(1.0, &arms, Some(&grippers)),
+            admit(1.0, &arms, Some(&grippers)),
             refused(FailureKind::LeaderStreaming, ARM_WORDS.leader_streaming)
         );
+
+        let (arms, grippers) = (admitted_limbs(), admitted_limbs::<GripperGoal>());
+        assert!(arms.move_slots[Side::Left].claim());
+        assert!(grippers.move_slots[Side::Left].claim());
+        let ready = admit(1.0, &arms, None);
+        assert_eq!(
+            ready,
+            refused(
+                FailureKind::PreconditionFailed,
+                "the left arm is already executing a motion"
+            )
+        );
+        assert_eq!(admit(1.0, &arms, Some(&grippers)), ready);
+        let other_moves = ArmPair::new(true, false);
+        assert_eq!(held(&arms), other_moves, "the other move keeps its arm");
+        assert_eq!(held(&grippers), other_moves, "the other move keeps it");
     }
 
     // The run of an admitted goal. The test plays the coordinator and the
@@ -593,10 +651,10 @@ mod tests {
     }
 
     /// The share of the gripper close that `queue` holds, and the side it
-    /// names. The close goes to a closed gripper under no effort cap.
+    /// names. The close goes to a closed gripper and keeps its effort cap.
     async fn next_close(queue: &mut mpsc::Receiver<GripperGoal>) -> (Side, PostureShare) {
         let goal = queue.recv().await.expect("a gripper close");
-        assert_eq!((goal.opening, goal.max_effort), (0.0, None));
+        assert_eq!((goal.opening, goal.effort), (0.0, EffortCap::Kept));
         match goal.reply {
             GripperReply::Close { side, share } => (side, share),
             GripperReply::MoveGripper(_) => panic!("a move_gripper goal, not a close"),
@@ -644,7 +702,7 @@ mod tests {
     async fn a_goal_that_closes_the_grippers_moves_the_arms_after_both_closes() {
         let (arms, mut arm_queues) = limbs();
         let (grippers, mut gripper_queues) = limbs();
-        assert_eq!(admit_posture(0.0, &arms, Some(&grippers)), Ok(()));
+        assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
         let run = run_posture(
             "move_to_home",
             &Uncancelled,
@@ -676,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn a_goal_that_closes_no_gripper_moves_the_arms_at_once() {
         let (arms, mut arm_queues) = limbs();
-        assert_eq!(admit_posture(0.0, &arms, None), Ok(()));
+        assert_eq!(admit(0.0, &arms, None), Ok(()));
         let run = run_posture(
             "move_to_ready",
             &Uncancelled,
@@ -705,7 +763,7 @@ mod tests {
     ) -> PostureEnd {
         let (arms, mut arm_queues) = limbs();
         let (grippers, mut gripper_queues) = limbs();
-        assert_eq!(admit_posture(0.0, &arms, Some(&grippers)), Ok(()));
+        assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
         let run = run_posture(
             "move_to_home",
             ctx,
@@ -769,7 +827,7 @@ mod tests {
     async fn the_cancel_of_the_goal_reaches_the_closes() {
         let (arms, _arm_queues) = limbs();
         let (grippers, mut gripper_queues) = limbs();
-        assert_eq!(admit_posture(0.0, &arms, Some(&grippers)), Ok(()));
+        assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
         let run = run_posture(
             "move_to_home",
             &CancelledByCaller,
@@ -801,7 +859,7 @@ mod tests {
         let (arms, mut arm_queues) = limbs();
         let (grippers, gripper_queues) = limbs();
         drop(gripper_queues);
-        assert_eq!(admit_posture(0.0, &arms, Some(&grippers)), Ok(()));
+        assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
         let end = run_posture(
             "move_to_home",
             &Uncancelled,

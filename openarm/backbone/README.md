@@ -378,13 +378,29 @@ move.
 
 `move_to_ready` claims both arms and sends no gripper command, so each
 gripper goes on as its last command drives it. `move_to_home` claims both
-grippers and both arms, and closes both grippers before the arms move:
+arms and both grippers, and closes both grippers before the arms move. It
+refuses for an arm ahead of a gripper, so both postures refuse a robot whose
+arms cannot move in the same words. A gripper whose follower reports no
+state does not refuse it:
 
-- Each close is a gripper move to the closed opening, under the effort
-  ceiling of the follower. It ends as a `move_gripper` ends: once the jaws
-  stand still, and at the latest 2 s after the planned end of the commanded
-  travel, where they stand. Jaws that an item stops close on it, and the
-  arms go home with it.
+- Each close is a gripper move to the closed opening. It keeps the effort
+  cap of the last setpoint that its gripper got, from a `move_gripper` or
+  from a leader, so jaws that hold an item keep the effort of their grasp.
+  A gripper that got no setpoint since the backbone started closes under
+  the effort ceiling of the follower.
+- A close ends as a `move_gripper` ends: once the jaws stand still, and at
+  the latest 2 s after the planned end of the commanded travel, where they
+  stand. Jaws that an item stops close on it, and the arms go home with it.
+- The commanded travel of a close has 8 s, so a close takes at most 10 s.
+  The operator can set an opening rate (`max_gripper_rate_frac_s`) at which
+  the travel takes longer: the close then fails with `timeout`
+  (`left_gripper: the commanded travel of the jaws did not end within 8 s:
+  the opening rate (max_gripper_rate_frac_s) is too low for the move, or the
+  collision guard slows the jaws`).
+- A gripper whose follower reports no state when the coordinator takes its
+  close gets no setpoint. The goal leaves that gripper as it stands and goes
+  on, so a robot with a silent gripper still parks its arms. A follower
+  that stops reporting during the close fails it.
 - The arms keep their claims through the close, and each planner gets its
   move once both closes ended. `duration_s` is the time of the arm move
   alone.
@@ -396,7 +412,10 @@ grippers and both arms, and closes both grippers before the arms move:
 On v2 with both grippers fully open, the jaws at Home sit closer to the
 torso than the validated stop distance (`d_stop_m`, 5 mm), and the governor
 holds both arms short of Home. The close of `move_to_home` takes the jaws
-out of that band before the arms move.
+out of that band before the arms move. Jaws that an item holds open in one
+gripper leave the band too, once the other gripper closed. An item in each
+gripper that holds both jaws fully open leaves them in the band: the arms
+then stop short of Home, and the goal fails with `timeout`.
 
 A goal that completes or ends cancelled gives the pose of each arm:
 
@@ -420,11 +439,16 @@ so its last measurement is stale, or the coordinator did not answer.
 through their planners, the gripper moves through their terminal, the
 posture moves through the limbs whose shares are in flight (both grippers
 during the close of `move_to_home`, both arms otherwise), and the goals
-admitted but not started yet. Each goal ends cancelled for the reason `stopped: <reason>` (`stopped`
-for an empty reason), a posture goal too. Each limb holds the setpoint it was
-last governed to, as after a cancel, and the answer's `stopped` names the
-limbs whose move was in flight, empty when none was. The stop does not latch:
-a goal admitted after it runs. A leader's streamed setpoints are not stopped.
+admitted but not started yet. A goal that holds a limb and that the
+coordinator has not taken when the stop comes ends when the coordinator
+takes it: the stop marks the move slot of the limb. This ends a goal on its
+way from its action to the coordinator, and a `move_to_home` goal between
+the end of its close and the moves of its arms. Each goal ends cancelled for
+the reason `stopped: <reason>` (`stopped` for an empty reason), a posture
+goal too. Each limb holds the setpoint it was last governed to, as after a
+cancel, and the answer's `stopped` names the limbs whose move was in flight,
+empty when none was. The stop does not latch: a goal admitted after it runs.
+A leader's streamed setpoints are not stopped.
 A coordinator that does not answer cannot carry the stop out: the stop then
 gives an error reply with `attempt_failed`.
 
@@ -524,9 +548,9 @@ The robot's own body is not checked for hiding a point from the camera.
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
 | `publish.rs` | every publisher (`Publishers`), one stamp/build/publish/log path | peppy vocabulary: a publisher on a slot; "wire" means the transport encoding only |
 | `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern_along` call, which is why the governor is not folded into it |
-| `gripper_move.rs` | gripper move execution: a `move_gripper` goal, or the close of a gripper for a `move_to_home` goal, admitted into a free side, the terminal it gets once the jaws stand still or its settle timeout passes, and the end of its goal or the report to its posture goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
+| `gripper_move.rs` | gripper move execution: a `move_gripper` goal, or the close of a gripper for a `move_to_home` goal, admitted into a free side, the effort cap it relays, the terminal it gets once the jaws stand still, its settle timeout passes or its travel timeout runs out, and the end of its goal or the report to its posture goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
-| `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, and the `SlotRelease` a move holds), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
+| `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, the `SlotRelease` a move holds, and the mark a stop leaves on a slot whose goal the coordinator has not taken), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move / share of an `execute_joint_path` path) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only, but for the path its share follows; never the collision model |
 | `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
 | `planner/stream_smoothing.rs` | the smoothing of a streamed pose's steps: one Butterworth per joint at MoveIt Servo's default cutoff for the control period | a smoother can overshoot its input, so the planner holds its output to the velocity limit |
