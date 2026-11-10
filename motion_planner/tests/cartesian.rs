@@ -2,8 +2,8 @@
 //! collisions waits for the camera's first depth frame and a path that does not answers
 //! before it; each waypoint comes with the grasp-point pose limb_state reports there; a
 //! line toward a table the camera sees ends before the table and covers its whole length with
-//! collisions unchecked; a start in contact fails, a cancel ends the goal cancelled, and every
-//! refusal comes at a goal's admission.
+//! collisions unchecked; a start in contact with the table or inside the clearance from it
+//! fails, a cancel ends the goal cancelled, and every refusal comes at a goal's admission.
 
 mod common;
 
@@ -17,9 +17,9 @@ use peppygen::fixtures::exposed_actions::motion_planning::plan_cartesian_path::{
 use peppygen::fixtures::harness::Harness;
 
 use common::{
-    LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, Solid, TIMEOUT, UNDER_THE_TABLE, along,
-    arms, at_ms, facing_the_robot, looking_at, publish_arms, render, start_with_camera,
-    start_without_camera, table_across, take_frame,
+    CLEAR_OR_ALLOW_WAY_OUT, LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, Solid, TIMEOUT,
+    UNDER_THE_TABLE, along, arms, at_ms, facing_the_robot, looking_at, publish_arms, render,
+    start_with_camera, start_without_camera, take_frame, under_a_seen_table,
 };
 
 /// A path of the left arm's grasp point from where it stands through `poses`.
@@ -185,39 +185,74 @@ async fn a_line_toward_a_table_ends_before_it_unless_collisions_go_unchecked()
     harness.shutdown().await
 }
 
-// A start in contact with a table the camera sees fails once taken, naming the pair; with
-// collisions unchecked, the same start walks.
+/// A path of the left arm's grasp point from `start` to 5 cm above where it stands there.
+fn up_from(start: &[f64; ARM_DOF], avoid_collisions: bool) -> GoalRequestData {
+    GoalRequestData {
+        start_joint_positions: start.to_vec(),
+        ..path_through(&[raised(&hand(start), 0.05)], avoid_collisions)
+    }
+}
+
+// A start in contact with a table the camera sees fails once taken, naming the pair and the
+// way out; with collisions unchecked, the same start walks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_in_contact_fails_unless_collisions_go_unchecked() -> peppygen::Result<()> {
-    let (table, crossing_t) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
-    let ([x0, y0, _], [x1, y1, top]) = table;
-    let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    let camera = looking_at(Vector3::new(x + 0.5, y, top + 0.7), Vector3::new(x, y, top));
-    let (harness, mocks) = start_with_camera(&camera).await?;
-    publish_arms(&mocks, at_ms(0), &arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    take_frame(
-        &harness,
-        &mocks,
-        at_ms(0),
-        &render(&camera, None, &[table]),
-        UNDER_THE_TABLE,
-    )
-    .await?;
+    let (harness, _mocks, crossing_t) = under_a_seen_table().await?;
     let crossing = along(&UNDER_THE_TABLE, &OVER_THE_TABLE, crossing_t);
-    let from_contact = |avoid_collisions: bool| GoalRequestData {
-        start_joint_positions: crossing.to_vec(),
-        ..path_through(&[raised(&hand(&crossing), 0.05)], avoid_collisions)
-    };
-    let Err(Ended::Failed(failed)) = path(&harness, &from_contact(true)).await else {
+    let Err(Ended::Failed(failed)) = path(&harness, &up_from(&crossing, true)).await else {
         panic!("a path from a start in contact fails once taken");
     };
     assert_eq!(failed.kind, FailureKind::StartInCollision, "{failed}");
     assert!(
-        failed.message.contains("touches the occupancy map"),
+        failed.message.contains("touches the occupancy map")
+            && failed.message.ends_with(CLEAR_OR_ALLOW_WAY_OUT),
         "{failed}"
     );
     assert!(
-        path(&harness, &from_contact(false)).await.is_ok(),
+        path(&harness, &up_from(&crossing, false)).await.is_ok(),
+        "the same start with collisions unchecked walks"
+    );
+    harness.shutdown().await
+}
+
+/// The steps the next test takes from where the hand crosses the table's top to over the
+/// table: each turns the elbow by a few milliradians, a link's motion small beside the
+/// clearance.
+const LIFT_STEPS: u32 = 200;
+
+// The first start out of contact with a table the camera sees, on the motion up from where
+// the hand crosses its top, stands inside the clearance from it: a path from there fails
+// once taken, naming the pair and the way out; with collisions unchecked, it walks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_inside_the_clearance_fails_unless_collisions_go_unchecked() -> peppygen::Result<()>
+{
+    let (harness, _mocks, crossing_t) = under_a_seen_table().await?;
+    let mut out_of_contact = None;
+    for step in 1..=LIFT_STEPS {
+        let t = crossing_t + (1.0 - crossing_t) * f64::from(step) / f64::from(LIFT_STEPS);
+        let start = along(&UNDER_THE_TABLE, &OVER_THE_TABLE, t);
+        let ended = path(&harness, &up_from(&start, true)).await;
+        let in_contact =
+            matches!(&ended, Err(Ended::Failed(failure)) if failure.message.contains(" touches "));
+        if !in_contact {
+            out_of_contact = Some((start, ended));
+            break;
+        }
+    }
+    let (start, failed) = match out_of_contact {
+        Some((start, Err(Ended::Failed(failed)))) => (start, failed),
+        other => panic!("the first start out of contact fails once taken, not {other:?}"),
+    };
+    assert_eq!(failed.kind, FailureKind::StartInCollision, "{failed}");
+    assert!(
+        failed
+            .message
+            .contains(" m from the map, inside the clearance ")
+            && failed.message.ends_with(CLEAR_OR_ALLOW_WAY_OUT),
+        "{failed}"
+    );
+    assert!(
+        path(&harness, &up_from(&start, false)).await.is_ok(),
         "the same start with collisions unchecked walks"
     );
     harness.shutdown().await

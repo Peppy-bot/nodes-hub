@@ -63,10 +63,10 @@ approach `+z` and closing `+x`; and its gripper's links, `gripper_link` and the 
 Its self model is `self_collision_model`'s SO-101 model: a state keeps its clearance from
 the objects of the planning scene and between the pairs of its own links that the model
 checks, and an object the hand holds keeps it from the base and from the links it may not
-touch. Its home posture folds the arm onto itself, its links touching in the model, so a plan
-from home is refused, `start_in_collision`, the message saying to move the arms to the ready
-posture with `move_to_ready` and plan from there. With no depth camera its launchers leave
-the four camera slots vacant.
+touch. Folded onto itself as it rests, its links touch in the model, so a plan from there is
+refused, `start_in_collision`, the message saying to move the arms to the home posture with
+`move_to_home`, which stands out of contact, and plan from there. With no depth camera its
+launchers leave the four camera slots vacant.
 
 Five joints hold few orientations at a position, so a goal of the grasp point, or of a link
 every joint moves, on an arm of fewer than six joints is sampled by these options:
@@ -218,9 +218,14 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   link or a carried object and the map or an object, or a carried object and a link, and
   how far apart they stand. Every state of a planned path past its start keeps the plan's
   clearance.
-- A start closer than the plan's clearance is valid when, until that clearance is
-  reached, none of its shortfalls, from the map and the objects, within the robot's own
-  body, and between an attached object and the arm that carries it, grows at a checked
+- A start nearer than `min_clearance_m` to the map or to an object no arm holds is
+  refused with `start_in_collision`, as MoveIt's collision check, padded by the
+  clearance, refuses a start in collision; the message names the nearest such pair, how
+  far apart it stands, and says to move the arms clear first or to allow the pair with
+  `set_allowed_collision`. Any other start closer than the plan's clearance is valid
+  when, until that clearance is reached, none of its shortfalls, from the map and the
+  objects, within the robot's own body, and between an attached object and the arm that
+  carries it, grows at a checked
   state, each on its own, to the rounding of the arithmetic (1e-9 m); between two
   checked states each comes at most half its distance nearer. The start sets each one's
   floor: 0 from a start below the clearance asked of it, `min_clearance_m`, or 0 for an
@@ -430,8 +435,9 @@ sampling, which departs too, is in "The robot".
   0.9 of it, which leaves the last tenth for what lies between them.
 - A Cartesian path: MoveIt checks each state for collisions, not its start and not the motion
   between two, and each interval's midpoint for the precision. Here the rounded path the
-  move runs is checked for both, a start in contact fails with `start_in_collision`, and a
-  start nearer than the clearance departs by the start rule in one run. MoveIt judges each
+  move runs is checked for both, a start in contact or nearer than the clearance to the map
+  or an object fails with `start_in_collision`, and a start nearer than the clearance within
+  the robot's own body departs by the start rule in one run. MoveIt judges each
   state alone, so a first state still nearer than its padding ends its path there. Any link
   but the grasp link and those fixed to it is refused with `rejected`, where MoveIt's inverse
   kinematics fails and its fraction is 0. At a clearance of 0.04 m a line among obstacles ends
@@ -461,10 +467,12 @@ sampling, which departs too, is in "The robot".
   extent apart (`longest_valid_segment_fraction`, moveit2 2.15.2
   `ModelBasedPlanningContext`) and nothing between them. Here every state between two
   checked ones keeps `min_clearance_m`, the steps at most 1.5 cm of any point.
-- The start: MoveIt refuses a start in contact (`START_STATE_IN_COLLISION`,
-  `CheckStartStateCollision`) and plans from any other. Here a start in contact fails
-  `start_in_collision`, and a start nearer than the plan's clearance plans by the start
-  rule above: between checked states it comes at most half its distance nearer.
+- The start: MoveIt refuses a start in collision (`START_STATE_IN_COLLISION`,
+  `CheckStartStateCollision`), its links padded against the world, and plans from any
+  other. Here a start in contact, or nearer than `min_clearance_m` to the map or an object,
+  fails `start_in_collision`, and a start nearer than the plan's clearance within the
+  robot's own body, which MoveIt does not pad, plans by the start rule above: between
+  checked states it comes at most half its distance nearer.
 - A start outside a joint limit: MoveIt refuses it (`START_STATE_INVALID`). Here a start
   within `start_tolerance_rad` (0.05 rad) of the limit moves onto it.
 - The answer: MoveIt checks the simplified path alone and answers `INVALID_MOTION_PLAN`
@@ -497,7 +505,7 @@ sampling, which departs too, is in "The robot".
 |---|---|
 | `rejected` | The request names no arm, an arm twice, an arm, joint or link the named arms do not have, a name twice in one list of constraints, or a number outside its range; an arm's constraints mix joint and pose constraints, or its position and orientation constraints name more than one of its links; or a check's arms hold different numbers of waypoints. The message names what to send. |
 | `precondition_failed` | The camera is linked and the map has taken in no depth frame since the node started or the map was cleared, the message naming what the map waits on; or no joint positions have been measured; or a plan's start lies outside a joint limit by more than `start_tolerance_rad`, the message naming the joint. |
-| `start_in_collision` | A plan's start touches the map, an object of the planning scene or the robot's own body; the message names the pair. |
+| `start_in_collision` | A plan's start touches the map, an object of the planning scene or the robot's own body, or stands nearer than `min_clearance_m` to the map or an object no arm holds; the message names the pair, how far apart it stands, and what to do. |
 | `unreachable` | No configuration meets the goal before the goal sampling ends (once the samples since the last goal found reach 1000 less the goals found so far, as MoveIt's `max_goal_sampling_attempts` bounds the samples its sampling function makes before it returns a goal, counting from the goals OMPL has taken) or within the time allowed, the message naming in a plan of both arms the first arm that met its goal in no sample; or every configuration, or state of both arms, that the goal sampling tried comes nearer than the plan's clearance, which the message names with the pair that the one falling short least falls short against: two links, a link or a carried object and the map or an object, a carried object and a link, or two objects the two arms carry. The message says so when the deadline ended the sampling, and that more time may find a goal. |
 | `no_path` | The planner finds no path within the time and the iterations allowed, or the start rule leaves no motion from the start; a planned waypoint falls short of the plan's clearance, or a corner's rounding does however near it the added waypoints lie; the planned path fails its check, simplified and as planned; the time allowed ends before the plan answers; or a start or a goal breaks a path orientation, or no configuration that meets the goal keeps them. The message names the plan's clearance where it falls short, and the link where a path orientation breaks. |
 | `timeout` | A check has a walk of a run or an arc left at 10 s. |

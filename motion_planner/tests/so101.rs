@@ -33,7 +33,8 @@ use peppygen::mock::deps::limb_state;
 use so101_description::{ARM_DOF, ARM_LIMB, BASE_LINK, GRIPPER_LIMB, JAW_LINK, TCP_LINK, URDF};
 
 use common::{
-    Ended, PLANNING_TIME_S, TIMEOUT, at_ms, check, plan, start_identified_as, vacant_camera,
+    Ended, OWN_BODY_WAY_OUT, PLANNING_TIME_S, TIMEOUT, at_ms, check, plan, start_identified_as,
+    vacant_camera,
 };
 
 /// The arm turned to one side of the base, every joint off its limits.
@@ -44,9 +45,11 @@ const ACROSS: [f64; ARM_DOF] = [0.9, -0.6, 0.9, 0.4, 0.0];
 const HALFWAY: [f64; ARM_DOF] = [0.0, -0.6, 0.9, 0.4, 0.0];
 /// A configuration whose pose the goals of a position or a pose name.
 const REACHED: [f64; ARM_DOF] = [0.5, -0.3, 0.6, 0.2, 0.0];
-/// The arm at home, folded over its base as it rests (so101_description's postures.py,
-/// `HOME_POSITIONS_RAD`), its own links touching in its self model.
-const HOME: [f64; ARM_DOF] = [-0.05, -1.72, 1.68, 1.24, 0.32];
+/// The arm folded over its base as it rests, its own links touching in its self model.
+const FOLDED: [f64; ARM_DOF] = [-0.05, -1.72, 1.68, 1.24, 0.32];
+/// The arm at home (so101_description's postures.py, `HOME_POSITIONS_RAD`): `FOLDED`
+/// unfolded out of contact.
+const HOME: [f64; ARM_DOF] = [-0.05, -1.51, 1.47, 1.03, 0.32];
 /// A posture whose grasp point stands where a box of `BOX_SIDE_M` around it comes within the
 /// clearance of the base, and stands more than the clearance from each link it may not touch,
 /// the arm's own links farther apart than the clearance a plan keeps between them.
@@ -282,30 +285,37 @@ async fn it_describes_its_one_arm() -> peppygen::Result<()> {
     Ok(())
 }
 
-// The arm at home, folded over its base, touches itself: a check of it fails, the reason
-// naming the links that touch, and answers no map stamp, its map empty. A plan from home is
-// refused, the message naming the links and the ready posture to plan from.
+// The arm folded over its base touches itself: a check of it fails, the reason naming the
+// links that touch and the home posture to plan from, and answers no map stamp, its map
+// empty. A plan from there is refused with the same way out.
 #[tokio::test(flavor = "multi_thread")]
 async fn it_keeps_its_own_links_apart() -> peppygen::Result<()> {
-    let (harness, _mocks) = started_at(&HOME).await?;
-    let home = checked(&harness, &[HOME]).await;
-    assert!(!home.clear, "the arm at home touches itself");
+    let (harness, _mocks) = started_at(&FOLDED).await?;
+    let folded = checked(&harness, &[FOLDED]).await;
+    assert!(!folded.clear, "the folded arm touches itself");
     assert!(
-        home.reason.starts_with("the start is in contact: ") && home.reason.contains(" touches "),
+        folded.reason.starts_with("the start is in contact: ")
+            && folded.reason.contains(" touches ")
+            && folded.reason.ends_with(OWN_BODY_WAY_OUT),
         "{}",
-        home.reason
+        folded.reason
     );
-    assert_eq!(home.map_stamp, None);
+    assert_eq!(folded.map_stamp, None);
     let Err(Ended::Failed(refused)) = plan(&harness, &joints_at(&REACHED)).await else {
-        panic!("a plan from home fails once taken");
+        panic!("a plan from the folded arm fails once taken");
     };
     assert_eq!(refused.kind, FailureKind::StartInCollision, "{refused}");
-    assert!(
-        refused.message.ends_with(
-            "; move the arms to the ready posture with move_to_ready and plan from there"
-        ),
-        "{refused}"
-    );
+    assert!(refused.message.ends_with(OWN_BODY_WAY_OUT), "{refused}");
+    Ok(())
+}
+
+// From home, the rest pose unfolded out of contact, a plan has a path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_from_home_has_a_path() -> peppygen::Result<()> {
+    let (harness, _mocks) = started_at(&HOME).await?;
+    plan(&harness, &joints_at(&REACHED))
+        .await
+        .expect("a plan from home");
     Ok(())
 }
 

@@ -32,10 +32,10 @@ use peppygen::fixtures::exposed_services::motion_planning::{
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 
 use common::{
-    Ended, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, Solid, TIMEOUT, UNDER_THE_TABLE, arms, at_ms,
-    check, left_path, looking_at, parameters, plan, plan_to, planned_waypoints, publish_arms,
-    render, start, start_with_camera, start_without_camera, table_across, take_frame,
-    wait_for_the_arms,
+    CLEAR_OR_ALLOW_WAY_OUT, Ended, OPENARM_V2, OVER_THE_TABLE, OWN_BODY_WAY_OUT, RIGHT_READY,
+    Solid, TIMEOUT, UNDER_THE_TABLE, arms, at_ms, check, left_path, looking_at, parameters, plan,
+    plan_to, planned_waypoints, publish_arms, render, start, start_with_camera,
+    start_without_camera, table_across, take_frame, wait_for_the_arms,
 };
 
 /// The left arm's grasp link.
@@ -228,6 +228,15 @@ async fn allow(
     )
 }
 
+/// `table_across` the motion from under the table to over it, raised by the clearance so the
+/// arm under it starts outside the clearance of it: a start inside it is refused.
+fn box_across() -> Solid {
+    let ((low, high), _) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
+    let rise = parameters().min_clearance_m;
+    let raised = |corner: [f64; 3]| [corner[0], corner[1], corner[2] + rise];
+    (raised(low), raised(high))
+}
+
 async fn scene(harness: &Harness) -> get_planning_scene::Response {
     get_planning_scene::poll(harness, TIMEOUT)
         .await
@@ -248,8 +257,7 @@ async fn standing(harness: &Harness, q: [f64; ARM_DOF]) -> check_joint_path::Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_box_between_start_and_goal_is_avoided_until_it_is_removed() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let (table, _) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
-    apply(&harness, vec![add_solid("box", table)])
+    apply(&harness, vec![add_solid("box", box_across())])
         .await
         .expect("the box is added");
     let straight = left_path(&[], &[OVER_THE_TABLE]);
@@ -286,7 +294,7 @@ async fn a_box_between_start_and_goal_is_avoided_until_it_is_removed() -> peppyg
         &free.arms[0].start_joint_positions,
         &planned_waypoints(&free),
     );
-    apply(&harness, vec![add_solid("box", table)])
+    apply(&harness, vec![add_solid("box", box_across())])
         .await
         .expect("the box is back");
     assert!(
@@ -529,8 +537,7 @@ async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
     attach(&harness, "item", &gripper_links())
         .await
         .expect("the item is attached, touching the gripper");
-    let (table, _) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
-    apply(&harness, vec![add_solid("box", table)])
+    apply(&harness, vec![add_solid("box", box_across())])
         .await
         .expect("the box is added");
     let carried = plan(&harness, &plan_to(&OVER_THE_TABLE))
@@ -589,7 +596,8 @@ async fn a_held_item_keeps_clear_of_the_other_arm_and_the_body() -> peppygen::Re
         let touching = standing(&harness, UNDER_THE_TABLE).await;
         assert!(
             !touching.clear
-                && touching.reason == format!("the start is in contact: item touches {body}"),
+                && touching.reason
+                    == format!("the start is in contact: item touches {body}{OWN_BODY_WAY_OUT}"),
             "an item reaching into {body}: {touching:?}"
         );
         detach(&harness, "item")
@@ -631,7 +639,9 @@ async fn an_item_the_right_arm_holds_stands_where_it_holds_it() -> peppygen::Res
                 standing_still
                     .reason
                     .starts_with("the start is in contact: openarm_left_")
-                    && standing_still.reason.ends_with(" touches item"),
+                    && standing_still
+                        .reason
+                        .ends_with(&format!(" touches item{CLEAR_OR_ALLOW_WAY_OUT}")),
                 "{standing_still:?}"
             );
         }
@@ -745,9 +755,10 @@ async fn a_held_item_keeps_out_of_contact_with_the_links_it_may_not_touch() -> p
 }
 
 // A held item that ends `SHORT_M` past the gripper's front, set down on a table, brings
-// the table nearer the gripper than the plan's clearance: with the item and the table
-// paired alone, the arm standing there falls short of the clearance from the objects, and
-// once the table is paired with the gripper's links too it stands clear.
+// the table nearer the gripper than the clearance: with the item and the table paired
+// alone, a check and a plan from there are refused, the reason naming the gripper, the
+// table and the way out, and once the table is paired with the gripper's links too it
+// stands clear.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> peppygen::Result<()>
 {
@@ -773,10 +784,16 @@ async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> 
     let near = standing(&harness, UNDER_THE_TABLE).await;
     assert!(
         !near.clear
-            && near.reason.starts_with("at waypoint 1, ")
-            && near.reason.contains(" from the map and the objects, "),
+            && near.reason.starts_with("the start keeps openarm_left_")
+            && near.reason.contains(" from table, inside the clearance ")
+            && near.reason.ends_with(CLEAR_OR_ALLOW_WAY_OUT),
         "the gripper near the table: {near:?}"
     );
+    let Err(Ended::Failed(refused)) = plan(&harness, &plan_to(&OVER_THE_TABLE)).await else {
+        panic!("a plan from a start inside the clearance fails once taken");
+    };
+    assert_eq!(refused.kind, FailureKind::StartInCollision, "{refused}");
+    assert_eq!(refused.message, near.reason);
     allow(&harness, "table", &gripper_links(), true)
         .await
         .expect("the table may touch the gripper");
