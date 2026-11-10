@@ -23,7 +23,8 @@
       // limb names are "arm" and "gripper".
       { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
       // Whole-robot posture moves, executed through the same admission and
-      // trajectory path as move_arm_joints.
+      // trajectory path as move_arm_joints. move_to_home first closes the
+      // gripper, a gripper plan as move_gripper installs one.
       { name: "postures", tag: "v1", link_id: "postures" },
       // Where the robot can work, from its design alone: where its arm
       // reaches, in the robot frame (the URDF's base_link frame), on a flat,

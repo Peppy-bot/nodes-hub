@@ -1126,7 +1126,8 @@ async fn tick_arm(
     // held setpoint needs no hand basis: there is no streamed motion to cap.
     // A move in that darkness can neither progress nor be verified, so it and
     // any queued goal fail here with no result, freeing the claim each holds:
-    // a ready share that kept its claim would wedge the ready action for good.
+    // a posture share that kept its claim would wedge its posture action for
+    // good.
     if admission == Admission::Stale {
         planner.fail_active(stale_failure()).await;
         while let Ok(goal) = channels.goals.try_recv() {

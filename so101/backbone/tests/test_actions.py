@@ -28,7 +28,7 @@ from peppygen.exposed_actions.limb_motion import execute_joint_path
 from so101_description import limits as limits_mod
 from so101_description.kinematics import Kinematics
 from so101_description.model import KINEMATICS_URDF_PATH
-from so101_description.postures import READY_POSITIONS_RAD
+from so101_description.postures import HOME_POSITIONS_RAD, READY_POSITIONS_RAD
 from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
 from so101_description.transforms import relative_rotation_rad
 
@@ -40,6 +40,7 @@ from so101_backbone.actions import (
     NOT_PLANNED,
     NOT_PLANNED_NAMING_ORIENTATION,
     WALKED_BACK,
+    HomeMove,
     JointPathMove,
     PendingSlot,
     PoseMove,
@@ -670,6 +671,225 @@ async def test_a_stopped_posture_reports_the_measured_grasp_point(
     assert ctx.cancelled == (reason, ["arm"], list(position), list(orientation))
     assert plan.aborted
     assert coordinator.try_claim_arm()
+
+
+# move_to_home: the close of the gripper, then the arm move.
+
+
+def admit_home(layer, duration_s=0.0) -> HomeMove:
+    return layer._admit_home(HOME_POSITIONS_RAD, duration_s)
+
+
+def home_layer(kinematics=None):
+    """A coordinator and its action layer with the arm measured at MEASURED
+    and the gripper fully open, its jaws ramping at 1.0 of their travel per
+    second."""
+    coordinator, layer = make_layer(kinematics, max_gripper_rate_frac_s=1.0)
+    coordinator.measured_joints.set(MEASURED)
+    coordinator.measured_gripper.set(1.0)
+    return coordinator, layer
+
+
+def both_limbs_free(coordinator) -> bool:
+    """Whether no goal holds the arm or the gripper. Leaves both claimed."""
+    return coordinator.try_claim_arm() and coordinator.try_claim_gripper()
+
+
+def test_move_to_home_claims_the_gripper_and_the_arm_and_installs_the_close(
+    follower_never_stale,
+):
+    coordinator, layer = home_layer()
+    move = admit_home(layer)
+    assert (move.close.target, move.close.settle_timeout_s) == (0.0, 2.0)
+    assert coordinator._gripper.plan is move.close
+    assert not coordinator.try_claim_gripper()
+    assert not coordinator.try_claim_arm()
+    # The arm waits for the close: it has no plan, and gets no setpoint.
+    assert coordinator._arm.plan is None
+    assert coordinator.arm_tick(0.0) is None
+
+
+@pytest.mark.parametrize(
+    ("jaws_stop_at", "what"), [(0.0, "closed"), (0.4, "on an item")], ids=["closed", "item"]
+)
+async def test_move_to_home_closes_the_gripper_then_moves_the_arm_home(
+    jaws_stop_at, what, follower_never_stale
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    # duration_s is the time of the arm move alone.
+    move = admit_home(layer, duration_s=5.0)
+    ctx = FakeGoalContext()
+    drive = asyncio.create_task(layer.drive_home(ctx, move, kinematics))
+
+    # The close runs from fully open until the jaws stand still, closed or
+    # on an item. The arm gets no setpoint before that.
+    assert coordinator.arm_tick(0.0) is None
+    run_gripper_plan_to_its_end(coordinator, move.close, jaws_stop_at)
+    assert coordinator._arm.plan is None, f"the arm moved before the jaws stood {what}"
+
+    plan = await installed_plan(coordinator)
+    assert plan.profile.start == MEASURED
+    assert plan.profile.end == HOME_POSITIONS_RAD
+    assert plan.profile.duration_s == pytest.approx(5.0)
+    assert coordinator.try_claim_gripper(), "the close released the gripper"
+    coordinator.measured_joints.set(HOME_POSITIONS_RAD)
+    run_arm_plan_to_its_end(coordinator, plan)
+    await drive
+
+    position, orientation = kinematics.forward_kinematics(HOME_POSITIONS_RAD)
+    assert ctx.completed == (["arm"], list(position), list(orientation))
+    assert coordinator.try_claim_arm()
+
+
+def stop_the_close(layer, _ctx):
+    assert layer.stop_moves("the operator asked") == ["gripper"]
+
+
+@pytest.mark.parametrize(
+    ("cut_the_close", "reason"),
+    [(stop_the_close, "stopped: the operator asked"), (cancel_the_goal, CANCELLED_BY_CALLER)],
+    ids=["stop", "cancel"],
+)
+async def test_a_close_that_is_cut_ends_move_to_home_before_the_arm_moves(
+    cut_the_close, reason, follower_never_stale
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    move = admit_home(layer)
+    # The jaws are on their way: the close sent its first opening.
+    gripper_step(coordinator, 1.0, 0.0)
+    ctx = FakeGoalContext()
+    cut_the_close(layer, ctx)
+    await layer.drive_home(ctx, move, kinematics)
+
+    position, orientation = kinematics.forward_kinematics(MEASURED)
+    assert ctx.cancelled == (reason, ["arm"], list(position), list(orientation))
+    assert move.close.aborted
+    assert coordinator._arm.plan is None and coordinator.commanded_arm is None
+    assert both_limbs_free(coordinator)
+
+
+async def test_a_close_that_fails_fails_move_to_home_and_the_arm_does_not_move(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    move = admit_home(layer)
+    coordinator._fail_gripper_plan(move.close, FOLLOWER_SILENT)
+    ctx = FakeGoalContext()
+    await layer.drive_home(ctx, move, kinematics)
+
+    assert ctx.failed == (FailureKind.RESOURCE_UNAVAILABLE, "the follower stopped reporting")
+    assert ctx.completed is None and ctx.cancelled is None
+    assert coordinator._arm.plan is None and coordinator.commanded_arm is None
+    assert both_limbs_free(coordinator)
+
+
+async def test_a_stop_between_the_close_and_the_arm_move_ends_move_to_home_cancelled(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    move = admit_home(layer)
+    run_gripper_plan_to_its_end(coordinator, move.close, 0.0)
+    # The close ended and no plan is installed: the stop names no limb.
+    assert layer.stop_moves("the operator asked") == []
+    ctx = FakeGoalContext()
+    await layer.drive_home(ctx, move, kinematics)
+
+    position, orientation = kinematics.forward_kinematics(MEASURED)
+    assert ctx.cancelled == (
+        "stopped: the operator asked",
+        ["arm"],
+        list(position),
+        list(orientation),
+    )
+    assert coordinator._arm.plan is None
+    assert both_limbs_free(coordinator)
+
+
+async def test_an_arm_with_stale_state_after_the_close_fails_move_to_home(follower_never_stale):
+    kinematics = FakeKinematics()
+    coordinator, layer = home_layer(kinematics)
+    move = admit_home(layer)
+    run_gripper_plan_to_its_end(coordinator, move.close, 0.0)
+    coordinator.measured_joints.clear()
+    ctx = FakeGoalContext()
+    await layer.drive_home(ctx, move, kinematics)
+
+    assert ctx.failed == (FailureKind.RESOURCE_UNAVAILABLE, "the follower stopped reporting")
+    assert coordinator._arm.plan is None
+    assert both_limbs_free(coordinator)
+
+
+def test_move_to_home_is_refused_as_a_gripper_goal_is_and_claims_nothing(follower_never_stale):
+    # A leader streams the gripper.
+    coordinator, layer = home_layer()
+    coordinator.leader_gripper.set(0.5)
+    with pytest.raises(Refusal) as raised:
+        admit_home(layer)
+    assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, GRIPPER_WORDS.leader_streaming)
+    coordinator.leader_gripper.clear()
+    assert both_limbs_free(coordinator)
+
+    # The gripper executes another move.
+    coordinator, layer = home_layer()
+    admit_gripper(layer, 0.5)
+    with pytest.raises(Refusal) as raised:
+        admit_home(layer)
+    assert refusal_of(raised) == (
+        FailureKind.PRECONDITION_FAILED,
+        "gripper is already executing a move",
+    )
+    assert coordinator.try_claim_arm(), "the refusal claimed the arm"
+
+    # The gripper's follower delivers no state.
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set(MEASURED)
+    with pytest.raises(Refusal) as raised:
+        admit_home(layer)
+    assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, GRIPPER_WORDS.no_fresh_state)
+    assert coordinator.try_claim_arm(), "the refusal claimed the arm"
+
+
+def test_move_to_home_is_refused_as_an_arm_goal_is_and_claims_nothing(follower_never_stale):
+    # The arm executes another move.
+    coordinator, layer = home_layer()
+    admit_joints(layer, (0.1,) * 5)
+    with pytest.raises(Refusal) as raised:
+        admit_home(layer)
+    assert refusal_of(raised) == (
+        FailureKind.PRECONDITION_FAILED,
+        "arm is already executing a motion",
+    )
+    assert coordinator.try_claim_gripper(), "the refusal claimed the gripper"
+
+    # The joint limits cannot run the arm move within the ceiling.
+    coordinator, layer = make_layer(max_joint_velocity_rad_s=(1e-3,) * 5)
+    coordinator.measured_joints.set(MEASURED)
+    coordinator.measured_gripper.set(1.0)
+    with pytest.raises(Refusal, match="to run this posture move") as raised:
+        admit_home(layer)
+    assert raised.value.kind is FailureKind.REJECTED
+    assert both_limbs_free(coordinator)
+
+    # A duration out of its bound.
+    coordinator, layer = home_layer()
+    with pytest.raises(Refusal, match="duration_s must be a number of seconds") as raised:
+        admit_home(layer, duration_s=61.0)
+    assert raised.value.kind is FailureKind.REJECTED
+    assert both_limbs_free(coordinator)
+
+
+def test_a_walked_back_move_to_home_frees_the_gripper_and_the_arm(follower_never_stale):
+    coordinator, layer = home_layer()
+    pending = PendingSlot()
+    pending.plan = admit_home(layer)
+    close = pending.plan.close
+    layer.abandon(pending)
+    assert close.aborted and coordinator._gripper.plan is None
+    assert both_limbs_free(coordinator)
 
 
 def test_admission_refuses_before_claiming():
@@ -1308,7 +1528,7 @@ def test_decide_refuses_any_admission_surprise_without_holding_the_slot():
 
 def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
     from peppygen.exposed_actions.limb_motion import move_arm, move_gripper
-    from peppygen.exposed_actions.postures import move_to_home
+    from peppygen.exposed_actions.postures import move_to_home, move_to_ready
 
     coordinator, layer = make_layer()
     coordinator.measured_joints.set((0.0,) * 5)
@@ -1341,7 +1561,12 @@ def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
             GRIPPER_WORDS.leader_streaming,
         ),
         (
-            layer.decide_posture(move_to_home, READY_POSITIONS_RAD, PendingSlot())(posture),
+            layer.decide_posture(move_to_ready, READY_POSITIONS_RAD, PendingSlot())(posture),
+            move_to_ready,
+            ARM_WORDS.leader_streaming,
+        ),
+        (
+            layer.decide_home(move_to_home, HOME_POSITIONS_RAD, PendingSlot())(posture),
             move_to_home,
             ARM_WORDS.leader_streaming,
         ),

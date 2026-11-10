@@ -1,7 +1,7 @@
-//! The actions and services a caller reaches the arms through. Each move
+//! The actions and services a caller reaches the limbs through. Each move
 //! goal is admitted here (validated, then its limb claimed) and handed to the
 //! planner or the coordinator that runs it; a posture goal also waits for the
-//! shares of both arms and ends with their one result, and an
+//! shares of the limbs it moves and ends with their one result, and an
 //! execute_joint_path goal for the share of each of its arms
 //! ([`collect_ends`]); the stop and the plan check ask the coordinator and
 //! answer what it says. The times and the tolerances every move goal names
@@ -103,10 +103,11 @@ fn check_limb_free(fresh: bool, streaming: bool, words: &LimbWords) -> Result<()
     Ok(())
 }
 
-/// Claim the move slot of each arm of `sides`, in their order, or give the
-/// first arm whose slot another move holds. A refusal releases the slots it
+/// Claim the move slot of the limb on each side of `sides`, in their order,
+/// `move_slots` being the slots of the arms or of the grippers, or give the
+/// first side whose slot another move holds. A refusal releases the slots it
 /// claimed before it, so it never leaves a slot held.
-fn claim_arms(sides: &[Side], move_slots: &ArmPair<MoveSlot>) -> Result<(), Side> {
+fn claim_slots(sides: &[Side], move_slots: &ArmPair<MoveSlot>) -> Result<(), Side> {
     for (k, &side) in sides.iter().enumerate() {
         if move_slots[side].claim() {
             continue;

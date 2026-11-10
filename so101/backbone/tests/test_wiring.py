@@ -577,6 +577,40 @@ async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
                 feeder.cancel()
 
 
+async def test_move_to_home_closes_the_gripper_before_the_arm_moves(follower_never_stale):
+    # The mocked follower measures the arm at Home and the gripper fully
+    # open, and never moves its jaws, as jaws that hold an item do: the close
+    # ends where they stand, and move_to_home completes.
+    async with harness.start(setup, parameters=make_parameters()) as h:
+        feeder = await feeding_measured(h, positions=postures.HOME_POSITIONS_RAD, opening=1.0)
+        try:
+            goal = await move_to_home_fx.send_goal(
+                h,
+                move_to_home_prod.GoalRequestData(duration_s=0.0),
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == move_to_home_fx.ResultStatus.COMPLETED
+            assert result.data.arm_names == ["arm"]
+            # The close ramps the gripper down from fully open: the last
+            # opening that went downstream is the closed one.
+            openings = []
+            while True:
+                try:
+                    setpoint = await asyncio.wait_for(
+                        h.mocks.pairings.gripper.gripper_setpoints.next(), 0.5
+                    )
+                except TimeoutError:
+                    break
+                openings.append(setpoint.opening)
+            assert openings, "move_to_home sent the gripper no opening"
+            assert openings == sorted(openings, reverse=True)
+            assert openings[-1] == 0.0
+        finally:
+            feeder.cancel()
+
+
 async def test_a_posture_the_arm_does_not_reach_fails_with_timeout(follower_never_stale):
     # The mocked follower always measures MEASURED, as an arm that an object
     # holds where it stands: move_to_ready fails, naming the joint.

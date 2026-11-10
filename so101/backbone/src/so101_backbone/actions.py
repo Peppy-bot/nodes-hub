@@ -13,10 +13,14 @@ reports the opening measured then, where an object may hold the jaws.
 Cancelling freezes the limb where the trajectory stands, and so does the
 stop service, whoever started the move: the goal then ends cancelled, with
 the reason of the cancel or of the stop, and its result. A failed goal
-gives no result. The plan check runs a move_arm goal's solve from the same
-anchor and installs nothing. Every terminal path releases the claimed slot,
-and no exception may ever kill an action server: an unforeseen failure
-refuses or fails the goal and abandons anything admission installed.
+gives no result. A move_to_home goal claims the gripper and the arm, closes
+the gripper, a gripper plan that ends as every gripper move ends, and plans
+its arm move once the close completed: a close that a cancel or a stop cuts,
+or that fails, ends the goal before the arm moves. The plan check runs a
+move_arm goal's solve from the same anchor and installs nothing. Every
+terminal path releases the claimed slot, and no exception may ever kill an
+action server: an unforeseen failure refuses or fails the goal and abandons
+anything admission installed.
 A joint path or a pose move is planned in its drive, from where the arm
 stands, and the planning may fail the goal: a joint path then runs none of
 its path, its arm held, once its expected start is met, at its measured
@@ -45,6 +49,7 @@ from so101_backbone.coordinator import (
     Coordinator,
     GripperPlan,
     JointSettle,
+    PlanFailure,
     POSTURE_SETTLE,
     PoseSettle,
     joint_past_tolerance,
@@ -64,6 +69,14 @@ MAX_REQUESTED_DURATION_S = 60.0
 
 # A quaternion of a smaller norm has no direction to normalize.
 _QUATERNION_MIN_NORM = 1e-6
+
+# The opening of a closed gripper.
+_CLOSED_OPENING = 0.0
+
+# How long past the planned end of its travel the close of a move_to_home
+# goal waits for the jaws to stand still: the settle timeout of the arm's
+# move to a posture.
+_CLOSE_SETTLE_TIMEOUT_S = POSTURE_SETTLE.timeout_s
 
 # The refusals of a goal naming no limb of this robot.
 _UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM_LIMB}"'
@@ -229,14 +242,43 @@ class PoseMove:
     stops_before: int
 
 
+@dataclass(frozen=True)
+class HomeMove:
+    """An admitted move_to_home goal: the close of the gripper, installed at
+    admission, and the arm move to home, which the drive plans once the close
+    completed. The gripper and the arm slots are both claimed, so no other
+    move or stream commands the arm during the close."""
+
+    close: GripperPlan
+    # The joints of home, and the requested duration of the arm move.
+    target: tuple[float, ...]
+    duration_s: float
+    # The stop count at admission: a stop since ends the goal before its arm
+    # moves.
+    stops_before: int
+
+
+@dataclass(frozen=True)
+class _PlanEnd:
+    """How an installed plan ended for its goal: cancelled for a reason, by
+    the goal's caller or by the stop; failed; or, with neither, completed."""
+
+    cancelled: str | None = None
+    failed: PlanFailure | None = None
+
+    @property
+    def completed(self) -> bool:
+        return self.cancelled is None and self.failed is None
+
+
 class PendingSlot:
     """One server's admitted-but-not-yet-driven goal. Per server, so a failed
     delivery on one action can only ever walk back its own admission."""
 
     def __init__(self) -> None:
-        self.plan: ArmPlan | GripperPlan | JointPathMove | PoseMove | None = None
+        self.plan: ArmPlan | GripperPlan | JointPathMove | PoseMove | HomeMove | None = None
 
-    def take(self) -> ArmPlan | GripperPlan | JointPathMove | PoseMove | None:
+    def take(self) -> ArmPlan | GripperPlan | JointPathMove | PoseMove | HomeMove | None:
         plan = self.plan
         self.plan = None
         return plan
@@ -361,13 +403,26 @@ class ActionLayer:
         refused goal never leaves the slot held."""
         anchor = self._claim_free_arm()
         try:
-            profile = self._joint_move(anchor, target, duration_s)
-            _require_within_move_ceiling(profile, *_ceiling_words(settle))
+            profile = self._move_within_ceiling(anchor, target, duration_s, settle)
             return self._coordinator.adopt_arm_plan(profile, settle)
         except BaseException:
             # A failure between claim and adopt must not hold the slot.
             self._coordinator.release_arm()
             raise
+
+    def _move_within_ceiling(
+        self,
+        start: tuple[float, ...],
+        end: tuple[float, ...],
+        duration_s: float,
+        settle: JointSettle,
+    ) -> JointTrajectory:
+        """The joint move from `start` to `end` that settles by `settle`, or
+        Refusal with `rejected` when the joint velocity and acceleration caps
+        need longer than MAX_REQUESTED_DURATION_S for it."""
+        profile = self._joint_move(start, end, duration_s)
+        _require_within_move_ceiling(profile, *_ceiling_words(settle))
+        return profile
 
     def _admit_joint_path(
         self,
@@ -506,6 +561,14 @@ class ActionLayer:
         # Same disposition as the streamed path: the opening runs and the
         # effort preference is dropped, not refused.
         note_ignored_max_effort(self._effort_unsupported, max_effort, "move_gripper")
+        return self._claim_gripper_for(opening, settle_timeout_s)
+
+    def _claim_gripper_for(self, opening: float, settle_timeout_s: float) -> GripperPlan:
+        """Claim the gripper's busy slot and install its ramp to `opening`,
+        which settles within `settle_timeout_s`, or raise Refusal, in the
+        order every gripper goal is refused: no fresh gripper state, a leader
+        streaming the gripper, a gripper goal in flight. A refused goal
+        leaves the slot unclaimed."""
         anchor = _admit_limb(
             self._coordinator.gripper_anchor(),
             self._coordinator.leader_streams_gripper,
@@ -566,9 +629,34 @@ class ActionLayer:
 
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
         """A posture move completes once the arm settles at the posture
-        (POSTURE_SETTLE), and reports the measured grasp point."""
+        (POSTURE_SETTLE), and reports the measured grasp point. It claims the
+        arm alone, and sends the gripper no command."""
         _require_duration(duration_s, "duration_s")
         return self._admit_trajectory(target, duration_s, POSTURE_SETTLE)
+
+    def _admit_home(self, target: tuple[float, ...], duration_s: float) -> HomeMove:
+        """Claim the gripper and the arm for a move_to_home goal to `target`
+        and install the close of the gripper, or raise Refusal, in this
+        order: a duration out of its bound; the refusals of an arm goal; an
+        arm move that the joint limits cannot run within the ceiling from
+        where the arm stands; the refusals of a gripper goal. A refused goal
+        leaves no limb claimed."""
+        _require_duration(duration_s, "duration_s")
+        self._move_within_ceiling(self._free_arm_anchor(), target, duration_s, POSTURE_SETTLE)
+        close = self._claim_gripper_for(_CLOSED_OPENING, _CLOSE_SETTLE_TIMEOUT_S)
+        try:
+            self._claim_free_arm()
+        except BaseException:
+            # A failure between the two claims must not hold the gripper.
+            self._coordinator.abort_gripper_plan(close)
+            self._coordinator.release_gripper()
+            raise
+        return HomeMove(
+            close=close,
+            target=target,
+            duration_s=duration_s,
+            stops_before=self._coordinator.stop_count,
+        )
 
     # ----------------------------------------------------- decide constructors
 
@@ -603,6 +691,16 @@ class ActionLayer:
             return self._decide(
                 module,
                 lambda: self._admit_posture(target, request.data.duration_s),
+                pending,
+            )
+
+        return decide
+
+    def decide_home(self, module, target: tuple[float, ...], pending: PendingSlot):
+        def decide(request):
+            return self._decide(
+                module,
+                lambda: self._admit_home(target, request.data.duration_s),
                 pending,
             )
 
@@ -660,6 +758,11 @@ class ActionLayer:
         if isinstance(plan, ArmPlan):
             self._coordinator.abort_arm_plan(plan)
             self._coordinator.release_arm()
+        elif isinstance(plan, HomeMove):
+            # The close is installed, and the arm move is not planned yet.
+            self._coordinator.abort_gripper_plan(plan.close)
+            self._coordinator.release_gripper()
+            self._coordinator.release_arm()
         elif isinstance(plan, (JointPathMove, PoseMove)):
             # Nothing installed yet: the planning had not run. Only the
             # claim is walked back.
@@ -670,31 +773,38 @@ class ActionLayer:
 
     # -------------------------------------------------------------- execution
 
-    async def _finish_plan(self, ctx, plan, abort, results, started: float) -> None:
-        """Wait out the plan, a cancel or a stop, and end the goal.
-        results(action_time) builds the result fields and runs after any
-        abort, so it reads the plan where it stopped. A stop has already cut
-        the plan, and the goal ends cancelled with the stop's reason; a plan
-        the coordinator failed fails the goal with its kind."""
+    async def _wait_out(self, ctx, plan, abort) -> _PlanEnd:
+        """Wait out the plan, a cancel or a stop, and give how the plan ended
+        for its goal. A stop has already cut the plan, and the plan ends
+        cancelled with the stop's reason; a plan the coordinator failed ends
+        failed with its kind; a cancel of the goal cuts the plan with
+        `abort`, and the plan ends cancelled with the reason of the cancel."""
         cancel_task = asyncio.ensure_future(ctx.cancel_signal())
         done_task = asyncio.ensure_future(plan.done.wait())
         try:
             await asyncio.wait([cancel_task, done_task], return_when=asyncio.FIRST_COMPLETED)
-            action_time = time.monotonic() - started
             if plan.stopped is not None:
-                await ctx.complete_cancelled(plan.stopped, *results(action_time))
-            elif plan.failed is not None:
-                await ctx.fail(plan.failed.kind, plan.failed.message)
-            elif plan.done.is_set():
-                await ctx.complete(*results(action_time))
-            else:
-                abort(plan)
-                await ctx.complete_cancelled(ctx.cancel_reason(), *results(action_time))
-        except Exception as e:
-            log(f"goal completion failed: {e!r}")
+                return _PlanEnd(cancelled=plan.stopped)
+            if plan.failed is not None:
+                return _PlanEnd(failed=plan.failed)
+            if plan.done.is_set():
+                return _PlanEnd()
+            abort(plan)
+            return _PlanEnd(cancelled=ctx.cancel_reason())
         finally:
             cancel_task.cancel()
             done_task.cancel()
+
+    async def _finish_plan(self, ctx, plan, abort, results, started: float) -> None:
+        """Wait out the plan as _wait_out does, and end the goal.
+        results(action_time) builds the result fields and runs after any
+        abort, so it reads the plan where it stopped."""
+        try:
+            end = await self._wait_out(ctx, plan, abort)
+            action_time = time.monotonic() - started
+            await _end_goal(ctx, end, lambda: results(action_time))
+        except Exception as e:
+            log(f"goal completion failed: {e!r}")
 
     async def drive_arm(self, ctx, plan: ArmPlan) -> None:
         """Wait out the plan or a cancel, then end the goal with the measured
@@ -744,6 +854,57 @@ class ActionLayer:
             return self._measured_grasp_pose(kinematics)
 
         await self._drive_arm_plan(ctx, plan, results)
+
+    async def drive_home(self, ctx, move: HomeMove, kinematics) -> None:
+        """Close the gripper of `move`, then move the arm to home (see
+        _run_home), and end the goal as drive_posture ends it: a completed or
+        cancelled goal gives the grasp pose of the arm, from the joints that
+        the follower measures at that time. Then release the arm."""
+        try:
+            end = await self._run_home(ctx, move)
+            await _end_goal(ctx, end, lambda: self._measured_grasp_pose(kinematics))
+        except Exception as e:
+            log(f"goal completion failed: {e!r}")
+        finally:
+            self._coordinator.release_arm()
+
+    async def _run_home(self, ctx, move: HomeMove) -> _PlanEnd:
+        """How the goal of `move` ends. The arm moves only once the close of
+        the gripper completed, where the jaws stand, closed or on an item:
+        - a close that a cancel or a stop cuts, or that fails, ends the goal
+          as it ended;
+        - a stop since admission ends the goal cancelled with its reason;
+        - an arm with no fresh follower state fails the goal with
+          `resource_unavailable`, and an arm move that the joint limits
+          cannot run within the ceiling with `rejected`.
+
+        The arm move is planned from where the arm stands once the close
+        completed, and takes the requested duration of `move`: the close
+        adds its own time."""
+        closed = await self._wait_out_close(ctx, move.close)
+        if not closed.completed:
+            return closed
+        if self._coordinator.stop_count != move.stops_before:
+            return _PlanEnd(cancelled=self._coordinator.last_stop)
+        anchor = self._coordinator.arm_anchor()
+        if anchor is None:
+            return _PlanEnd(failed=FOLLOWER_SILENT)
+        try:
+            profile = self._move_within_ceiling(
+                anchor, move.target, move.duration_s, POSTURE_SETTLE
+            )
+        except Refusal as e:
+            return _PlanEnd(failed=PlanFailure(e.kind, str(e)))
+        plan = self._coordinator.adopt_arm_plan(profile, POSTURE_SETTLE)
+        return await self._wait_out(ctx, plan, self._coordinator.abort_arm_plan)
+
+    async def _wait_out_close(self, ctx, close: GripperPlan) -> _PlanEnd:
+        """Wait out the close of a move_to_home goal as _wait_out does, then
+        release the gripper."""
+        try:
+            return await self._wait_out(ctx, close, self._coordinator.abort_gripper_plan)
+        finally:
+            self._coordinator.release_gripper()
 
     async def _drive_arm_plan(self, ctx, plan: ArmPlan, results) -> None:
         """Finish the goal of an installed arm `plan` with `results`, then
@@ -1173,6 +1334,19 @@ def _no_pose() -> tuple[list[float], list[float]]:
     measured joints nor a commanded setpoint to place the arm. Fresh lists
     per call, since they are handed to the generated completion API."""
     return [0.0] * 3, [0.0, 0.0, 0.0, 1.0]
+
+
+async def _end_goal(ctx, end: _PlanEnd, results: Callable[[], tuple]) -> None:
+    """End the goal of `ctx` as its plan ended: failed with the kind and the
+    message of the failure and no result, or cancelled for its reason or
+    completed, each with `results()`, the result fields."""
+    if end.failed is not None:
+        await ctx.fail(end.failed.kind, end.failed.message)
+        return
+    if end.cancelled is not None:
+        await ctx.complete_cancelled(end.cancelled, *results())
+        return
+    await ctx.complete(*results())
 
 
 async def _end_guarded(end, *args) -> None:

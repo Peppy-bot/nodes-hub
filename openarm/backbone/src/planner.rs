@@ -144,9 +144,11 @@ pub const POSTURE_SETTLE: Settle<JointVec> = Settle {
     timeout: Duration::from_secs(2),
 };
 
-/// One arm's share of a whole-robot ready move: where its terminal reports,
-/// and the cancel flag the admission task flips on the action's cancel.
-pub struct ReadyReply {
+/// One limb's share of a posture goal (move_to_ready or move_to_home): where
+/// its terminal reports, and the cancel flag the posture action raises on
+/// the goal's cancel. The share of an arm is its move to the posture; the
+/// share of a gripper is its close ahead of the move to home.
+pub struct PostureShare {
     pub done_tx: mpsc::Sender<Outcome>,
     pub cancelled: Arc<AtomicBool>,
 }
@@ -160,7 +162,7 @@ pub enum JointReply {
         ctx: Box<move_arm_joints::GoalContext>,
         settle: Settle<JointVec>,
     },
-    Ready(ReadyReply),
+    Posture(PostureShare),
 }
 
 impl JointReply {
@@ -172,10 +174,7 @@ impl JointReply {
             Self::MoveArmJoints { ctx, .. } => {
                 ctx.cancel_cause().map(|cause| cause.reason().to_string())
             }
-            Self::Ready(r) => r
-                .cancelled
-                .load(Ordering::Acquire)
-                .then(|| POSTURE_CANCELLED.to_string()),
+            Self::Posture(share) => share.cancel_reason(),
         }
     }
 
@@ -193,7 +192,7 @@ impl JointReply {
         now: Instant,
     ) -> Option<Outcome> {
         let settle = match self {
-            Self::Ready(_) => &POSTURE_SETTLE,
+            Self::Posture(_) => &POSTURE_SETTLE,
             Self::MoveArmJoints { settle, .. } => settle,
         };
         verdict(
@@ -221,7 +220,7 @@ impl JointReply {
         let side = planner.side;
         let ctx = match self {
             Self::MoveArmJoints { ctx, .. } => ctx,
-            Self::Ready(r) => return r.report(side, outcome).await,
+            Self::Posture(share) => return share.report(side, outcome).await,
         };
         let joints = planner.reported_joints(&measured);
         let ended = match outcome {
@@ -246,21 +245,29 @@ impl JointReply {
                     error!("{}: move_arm_joints end: {e}", side);
                 }
             }
-            Self::Ready(r) => r.report(side, Outcome::Failed(failure)).await,
+            Self::Posture(share) => share.report(side, Outcome::Failed(failure)).await,
         }
     }
 }
 
-impl ReadyReply {
-    /// Report how the share of the arm on `side` ended, its failure labelled
-    /// with the side.
-    async fn report(self, side: Side, outcome: Outcome) {
+impl PostureShare {
+    /// The reason of the cancel of the posture goal, which its action flags,
+    /// or `None` before one.
+    pub fn cancel_reason(&self) -> Option<String> {
+        self.cancelled
+            .load(Ordering::Acquire)
+            .then(|| POSTURE_CANCELLED.to_string())
+    }
+
+    /// Report how the share of `limb` ended, its failure labelled with the
+    /// limb: the side of an arm, or the name of a gripper.
+    pub async fn report(self, limb: impl std::fmt::Display, outcome: Outcome) {
         let outcome = match outcome {
-            Outcome::Failed(failure) => Outcome::Failed(failure.labelled(side)),
+            Outcome::Failed(failure) => Outcome::Failed(failure.labelled(&limb)),
             other => other,
         };
         if self.done_tx.send(outcome).await.is_err() {
-            error!("{}: ready outcome aggregation closed", side);
+            error!("{limb}: posture outcome aggregation closed");
         }
     }
 }
@@ -299,7 +306,7 @@ impl Goal {
         Goal::Joint {
             target,
             duration: Duration::from_secs(1),
-            reply: JointReply::Ready(ReadyReply {
+            reply: JointReply::Posture(PostureShare {
                 done_tx,
                 cancelled: Arc::new(AtomicBool::new(false)),
             }),
@@ -806,7 +813,7 @@ impl Planner {
                 );
                 let (what, remedy) = match reply {
                     JointReply::MoveArmJoints { .. } => ("move", SPLIT_INTO_SHORTER_MOVES),
-                    JointReply::Ready(_) => ("posture move", RAISE_THE_JOINT_LIMITS),
+                    JointReply::Posture(_) => ("posture move", RAISE_THE_JOINT_LIMITS),
                 };
                 if let Err(failure) = path::check_move_time(&traj, what, remedy) {
                     reply.fail(self.side, failure).await;
@@ -1903,7 +1910,7 @@ mod tests {
                 let goal = Goal::Joint {
                     target,
                     duration: Duration::ZERO,
-                    reply: JointReply::Ready(ReadyReply {
+                    reply: JointReply::Posture(PostureShare {
                         done_tx,
                         cancelled: Arc::new(AtomicBool::new(false)),
                     }),
