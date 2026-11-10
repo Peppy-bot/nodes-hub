@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Build the SO-101's Isaac Sim stage from its upstream MuJoCo model.
 
-so101_description, the hardware's source of truth, carries a kinematics-only
-URDF: no meshes, no collision, no inertia. The geometry comes from MuJoCo
-Menagerie's robotstudio_so101 (Apache-2.0) at the commit
+so101_description, the hardware's source of truth, carries a URDF of the arm's
+joints and its links' collision meshes: no visual mesh, no inertia. The geometry
+comes from MuJoCo Menagerie's robotstudio_so101 (Apache-2.0) at the commit
 sim_base_images/so101_model.lock.json pins, the same files the MuJoCo node
 bakes and Waldo's catalogue names, so the three engines stand the same robot.
 

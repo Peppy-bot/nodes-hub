@@ -17,13 +17,12 @@ use control_core::latched_log::LatchedLog;
 use control_core::{receiving, serving};
 use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
-    DepthCamera, Goal, IkGoalSampler, PathCheck, PathOrientation, PlanFailure, PlanRequest,
-    PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault, cartesian_path,
-    check_path, insert_cut_out, plan_path, pose_parts, start_inside_limits,
+    Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathOrientation, PlanFailure,
+    PlanRequest, PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault,
+    cartesian_path, check_path, insert_cut_out, plan_path, pose_parts, start_inside_limits,
 };
 use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
 use ompl_bridge::{PLANNING_THREADS, Planner};
-use openarm_description::{ARM_DOF, ArmPair, DUAL_DOF, Side};
 use peppygen::consumed_services::camera::depth_stream_info;
 use peppygen::consumed_services::camera_mounts::get_camera_poses;
 use peppygen::consumed_services::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
@@ -41,21 +40,21 @@ use peppygen::exposed_services::motion_planning::{
     clear_occupancy_map, describe_arms, get_planning_scene, set_allowed_collision,
 };
 use peppygen::{NodeRunner, Parameters, ProducerRef, Result};
-use self_collision_model::SelfCollisionModel;
 use tokio::sync::watch;
 use tracing::{error, info};
 
+use crate::arm_set::{ArmId, PerArm};
 use crate::config::Config;
-use crate::fingers::{FingerFault, riders, riders_of_both_arms, with_held_objects};
+use crate::fingers::{FingerFault, riders_of_the_arms, with_held_objects};
 use crate::history::{ArmJoints, History, Measured};
 use crate::intake::robot_mask;
+use crate::own_body::OwnBody;
 use crate::request::{
     ArmGoals, ArmStarts, CartesianQuery, CheckQuery, PlanQuery, parse_cartesian, parse_check,
     parse_plan,
 };
-use crate::robot::{ArmModel, Robot, RobotModel};
+use crate::robot::{ArmModel, ModelError, Robot, RobotModel, openarm_v2, so101};
 use crate::scene::{attach_request, object_requests, scene_response};
-use crate::self_model::{BothArms, HeldOtherArm};
 
 /// Bounds every call to another node.
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,10 +81,14 @@ const AWAITING_FRAME: &str = "no depth frame has reached the map yet";
 /// Why a plan, a check or an attach is refused before the arms' joint positions are
 /// measured.
 const NO_JOINTS: &str = "no joint positions of the arms have been measured yet; ask again \
-                         once limb_state publishes both arms' joints and both grippers' openings";
+                         once limb_state publishes every arm's joints and every gripper's opening";
 /// What the node logs on a robot whose launcher linked no depth camera.
 const NO_CAMERA: &str = "no depth camera is linked to the planner: plans and checks keep \
-                         the clearance from the robot's own body alone";
+                         the clearance from the planning scene's objects and from the robot's \
+                         own body alone";
+/// What a plan refused for a start where the robot's own bodies touch tells the caller to do.
+const OWN_CONTACT_WAY_OUT: &str = "move the arms to the ready posture with move_to_ready and \
+                                   plan from there";
 
 /// The links of the perception camera the map reads.
 struct CameraLinks {
@@ -196,23 +199,23 @@ impl Map {
 }
 
 /// What the node holds.
-struct Node {
+struct Node<const N: usize, const D: usize, const K: usize> {
     config: Config,
     /// The robot frame, the URDF's root link: the frame of the map, of each depth
     /// frame's sensor and of the robot cut out of it.
     frame: Frame,
-    arms: ArmPair<ArmModel>,
+    arms: PerArm<ArmModel<N>>,
     /// The robot's body around its arms, which the map cuts out of each frame.
     body: BodyGeometry,
-    /// The self model, its grippers at the openings it was built with.
-    self_model: SelfCollisionModel,
+    /// The robot's own body, its grippers at the openings it was built with.
+    own: OwnBody<N, K>,
     /// The collision objects, the objects attached to the arms' grasp links, and the
     /// pairs allowed to touch.
     scene: Mutex<PlanningScene>,
     map: Mutex<Map>,
     /// The measured joint positions and gripper openings, which a depth frame waits on
     /// until they reach its stamp.
-    history: watch::Sender<History>,
+    history: watch::Sender<History<N>>,
     /// How many times the history has restarted on a clock that stepped back.
     restarts: AtomicU64,
     /// Whether the launcher bound a slot of the depth camera.
@@ -230,15 +233,19 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// # Panics
 ///
 /// When `link` is no arm's grasp link: the scene attaches objects to grasp links alone.
-fn grasp_pose(models: &ArmPair<ArmModel>, arms: &ArmJoints, link: &str) -> Isometry3<f64> {
+fn grasp_pose<const N: usize>(
+    models: &PerArm<ArmModel<N>>,
+    arms: &ArmJoints<N>,
+    link: &str,
+) -> Isometry3<f64> {
     let arm = models
         .iter()
         .find(|arm| arm.grasp_link == link)
         .expect("the scene attaches objects to grasp links alone");
-    arm.geometry.chain().world_ee_pose(&arms[arm.side])
+    arm.geometry.chain().world_ee_pose(&arms[arm.id])
 }
 
-impl Node {
+impl<const N: usize, const D: usize, const K: usize> Node<N, D, K> {
     /// The planning scene and the map, held together: every holder of both takes them
     /// here, the scene first.
     fn scene_and_map(&self) -> (MutexGuard<'_, PlanningScene>, MutexGuard<'_, Map>) {
@@ -257,27 +264,19 @@ impl Node {
     }
 
     /// The newest measurement.
-    fn latest(&self) -> Option<Measured> {
-        self.history.borrow().latest().map(Measured::from_values)
+    fn latest(&self) -> Option<Measured<N>> {
+        self.history.borrow().latest()
     }
 
-    /// The self model with the grippers at the openings of `measured`, or at the
+    /// The robot's own body with the grippers at the openings of `measured`, or at the
     /// openings it was built with when nothing is measured.
-    fn self_model_at(&self, measured: Option<&Measured>) -> SelfCollisionModel {
-        let mut model = self.self_model.clone();
+    fn own_at(&self, measured: Option<&Measured<N>>) -> OwnBody<N, K> {
+        let mut own = self.own.clone();
         if let Some(measured) = measured {
-            set_openings(&mut model, measured);
+            own.set_openings(&measured.openings);
         }
-        model
+        own
     }
-}
-
-/// Puts `model`'s grippers at the openings of `measured`.
-fn set_openings(model: &mut SelfCollisionModel, measured: &Measured) {
-    model.set_gripper_openings(
-        measured.openings[Side::Left],
-        measured.openings[Side::Right],
-    );
 }
 
 /// The fault that ends the node after its setup: a model the robot's identity names that
@@ -323,9 +322,27 @@ async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config, fault: F
         Ok(robot) => robot,
         Err(e) => return fault.raise(&runner, &format!("robot_identity: {e}")),
     };
+    match robot {
+        Robot::OpenArmV2 => serve_robot(runner, config, fault, robot, openarm_v2()),
+        Robot::So101 => serve_robot(runner, config, fault, robot, so101()),
+    }
+}
+
+/// Starts the node for `robot`, whose model is `model`, and its followers and servers. A
+/// model that fails to build, or to start, raises `fault`.
+fn serve_robot<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    config: Config,
+    fault: Fault,
+    robot: Robot,
+    model: std::result::Result<RobotModel<N, D, K>, ModelError>,
+) {
     let slots = camera_slots(&runner);
     let linked = !matches!(slots, CameraSlots::Vacant);
-    let node = match start(config, robot, linked) {
+    let started = model
+        .map_err(|e| e.to_string())
+        .and_then(|model| start(config, robot, model, linked).map_err(|e| e.to_string()));
+    let node = match started {
         Ok(node) => Arc::new(node),
         Err(e) => return fault.raise(&runner, &format!("the motion planner for {robot}: {e}")),
     };
@@ -372,19 +389,20 @@ async fn identify(runner: &NodeRunner) -> Option<String> {
     }
 }
 
-/// The node at start: the robot's model fitted to its meshes, an empty scene of the
-/// robot's links, and an empty map.
-fn start(
+/// The node at start: the model of `robot`, an empty scene of the robot's links, and an
+/// empty map.
+fn start<const N: usize, const D: usize, const K: usize>(
     config: Config,
     robot: Robot,
+    model: RobotModel<N, D, K>,
     camera_linked: bool,
-) -> std::result::Result<Node, Box<dyn std::error::Error + Send + Sync>> {
+) -> std::result::Result<Node<N, D, K>, Box<dyn std::error::Error + Send + Sync>> {
     let RobotModel {
         frame,
         arms,
         body,
-        self_model,
-    } = robot.model()?;
+        own,
+    } = model;
     let links = RobotLinks::new(
         arms.iter()
             .flat_map(|arm| arm.link_names.iter().cloned())
@@ -399,12 +417,13 @@ fn start(
         config.min_clearance_m,
         config.planning_attempts
     );
+    let history = History::new(&arms, HISTORY_SPAN);
     Ok(Node {
         config,
         frame,
         arms,
         body,
-        self_model,
+        own,
         scene: Mutex::new(PlanningScene::new(links)),
         map: Mutex::new(Map {
             voxels,
@@ -412,7 +431,7 @@ fn start(
             waiting: Waiting::Passing(AWAITING_FRAME.to_string()),
             cleared_at: None,
         }),
-        history: watch::Sender::new(History::new(HISTORY_SPAN)),
+        history: watch::Sender::new(history),
         restarts: AtomicU64::new(0),
         camera_linked,
     })
@@ -420,7 +439,10 @@ fn start(
 
 /// Records each limb_states message; a run of messages that lack an arm's joints logs
 /// once.
-async fn follow_limb_states(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn follow_limb_states<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     let mut subscription = match limb_states::subscribe(&runner).await {
         Ok(subscription) => subscription,
@@ -439,28 +461,36 @@ async fn follow_limb_states(runner: Arc<NodeRunner>, node: Arc<Node>) {
     .await;
 }
 
-/// Records one limb_states message in the history, at its stamp: both arms' joint
-/// positions and both grippers' openings.
-fn record(node: &Node, message: &limb_states::Message, malformed: &LatchedLog) {
-    let measured = arms_of(message)
-        .zip(openings_of(message))
+/// Records one limb_states message in the history, at its stamp: each arm's joint
+/// positions and each gripper's opening.
+fn record<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    message: &limb_states::Message,
+    malformed: &LatchedLog,
+) {
+    let measured = arms_of(&node.arms, message)
+        .zip(openings_of(&node.arms, message))
         .map(|(arms, openings)| Measured { arms, openings });
     match measured {
         Some(measured) => {
             push_measured(node, message.timestamp, &measured);
             malformed.success();
         }
-        None => malformed.failure(
-            "a message holds no seven finite joint positions for each arm, or no opening for \
-             each gripper",
-        ),
+        None => malformed.failure(format!(
+            "a message holds no {N} finite joint positions for each arm, or no opening for each \
+             gripper"
+        )),
     }
 }
 
 /// Records `measured` in the history at `at`. A stamp before the newest restarts the
 /// history on a clock that stepped back, and clears the map at that stamp; the frames that
 /// wait for joint positions on the clock before it are dropped (`WaitingFrames`).
-fn push_measured(node: &Node, at: SystemTime, measured: &Measured) {
+fn push_measured<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    at: SystemTime,
+    measured: &Measured<N>,
+) {
     let stepped_back = node
         .history
         .borrow()
@@ -470,7 +500,7 @@ fn push_measured(node: &Node, at: SystemTime, measured: &Measured) {
         node.restarts.fetch_add(1, Ordering::SeqCst);
     }
     node.history
-        .send_modify(|history| history.push(at, measured.values()));
+        .send_modify(|history| history.push(at, measured));
     if stepped_back {
         clear(node);
         info!(
@@ -479,16 +509,19 @@ fn push_measured(node: &Node, at: SystemTime, measured: &Measured) {
     }
 }
 
-/// Both arms' joint positions in a limb_states message, each finite.
-fn arms_of(message: &limb_states::Message) -> Option<ArmJoints> {
+/// Each arm of `models`' joint positions in a limb_states message, each finite.
+fn arms_of<const N: usize>(
+    models: &PerArm<ArmModel<N>>,
+    message: &limb_states::Message,
+) -> Option<ArmJoints<N>> {
     let mut offset = 0;
-    let mut found: ArmPair<Option<[f64; ARM_DOF]>> = ArmPair::new(None, None);
+    let mut found: PerArm<Option<[f64; N]>> = models.each(|_, _| None);
     for (name, &count) in message.arm_names.iter().zip(&message.joints_per_arm) {
         let count = count as usize;
         let values = message.joint_positions.get(offset..offset + count)?;
         offset += count;
-        if let Ok(side) = Side::from_arm_name(name) {
-            found[side] = <[f64; ARM_DOF]>::try_from(values)
+        if let Some(arm) = models.ids().find(|arm| models[*arm].name == name) {
+            found[arm] = <[f64; N]>::try_from(values)
                 .ok()
                 .filter(|q| q.iter().all(|v| v.is_finite()));
         }
@@ -496,12 +529,15 @@ fn arms_of(message: &limb_states::Message) -> Option<ArmJoints> {
     found.transpose()
 }
 
-/// Both grippers' openings in a limb_states message.
-fn openings_of(message: &limb_states::Message) -> Option<ArmPair<f64>> {
-    let mut found: ArmPair<Option<f64>> = ArmPair::new(None, None);
+/// Each gripper of `models`' opening in a limb_states message.
+fn openings_of<const N: usize>(
+    models: &PerArm<ArmModel<N>>,
+    message: &limb_states::Message,
+) -> Option<PerArm<f64>> {
+    let mut found: PerArm<Option<f64>> = models.each(|_, _| None);
     for (name, &opening) in message.gripper_names.iter().zip(&message.gripper_openings) {
-        if let Ok(side) = Side::from_gripper_name(name) {
-            found[side] = Some(opening);
+        if let Some(arm) = models.ids().find(|arm| models[*arm].gripper_name == name) {
+            found[arm] = Some(opening);
         }
     }
     found.transpose()
@@ -528,9 +564,9 @@ enum CameraFault {
 /// The depth camera, asked for until the robot names one and the camera describes
 /// itself; `None` once a lasting fault, or the node's shutdown, ends the asking. The
 /// map waits on each fault meanwhile.
-async fn discover_camera(
+async fn discover_camera<const N: usize, const D: usize, const K: usize>(
     runner: &Arc<NodeRunner>,
-    node: &Node,
+    node: &Node<N, D, K>,
     links: &CameraLinks,
 ) -> Option<PerceptionCamera> {
     let token = runner.cancellation_token().clone();
@@ -685,7 +721,11 @@ type Newest = Option<Arc<depth_stream::Message>>;
 
 /// Receives the perception camera's depth frames, each in place of the one before it,
 /// and takes the newest into the map whenever the intake is free.
-async fn follow_depth(runner: Arc<NodeRunner>, node: Arc<Node>, links: CameraLinks) {
+async fn follow_depth<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+    links: CameraLinks,
+) {
     let token = runner.cancellation_token().clone();
     let mut subscription = match depth_stream::subscribe(&runner).await {
         Ok(subscription) => subscription,
@@ -709,9 +749,9 @@ async fn follow_depth(runner: Arc<NodeRunner>, node: Arc<Node>, links: CameraLin
 /// described itself: of the frames that wait for the joint positions at their stamps,
 /// the newest whose joint positions are measured (`WaitingFrames`). A frame whose
 /// alignment the description does not describe asks the camera again.
-async fn take_frames(
+async fn take_frames<const N: usize, const D: usize, const K: usize>(
     runner: Arc<NodeRunner>,
-    node: Arc<Node>,
+    node: Arc<Node<N, D, K>>,
     links: CameraLinks,
     frames: watch::Receiver<Newest>,
 ) {
@@ -752,18 +792,18 @@ async fn take_frames(
 /// The depth frames that wait for the joint positions of `node` at their stamps: the
 /// oldest frame that has arrived since the intake last took one, and the newest that
 /// arrived after it. A frame between the two is never taken.
-struct WaitingFrames {
-    node: Arc<Node>,
+struct WaitingFrames<const N: usize, const D: usize, const K: usize> {
+    node: Arc<Node<N, D, K>>,
     frames: watch::Receiver<Newest>,
-    history: watch::Receiver<History>,
+    history: watch::Receiver<History<N>>,
     /// The history's restarts the waiting frames were stamped after.
     restarts: u64,
     oldest: Option<Arc<depth_stream::Message>>,
     newest: Option<Arc<depth_stream::Message>>,
 }
 
-impl WaitingFrames {
-    fn new(node: Arc<Node>, frames: watch::Receiver<Newest>) -> Self {
+impl<const N: usize, const D: usize, const K: usize> WaitingFrames<N, D, K> {
+    fn new(node: Arc<Node<N, D, K>>, frames: watch::Receiver<Newest>) -> Self {
         Self {
             history: node.history.subscribe(),
             restarts: node.restarts.load(Ordering::SeqCst),
@@ -899,21 +939,21 @@ async fn next_frame(frames: &mut watch::Receiver<Newest>) -> Option<Arc<depth_st
 }
 
 /// The map's intake of the perception camera's depth frames.
-struct Intake {
-    node: Arc<Node>,
+struct Intake<const N: usize, const D: usize, const K: usize> {
+    node: Arc<Node<N, D, K>>,
     camera: PerceptionCamera,
-    /// The self model whose grippers the intake puts at each frame's openings.
-    self_model: SelfCollisionModel,
+    /// The robot's own body, whose grippers the intake puts at each frame's openings.
+    own: OwnBody<N, K>,
     /// The stamp of the last frame the map took in.
     taken: Option<SystemTime>,
     /// The frames the map skips.
     skipped: LatchedLog,
 }
 
-impl Intake {
-    fn new(node: Arc<Node>, camera: PerceptionCamera) -> Self {
+impl<const N: usize, const D: usize, const K: usize> Intake<N, D, K> {
+    fn new(node: Arc<Node<N, D, K>>, camera: PerceptionCamera) -> Self {
         Self {
-            self_model: node.self_model.clone(),
+            own: node.own.clone(),
             node,
             camera,
             taken: None,
@@ -943,25 +983,24 @@ impl Intake {
         if recent {
             return;
         }
-        let Some(values) = node.history.borrow().at(at) else {
+        let Some(measured) = node.history.borrow().at(at) else {
             return self.skip("no joint positions were measured at its stamp");
         };
-        let measured = Measured::from_values(&values);
         let points = match self.camera.depth.points(&frame.frame) {
             Ok(points) => points,
             Err(e) => return self.skip(e.to_string()),
         };
-        set_openings(&mut self.self_model, &measured);
-        let fingers = match riders_of_both_arms(&self.self_model, &node.arms) {
+        self.own.set_openings(&measured.openings);
+        let fingers = match riders_of_the_arms(&self.own, &node.arms) {
             Ok(fingers) => fingers,
-            Err(e) => return self.skip(format!("the self model's fingers: {e}")),
+            Err(e) => return self.skip(format!("the robot's fingers: {e}")),
         };
         let (scene, mut map) = node.scene_and_map();
         if map.cleared_at.is_some_and(|cleared| at <= cleared) {
             return;
         }
         let carried =
-            fingers.map(|side, fingers| with_held_objects(fingers, &node.arms[side], &scene));
+            fingers.map(|arm, fingers| with_held_objects(fingers, &node.arms[arm], &scene));
         let robot = robot_mask(
             &node.arms,
             &node.body,
@@ -996,7 +1035,7 @@ impl Intake {
 
 /// Why a request is refused, or ends with no answer: it does not parse or the planning
 /// scene refuses it, the planner cannot plan or check yet, a check runs past
-/// `CHECK_TIME`, or a finger of the self model does not fit its arm, which the robot's
+/// `CHECK_TIME`, or a finger of the robot's own body does not fit its arm, which the robot's
 /// model refuses at start.
 #[derive(Debug, PartialEq)]
 enum Refusal {
@@ -1050,7 +1089,10 @@ member_failures!(
 );
 
 /// Refuses `map` while a linked camera has given it no frame, naming what it waits on.
-fn framed(node: &Node, map: &Map) -> std::result::Result<(), Refusal> {
+fn framed<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    map: &Map,
+) -> std::result::Result<(), Refusal> {
     if node.camera_linked && map.stamp.is_none() {
         return Err(Refusal::PreconditionFailed(format!(
             "{NO_DEPTH_FRAME}: {}",
@@ -1061,62 +1103,66 @@ fn framed(node: &Node, map: &Map) -> std::result::Result<(), Refusal> {
 }
 
 /// The arms a plan or a check moves, in the order a state of it holds their joints: one
-/// arm, or both, the left arm's first.
+/// arm, or every arm of the robot, in the order of its model.
 #[derive(Clone, Copy)]
 enum Group {
-    One(Side),
-    Both,
+    One(ArmId),
+    Every,
 }
 
 impl Group {
-    /// The group of the arms of `moving`, each once.
+    /// The group of the arms of `moving`, each once: every arm of the robot when more than
+    /// one moves.
     ///
     /// # Panics
     ///
     /// When `moving` holds no arm.
-    fn of(moving: &[Side]) -> Self {
+    fn of(moving: &[ArmId]) -> Self {
         match moving {
             [] => panic!("a plan or a check moves an arm"),
-            [side] => Self::One(*side),
-            _ => Self::Both,
+            [arm] => Self::One(*arm),
+            _ => Self::Every,
         }
     }
 
-    /// Its arms, the left first.
-    fn sides(self) -> &'static [Side] {
+    /// Its arms, of the arms of `all`, in the order of the robot's model.
+    fn arms<T>(self, all: &PerArm<T>) -> Vec<ArmId> {
         match self {
-            Self::One(Side::Left) => &[Side::Left],
-            Self::One(Side::Right) => &[Side::Right],
-            Self::Both => &Side::BOTH,
+            Self::One(arm) => vec![arm],
+            Self::Every => all.ids().collect(),
         }
     }
 
-    /// The state of its arms, each at the joints `at` gives it.
-    fn state<const D: usize>(self, at: impl Fn(Side) -> [f64; ARM_DOF]) -> [f64; D] {
-        let parts: Vec<[f64; ARM_DOF]> = self.sides().iter().map(|side| at(*side)).collect();
-        Arms::<ARM_DOF, D>::join(&parts)
+    /// The state of its arms, of `G` joints in all, each at the joints `at` gives it.
+    fn state<T, const N: usize, const G: usize>(
+        self,
+        all: &PerArm<T>,
+        at: impl Fn(ArmId) -> [f64; N],
+    ) -> [f64; G] {
+        let parts: Vec<[f64; N]> = self.arms(all).into_iter().map(at).collect();
+        Arms::<N, G>::join(&parts)
     }
 }
 
 /// What a plan or a check runs on, taken at once: the planning scene and the map as they
 /// stand and the stamp of the map's newest frame, the arms' last measured joint
-/// positions, and the self model with the grippers at their measured openings.
-struct Snapshot {
+/// positions, and the robot's own body with the grippers at their measured openings.
+struct Snapshot<const N: usize, const D: usize, const K: usize> {
     scene: PlanningScene,
     voxels: VoxelMap,
     stamp: Option<SystemTime>,
-    measured: ArmJoints,
-    self_model: SelfCollisionModel,
+    measured: ArmJoints<N>,
+    own: OwnBody<N, K>,
 }
 
-impl Snapshot {
+impl<const N: usize, const D: usize, const K: usize> Snapshot<N, D, K> {
     /// The snapshot of `node`'s planning scene and map now, with the arms where `latest`
-    /// measured them and `self_model` at its openings; refused while a linked camera has
-    /// given the map no frame, and before the arms' joint positions are measured.
+    /// measured them and `own` at its openings; refused while a linked camera has given the
+    /// map no frame, and before the arms' joint positions are measured.
     fn of(
-        node: &Node,
-        latest: Option<Measured>,
-        self_model: SelfCollisionModel,
+        node: &Node<N, D, K>,
+        latest: Option<Measured<N>>,
+        own: OwnBody<N, K>,
     ) -> std::result::Result<Self, Refusal> {
         let (scene, voxels, stamp) = {
             let (scene, map) = node.scene_and_map();
@@ -1129,32 +1175,35 @@ impl Snapshot {
             voxels,
             stamp,
             measured,
-            self_model,
+            own,
         })
     }
 
-    /// Runs `run` on the arms of `group` as a plan or a check moves them: each arm's
-    /// fingers carried by its hand at the gripper's opening and the objects attached to its
-    /// grasp link carried with them, the robot's own body checked by `self_model`, the
-    /// scene's other objects where they stand or where an arm the plan does not move holds
-    /// them, and the self model's bodies of the arms it does not move and of the body,
-    /// which a carried object keeps clear of, each arm at its joints of `standing`. A
-    /// finger that does not fit its arm, which the robot's model refuses at start, runs
-    /// nothing.
-    fn run<const D: usize, T>(
+    /// Runs `run` on the arms of `group`, `G` joints in all, as a plan or a check moves
+    /// them: each arm's fingers carried by its hand at the gripper's opening and the objects
+    /// attached to its grasp link carried with them, the robot's own body checked by
+    /// `self_model`, the scene's other objects where they stand or where an arm the plan
+    /// does not move holds them, and the pieces of the robot it does not move, which a
+    /// carried object keeps clear of, each arm at its joints of `standing`. A finger that
+    /// does not fit its arm, which the robot's model refuses at start, runs nothing.
+    fn run<const G: usize, T>(
         &self,
-        node: &Node,
+        node: &Node<N, D, K>,
         group: Group,
-        standing: &ArmJoints,
-        self_model: &dyn SelfModel<D>,
-        run: impl FnOnce(&Arms<ARM_DOF, D>, &Scene) -> T,
+        standing: &ArmJoints<N>,
+        self_model: &dyn SelfModel<G>,
+        run: impl FnOnce(&Arms<N, G>, &Scene) -> T,
     ) -> std::result::Result<T, FingerFault> {
-        let models: Vec<&ArmModel> = group.sides().iter().map(|side| &node.arms[*side]).collect();
+        let models: Vec<&ArmModel<N>> = group
+            .arms(&node.arms)
+            .into_iter()
+            .map(|arm| &node.arms[arm])
+            .collect();
         let field = DistanceField::of(&self.voxels);
         let carried = models
             .iter()
             .map(|model| {
-                let fingers = riders(&self.self_model, &model.geometry, model.side)?;
+                let fingers = self.own.fingers(model.id, &model.geometry)?;
                 Ok(with_held_objects(fingers, model, &self.scene))
             })
             .collect::<std::result::Result<Vec<_>, FingerFault>>()?;
@@ -1168,8 +1217,8 @@ impl Snapshot {
         let objects = self
             .scene
             .for_arms(&grasp_links, |link| grasp_pose(&node.arms, standing, link));
-        let mut placed_model = self.self_model.clone();
-        let parts = unmoved_parts(&mut placed_model, standing, &models);
+        let mut placed = self.own.clone();
+        let parts = unmoved_parts(&mut placed, standing, &models);
         let stamp_ns = self
             .stamp
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -1185,13 +1234,15 @@ impl Snapshot {
 
     /// Where each arm stands for a request whose arms start at `starts`: an arm's start,
     /// or where it was measured.
-    fn standing(&self, starts: &ArmStarts) -> ArmJoints {
+    fn standing(&self, starts: &ArmStarts<N>) -> ArmJoints<N> {
         standing_at(&self.measured, starts)
     }
 }
 
 /// The arms' joints `latest` measured; refused before they are measured.
-fn measured_arms(latest: Option<Measured>) -> std::result::Result<ArmJoints, Refusal> {
+fn measured_arms<const N: usize>(
+    latest: Option<Measured<N>>,
+) -> std::result::Result<ArmJoints<N>, Refusal> {
     latest
         .map(|measured| measured.arms)
         .ok_or_else(|| Refusal::PreconditionFailed(NO_JOINTS.to_string()))
@@ -1199,61 +1250,55 @@ fn measured_arms(latest: Option<Measured>) -> std::result::Result<ArmJoints, Ref
 
 /// Where each arm stands for a request: at its start in `starts`, or where `measured` has
 /// it.
-fn standing_at(measured: &ArmJoints, starts: &ArmStarts) -> ArmJoints {
-    ArmPair::from_fn(|side| starts[side].unwrap_or(measured[side]))
+fn standing_at<const N: usize>(measured: &ArmJoints<N>, starts: &ArmStarts<N>) -> ArmJoints<N> {
+    measured.each(|arm, at| starts[arm].unwrap_or(*at))
 }
 
-/// The pieces of the bodies of `model`, the self model, with the arms at `standing`, that
-/// a plan of the arms of `moving` does not move: each other arm's with its fingers, and
-/// the body's, each by the name of its link.
-fn unmoved_parts<'m>(
-    model: &'m mut SelfCollisionModel,
-    standing: &ArmJoints,
-    moving: &[&ArmModel],
+/// The pieces of the robot, its own body `own` with the arms at `standing`, that a plan of
+/// the arms of `moving` does not move: each other arm's with its fingers, and the body's,
+/// each by the name of its link.
+fn unmoved_parts<'m, const N: usize, const K: usize>(
+    own: &'m mut OwnBody<N, K>,
+    standing: &ArmJoints<N>,
+    moving: &[&ArmModel<N>],
 ) -> Vec<RobotPart<'m>> {
-    model
-        .world_pieces(&standing[Side::Left], &standing[Side::Right])
-        .expect("the history holds finite joint positions")
+    own.standing_pieces(standing)
         .into_iter()
         .filter(|(link, _)| {
             !moving
                 .iter()
                 .any(|arm| arm.link_names.iter().any(|own| own == link))
         })
-        .flat_map(|(link, pieces)| {
-            pieces
-                .into_iter()
-                .map(move |piece| RobotPart { link, piece })
-        })
+        .map(|(link, piece)| RobotPart { link, piece })
         .collect()
 }
 
-/// A start tolerance for each joint of a state of `D` joints.
-fn start_tolerance<const D: usize>(node: &Node) -> [f64; D] {
-    [node.config.start_tolerance.get(); D]
+/// A start tolerance for each joint of a state of `G` joints.
+fn start_tolerance<const G: usize>(config: &Config) -> [f64; G] {
+    [config.start_tolerance.get(); G]
 }
 
-/// The check on `snapshot` of the path of the arms of `group`, each from its joints of
-/// `standing` through its waypoints of `paths`, against `self_model`, ending by
+/// The check on `snapshot` of the path of the arms of `group`, `G` joints in all, each from
+/// its joints of `standing` through its waypoints of `paths`, against `self_model`, ending by
 /// `deadline`.
-fn check_group<const D: usize>(
-    node: &Node,
-    snapshot: &Snapshot,
+fn check_group<const N: usize, const D: usize, const K: usize, const G: usize>(
+    node: &Node<N, D, K>,
+    snapshot: &Snapshot<N, D, K>,
     group: Group,
-    standing: &ArmJoints,
-    self_model: &dyn SelfModel<D>,
-    paths: &ArmPair<Option<Vec<[f64; ARM_DOF]>>>,
+    standing: &ArmJoints<N>,
+    self_model: &dyn SelfModel<G>,
+    paths: &ArmPaths<N>,
     deadline: Instant,
 ) -> std::result::Result<std::result::Result<PathCheck, CheckFailure>, FingerFault> {
-    let path_of = |side: Side| {
-        paths[side]
+    let path_of = |arm: ArmId| {
+        paths[arm]
             .as_ref()
             .expect("an arm the check moves is named")
     };
-    let start = group.state(|side| standing[side]);
-    let count = path_of(group.sides()[0]).len();
-    let waypoints: Vec<[f64; D]> = (0..count)
-        .map(|k| group.state(|side| path_of(side)[k]))
+    let start = group.state(&node.arms, |arm| standing[arm]);
+    let count = path_of(group.arms(&node.arms)[0]).len();
+    let waypoints: Vec<[f64; G]> = (0..count)
+        .map(|k| group.state(&node.arms, |arm| path_of(arm)[k]))
         .collect();
     snapshot.run(node, group, standing, self_model, |arms, scene| {
         check_path(
@@ -1261,7 +1306,7 @@ fn check_group<const D: usize>(
             scene,
             &CheckRequest {
                 start,
-                start_tolerance: start_tolerance(node),
+                start_tolerance: start_tolerance(&node.config),
                 waypoints: &waypoints,
                 min_clearance_m: node.config.min_clearance_m,
                 deadline,
@@ -1270,7 +1315,10 @@ fn check_group<const D: usize>(
     })
 }
 
-async fn serve_descriptions(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_descriptions<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("describe_arms", token.cancelled(), || {
         describe_arms::handle_requests(&runner, |_request| Ok(description(&node)))
@@ -1279,7 +1327,9 @@ async fn serve_descriptions(runner: Arc<NodeRunner>, node: Arc<Node>) {
 }
 
 /// Each arm's joints, limits and links, and the body's links.
-fn description(node: &Node) -> describe_arms::Response {
+fn description<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+) -> describe_arms::Response {
     let arms = node
         .arms
         .iter()
@@ -1303,7 +1353,10 @@ fn description(node: &Node) -> describe_arms::Response {
 }
 
 /// Serves clear_occupancy_map.
-async fn serve_clear(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_clear<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("clear_occupancy_map", token.cancelled(), || {
         clear_occupancy_map::handle_requests(&runner, |_request| {
@@ -1318,7 +1371,7 @@ async fn serve_clear(runner: Arc<NodeRunner>, node: Arc<Node>) {
 /// Empties the map: it waits on its next frame, or on the fault that holds the camera's
 /// frames back while it held none, or on a lasting fault, and takes no frame the camera
 /// took at or before the newest joint positions measured now.
-fn clear(node: &Node) {
+fn clear<const N: usize, const D: usize, const K: usize>(node: &Node<N, D, K>) {
     let cleared_at = node.history.borrow().latest_at();
     let mut map = lock(&node.map);
     map.voxels.clear();
@@ -1331,7 +1384,10 @@ fn clear(node: &Node) {
 /// Serves apply_collision_objects: a call blocks its handler's thread in place while it
 /// waits on the scene and the map, which a frame's intake holds, and clears the map, and
 /// the runtime moves its other tasks off that thread.
-async fn serve_objects(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_objects<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("apply_collision_objects", token.cancelled(), || {
         apply_collision_objects::handle_requests(&runner, |request| {
@@ -1344,8 +1400,8 @@ async fn serve_objects(runner: Arc<NodeRunner>, node: Arc<Node>) {
 
 /// Applies apply_collision_objects' `request`: the scene applies its objects in order, all
 /// or none, and clears from the map every voxel an object it places intersects.
-fn apply_objects(
-    node: &Node,
+fn apply_objects<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
     request: &apply_collision_objects::RequestData,
 ) -> std::result::Result<(), Refusal> {
     let (mut scene, mut map) = node.scene_and_map();
@@ -1356,7 +1412,10 @@ fn apply_objects(
 
 /// Serves apply_attached_collision_object: a call blocks its handler's thread in place as
 /// apply_collision_objects' does.
-async fn serve_attachments(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_attachments<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("apply_attached_collision_object", token.cancelled(), || {
         apply_attached_collision_object::handle_requests(&runner, |request| {
@@ -1370,8 +1429,8 @@ async fn serve_attachments(runner: Arc<NodeRunner>, node: Arc<Node>) {
 /// Applies apply_attached_collision_object's `request`: an object attaches to a grasp
 /// link, or detaches from it, where the link stands at the arms' last measured joint
 /// positions, and an attached object clears from the map every voxel it intersects.
-fn apply_attachment(
-    node: &Node,
+fn apply_attachment<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
     request: &apply_attached_collision_object::RequestData,
 ) -> std::result::Result<(), Refusal> {
     let measured = node.latest().map(|measured| measured.arms);
@@ -1379,7 +1438,11 @@ fn apply_attachment(
     scene
         .apply_attached_collision_object(
             &attach_request(request),
-            |link| measured.map(|arms| grasp_pose(&node.arms, &arms, link)),
+            |link| {
+                measured
+                    .as_ref()
+                    .map(|arms| grasp_pose(&node.arms, arms, link))
+            },
             &mut map.voxels,
         )
         .map_err(Refusal::from)
@@ -1387,7 +1450,10 @@ fn apply_attachment(
 
 /// Serves set_allowed_collision: a call blocks its handler's thread in place while it waits
 /// on the scene, which a frame's intake holds.
-async fn serve_allowed_pairs(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_allowed_pairs<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("set_allowed_collision", token.cancelled(), || {
         set_allowed_collision::handle_requests(&runner, |request| {
@@ -1400,8 +1466,8 @@ async fn serve_allowed_pairs(runner: Arc<NodeRunner>, node: Arc<Node>) {
 
 /// Applies set_allowed_collision's `request`: the scene lets its object touch each of its
 /// other names, or stops it.
-fn allow_pairs(
-    node: &Node,
+fn allow_pairs<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
     request: &set_allowed_collision::RequestData,
 ) -> std::result::Result<(), Refusal> {
     lock(&node.scene)
@@ -1412,7 +1478,10 @@ fn allow_pairs(
 /// Serves get_planning_scene: the scene, the clearance each state keeps, and the side of
 /// the map's voxels. A call blocks its handler's thread in place while it waits on the
 /// scene, which a frame's intake holds.
-async fn serve_scene(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_scene<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("get_planning_scene", token.cancelled(), || {
         get_planning_scene::handle_requests(&runner, |_request| {
@@ -1434,7 +1503,10 @@ fn check_deadline(asked_at: Instant) -> Instant {
 /// Serves check_joint_path: a request is refused when it does not parse and before the
 /// planner can check; a check blocks its handler's thread in place, and the runtime
 /// moves its other tasks off that thread.
-async fn serve_checks(runner: Arc<NodeRunner>, node: Arc<Node>) {
+async fn serve_checks<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
     let token = runner.cancellation_token().clone();
     serving::serve("check_joint_path", token.cancelled(), || {
         check_joint_path::handle_requests(&runner, |request| {
@@ -1451,41 +1523,33 @@ async fn serve_checks(runner: Arc<NodeRunner>, node: Arc<Node>) {
 /// request whose every waypoint is its start, inside its joint limits, stands still where
 /// it starts, as a plan holds an arm it does not move, and the check moves the others;
 /// when every arm stands still, it moves them all.
-fn check(
-    node: &Node,
+fn check<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
     request: &check_joint_path::RequestData,
     deadline: Instant,
 ) -> std::result::Result<check_joint_path::Response, Refusal> {
     let CheckQuery { starts, waypoints } =
         parse_check(request, &node.arms).map_err(Refusal::Rejected)?;
     let latest = node.latest();
-    let snapshot = Snapshot::of(node, latest, node.self_model_at(latest.as_ref()))?;
+    let own = node.own_at(latest.as_ref());
+    let snapshot = Snapshot::of(node, latest, own)?;
     let standing = snapshot.standing(&starts);
-    let paths = ArmPair::from_fn(|side| waypoints.of(side));
-    let still = |side: Side| {
-        let limits = node.arms[side].geometry.chain().limits();
-        paths[side].as_ref().is_some_and(|path| {
+    let paths: ArmPaths<N> = node.arms.each(|arm, _| waypoints.of(arm));
+    let still = |arm: ArmId| {
+        let limits = node.arms[arm].geometry.chain().limits();
+        paths[arm].as_ref().is_some_and(|path| {
             path.iter().all(|q| {
-                *q == standing[side]
-                    && (0..ARM_DOF).all(|j| (limits[j].lo..=limits[j].hi).contains(&q[j]))
+                *q == standing[arm] && (0..N).all(|j| (limits[j].lo..=limits[j].hi).contains(&q[j]))
             })
         })
     };
-    let named: Vec<Side> = Side::BOTH
-        .into_iter()
-        .filter(|side| paths[*side].is_some())
-        .collect();
-    let moved: Vec<Side> = named.iter().copied().filter(|side| !still(*side)).collect();
+    let named: Vec<ArmId> = paths.ids().filter(|arm| paths[*arm].is_some()).collect();
+    let moved: Vec<ArmId> = named.iter().copied().filter(|arm| !still(*arm)).collect();
     let group = Group::of(if moved.is_empty() { &named } else { &moved });
     let checked = match group {
-        Group::One(side) => {
-            let self_model = HeldOtherArm::new(
-                &snapshot.self_model,
-                NonZeroUsize::MIN,
-                side,
-                standing[side.other()],
-            );
-            check_group::<ARM_DOF>(
+        Group::One(arm) => {
+            let self_model = snapshot.own.of_one_arm(NonZeroUsize::MIN, arm, &standing);
+            check_group::<N, D, K, N>(
                 node,
                 &snapshot,
                 group,
@@ -1495,9 +1559,9 @@ fn check(
                 deadline,
             )
         }
-        Group::Both => {
-            let self_model = BothArms::new(&snapshot.self_model, NonZeroUsize::MIN);
-            check_group::<DUAL_DOF>(
+        Group::Every => {
+            let self_model = snapshot.own.of_every_arm(NonZeroUsize::MIN);
+            check_group::<N, D, K, D>(
                 node,
                 &snapshot,
                 group,
@@ -1530,7 +1594,10 @@ fn check(
 /// its own task, on what its admission took.
 macro_rules! serve_action {
     ($serve:ident, $member:ident, $admit:ident, $run:ident) => {
-        async fn $serve(runner: Arc<NodeRunner>, node: Arc<Node>) {
+        async fn $serve<const N: usize, const D: usize, const K: usize>(
+            runner: Arc<NodeRunner>,
+            node: Arc<Node<N, D, K>>,
+        ) {
             let token = runner.cancellation_token().clone();
             let mut action = match $member::ActionHandle::expose(&runner).await {
                 Ok(action) => action,
@@ -1583,24 +1650,27 @@ serve_action!(
 /// A goal the planner takes: its query, the snapshot it plans on, where each arm stands
 /// for it, each arm the goal names at its start moved inside its joint limits, and the
 /// instant its plan ends by, its time limit after it is taken.
-struct Taken {
-    query: PlanQuery,
-    snapshot: Snapshot,
-    standing: ArmJoints,
+struct Taken<const N: usize, const D: usize, const K: usize> {
+    query: PlanQuery<N>,
+    snapshot: Snapshot<N, D, K>,
+    standing: ArmJoints<N>,
     deadline: Instant,
 }
 
 /// The goal the planner takes: refused with rejected when it does not parse, and with
 /// precondition_failed before the planner can plan and when the start of an arm it names
 /// lies outside a joint limit by more than the start tolerance.
-fn admit(node: &Node, goal: &GoalRequestData) -> std::result::Result<Taken, Refusal> {
+fn admit<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    goal: &GoalRequestData,
+) -> std::result::Result<Taken<N, D, K>, Refusal> {
     let latest = node.latest();
-    let self_model = node.self_model_at(latest.as_ref());
-    let fingers = riders_of_both_arms(&self_model, &node.arms)
-        .map_err(|e| Refusal::AttemptFailed(format!("the self model's fingers: {e}")))?;
+    let own = node.own_at(latest.as_ref());
+    let fingers = riders_of_the_arms(&own, &node.arms)
+        .map_err(|e| Refusal::AttemptFailed(format!("the robot's fingers: {e}")))?;
     let query = parse_plan(goal, &node.arms, &fingers).map_err(Refusal::Rejected)?;
-    let snapshot = Snapshot::of(node, latest, self_model)?;
-    let standing = inside_limits(node, snapshot.standing(&query.starts), query.order.sides())?;
+    let snapshot = Snapshot::of(node, latest, own)?;
+    let standing = inside_limits(node, snapshot.standing(&query.starts), &query.order)?;
     let deadline = Instant::now() + query.time_limit;
     Ok(Taken {
         query,
@@ -1610,18 +1680,18 @@ fn admit(node: &Node, goal: &GoalRequestData) -> std::result::Result<Taken, Refu
     })
 }
 
-/// `standing` with each arm of `sides` at its start moved inside its joint limits; refused
+/// `standing` with each arm of `moving` at its start moved inside its joint limits; refused
 /// with precondition_failed when one lies outside a limit by more than the start tolerance.
-fn inside_limits(
-    node: &Node,
-    standing: ArmJoints,
-    sides: &[Side],
-) -> std::result::Result<ArmJoints, Refusal> {
-    sides.iter().try_fold(standing, |mut standing, side| {
-        standing[*side] = start_inside_limits(
-            node.arms[*side].geometry.chain(),
-            &standing[*side],
-            &start_tolerance(node),
+fn inside_limits<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    standing: ArmJoints<N>,
+    moving: &[ArmId],
+) -> std::result::Result<ArmJoints<N>, Refusal> {
+    moving.iter().try_fold(standing, |mut standing, arm| {
+        standing[*arm] = start_inside_limits(
+            node.arms[*arm].geometry.chain(),
+            &standing[*arm],
+            &start_tolerance(&node.config),
         )
         .map_err(|fault| Refusal::PreconditionFailed(fault.to_string()))?;
         Ok(standing)
@@ -1637,7 +1707,11 @@ macro_rules! run_action {
         $run:ident, $end_cancelled:ident, $member:ident, $taken:ty, $compute:ident, $what:literal,
         ($($field:ident),+), ($($empty:expr),+)
     ) => {
-        async fn $run(node: Arc<Node>, context: $member::GoalContext, taken: $taken) {
+        async fn $run<const N: usize, const D: usize, const K: usize>(
+            node: Arc<Node<N, D, K>>,
+            context: $member::GoalContext,
+            taken: $taken,
+        ) {
             let stop = Arc::new(AtomicBool::new(false));
             let computed = {
                 let node = node.clone();
@@ -1678,7 +1752,7 @@ run_action!(
     run_plan,
     end_cancelled,
     plan_joint_path,
-    Taken,
+    Taken<N, D, K>,
     plan,
     "plan",
     (arms, stamp),
@@ -1688,7 +1762,7 @@ run_action!(
     run_cartesian,
     end_cartesian_cancelled,
     plan_cartesian_path,
-    TakenCartesian,
+    TakenCartesian<N, D, K>,
     cartesian,
     "path",
     (start_joint_positions, waypoints, fraction, stamp),
@@ -1725,9 +1799,9 @@ enum PlanEnd<Kind> {
 /// move at its start as many times as the others' waypoints; and the stamp of the map's
 /// newest frame. The attempts that run at once ask the self model from their threads, each
 /// on a copy no other holds.
-fn plan(
-    node: &Node,
-    taken: &Taken,
+fn plan<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    taken: &Taken<N, D, K>,
     stop: &AtomicBool,
 ) -> std::result::Result<(Vec<PlanJointPathResultArmsItem>, Option<SystemTime>), PlanEnd<FailureKind>>
 {
@@ -1739,22 +1813,21 @@ fn plan(
     } = taken;
     let copies = self_model_copies(node.config.planning_attempts);
     let planned = match &query.arm_goals {
-        ArmGoals::One { side, goal } => {
-            if let Some(fault) = standing_arm_fault(node, taken, side.other()) {
+        ArmGoals::One { arm, goal } => {
+            if let Some(fault) = standing_arms_fault(node, taken, *arm) {
                 return Err(PlanEnd::Failed(FailureKind::NoPath, fault));
             }
-            let self_model =
-                HeldOtherArm::new(&snapshot.self_model, copies, *side, standing[side.other()]);
-            plan_group::<ARM_DOF>(node, taken, Group::One(*side), &self_model, &|_| goal, stop)
+            let self_model = snapshot.own.of_one_arm(copies, *arm, standing);
+            plan_group::<N, D, K, N>(node, taken, Group::One(*arm), &self_model, &|_| goal, stop)
         }
-        ArmGoals::Both(goals) => {
-            let self_model = BothArms::new(&snapshot.self_model, copies);
-            plan_group::<DUAL_DOF>(
+        ArmGoals::Every(goals) => {
+            let self_model = snapshot.own.of_every_arm(copies);
+            plan_group::<N, D, K, D>(
                 node,
                 taken,
-                Group::Both,
+                Group::Every,
                 &self_model,
-                &|side| &goals[side],
+                &|arm| &goals[arm],
                 stop,
             )
         }
@@ -1770,13 +1843,12 @@ fn plan(
                 .expect("the plan moves an arm");
             let arms = query
                 .order
-                .sides()
                 .iter()
-                .map(|side| {
-                    let waypoints = paths[*side]
+                .map(|arm| {
+                    let waypoints = paths[*arm]
                         .clone()
-                        .unwrap_or_else(|| vec![standing[*side]; count]);
-                    result_arm(&node.arms[*side], &waypoints)
+                        .unwrap_or_else(|| vec![standing[*arm]; count]);
+                    result_arm(&node.arms[*arm], &waypoints)
                 })
                 .collect();
             (arms, snapshot.stamp)
@@ -1793,91 +1865,116 @@ fn plan(
                 PlanFailure::NoPath(_) => FailureKind::NoPath,
                 PlanFailure::Planner(_) => FailureKind::AttemptFailed,
             };
-            PlanEnd::Failed(kind, failure.to_string())
+            let start = match &failure {
+                PlanFailure::Start(fault) => Some(fault),
+                _ => None,
+            };
+            PlanEnd::Failed(kind, with_way_out(failure.to_string(), start))
         })
 }
 
-/// Why the arm on `side`, which the plan leaves where it starts, breaks a path orientation
-/// of its links; none where its start holds each.
-fn standing_arm_fault(node: &Node, taken: &Taken, side: Side) -> Option<String> {
-    let chain = node.arms[side].geometry.chain();
-    taken.query.path_orientations[side].iter().find_map(|held| {
-        let error = held.target.error_at(chain, &taken.standing[side]);
-        let tolerance = held.target.tolerance_rad.get();
-        (error > tolerance).then(|| {
-            format!(
-                "the start holds {} {error:.4} rad from its path orientation, past its \
-                 tolerance_rad {tolerance:.4}, and its arm stays where it starts; send a start \
-                 within it or a wider tolerance_rad",
-                held.link_name
-            )
+/// `message`, the words of a plan's failure, and after them, for a start where the robot's
+/// own bodies touch, `start`, what the caller does to leave it.
+fn with_way_out(message: String, start: Option<&StartFault>) -> String {
+    match start {
+        Some(StartFault::InCollision(Contact::Own { .. })) => {
+            format!("{message}; {OWN_CONTACT_WAY_OUT}")
+        }
+        _ => message,
+    }
+}
+
+/// Why an arm the plan leaves where it starts, every arm but `moving`, breaks a path
+/// orientation of its links; none where each such arm's start holds its orientations.
+fn standing_arms_fault<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    taken: &Taken<N, D, K>,
+    moving: ArmId,
+) -> Option<String> {
+    let paths = &taken.query.path_orientations;
+    paths.ids().filter(|arm| *arm != moving).find_map(|arm| {
+        let chain = node.arms[arm].geometry.chain();
+        paths[arm].iter().find_map(|held| {
+            let error = held.target.error_at(chain, &taken.standing[arm]);
+            let tolerance = held.target.tolerance_rad.get();
+            (error > tolerance).then(|| {
+                format!(
+                    "the start holds {} {error:.4} rad from its path orientation, past its \
+                     tolerance_rad {tolerance:.4}, and its arm stays where it starts; send a start \
+                     within it or a wider tolerance_rad",
+                    held.link_name
+                )
+            })
         })
     })
 }
 
-/// The plan of the arms of `group`, which `taken` takes, each from its joints of where
-/// they stand to the goal `goal_of` gives it, against `self_model`: each arm's waypoints
-/// from its start, none for an arm the plan does not move.
-fn plan_group<'g, const D: usize>(
-    node: &Node,
-    taken: &Taken,
+/// The plan of the arms of `group`, `G` joints in all, which `taken` takes, each from its
+/// joints of where they stand to the goal `goal_of` gives it, against `self_model`: each
+/// arm's waypoints from its start, none for an arm the plan does not move.
+fn plan_group<'g, const N: usize, const D: usize, const K: usize, const G: usize>(
+    node: &Node<N, D, K>,
+    taken: &Taken<N, D, K>,
     group: Group,
-    self_model: &dyn SelfModel<D>,
-    goal_of: &dyn Fn(Side) -> &'g Goal,
+    self_model: &dyn SelfModel<G>,
+    goal_of: &dyn Fn(ArmId) -> &'g Goal,
     stop: &AtomicBool,
-) -> std::result::Result<std::result::Result<ArmPaths, PlanFailure>, FingerFault> {
-    let samplers: Vec<IkGoalSampler<ARM_DOF>> = group
-        .sides()
+) -> std::result::Result<std::result::Result<ArmPaths<N>, PlanFailure>, FingerFault> {
+    let moving = group.arms(&node.arms);
+    let samplers: Vec<IkGoalSampler<N>> = moving
         .iter()
-        .map(|side| IkGoalSampler::new(node.arms[*side].geometry.chain().clone()))
+        .map(|arm| IkGoalSampler::new(node.arms[*arm].geometry.chain().clone()))
         .collect();
-    let goals = group
-        .sides()
+    let goals = moving
         .iter()
         .zip(&samplers)
-        .map(|(side, sampler)| ArmGoal {
-            goal: goal_of(*side),
+        .map(|(arm, sampler)| ArmGoal {
+            goal: goal_of(*arm),
             sampler,
         })
         .collect();
-    let path_orientations: Vec<PathOrientation> = group
-        .sides()
+    let path_orientations: Vec<PathOrientation> = moving
         .iter()
         .enumerate()
-        .flat_map(|(arm, side)| {
-            taken.query.path_orientations[*side]
+        .flat_map(|(index, arm)| {
+            taken.query.path_orientations[*arm]
                 .iter()
                 .map(move |held| PathOrientation {
-                    arm,
+                    arm: index,
                     link_name: &held.link_name,
                     target: held.target,
                 })
         })
         .collect();
-    let start = group.state(|side| taken.standing[side]);
+    let start = group.state(&node.arms, |arm| taken.standing[arm]);
     taken
         .snapshot
         .run(node, group, &taken.standing, self_model, |arms, scene| {
-            let request =
-                plan_request(node, start, goals, &path_orientations, taken.deadline, stop);
-            plan_path(arms, scene, &request).map(|path| split(&path, group))
+            let request = plan_request(
+                &node.config,
+                start,
+                goals,
+                &path_orientations,
+                taken.deadline,
+                stop,
+            );
+            plan_path(arms, scene, &request).map(|path| split(&path, group, &node.arms))
         })
 }
 
 /// The request of a plan of the arms of `goals` from `start`, holding `path_orientations`,
 /// by `deadline`, which `stop` ends.
-fn plan_request<'a, const D: usize>(
-    node: &Node,
-    start: [f64; D],
-    goals: Vec<ArmGoal<'a, ARM_DOF>>,
+fn plan_request<'a, const N: usize, const G: usize>(
+    config: &Config,
+    start: [f64; G],
+    goals: Vec<ArmGoal<'a, N>>,
     path_orientations: &'a [PathOrientation<'a>],
     deadline: Instant,
     stop: &'a AtomicBool,
-) -> PlanRequest<'a, ARM_DOF, D> {
-    let config = &node.config;
+) -> PlanRequest<'a, N, G> {
     PlanRequest {
         start,
-        start_tolerance: start_tolerance(node),
+        start_tolerance: start_tolerance(config),
         goals,
         path_orientations,
         goal_samples: config.goal_samples,
@@ -1892,66 +1989,67 @@ fn plan_request<'a, const D: usize>(
 }
 
 /// Each arm's waypoints from its start, none for an arm a plan does not move.
-type ArmPaths = ArmPair<Option<Vec<[f64; ARM_DOF]>>>;
+type ArmPaths<const N: usize> = PerArm<Option<Vec<[f64; N]>>>;
 
-/// Each arm's waypoints of `path`, a path of the arms of `group`; none for an arm it does
-/// not move.
-fn split<const D: usize>(path: &[[f64; D]], group: Group) -> ArmPaths {
-    ArmPair::from_fn(|side| {
-        let k = group.sides().iter().position(|named| *named == side)?;
-        Some(
-            path.iter()
-                .map(|q| Arms::<ARM_DOF, D>::slice(q, k))
-                .collect(),
-        )
+/// Each arm of `all`'s waypoints of `path`, a path of the arms of `group`, `G` joints in all;
+/// none for an arm it does not move.
+fn split<T, const N: usize, const G: usize>(
+    path: &[[f64; G]],
+    group: Group,
+    all: &PerArm<T>,
+) -> ArmPaths<N> {
+    let moving = group.arms(all);
+    all.each(|arm, _| {
+        let k = moving.iter().position(|named| *named == arm)?;
+        Some(path.iter().map(|q| Arms::<N, G>::slice(q, k)).collect())
     })
 }
 
 /// A Cartesian path the planner takes: its query, where each arm stands for it, the arm it
 /// moves at its start moved inside its joint limits, and the snapshot its states keep clear
 /// of, where it checks collisions.
-struct TakenCartesian {
-    query: CartesianQuery,
-    standing: ArmJoints,
-    snapshot: Option<Snapshot>,
+struct TakenCartesian<const N: usize, const D: usize, const K: usize> {
+    query: CartesianQuery<N>,
+    standing: ArmJoints<N>,
+    snapshot: Option<Snapshot<N, D, K>>,
 }
 
 /// The Cartesian path the planner takes: refused with rejected when it does not parse, and
 /// with precondition_failed before the arms are measured, where it checks collisions before
 /// the planner's depth frame, and when its start lies outside a joint limit by more than the
 /// start tolerance.
-fn admit_cartesian(
-    node: &Node,
+fn admit_cartesian<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
     goal: &plan_cartesian_path::GoalRequestData,
-) -> std::result::Result<TakenCartesian, Refusal> {
+) -> std::result::Result<TakenCartesian<N, D, K>, Refusal> {
     let latest = node.latest();
-    let self_model = node.self_model_at(latest.as_ref());
-    let fingers = riders_of_both_arms(&self_model, &node.arms)
-        .map_err(|e| Refusal::AttemptFailed(format!("the self model's fingers: {e}")))?;
+    let own = node.own_at(latest.as_ref());
+    let fingers = riders_of_the_arms(&own, &node.arms)
+        .map_err(|e| Refusal::AttemptFailed(format!("the robot's fingers: {e}")))?;
     let query = parse_cartesian(goal, &node.arms, &fingers).map_err(Refusal::Rejected)?;
     let (standing, snapshot) = if query.avoid_collisions {
-        let snapshot = Snapshot::of(node, latest, self_model)?;
+        let snapshot = Snapshot::of(node, latest, own)?;
         (snapshot.standing(&query.starts), Some(snapshot))
     } else {
         (standing_at(&measured_arms(latest)?, &query.starts), None)
     };
     Ok(TakenCartesian {
-        standing: inside_limits(node, standing, &[query.side])?,
+        standing: inside_limits(node, standing, &[query.arm])?,
         query,
         snapshot,
     })
 }
 
 /// The request of the Cartesian path `taken`, its states keeping clear of `collisions`.
-fn cartesian_request<'a>(
-    node: &Node,
-    taken: &'a TakenCartesian,
+fn cartesian_request<'a, const N: usize, const D: usize, const K: usize>(
+    config: &Config,
+    taken: &'a TakenCartesian<N, D, K>,
     collisions: Collisions<'a>,
     stop: &'a AtomicBool,
-) -> CartesianRequest<'a, ARM_DOF> {
+) -> CartesianRequest<'a, N> {
     CartesianRequest {
-        start: taken.standing[taken.query.side],
-        start_tolerance: start_tolerance(node),
+        start: taken.standing[taken.query.arm],
+        start_tolerance: start_tolerance(config),
         frame: taken.query.frame,
         waypoints: &taken.query.poses,
         collisions,
@@ -1972,9 +2070,9 @@ type CartesianResult = (
 /// One Cartesian path of a goal the planner took, keeping clear of its snapshot where it
 /// checks collisions: each waypoint with the grasp-point pose there, as limb_state reports
 /// it, and the stamp of the map's newest frame it kept clear of.
-fn cartesian(
-    node: &Node,
-    taken: &TakenCartesian,
+fn cartesian<const N: usize, const D: usize, const K: usize>(
+    node: &Node<N, D, K>,
+    taken: &TakenCartesian<N, D, K>,
     stop: &AtomicBool,
 ) -> std::result::Result<CartesianResult, PlanEnd<plan_cartesian_path::FailureKind>> {
     use plan_cartesian_path::FailureKind as Kind;
@@ -1983,20 +2081,15 @@ fn cartesian(
         standing,
         snapshot,
     } = taken;
-    let side = query.side;
-    let model = &node.arms[side];
+    let id = query.arm;
+    let model = &node.arms[id];
     let path = match snapshot {
         Some(snapshot) => {
-            let self_model = HeldOtherArm::new(
-                &snapshot.self_model,
-                NonZeroUsize::MIN,
-                side,
-                standing[side.other()],
-            );
+            let self_model = snapshot.own.of_one_arm(NonZeroUsize::MIN, id, standing);
             snapshot
-                .run::<ARM_DOF, _>(
+                .run::<N, _>(
                     node,
-                    Group::One(side),
+                    Group::One(id),
                     standing,
                     &self_model,
                     |arms, scene| {
@@ -2004,14 +2097,17 @@ fn cartesian(
                             scene,
                             min_clearance_m: node.config.min_clearance_m,
                         };
-                        cartesian_path(arms, &cartesian_request(node, taken, collisions, stop))
+                        cartesian_path(
+                            arms,
+                            &cartesian_request(&node.config, taken, collisions, stop),
+                        )
                     },
                 )
                 .map_err(|fault| PlanEnd::Failed(Kind::AttemptFailed, fault.to_string()))?
         }
         None => {
             let arms = Arms::new(vec![Arm::new(model.name, &model.geometry)], None);
-            let unchecked = cartesian_request(node, taken, Collisions::Unchecked, stop);
+            let unchecked = cartesian_request(&node.config, taken, Collisions::Unchecked, stop);
             cartesian_path(&arms, &unchecked)
         }
     };
@@ -2022,7 +2118,11 @@ fn cartesian(
             CartesianFailure::Start(StartFault::OutsideLimits { .. }) => Kind::PreconditionFailed,
             CartesianFailure::Start(StartFault::InCollision(_)) => Kind::StartInCollision,
         };
-        PlanEnd::Failed(kind, failure.to_string())
+        let start = match &failure {
+            CartesianFailure::Start(fault) => Some(fault),
+            _ => None,
+        };
+        PlanEnd::Failed(kind, with_way_out(failure.to_string(), start))
     })?;
     let waypoints = path
         .waypoints
@@ -2049,7 +2149,10 @@ fn self_model_copies(attempts: NonZeroU32) -> NonZeroUsize {
 /// The answer of `arm`'s planned `waypoints`: where the path starts, and each waypoint
 /// after it with the grasp-point pose there, as limb_state reports it. A path that
 /// stays where it starts has the start as its one waypoint.
-fn result_arm(arm: &ArmModel, waypoints: &[[f64; ARM_DOF]]) -> PlanJointPathResultArmsItem {
+fn result_arm<const N: usize>(
+    arm: &ArmModel<N>,
+    waypoints: &[[f64; N]],
+) -> PlanJointPathResultArmsItem {
     let (start, after) = waypoints
         .split_first()
         .expect("a planned path has its start");
@@ -2078,7 +2181,12 @@ fn result_arm(arm: &ArmModel, waypoints: &[[f64; ARM_DOF]]) -> PlanJointPathResu
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Node as ANode, *};
+
+    use openarm_description::{ARM_DOF, DUAL_DOF, Side};
+
+    /// The node of OpenArm v2, which these tests run.
+    type Node = ANode<ARM_DOF, DUAL_DOF, 2>;
 
     use std::task::{Context, Poll, Waker};
 
@@ -2102,20 +2210,22 @@ mod tests {
     /// The node for an OpenArm v2 from `params`, the camera linked or not.
     fn started(params: &Parameters, camera_linked: bool) -> Node {
         let config = Config::parse(params).expect("a config");
-        start(config, Robot::OpenArmV2, camera_linked).expect("the node starts")
+        let model = openarm_v2().expect("OpenArm v2's model");
+        start(config, Robot::OpenArmV2, model, camera_linked).expect("the node starts")
     }
 
     /// Both arms at Ready, both grippers open.
-    fn still() -> Measured {
+    fn still() -> Measured<ARM_DOF> {
         Measured {
-            arms: ArmPair::new(ready(Side::Left), ready(Side::Right)),
-            openings: ArmPair::new(1.0, 1.0),
+            arms: PerArm::both(ready(Side::Left), ready(Side::Right)),
+            openings: PerArm::both(1.0, 1.0),
         }
     }
 
     fn snapshot(node: &Node) -> std::result::Result<(), Refusal> {
         let latest = node.latest();
-        Snapshot::of(node, latest, node.self_model_at(latest.as_ref())).map(|_| ())
+        let own = node.own_at(latest.as_ref());
+        Snapshot::of(node, latest, own).map(|_| ())
     }
 
     // A check ends 10 s after it is asked. One whose time has ended fails with timeout,
@@ -2244,7 +2354,7 @@ mod tests {
         let mut swung_in = ready(Side::Right);
         swung_in[1] = 0.1;
         let measured = Measured {
-            arms: ArmPair::new(ready(Side::Left), swung_in),
+            arms: PerArm::both(ready(Side::Left), swung_in),
             ..still()
         };
         measure_at(&node, after(100), measured);
@@ -2397,7 +2507,7 @@ mod tests {
     fn an_arm_that_stays_at_its_start_beside_a_moving_one_is_not_checked() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let mut model = node.self_model.clone();
+        let mut model = node.own.model.clone();
         let right = ready(Side::Right);
         let raised = |turn: f64| {
             let mut q = ready(Side::Left);
@@ -2406,7 +2516,7 @@ mod tests {
         };
         let mut gripper_to_torso = |turn: f64| -> f64 {
             model
-                .min_distance_of_arm(Side::Left, &raised(turn), &right)
+                .min_distance_of_chain(Side::Left.index(), &[raised(turn), right])
                 .expect("a finite configuration")
                 .distance
         };
@@ -2424,7 +2534,7 @@ mod tests {
         }
         let left = raised(apart);
         let nearest = model
-            .min_distance_of_arm(Side::Left, &left, &right)
+            .min_distance_of_chain(Side::Left.index(), &[left, right])
             .expect("a finite configuration");
         assert_eq!(
             (nearest.link_a, nearest.link_b),
@@ -2610,7 +2720,7 @@ mod tests {
     }
 
     /// Records `measured` in the history of `node` at `at`.
-    fn measure_at(node: &Node, at: SystemTime, measured: Measured) {
+    fn measure_at(node: &Node, at: SystemTime, measured: Measured<ARM_DOF>) {
         push_measured(node, at, &measured);
     }
 
@@ -2622,7 +2732,7 @@ mod tests {
     }
 
     /// The intake of `node` from a camera of one pixel at the robot frame's origin.
-    fn intake(node: Arc<Node>) -> Intake {
+    fn intake(node: Arc<Node>) -> Intake<ARM_DOF, DUAL_DOF, 2> {
         intake_at(node, &identity())
     }
 
@@ -2633,7 +2743,7 @@ mod tests {
 
     /// The intake of `node` from a camera of one pixel at `pose`, which sees along its
     /// optical axis.
-    fn intake_at(node: Arc<Node>, pose: &Pose) -> Intake {
+    fn intake_at(node: Arc<Node>, pose: &Pose) -> Intake<ARM_DOF, DUAL_DOF, 2> {
         let lens = Pinhole::parse(&Intrinsics {
             width: 1,
             height: 1,
@@ -2705,7 +2815,9 @@ mod tests {
 
     /// The waiting frames of `node`'s depth frames, which the sender gives, and of its
     /// joint positions.
-    fn waiting_frames(node: &Arc<Node>) -> (watch::Sender<Newest>, WaitingFrames) {
+    fn waiting_frames(
+        node: &Arc<Node>,
+    ) -> (watch::Sender<Newest>, WaitingFrames<ARM_DOF, DUAL_DOF, 2>) {
         let (newest, frames) = watch::channel::<Newest>(None);
         (newest, WaitingFrames::new(node.clone(), frames))
     }
@@ -2716,7 +2828,7 @@ mod tests {
     }
 
     /// The stamp of the frame `waiting` gives now; `None` while every frame waits.
-    fn given(waiting: &mut WaitingFrames) -> Option<SystemTime> {
+    fn given(waiting: &mut WaitingFrames<ARM_DOF, DUAL_DOF, 2>) -> Option<SystemTime> {
         let mut context = Context::from_waker(Waker::noop());
         match std::pin::pin!(waiting.next()).poll(&mut context) {
             Poll::Ready(frame) => Some(frame.expect("the frames' follower runs").header.timestamp),
@@ -2917,11 +3029,11 @@ mod tests {
     }
 
     /// Where each finger of `model` hangs in its link's frame, on the arms of `node`.
-    fn finger_offsets(node: &Node, model: &SelfCollisionModel) -> Vec<Isometry3<f64>> {
-        riders_of_both_arms(model, &node.arms)
+    fn finger_offsets(node: &Node, own: &OwnBody<ARM_DOF, 2>) -> Vec<Isometry3<f64>> {
+        riders_of_the_arms(own, &node.arms)
             .expect("the arms' fingers")
             .into_iter()
-            .flat_map(|(_, fingers)| fingers)
+            .flatten()
             .map(|finger| finger.offset)
             .collect()
     }
@@ -2964,14 +3076,14 @@ mod tests {
             &malformed,
         );
         let measured = Measured {
-            arms: ArmPair::new(left, right),
-            openings: ArmPair::new(0.25, 0.75),
+            arms: PerArm::both(left, right),
+            openings: PerArm::both(0.25, 0.75),
         };
-        assert_eq!(node.latest(), Some(measured));
-        let mut opened = node.self_model.clone();
-        opened.set_gripper_openings(0.25, 0.75);
+        assert_eq!(node.latest().as_ref(), Some(&measured));
+        let mut opened = node.own.clone();
+        opened.set_openings(&PerArm::both(0.25, 0.75));
         assert_eq!(
-            finger_offsets(&node, &node.self_model_at(node.latest().as_ref())),
+            finger_offsets(&node, &node.own_at(node.latest().as_ref())),
             finger_offsets(&node, &opened)
         );
         record(
@@ -2979,7 +3091,7 @@ mod tests {
             &limb_states_at(after(1_100), right, left, &[0.5]),
             &malformed,
         );
-        assert_eq!(node.latest(), Some(measured));
+        assert_eq!(node.latest().as_ref(), Some(&measured));
         let mut broken = left;
         broken[3] = f64::NAN;
         record(
@@ -2987,7 +3099,7 @@ mod tests {
             &limb_states_at(after(1_200), broken, right, &[0.5, 0.5]),
             &malformed,
         );
-        assert_eq!(node.latest(), Some(measured));
+        assert_eq!(node.latest().as_ref(), Some(&measured));
     }
 
     // The intake cuts the fingers out of a frame where the grippers' openings, read at its
@@ -2996,7 +3108,7 @@ mod tests {
     fn a_frame_cuts_the_fingers_out_at_its_openings() {
         let node = Arc::new(started(&parameters(), true));
         let opened = |left: f64| Measured {
-            openings: ArmPair::new(left, 1.0 - left),
+            openings: PerArm::both(left, 1.0 - left),
             ..still()
         };
         measure_at(&node, after(1_000), opened(0.0));
@@ -3004,14 +3116,14 @@ mod tests {
         let mut intake = intake(node.clone());
         intake.take(&frame_at(after(1_050)));
         assert_eq!(map_stamp(&node), Some(after(1_050)));
-        let mut halfway = node.self_model.clone();
-        halfway.set_gripper_openings(0.5, 0.5);
+        let mut halfway = node.own.clone();
+        halfway.set_openings(&PerArm::both(0.5, 0.5));
         assert_eq!(
-            finger_offsets(&node, &intake.self_model),
+            finger_offsets(&node, &intake.own),
             finger_offsets(&node, &halfway)
         );
         assert_ne!(
-            finger_offsets(&node, &node.self_model),
+            finger_offsets(&node, &node.own),
             finger_offsets(&node, &halfway)
         );
     }
@@ -3097,16 +3209,16 @@ mod tests {
         };
         let node = Arc::new(started(&params, true));
         let closed = Measured {
-            openings: ArmPair::new(0.0, 0.0),
+            openings: PerArm::both(0.0, 0.0),
             ..still()
         };
-        measure_at(&node, after(1_000), closed);
-        measure_at(&node, after(1_100), closed);
-        let mut shut = node.self_model.clone();
-        set_openings(&mut shut, &closed);
+        measure_at(&node, after(1_000), closed.clone());
+        measure_at(&node, after(1_100), closed.clone());
+        let mut shut = node.own.clone();
+        shut.set_openings(&closed.openings);
         let unpadded = Padding::new(1.0, 0.0).expect("the padding that grows nothing");
-        let robot_holds = |model: &SelfCollisionModel, point: &Point3<f64>| {
-            let fingers = riders_of_both_arms(model, &node.arms).expect("the arms' fingers");
+        let robot_holds = |own: &OwnBody<ARM_DOF, 2>, point: &Point3<f64>| {
+            let fingers = riders_of_the_arms(own, &node.arms).expect("the arms' fingers");
             let scene = lock(&node.scene);
             robot_mask(
                 &node.arms,
@@ -3120,7 +3232,7 @@ mod tests {
             .iter()
             .any(|part| part.contains(point))
         };
-        let shut_fingers = riders_of_both_arms(&shut, &node.arms).expect("the arms' fingers");
+        let shut_fingers = riders_of_the_arms(&shut, &node.arms).expect("the arms' fingers");
         let point = Side::BOTH
             .into_iter()
             .flat_map(|side| {
@@ -3136,7 +3248,7 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             })
-            .find(|point| !robot_holds(&node.self_model, point))
+            .find(|point| !robot_holds(&node.own, point))
             .expect("a closed finger's piece the open fingers leave outside the robot");
         assert!(robot_holds(&shut, &point), "{point}");
 
@@ -3318,7 +3430,7 @@ mod tests {
     fn a_frame_marks_nothing_inside_an_object_where_it_stood_at_the_stamp() {
         let node = Arc::new(started(&parameters(), true));
         let mut intake = intake_at(node.clone(), &above(BESIDE));
-        let three_frames = |intake: &mut Intake, from_ms: u64| {
+        let three_frames = |intake: &mut Intake<ARM_DOF, DUAL_DOF, 2>, from_ms: u64| {
             for ms in [from_ms, from_ms + 200, from_ms + 400] {
                 intake.take(&frame_seeing(after(ms), 300));
                 assert_eq!(map_stamp(&node), Some(after(ms)));
@@ -3332,7 +3444,7 @@ mod tests {
         let mut moved = still();
         moved.arms[Side::Left][3] += 0.5;
         for ms in (2_300..=2_900).step_by(100) {
-            measure_at(&node, after(ms), moved);
+            measure_at(&node, after(ms), moved.clone());
         }
         three_frames(&mut intake, 1_700);
         assert!(

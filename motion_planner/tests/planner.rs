@@ -13,7 +13,6 @@
 mod common;
 
 use chain_kinematics::nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
-use motion_planner::fingers::riders;
 use motion_planner::node::NO_DEPTH_FRAME;
 use motion_planner::request::MAX_PLANNING_TIME_S;
 use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
@@ -312,18 +311,16 @@ fn grasp_axes(side: Side) -> (Vector3<f64>, Vector3<f64>) {
     let q = ready(side);
     let grasp = chain.world_ee_pose(&q);
     let posed = chain.at(&q);
-    let joints: Vec<Vector3<f64>> = riders(
-        &OPENARM_V2.self_model,
-        &OPENARM_V2.arms[side].geometry,
-        side,
-    )
-    .expect("the arm's fingers")
-    .into_iter()
-    .map(|finger| {
-        let world = posed.link_pose_world(finger.segment) * finger.offset;
-        (grasp.inverse() * Point3::from(world.translation.vector)).coords
-    })
-    .collect();
+    let joints: Vec<Vector3<f64>> = OPENARM_V2
+        .own
+        .fingers(side.into(), &OPENARM_V2.arms[side].geometry)
+        .expect("the arm's fingers")
+        .into_iter()
+        .map(|finger| {
+            let world = posed.link_pose_world(finger.segment) * finger.offset;
+            (grasp.inverse() * Point3::from(world.translation.vector)).coords
+        })
+        .collect();
     let [a, b] = joints.as_slice() else {
         panic!("the gripper has two fingers, not {}", joints.len());
     };
