@@ -19,10 +19,11 @@ use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
     Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathFault, PathOrientation, PlanFailure,
     PlanRequest, PlanningScene, RobotLinks, RobotPart, Scene, SceneError, SelfModel, StartFault,
-    cartesian_path, check_path, insert_cut_out, plan_path, pose_parts, start_inside_limits,
+    cartesian_path, check_path, insert_cut_out, iteration_bound, plan_path, pose_parts,
+    start_inside_limits,
 };
 use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
-use ompl_bridge::{PLANNING_THREADS, Planner};
+use ompl_bridge::PLANNING_THREADS;
 use peppygen::consumed_services::camera::depth_stream_info;
 use peppygen::consumed_services::camera_mounts::get_camera_poses;
 use peppygen::consumed_services::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
@@ -50,8 +51,8 @@ use crate::history::{ArmJoints, History, Measured};
 use crate::intake::robot_mask;
 use crate::own_body::OwnBody;
 use crate::request::{
-    ArmGoals, ArmStarts, CartesianQuery, CheckQuery, PlanQuery, parse_cartesian, parse_check,
-    parse_plan,
+    ArmGoals, ArmStarts, CartesianQuery, CheckQuery, PlanQuery, listed, parse_cartesian,
+    parse_check, parse_plan,
 };
 use crate::robot::{ArmModel, ModelError, Robot, RobotModel, openarm_v2, so101};
 use crate::scene::{attach_request, object_requests, scene_response};
@@ -69,7 +70,8 @@ const HISTORY_SPAN: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_secs(1);
 /// The seed of every plan, joined by the map's stamp: the same request from the same
 /// start on the same map gives the same path when no part of the plan ends at its
-/// deadline.
+/// deadline. An `rrt_star` plan plans until its deadline, so its path depends on how far
+/// it got by then.
 const PLAN_SEED: u32 = 1;
 
 /// Why a plan or a check is refused while the camera has given the map no frame; the
@@ -151,18 +153,9 @@ fn camera_slots(runner: &NodeRunner) -> CameraSlots {
         _ => CameraSlots::Mixed(format!(
             "the launcher binds the planner's {} and leaves its {} vacant; bind camera, \
              geometry, camera_mounts and workspace, or leave camera and geometry vacant",
-            listed(&names(true)),
-            listed(&names(false))
+            listed(&names(true), "and"),
+            listed(&names(false), "and")
         )),
-    }
-}
-
-/// `names` as a list in a sentence: "a", "a and b", "a, b and c".
-fn listed(names: &[&str]) -> String {
-    match names {
-        [] => String::new(),
-        [one] => (*one).to_string(),
-        [init @ .., last] => format!("{} and {last}", init.join(", ")),
     }
 }
 
@@ -1966,6 +1959,7 @@ fn plan_group<'g, const N: usize, const D: usize, const K: usize, const G: usize
         .run(node, group, &taken.standing, self_model, |arms, scene| {
             let request = plan_request(
                 &node.config,
+                &taken.query,
                 start,
                 goals,
                 &path_orientations,
@@ -1976,25 +1970,29 @@ fn plan_group<'g, const N: usize, const D: usize, const K: usize, const G: usize
         })
 }
 
-/// The request of a plan of the arms of `goals` from `start`, holding `path_orientations`,
-/// by `deadline`, which `stop` ends.
+/// The request of a plan by the planner `query` names, its path refined by its refiner, of
+/// the arms of `goals` from `start`, holding `path_orientations`, by `deadline`, which `stop`
+/// ends.
 fn plan_request<'a, const N: usize, const G: usize>(
     config: &Config,
+    query: &PlanQuery<N>,
     start: [f64; G],
     goals: Vec<ArmGoal<'a, N>>,
     path_orientations: &'a [PathOrientation<'a>],
     deadline: Instant,
     stop: &'a AtomicBool,
 ) -> PlanRequest<'a, N, G> {
+    let planner = query.planner.into();
     PlanRequest {
         start,
         start_tolerance: start_tolerance(config),
         goals,
         path_orientations,
         goal_samples: config.goal_samples,
-        planner: Planner::RrtConnect,
+        planner,
+        refiner: query.refiner.into(),
         deadline,
-        max_iterations: config.max_iterations,
+        max_iterations: iteration_bound(planner, config.max_iterations),
         attempts: config.planning_attempts,
         seed: PLAN_SEED,
         min_clearance_m: config.min_clearance_m,
@@ -2204,8 +2202,10 @@ mod tests {
     /// The node of OpenArm v2, which these tests run.
     type Node = ANode<ARM_DOF, DUAL_DOF, 2>;
 
+    use std::num::NonZeroU64;
     use std::task::{Context, Poll, Waker};
 
+    use crate::request::{Named, Planner, Refiner};
     use chain_kinematics::nalgebra::{Point3, UnitQuaternion, Vector3};
     use collision_geometry::chain::{Padding, RiderBody};
     use motion_planning_core::OCCUPANCY_MAP;
@@ -2310,7 +2310,8 @@ mod tests {
             goal_position_constraints: Vec::new(),
             path_orientation_constraints: Vec::new(),
             goal_orientation_constraints: Vec::new(),
-            objective: crate::request::OBJECTIVE.to_string(),
+            planner: Planner::RrtConnect.name().to_string(),
+            refiner: Refiner::None.name().to_string(),
             allowed_planning_time_s: crate::request::MAX_PLANNING_TIME_S,
         }
     }
@@ -2612,6 +2613,50 @@ mod tests {
             plan(&node, &taken, &AtomicBool::new(true)),
             Err(PlanEnd::Stopped)
         ));
+    }
+
+    // A plan takes the planner and the refiner its goal names: rrt_star refined by chomp
+    // plans with RRT*, no iteration bound and CHOMP, and rrt_connect with none plans with
+    // RRTConnect within the node's iterations and no refiner.
+    #[test]
+    fn a_plan_takes_the_planner_and_refiner_its_goal_names() {
+        let node = started(&parameters(), false);
+        measure_at(&node, SystemTime::UNIX_EPOCH, still());
+        let stop = AtomicBool::new(false);
+        let request_of = |planner: Planner, refiner: Refiner| {
+            let goal = GoalRequestData {
+                planner: planner.name().to_string(),
+                refiner: refiner.name().to_string(),
+                ..joint_goal(&node, Side::Left, &elbow_at(Side::Left, 1.3))
+            };
+            let taken = admit(&node, &goal).expect("the goal is taken");
+            let request = plan_request(
+                &node.config,
+                &taken.query,
+                [0.0; ARM_DOF],
+                Vec::new(),
+                &[],
+                an_hour_on(),
+                &stop,
+            );
+            (request.planner, request.refiner, request.max_iterations)
+        };
+        assert_eq!(
+            request_of(Planner::RrtStar, Refiner::Chomp),
+            (
+                ompl_bridge::Planner::RrtStar,
+                Some(motion_planning_core::Refiner::Chomp),
+                NonZeroU64::MAX
+            )
+        );
+        assert_eq!(
+            request_of(Planner::RrtConnect, Refiner::None),
+            (
+                ompl_bridge::Planner::RrtConnect,
+                None,
+                node.config.max_iterations
+            )
+        );
     }
 
     // A stop set before a Cartesian path starts ends it stopped: it answers no path.
@@ -3257,10 +3302,12 @@ mod tests {
                     .iter()
                     .flat_map(move |finger| {
                         let placed = posed.link_pose_world(finger.segment) * finger.offset;
-                        let RiderBody::Pieces(pieces) = finger.body else {
+                        let RiderBody::Part(part) = finger.body else {
                             panic!("a finger is a part of the robot");
                         };
-                        pieces.iter().map(move |piece| placed * piece.center())
+                        part.pieces()
+                            .iter()
+                            .map(move |piece| placed * piece.center())
                     })
                     .collect::<Vec<_>>()
             })

@@ -264,7 +264,10 @@ fn with_pieces<const N: usize>(geometry: &ChainGeometry<N>, links: Vec<String>) 
                 .map(CarriedPart::rider)
                 .any(|carried| {
                     carried.name == link
-                        && matches!(carried.body, RiderBody::Pieces(pieces) if !pieces.is_empty())
+                        && matches!(
+                            carried.body,
+                            RiderBody::Part(part) if !part.pieces().is_empty()
+                        )
                 })
     };
     links.into_iter().filter(|link| has_pieces(link)).collect()
@@ -549,8 +552,11 @@ pub(crate) mod tests {
                 panic!("SO-101 has one jaw");
             };
             assert_eq!(jaw.name, so101_description::JAW_LINK);
-            let RiderBody::Pieces([piece, ..]) = jaw.body else {
+            let RiderBody::Part(part) = jaw.body else {
                 panic!("the jaw is a part of the robot");
+            };
+            let [piece, ..] = part.pieces() else {
+                panic!("the jaw holds a piece");
             };
             let corners = piece.vertices();
             let sum = corners

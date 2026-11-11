@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use chain_kinematics::{Chain, ChainSpec, JointSelection};
+use motion_planner::request::{Named, Planner, Refiner};
 use motion_planning_core::pose_parts;
 use peppygen::Parameters;
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path::GoalWaypointsItem;
@@ -27,6 +28,7 @@ use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
 };
 use peppygen::fixtures::exposed_services::motion_planning::{
     apply_attached_collision_object, apply_collision_objects, check_joint_path, describe_arms,
+    set_allowed_collision,
 };
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::limb_state;
@@ -50,10 +52,13 @@ const FOLDED: [f64; ARM_DOF] = [-0.05, -1.72, 1.68, 1.24, 0.32];
 /// The arm at home (so101_description's postures.py, `HOME_POSITIONS_RAD`): `FOLDED`
 /// unfolded out of contact.
 const HOME: [f64; ARM_DOF] = [-0.05, -1.51, 1.47, 1.03, 0.32];
-/// A posture whose grasp point stands where a box of `BOX_SIDE_M` around it comes within the
-/// clearance of the base, and stands more than the clearance from each link it may not touch,
-/// the arm's own links farther apart than the clearance a plan keeps between them.
+/// A posture whose grasp point stands where a box of `HELD_BOX_SIDE_M` around it reaches into
+/// the base and touches no other link, the arm's own links farther apart than the clearance a
+/// plan keeps between them.
 const BOX_AT_THE_BASE: [f64; ARM_DOF] = [0.0, 1.15, 0.01, 1.54, 0.0];
+/// The side of the box the hand holds at `BOX_AT_THE_BASE` (m): a held box there keeps clear of
+/// the base at 0.084 m and touches it from 0.088 m.
+const HELD_BOX_SIDE_M: f64 = 0.1;
 /// A turn of the frame about its x axis that lies past the orientations the arm holds at
 /// `REACHED`'s position by more than the goals' tolerance (rad).
 const FAR_TURN_RAD: f64 = 0.8;
@@ -64,7 +69,7 @@ const JOINTS: [&str; ARM_DOF] = [
     "wrist_flex",
     "wrist_roll",
 ];
-/// The side of the boxes these tests enter (m).
+/// The side of the box a plan goes around (m).
 const BOX_SIDE_M: f64 = 0.06;
 /// How near its position a goal holds the grasp point (m).
 const POSITION_TOLERANCE_M: f64 = 0.001;
@@ -95,17 +100,17 @@ fn tool_point(q: &[f64; ARM_DOF]) -> [f64; 3] {
 fn so101_parameters() -> Parameters {
     Parameters {
         goal_samples: 10,
-        map_max_x_m: 0.52,
-        map_max_y_m: 0.48,
-        map_max_z_m: 0.56,
-        map_min_x_m: -0.38,
-        map_min_y_m: -0.48,
-        map_min_z_m: -0.26,
+        map_max_x_m: 0.50,
+        map_max_y_m: 0.46,
+        map_max_z_m: 0.54,
+        map_min_x_m: -0.36,
+        map_min_y_m: -0.46,
+        map_min_z_m: -0.24,
         max_iterations: 20_000,
         max_range_m: 1.36,
         max_update_rate_hz: 5.0,
-        min_clearance_m: 0.02,
-        padding_offset_m: 0.02,
+        min_clearance_m: 0.0,
+        padding_offset_m: 0.0,
         padding_scale: 1.0,
         planning_attempts: 1,
         start_tolerance_rad: 0.05,
@@ -190,7 +195,8 @@ fn goal_of(
         goal_position_constraints: positions,
         goal_orientation_constraints: orientations,
         path_orientation_constraints: Vec::new(),
-        objective: "any".to_string(),
+        planner: Planner::RrtConnect.name().to_string(),
+        refiner: Refiner::None.name().to_string(),
         allowed_planning_time_s: PLANNING_TIME_S,
     }
 }
@@ -240,8 +246,8 @@ fn turned_goal(turn_rad: f64, tolerance_rad: f64, free_axis: &str) -> GoalReques
     )
 }
 
-/// Enters a box of `BOX_SIDE_M` as the object `id`, centered at `center`.
-async fn enter_box(harness: &Harness, id: &str, center: [f64; 3]) {
+/// Enters a box of side `side_m` as the object `id`, centered at `center`.
+async fn enter_box(harness: &Harness, id: &str, center: [f64; 3], side_m: f64) {
     apply_collision_objects::poll(
         harness,
         &apply_collision_objects::RequestData {
@@ -252,7 +258,7 @@ async fn enter_box(harness: &Harness, id: &str, center: [f64; 3]) {
                 orientation: [0.0, 0.0, 0.0, 1.0],
                 shapes: vec![Shape {
                     kind: "box".to_string(),
-                    dimensions: vec![BOX_SIDE_M; 3],
+                    dimensions: vec![side_m; 3],
                     mesh_vertices: Vec::new(),
                     mesh_triangles: Vec::new(),
                     position: [0.0; 3],
@@ -319,6 +325,17 @@ async fn a_plan_from_home_has_a_path() -> peppygen::Result<()> {
     Ok(())
 }
 
+// Home keeps the arm's own links farther apart than the clearance a plan keeps between them:
+// a plan to home has a path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_to_home_has_a_path() -> peppygen::Result<()> {
+    let (harness, _mocks) = started_at(&REACHED).await?;
+    plan(&harness, &joints_at(&HOME))
+        .await
+        .expect("a plan to home");
+    Ok(())
+}
+
 // A box on the straight joint path fails the check of that path, the reason saying the arm
 // comes too near the objects. A plan to the same goal goes around it, and its path passes the
 // check.
@@ -327,7 +344,7 @@ async fn it_plans_around_a_box_the_straight_path_meets() -> peppygen::Result<()>
     let (harness, _mocks) = started_at(&START).await?;
     let free = checked(&harness, &[ACROSS]).await;
     assert!(free.clear, "{}", free.reason);
-    enter_box(&harness, "box", tool_point(&HALFWAY)).await;
+    enter_box(&harness, "box", tool_point(&HALFWAY), BOX_SIDE_M).await;
     let met = checked(&harness, &[ACROSS]).await;
     assert!(!met.clear, "the straight path keeps clear of the box");
     assert!(met.reason.contains("the objects"), "{}", met.reason);
@@ -388,15 +405,21 @@ async fn a_tolerance_or_a_free_axis_reaches_an_orientation_off_those_it_holds()
     Ok(())
 }
 
-// An object the hand holds keeps clear of the base: the arm at a posture that brings the box
-// within the clearance of the base, and of no link it may not touch, fails a check holding the
-// box, and passes it with nothing held.
+// An object the hand holds keeps clear of the base: at a posture where the held box reaches into
+// the base, a check passes with nothing held, fails holding the box, naming the box and the
+// base, and passes once the two may touch.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_held_object_keeps_clear_of_the_base() -> peppygen::Result<()> {
     let (harness, _mocks) = started_at(&BOX_AT_THE_BASE).await?;
     let empty = checked(&harness, &[BOX_AT_THE_BASE]).await;
     assert!(empty.clear, "{}", empty.reason);
-    enter_box(&harness, "held", tool_point(&BOX_AT_THE_BASE)).await;
+    enter_box(
+        &harness,
+        "held",
+        tool_point(&BOX_AT_THE_BASE),
+        HELD_BOX_SIDE_M,
+    )
+    .await;
     apply_attached_collision_object::poll(
         &harness,
         &apply_attached_collision_object::RequestData {
@@ -410,15 +433,25 @@ async fn a_held_object_keeps_clear_of_the_base() -> peppygen::Result<()> {
     .await
     .expect("the box attaches");
     let held = checked(&harness, &[BOX_AT_THE_BASE]).await;
+    assert!(!held.clear, "the held box reaches into the base");
     assert!(
-        !held.clear,
-        "the held box keeps its clearance from the base"
-    );
-    assert!(
-        held.reason.contains("the map and the objects"),
+        held.reason.contains(&format!("held touches {BASE_LINK}")),
         "{}",
         held.reason
     );
+    set_allowed_collision::poll(
+        &harness,
+        &set_allowed_collision::RequestData {
+            name: "held".to_string(),
+            other_names: vec![BASE_LINK.to_string()],
+            allowed: true,
+        },
+        TIMEOUT,
+    )
+    .await
+    .expect("the pair is allowed");
+    let allowed = checked(&harness, &[BOX_AT_THE_BASE]).await;
+    assert!(allowed.clear, "{}", allowed.reason);
     Ok(())
 }
 

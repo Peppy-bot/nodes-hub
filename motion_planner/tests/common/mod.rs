@@ -21,7 +21,7 @@ use collision_geometry::chain::{BodyMask, Padding, PlacedMask, RiderBody};
 use motion_planner::arm_set::PerArm;
 use motion_planner::history::ArmJoints;
 use motion_planner::node::Fault;
-use motion_planner::request::OBJECTIVE;
+use motion_planner::request::{Named, Planner, Refiner};
 use motion_planner::robot::{Robot, RobotModel, openarm_v2};
 use openarm_description::{ARM_DOF, DUAL_DOF, Side, ready};
 use peppygen::Parameters;
@@ -56,7 +56,7 @@ pub const CAMERA: &str = "chest";
 
 pub use parameters::parameters;
 
-/// The planning time every test's plan asks for (s).
+/// The planning time a test's plan asks for (s), unless the test names its own.
 pub const PLANNING_TIME_S: f64 = 20.0;
 
 /// What a refused start in contact within the robot's own body says to do.
@@ -122,10 +122,10 @@ pub fn render(
                     .into_iter()
                     .map(move |finger| {
                         let hand = posed.link_pose_world(finger.segment);
-                        let RiderBody::Pieces(pieces) = finger.body else {
+                        let RiderBody::Part(part) = finger.body else {
                             panic!("a finger is a part of the robot");
                         };
-                        (finger.name, pieces, hand * finger.offset)
+                        (finger.name, part.pieces(), hand * finger.offset)
                     })
             }),
             none,
@@ -553,7 +553,8 @@ pub fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
         goal_position_constraints: Vec::new(),
         path_orientation_constraints: Vec::new(),
         goal_orientation_constraints: Vec::new(),
-        objective: OBJECTIVE.to_string(),
+        planner: Planner::RrtConnect.name().to_string(),
+        refiner: Refiner::None.name().to_string(),
         allowed_planning_time_s: PLANNING_TIME_S,
     }
 }

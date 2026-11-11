@@ -124,8 +124,9 @@
       // The most goals each attempt of a plan samples, as MoveIt's
       // max_goal_samples bounds the goals its goal sampler adds: 1 or more.
       goal_samples: "u32",
-      // The iterations each attempt of a plan may take, besides its time
-      // limit: 1 or more.
+      // The iterations each attempt of an `rrt_connect` plan may take,
+      // besides its time limit: 1 or more. An `rrt_star` plan takes no
+      // iteration bound.
       max_iterations: "u64",
       // The attempts of each plan, 1 or more, each from its own seed, four at
       // once and each further four once the four before them have ended; the
