@@ -37,10 +37,10 @@ impl<const N: usize, const K: usize> Copies<N, K> {
     }
 }
 
-/// The smallest distance of `nearest`; a configuration the model cannot measure, a
-/// non-finite one, reads as a collision.
-fn clearance_of(nearest: Result<Proximity<'_>, CollisionError>) -> f64 {
-    nearest.map_or(f64::NEG_INFINITY, |proximity| proximity.distance)
+/// The distance `read` holds; a configuration the model cannot measure, a non-finite one,
+/// reads as a collision.
+fn clearance_of(read: Result<f64, CollisionError>) -> f64 {
+    read.unwrap_or(f64::NEG_INFINITY)
 }
 
 /// The links of the pair of `nearest`; a configuration the model cannot measure names why
@@ -79,26 +79,21 @@ impl<const N: usize, const K: usize> HeldOtherArms<N, K> {
         }
     }
 
-    /// Runs `read` on the moving arm's nearest pair with the arm at `q`.
-    fn nearest<T>(
-        &self,
-        q: &[f64; N],
-        read: impl FnOnce(Result<Proximity<'_>, CollisionError>) -> T,
-    ) -> T {
-        let at: Joints<N, K> =
-            std::array::from_fn(|k| if k == self.arm { *q } else { self.standing[k] });
-        let mut model = self.copies.free_copy();
-        read(model.min_distance_of_chain(self.arm, &at))
+    /// Every arm's joints, the moving arm at `q`.
+    fn at(&self, q: &[f64; N]) -> Joints<N, K> {
+        std::array::from_fn(|k| if k == self.arm { *q } else { self.standing[k] })
     }
 }
 
 impl<const N: usize, const K: usize> SelfModel<N> for HeldOtherArms<N, K> {
-    fn clearance(&self, q: &[f64; N], _: Moving) -> f64 {
-        self.nearest(q, clearance_of)
+    fn clearance(&self, q: &[f64; N], _: Moving, within: f64) -> f64 {
+        let mut model = self.copies.free_copy();
+        clearance_of(model.min_distance_of_chain_within(self.arm, &self.at(q), within))
     }
 
     fn nearest_pair(&self, q: &[f64; N], _: Moving) -> (String, String) {
-        self.nearest(q, pair_of)
+        let mut model = self.copies.free_copy();
+        pair_of(model.min_distance_of_chain(self.arm, &self.at(q)))
     }
 }
 
@@ -124,34 +119,41 @@ impl<const N: usize, const K: usize, const D: usize> EveryArm<N, K, D> {
         }
     }
 
-    /// Runs `read` on the robot's nearest pair that `moving` judges, with the arms at `q`.
-    fn nearest<T>(
-        &self,
-        q: &[f64; D],
-        moving: Moving,
-        read: impl FnOnce(Result<Proximity<'_>, CollisionError>) -> T,
-    ) -> T {
-        let at: Joints<N, K> = std::array::from_fn(|k| Arms::<N, D>::slice(q, k));
-        let mut model = self.copies.free_copy();
-        read(match moving {
-            Moving::All => model.min_distance(&at),
-            Moving::Arm(k) if k + 1 == K => model.min_distance_of_chain(k, &at),
-            Moving::Arm(0) if K == 2 => model.min_distance_of_chain_alone(0, &at),
-            Moving::Arm(k) => panic!(
-                "a turn of arm {k} of a plan of {K} arms: the self model reads the last arm's, \
-                 and the first's of two"
-            ),
-        })
+    /// Each arm's joints of the state `q`.
+    fn at(q: &[f64; D]) -> Joints<N, K> {
+        std::array::from_fn(|k| Arms::<N, D>::slice(q, k))
+    }
+
+    /// Refuses a turn of an arm whose pairs the self model reads for no turn.
+    fn no_turn_of(k: usize) -> ! {
+        panic!(
+            "a turn of arm {k} of a plan of {K} arms: the self model reads the last arm's, \
+             and the first's of two"
+        )
     }
 }
 
 impl<const N: usize, const K: usize, const D: usize> SelfModel<D> for EveryArm<N, K, D> {
-    fn clearance(&self, q: &[f64; D], moving: Moving) -> f64 {
-        self.nearest(q, moving, clearance_of)
+    fn clearance(&self, q: &[f64; D], moving: Moving, within: f64) -> f64 {
+        let at = Self::at(q);
+        let mut model = self.copies.free_copy();
+        clearance_of(match moving {
+            Moving::All => model.min_distance_within(&at, within),
+            Moving::Arm(k) if k + 1 == K => model.min_distance_of_chain_within(k, &at, within),
+            Moving::Arm(0) if K == 2 => model.min_distance_of_chain_alone_within(0, &at, within),
+            Moving::Arm(k) => Self::no_turn_of(k),
+        })
     }
 
     fn nearest_pair(&self, q: &[f64; D], moving: Moving) -> (String, String) {
-        self.nearest(q, moving, pair_of)
+        let at = Self::at(q);
+        let mut model = self.copies.free_copy();
+        pair_of(match moving {
+            Moving::All => model.min_distance(&at),
+            Moving::Arm(k) if k + 1 == K => model.min_distance_of_chain(k, &at),
+            Moving::Arm(0) if K == 2 => model.min_distance_of_chain_alone(0, &at),
+            Moving::Arm(k) => Self::no_turn_of(k),
+        })
     }
 }
 
@@ -163,6 +165,21 @@ mod tests {
     use super::*;
     use crate::arm_set::PerArm;
     use crate::robot::{openarm_v2, so101};
+
+    /// A bound under the distance of every pair of the robots at the postures of the tests.
+    const UNDER_EVERY_PAIR_M: f64 = -1.0;
+
+    /// Checks that `model` reads `exact`, the distance the self-collision model measures,
+    /// with no bound, and at `UNDER_EVERY_PAIR_M` a lower bound under it, the model's
+    /// reading at that bound.
+    fn reads<const D: usize>(model: &dyn SelfModel<D>, q: &[f64; D], moving: Moving, exact: f64) {
+        assert_eq!(model.clearance(q, moving, f64::INFINITY), exact);
+        let bounded = model.clearance(q, moving, UNDER_EVERY_PAIR_M);
+        assert!(
+            (UNDER_EVERY_PAIR_M..exact).contains(&bounded),
+            "{moving:?}: {bounded} against {exact}"
+        );
+    }
 
     // A turn of the left arm, first in the state, reads its pairs without the right arm,
     // and a turn of the right arm its pairs with the left: the left arm at Ready and the
@@ -181,9 +198,9 @@ mod tests {
         let of_right = distance(model.min_distance_of_chain(1, &at));
         let of_all = distance(model.min_distance(&at));
         assert_ne!(left_alone, of_right);
-        assert_eq!(both.clearance(&q, Moving::Arm(0)), left_alone);
-        assert_eq!(both.clearance(&q, Moving::Arm(1)), of_right);
-        assert_eq!(both.clearance(&q, Moving::All), of_all);
+        reads(&both, &q, Moving::Arm(0), left_alone);
+        reads(&both, &q, Moving::Arm(1), of_right);
+        reads(&both, &q, Moving::All, of_all);
     }
 
     // A plan of one arm reads the pairs it rides with the other arm where it stands, which
@@ -202,7 +219,7 @@ mod tests {
             .min_distance_of_chain(1, &at)
             .expect("a measured state")
             .distance;
-        assert_eq!(held.clearance(&at[1], Moving::All), of_right);
+        reads(&held, &at[1], Moving::All, of_right);
     }
 
     // SO-101's one arm reads every checked pair, planned alone or as every arm.
@@ -216,8 +233,8 @@ mod tests {
             .own
             .of_one_arm(NonZeroUsize::MIN, ArmId::new(0), &PerArm::new(vec![q]));
         let every = robot.own.of_every_arm::<SO101_DOF>(NonZeroUsize::MIN);
-        assert_eq!(alone.clearance(&q, Moving::All), of_all);
-        assert_eq!(every.clearance(&q, Moving::Arm(0)), of_all);
-        assert_eq!(every.clearance(&q, Moving::All), of_all);
+        reads(&alone, &q, Moving::All, of_all);
+        reads(&every, &q, Moving::Arm(0), of_all);
+        reads(&every, &q, Moving::All, of_all);
     }
 }

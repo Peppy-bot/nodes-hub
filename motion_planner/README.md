@@ -250,9 +250,22 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   measured joint positions and the grippers' openings, and the self-collision model at
   them. A frame, a clear, a change of the scene or a message of limb_states after
   acceptance changes nothing of it.
-- `objective` is `any`: the node plans with RRTConnect, which answers the first path it
-  finds within `max_iterations`, and simplifies it in the time left. A goal of another
-  objective is refused, the message naming `any`.
+- `planner` names the planner, as MoveIt's `pipeline_id` and `planner_id` do, and
+  `refiner` what refines its path, as a MoveIt pipeline chains a refining planner after
+  its planner. Each planner plans in the joints' space measured as MoveIt measures it, by
+  the sum of the joints' changes. With `rrt_connect`, MoveIt's pipeline `ompl` with
+  `planner_id` `RRTConnectkConfigDefault`, the node plans with RRTConnect, which answers
+  the first path it finds within `max_iterations`, and simplifies it in the time left. With
+  `rrt_star`, `planner_id` `RRTstarkConfigDefault`, it plans with RRT*, which shortens its
+  path's length in that measure until the plan's time ends, with no iteration bound, and
+  simplifies it once. With `refiner` `chomp`, it then refines the planner's path with
+  MoveIt's CHOMP, from that path as the robot runs it, every one of its iterations, as
+  `motion_planning_core` describes (CHOMP), and answers the refined path, CHOMP's 101
+  points as a plan answers any path, less each that barely moves from the one kept before
+  it, with the waypoints a repaired corner adds, when it passes the plan's checks and costs less than the planner's path in
+  CHOMP's cost, and the planner's path otherwise; with `none` it answers the planner's
+  path. A goal of another planner or refiner is refused, the message naming each the node
+  takes.
 - A plan's time follows MoveIt's allowed planning time, as `motion_planning_core`
   implements it, with no share kept for any part: the attempts take
   `allowed_planning_time_s`, which a request gives above 0 and at most 60, from when the
@@ -263,7 +276,8 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   check of the rounded path runs to its end after the deadline, so a plan answers after
   its deadline by the time the simplifier's first pass, when the attempts leave it none
   of the time, and that check take. With more than 1 attempt, the hybrid of the attempts'
-  paths and its checks also run after the deadline.
+  paths and its checks also run after the deadline, and with `refiner` `chomp`, CHOMP's
+  iterations and the checks of its trajectories.
 - The planner makes `planning_attempts` attempts, each from its own seed: four at once,
   MoveIt's default `max_planning_threads`, and each further four once the four before
   them have ended, while the time lasts; a single attempt plans on the plan's own

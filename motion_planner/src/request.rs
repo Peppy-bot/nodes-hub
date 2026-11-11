@@ -3,6 +3,7 @@
 //! its poses or its waypoints, in the terms of motion_planning_core. A request that does
 //! not parse is refused with `rejected`, and the message says what to send instead.
 
+use std::borrow::Borrow;
 use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, Vector3};
@@ -25,13 +26,115 @@ use crate::robot::ArmModel;
 /// The longest a plan may plan, in seconds.
 pub const MAX_PLANNING_TIME_S: f64 = 60.0;
 
-/// The one objective the planner serves: the first valid path RRTConnect finds,
-/// simplified in the time left.
-pub const OBJECTIVE: &str = "any";
+/// A choice a plan_joint_path goal names by one of its field's names.
+pub trait Named: Copy + PartialEq + 'static {
+    /// The goal's field that names it.
+    const FIELD: &'static str;
+    /// Every choice, in the contract's order.
+    const ALL: &'static [Self];
+
+    /// The name a goal gives it.
+    fn name(self) -> &'static str;
+
+    /// The choice named `name`, refused with the names a goal can send.
+    fn named(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|choice| choice.name() == name)
+            .ok_or_else(|| {
+                let names: Vec<String> = Self::ALL
+                    .iter()
+                    .map(|choice| format!("{:?}", choice.name()))
+                    .collect();
+                format!("{} is {}, not {name:?}", Self::FIELD, listed(&names, "or"))
+            })
+    }
+}
+
+/// The planner a plan_joint_path goal names, as MoveIt's MotionPlanRequest names its
+/// pipeline_id and planner_id.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Planner {
+    /// RRTConnect, MoveIt's pipeline "ompl" with planner_id "RRTConnectkConfigDefault":
+    /// the first valid path it finds, simplified in the time left.
+    RrtConnect,
+    /// RRT*, MoveIt's pipeline "ompl" with planner_id "RRTstarkConfigDefault": a path it
+    /// shortens until the plan's time ends, then simplified once.
+    RrtStar,
+}
+
+impl Named for Planner {
+    const FIELD: &'static str = "planner";
+    const ALL: &'static [Self] = &[Self::RrtConnect, Self::RrtStar];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::RrtConnect => "rrt_connect",
+            Self::RrtStar => "rrt_star",
+        }
+    }
+}
+
+/// What refines the planner's path of a plan_joint_path goal, as a MoveIt pipeline chains
+/// a refining planner after its planner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Refiner {
+    /// The planner's path, as it answers it.
+    None,
+    /// The planner's path refined by MoveIt's CHOMP, every iteration of it
+    /// (`motion_planning_core::Refiner::Chomp`): the refined path when it passes the plan's
+    /// checks and costs less in CHOMP's cost, and the planner's path otherwise.
+    Chomp,
+}
+
+impl Named for Refiner {
+    const FIELD: &'static str = "refiner";
+    const ALL: &'static [Self] = &[Self::None, Self::Chomp];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Chomp => "chomp",
+        }
+    }
+}
+
+impl From<Planner> for ompl_bridge::Planner {
+    fn from(planner: Planner) -> Self {
+        match planner {
+            Planner::RrtConnect => Self::RrtConnect,
+            Planner::RrtStar => Self::RrtStar,
+        }
+    }
+}
+
+impl From<Refiner> for Option<motion_planning_core::Refiner> {
+    fn from(refiner: Refiner) -> Self {
+        match refiner {
+            Refiner::None => None,
+            Refiner::Chomp => Some(motion_planning_core::Refiner::Chomp),
+        }
+    }
+}
+
+/// `names` as a list in a sentence, the last joined by `conjunction`: "a", "a and b",
+/// "a, b or c".
+pub fn listed<S: Borrow<str>>(names: &[S], conjunction: &str) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.borrow().to_string(),
+        [init @ .., last] => format!("{} {conjunction} {}", init.join(", "), last.borrow()),
+    }
+}
 
 /// A plan_joint_path goal that parses.
 #[derive(Debug)]
 pub struct PlanQuery<const N: usize> {
+    /// The planner that plans the path.
+    pub planner: Planner,
+    /// What refines the planner's path.
+    pub refiner: Refiner,
     /// The goal's arms, in its order: the order of the answer.
     pub order: Vec<ArmId>,
     /// Where each arm's path starts.
@@ -194,12 +297,8 @@ pub fn parse_plan<const N: usize>(
         })
         .transpose()?;
     let arm_goals = arm_goals(goals).ok_or_else(|| GoalError::Empty.to_string())?;
-    if raw.objective != OBJECTIVE {
-        return Err(format!(
-            "objective is {OBJECTIVE:?}, not {:?}",
-            raw.objective
-        ));
-    }
+    let planner = Planner::named(&raw.planner)?;
+    let refiner = Refiner::named(&raw.refiner)?;
     let time = raw.allowed_planning_time_s;
     if !(time > 0.0 && time <= MAX_PLANNING_TIME_S) {
         return Err(format!(
@@ -208,6 +307,8 @@ pub fn parse_plan<const N: usize>(
         ));
     }
     Ok(PlanQuery {
+        planner,
+        refiner,
         order,
         starts,
         arm_goals,
@@ -701,7 +802,8 @@ mod tests {
                 tolerance_rad: 0.1,
                 free_axis: "z".to_string(),
             }],
-            objective: "any".to_string(),
+            planner: "rrt_connect".to_string(),
+            refiner: "none".to_string(),
             allowed_planning_time_s: 1.0,
         }
     }
@@ -820,11 +922,13 @@ mod tests {
         parse(&goal).expect_err("a refusal")
     }
 
-    // A goal for the grasp link parses into the arm it moves, its start where it stands,
-    // and its time; a near-unit orientation is normalized.
+    // A goal for the grasp link parses into its planner and refiner, the arm it moves, its
+    // start where it stands, and its time; a near-unit orientation is normalized.
     #[test]
     fn a_goal_of_the_grasp_link_parses() {
         let query = parse(&goal()).expect("a query");
+        assert_eq!(query.planner, Planner::RrtConnect);
+        assert_eq!(query.refiner, Refiner::None);
         assert!(matches!(
             query.arm_goals,
             ArmGoals::One { arm, .. } if arm == Side::Left.into()
@@ -844,6 +948,49 @@ mod tests {
             parse(&started).expect("a query").starts,
             PerArm::both(Some([0.1; ARM_DOF]), None)
         );
+    }
+
+    // Each planner and each refiner parses from the name a goal gives it, which no
+    // other choice of its field shares.
+    #[test]
+    fn each_choice_parses_from_its_name() {
+        fn each_parses<T: Named + std::fmt::Debug>() {
+            for &choice in T::ALL {
+                assert_eq!(T::named(choice.name()), Ok(choice));
+            }
+        }
+        each_parses::<Planner>();
+        each_parses::<Refiner>();
+    }
+
+    // Each planner names the libraries' planner of the same name, and each refiner what
+    // refines the planner's path.
+    #[test]
+    fn each_choice_names_the_planner_and_refiner_of_the_libraries() {
+        assert_eq!(
+            ompl_bridge::Planner::from(Planner::RrtConnect),
+            ompl_bridge::Planner::RrtConnect
+        );
+        assert_eq!(
+            ompl_bridge::Planner::from(Planner::RrtStar),
+            ompl_bridge::Planner::RrtStar
+        );
+        assert_eq!(
+            Option::<motion_planning_core::Refiner>::from(Refiner::None),
+            None
+        );
+        assert_eq!(
+            Option::<motion_planning_core::Refiner>::from(Refiner::Chomp),
+            Some(motion_planning_core::Refiner::Chomp)
+        );
+    }
+
+    #[test]
+    fn a_list_joins_its_last_name_by_the_conjunction() {
+        assert_eq!(listed::<&str>(&[], "or"), "");
+        assert_eq!(listed(&["a"], "or"), "a");
+        assert_eq!(listed(&["a", "b"], "and"), "a and b");
+        assert_eq!(listed(&["a", "b", "c"], "or"), "a, b or c");
     }
 
     /// A path orientation of `link`, within 0.1 rad of the identity, free about `free_axis`.
@@ -1170,10 +1317,21 @@ mod tests {
             );
         }
         let shortest = GoalRequestData {
-            objective: "shortest".to_string(),
+            planner: "shortest".to_string(),
             ..goal()
         };
-        assert_eq!(refusal(shortest), "objective is \"any\", not \"shortest\"");
+        assert_eq!(
+            refusal(shortest),
+            "planner is \"rrt_connect\" or \"rrt_star\", not \"shortest\""
+        );
+        let smooth = GoalRequestData {
+            refiner: "smooth".to_string(),
+            ..goal()
+        };
+        assert_eq!(
+            refusal(smooth),
+            "refiner is \"none\" or \"chomp\", not \"smooth\""
+        );
     }
 
     fn path_of(name: &str, waypoints: Vec<Vec<f64>>) -> CheckJointPathArmsItem {

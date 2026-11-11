@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use chain_kinematics::{Chain, ChainSpec, JointSelection};
+use motion_planner::request::{Named, Planner, Refiner};
 use motion_planning_core::pose_parts;
 use peppygen::Parameters;
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path::GoalWaypointsItem;
@@ -194,7 +195,8 @@ fn goal_of(
         goal_position_constraints: positions,
         goal_orientation_constraints: orientations,
         path_orientation_constraints: Vec::new(),
-        objective: "any".to_string(),
+        planner: Planner::RrtConnect.name().to_string(),
+        refiner: Refiner::None.name().to_string(),
         allowed_planning_time_s: PLANNING_TIME_S,
     }
 }
