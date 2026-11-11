@@ -198,9 +198,8 @@ jobs:
     #
     # The job runs on an on-demand instance in every attempt (spot=false). A
     # warm run takes about an hour and a half, and a run on a spot instance
-    # that AWS interrupts loses all of its work: the job fails, its sticky
-    # disk keeps the snapshot of the run before it, and RunsOn runs the job
-    # again from the start once the other jobs of the run end.
+    # that AWS interrupts loses all of its work: the job fails, and RunsOn
+    # runs it again from the start once the other jobs of the run end.
     runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb:lazy-init/spot=false  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The sticky disk keeps warm runs far under
