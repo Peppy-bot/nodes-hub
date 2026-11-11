@@ -999,16 +999,13 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
             feeder.cancel()
 
 
-async def test_the_plan_check_answers_without_moving():
+async def test_the_plan_check_answers_without_moving(follower_never_stale):
+    # follower_never_stale keeps a pause of the event loop from making the
+    # measured joints stale.
+    position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(MEASURED)
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
         try:
-            from so101_description.kinematics import Kinematics
-            from so101_description.model import KINEMATICS_URDF_PATH
-
-            position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(
-                MEASURED
-            )
             check = check_arm_move_prod.RequestData(
                 arm_name="arm",
                 position=[position[0], position[1], position[2] + 0.02],
@@ -1050,13 +1047,13 @@ async def test_the_plan_check_answers_without_moving():
             feeder.cancel()
 
 
-async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
+async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable(follower_never_stale):
+    # follower_never_stale keeps a pause of the event loop from making the
+    # measured joints stale.
+    position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(MEASURED)
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
         try:
-            position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(
-                MEASURED
-            )
             goal = await move_arm_fx.send_goal(
                 h,
                 move_arm_prod.GoalRequestData(
@@ -1080,7 +1077,13 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable():
             feeder.cancel()
 
 
-async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming():
+async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming(
+    follower_never_stale,
+):
+    # The node refuses for no fresh follower state before it looks at the
+    # leader, so follower_never_stale keeps a pause of the event loop from
+    # turning the refusal into RESOURCE_UNAVAILABLE.
+    position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(MEASURED)
     async with harness.start(setup, parameters=make_parameters()) as h:
         feeder = await feeding_measured(h)
         streamer = asyncio.create_task(_stream_leader_target(h, list(MEASURED), []))
@@ -1095,9 +1098,6 @@ async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming
             assert posture.refusal.kind is move_to_ready_fx.FailureKind.LEADER_STREAMING
             assert posture.refusal.message.startswith("a leader is streaming arm commands")
 
-            position, orientation = Kinematics(KINEMATICS_URDF_PATH).forward_kinematics(
-                MEASURED
-            )
             check = check_arm_move_prod.RequestData(
                 arm_name="arm",
                 position=list(position),
