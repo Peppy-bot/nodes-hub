@@ -47,14 +47,13 @@ name: Tests
 # current. A pull request from a fork runs on the same runners, so what holds
 # fork code is the repository's fork-PR approval gate.
 #
-# The test job runs on an on-demand instance in every attempt (see its
-# runs-on label). Each other job runs on a RunsOn spot instance in attempts 1
-# and 2 of its run, and on an on-demand instance from attempt 3. When AWS
-# interrupts a spot instance, RunsOn runs the failed jobs again in the next
-# attempt, but only after attempt 1 or 2. A re-run is also an attempt, and the
-# merge-set bot of peppy re-runs this workflow to test a new commit of another
-# branch of its set. So each of their runs-on labels adds spot=false from
-# attempt 3, and AWS cannot interrupt a job that RunsOn does not run again.
+# Each job runs on a RunsOn spot instance in attempts 1 and 2 of its run, and
+# on an on-demand instance from attempt 3. When AWS interrupts a spot
+# instance, RunsOn runs the failed jobs again in the next attempt, but only
+# after attempt 1 or 2. A re-run is also an attempt, and the merge-set bot of
+# peppy re-runs this workflow to test a new commit of another branch of its
+# set. So each runs-on label adds spot=false from attempt 3, and AWS cannot
+# interrupt a job that RunsOn does not run again.
 on:
   push:
     branches: [main]
@@ -192,15 +191,12 @@ jobs:
     # average) and peaks near 7 GB. The root disk holds the run's uv
     # environments (a full run writes near 27 GB there), and the sticky disk
     # holds the caches named below (a cold full run fills about 77 GB of it).
-    # RunsOn keeps a sticky disk per architecture, so moving this job onto an
-    # arm runner starts from an empty cache rather than a wrong-arch one. The
-    # base images and the librealsense apt repository are published for both.
-    #
-    # The job runs on an on-demand instance in every attempt (spot=false). A
-    # warm run takes about an hour and a half, and a run on a spot instance
-    # that AWS interrupts loses all of its work: the job fails, and RunsOn
-    # runs it again from the start once the other jobs of the run end.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb:lazy-init/spot=false  # custom Peppy AMI
+    # Four families in each zone give enough spot pools that a spot instance is
+    # found at once. RunsOn keeps a sticky disk per architecture, so moving
+    # this job onto an arm runner starts from an empty cache rather than a
+    # wrong-arch one. The base images and the librealsense apt repository are
+    # published for both.
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c8a+c7a+m8a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb:lazy-init${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The sticky disk keeps warm runs far under
     # this, but a run that starts from an empty disk is legitimately slow.
