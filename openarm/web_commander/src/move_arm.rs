@@ -14,7 +14,8 @@ use tracing::{info, warn};
 
 use crate::owner::Feedback;
 use crate::result_wait::{
-    GOAL_TIMEOUT, Waited, limb_goal_handle, preempt_grace_elapsed, summarize, wait_for_end,
+    GOAL_TIMEOUT, NO_CONTACT_CHECK_M, Waited, limb_goal_handle, preempt_grace_elapsed, summarize,
+    wait_for_end,
 };
 use crate::robot;
 
@@ -82,6 +83,7 @@ async fn run(
         settle_position_tolerance_m,
         settle_orientation_tolerance_rad,
         settle_timeout_s,
+        contact_gap_m: NO_CONTACT_CHECK_M,
     };
 
     let downstream = match limb_motion_move_arm::ActionHandle::fire_goal(
