@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, UnitQuaternion, Vector3};
@@ -32,12 +33,41 @@ use peppygen::fixtures::exposed_services::motion_planning::{
 };
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::limb_state;
-use so101_description::{ARM_DOF, ARM_LIMB, BASE_LINK, GRIPPER_LIMB, JAW_LINK, TCP_LINK, URDF};
+use robot_description::RobotDescription;
 
 use common::{
     Ended, OWN_BODY_WAY_OUT, PLANNING_TIME_S, TIMEOUT, at_ms, check, plan, start_identified_as,
     vacant_camera,
 };
+
+/// SO-101's description, as robot_description bundles it.
+static SO101: LazyLock<RobotDescription> = LazyLock::new(|| {
+    robot_description::model("so101")
+        .expect("robot_description bundles SO-101")
+        .description()
+});
+
+/// The joints of SO-101's one arm.
+const ARM_DOF: usize = 5;
+
+/// SO-101's one arm.
+fn arm() -> &'static robot_description::Arm {
+    &SO101.arms()[0]
+}
+
+/// The link of SO-101's jaw.
+fn jaw() -> &'static str {
+    &arm().gripper.fingers[0].link
+}
+
+/// The arm at home, as its description gives it: `FOLDED` unfolded out of contact.
+fn home() -> [f64; ARM_DOF] {
+    SO101
+        .state(&arm().name, robot_description::states::HOME)
+        .expect("the arm's home posture")
+        .try_into()
+        .expect("a posture of the five joints")
+}
 
 /// The arm turned to one side of the base, every joint off its limits.
 const START: [f64; ARM_DOF] = [-0.9, -0.6, 0.9, 0.4, 0.0];
@@ -49,9 +79,6 @@ const HALFWAY: [f64; ARM_DOF] = [0.0, -0.6, 0.9, 0.4, 0.0];
 const REACHED: [f64; ARM_DOF] = [0.5, -0.3, 0.6, 0.2, 0.0];
 /// The arm folded over its base as it rests, its own links touching in its self model.
 const FOLDED: [f64; ARM_DOF] = [-0.05, -1.72, 1.68, 1.24, 0.32];
-/// The arm at home (so101_description's postures.py, `HOME_POSITIONS_RAD`): `FOLDED`
-/// unfolded out of contact.
-const HOME: [f64; ARM_DOF] = [-0.05, -1.51, 1.47, 1.03, 0.32];
 /// A posture whose grasp point stands where a box of `HELD_BOX_SIDE_M` around it reaches into
 /// the base and touches no other link, the arm's own links farther apart than the clearance a
 /// plan keeps between them.
@@ -62,13 +89,6 @@ const HELD_BOX_SIDE_M: f64 = 0.1;
 /// A turn of the frame about its x axis that lies past the orientations the arm holds at
 /// `REACHED`'s position by more than the goals' tolerance (rad).
 const FAR_TURN_RAD: f64 = 0.8;
-const JOINTS: [&str; ARM_DOF] = [
-    "shoulder_pan",
-    "shoulder_lift",
-    "elbow_flex",
-    "wrist_flex",
-    "wrist_roll",
-];
 /// The side of the box a plan goes around (m).
 const BOX_SIDE_M: f64 = 0.06;
 /// How near its position a goal holds the grasp point (m).
@@ -77,10 +97,10 @@ const POSITION_TOLERANCE_M: f64 = 0.001;
 /// SO-101's arm from its base link to its grasp point.
 fn chain() -> Chain<ARM_DOF> {
     Chain::from_urdf(
-        &urdf_rs::read_from_string(URDF).expect("the URDF parses"),
+        SO101.robot(),
         &ChainSpec {
-            base_link: Some(BASE_LINK),
-            tip_link: TCP_LINK,
+            base_link: Some(&arm().base_link),
+            tip_link: &arm().grasp_link,
             joints: JointSelection::PathOrder,
         },
     )
@@ -134,12 +154,12 @@ async fn started_at(q: &[f64; ARM_DOF]) -> peppygen::Result<(Harness, Mocks)> {
         .limb_states
         .publish(&limb_state::limb_states::Message {
             timestamp: at_ms(0),
-            arm_names: vec![ARM_LIMB.to_string()],
+            arm_names: vec![arm().name.clone()],
             joints_per_arm: vec![ARM_DOF as u32],
             joint_positions: q.to_vec(),
             positions: vec![0.0; 3],
             orientations: vec![0.0, 0.0, 0.0, 1.0],
-            gripper_names: vec![GRIPPER_LIMB.to_string()],
+            gripper_names: vec![arm().gripper.name.clone()],
             gripper_openings: vec![0.0],
         })
         .await?;
@@ -161,7 +181,7 @@ async fn started_at(q: &[f64; ARM_DOF]) -> peppygen::Result<(Harness, Mocks)> {
 fn path_through(waypoints: &[[f64; ARM_DOF]]) -> check_joint_path::RequestData {
     check_joint_path::RequestData {
         arms: vec![CheckJointPathArmsItem {
-            arm_name: ARM_LIMB.to_string(),
+            arm_name: arm().name.clone(),
             start_joint_positions: Vec::new(),
             waypoints: waypoints
                 .iter()
@@ -188,7 +208,7 @@ fn goal_of(
 ) -> GoalRequestData {
     GoalRequestData {
         arms: vec![GoalArmsItem {
-            arm_name: ARM_LIMB.to_string(),
+            arm_name: arm().name.clone(),
             start_joint_positions: Vec::new(),
         }],
         goal_joint_constraints: joints,
@@ -204,7 +224,8 @@ fn goal_of(
 /// The goal of every joint within 0.01 rad of `q`.
 fn joints_at(q: &[f64; ARM_DOF]) -> GoalRequestData {
     goal_of(
-        JOINTS
+        arm()
+            .joints
             .iter()
             .zip(q)
             .map(|(joint, position)| GoalGoalJointConstraintsItem {
@@ -222,7 +243,7 @@ fn joints_at(q: &[f64; ARM_DOF]) -> GoalRequestData {
 /// The goal of the grasp point within `POSITION_TOLERANCE_M` of `position`.
 fn position_constraint(position: [f64; 3]) -> GoalGoalPositionConstraintsItem {
     GoalGoalPositionConstraintsItem {
-        link_name: TCP_LINK.to_string(),
+        link_name: arm().grasp_link.clone(),
         position,
         tolerance_m: POSITION_TOLERANCE_M,
     }
@@ -238,7 +259,7 @@ fn turned_goal(turn_rad: f64, tolerance_rad: f64, free_axis: &str) -> GoalReques
         Vec::new(),
         vec![position_constraint(tool_point(&REACHED))],
         vec![GoalGoalOrientationConstraintsItem {
-            link_name: TCP_LINK.to_string(),
+            link_name: arm().grasp_link.clone(),
             orientation,
             tolerance_rad,
             free_axis: free_axis.to_string(),
@@ -277,17 +298,17 @@ async fn enter_box(harness: &Harness, id: &str, center: [f64; 3], side_m: f64) {
 async fn it_describes_its_one_arm() -> peppygen::Result<()> {
     let (harness, _mocks) = started_at(&START).await?;
     let described = describe_arms::poll(&harness, TIMEOUT).await?;
-    let [arm] = &described.arms[..] else {
+    let [answered] = &described.arms[..] else {
         panic!("{:?}", described.arms);
     };
     assert_eq!(
-        (arm.name.as_str(), arm.gripper_name.as_str()),
-        (ARM_LIMB, GRIPPER_LIMB)
+        (answered.name.as_str(), answered.gripper_name.as_str()),
+        (arm().name.as_str(), arm().gripper.name.as_str())
     );
-    assert_eq!(arm.joint_names, JOINTS);
-    assert_eq!(arm.grasp_link, TCP_LINK);
-    assert_eq!(arm.gripper_links, ["gripper_link", JAW_LINK]);
-    assert_eq!(described.body_link_names, [BASE_LINK]);
+    assert_eq!(answered.joint_names, arm().joints);
+    assert_eq!(answered.grasp_link, arm().grasp_link.as_str());
+    assert_eq!(answered.gripper_links, ["gripper_link", jaw()]);
+    assert_eq!(described.body_link_names, [arm().base_link.as_str()]);
     Ok(())
 }
 
@@ -318,7 +339,7 @@ async fn it_keeps_its_own_links_apart() -> peppygen::Result<()> {
 // From home, the rest pose unfolded out of contact, a plan has a path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_from_home_has_a_path() -> peppygen::Result<()> {
-    let (harness, _mocks) = started_at(&HOME).await?;
+    let (harness, _mocks) = started_at(&home()).await?;
     plan(&harness, &joints_at(&REACHED))
         .await
         .expect("a plan from home");
@@ -330,7 +351,7 @@ async fn a_plan_from_home_has_a_path() -> peppygen::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_to_home_has_a_path() -> peppygen::Result<()> {
     let (harness, _mocks) = started_at(&REACHED).await?;
-    plan(&harness, &joints_at(&HOME))
+    plan(&harness, &joints_at(&home()))
         .await
         .expect("a plan to home");
     Ok(())
@@ -424,8 +445,8 @@ async fn a_held_object_keeps_clear_of_the_base() -> peppygen::Result<()> {
         &harness,
         &apply_attached_collision_object::RequestData {
             object_id: "held".to_string(),
-            link_name: TCP_LINK.to_string(),
-            touch_links: vec!["gripper_link".to_string(), JAW_LINK.to_string()],
+            link_name: arm().grasp_link.clone(),
+            touch_links: vec!["gripper_link".to_string(), jaw().to_string()],
             operation: "attach".to_string(),
         },
         TIMEOUT,
@@ -435,7 +456,8 @@ async fn a_held_object_keeps_clear_of_the_base() -> peppygen::Result<()> {
     let held = checked(&harness, &[BOX_AT_THE_BASE]).await;
     assert!(!held.clear, "the held box reaches into the base");
     assert!(
-        held.reason.contains(&format!("held touches {BASE_LINK}")),
+        held.reason
+            .contains(&format!("held touches {}", arm().base_link)),
         "{}",
         held.reason
     );
@@ -443,7 +465,7 @@ async fn a_held_object_keeps_clear_of_the_base() -> peppygen::Result<()> {
         &harness,
         &set_allowed_collision::RequestData {
             name: "held".to_string(),
-            other_names: vec![BASE_LINK.to_string()],
+            other_names: vec![arm().base_link.clone()],
             allowed: true,
         },
         TIMEOUT,
@@ -460,9 +482,9 @@ async fn a_held_object_keeps_clear_of_the_base() -> peppygen::Result<()> {
 async fn fraction_along(harness: &Harness, by: [f64; 3]) -> f64 {
     let pose = tool_pose(&START);
     let goal = cartesian::GoalRequestData {
-        arm_name: ARM_LIMB.to_string(),
+        arm_name: arm().name.clone(),
         start_joint_positions: Vec::new(),
-        link_name: TCP_LINK.to_string(),
+        link_name: arm().grasp_link.clone(),
         waypoints: vec![GoalWaypointsItem {
             position: (pose.translation.vector + Vector3::from(by)).into(),
             orientation: pose_parts(&pose).1,
