@@ -1117,11 +1117,16 @@ async fn a_leader_command_fans_through_to_the_governed_arm_wire() -> peppygen::R
         );
     }
 
-    // The leading node commands an elbow bend on the left arm only. The watch
-    // keeps the latest command, so one delivery suffices; the republish on an
-    // empty read window covers a best-effort drop.
+    // The leading node commands an elbow bend on the left arm only, once the
+    // node's subscription to it stands. The watch keeps the latest command, so
+    // one delivery suffices; the republish on an empty read window covers a
+    // best-effort drop.
     let mut target = left_home();
     target[3] = 0.4;
+    assert!(
+        leader.wait_for_subscriber(DEADLINE).await?,
+        "the node never subscribed to the left leader"
+    );
     let deadline = tokio::time::Instant::now() + DEADLINE;
     leader.publish(&leader_command(target)).await?;
     loop {
