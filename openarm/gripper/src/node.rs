@@ -324,22 +324,19 @@ fn serve_readiness(
         let model = ComponentModel::default();
         let set = serving::serve("set_model", token.cancelled(), || {
             set_model::handle_requests(&runner, |request| {
-                match model.name(&request.data.model, |named| configure(named, &params)) {
-                    Ok(configuration) => {
-                        if let Some(config) = configuration {
+                model
+                    .set(
+                        &request.data.model,
+                        |named| configure(named, &params),
+                        |config| {
                             let _ = configured.send(config);
-                        }
-                        Ok(())
-                    }
-                    Err(refusal) => {
-                        let failure = set_model::Failure::new(
-                            set_model::FailureKind::Rejected,
-                            refusal.to_string(),
-                        );
-                        fault.raise(refusal, || token.cancel());
-                        Err(failure)
-                    }
-                }
+                        },
+                        &fault,
+                        || token.cancel(),
+                    )
+                    .map_err(|reply| {
+                        set_model::Failure::new(set_model::FailureKind::Rejected, reply)
+                    })
             })
         });
         let answer = serving::serve("is_ready", token.cancelled(), || {
