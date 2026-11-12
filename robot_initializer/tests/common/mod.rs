@@ -8,14 +8,10 @@ use std::sync::{Arc, LazyLock, Once};
 use std::time::Duration;
 
 use peppygen::fixtures::harness::{Config, Harness};
-use peppygen::mock::deps::simulation::attach;
 use peppygen::parameters::placement::Placement;
 use peppygen::{NodeRunner, Parameters};
 use robot_initializer::{Moment, StandClock};
 use tokio::sync::{mpsc, watch};
-
-/// Joints of one OpenArm arm, as the engine reports them.
-const ARM_DOF: u32 = 7;
 
 /// How long a test waits for the node's `setup` to return.
 const SETUP_BUDGET: Duration = Duration::from_secs(30);
@@ -33,7 +29,6 @@ pub const LIMBS: usize = 4;
 pub fn parameters(model: &str) -> Parameters {
     Parameters {
         model: model.into(),
-        park_poses: String::new(),
         placement: Placement {
             auto: true,
             x: 0.0,
@@ -87,16 +82,6 @@ pub fn an_so101_on_its_own_hardware() -> Config {
         parameters: Some(parameters("so101")),
         limbs_instances: 1,
         ..on_its_own_hardware()
-    }
-}
-
-/// The engine's answer to a robot it stood: the model's limbs, listed right
-/// before left, which is not the order of this robot's own slots.
-pub fn stood() -> attach::GoalResponseData {
-    attach::GoalResponseData {
-        arm_names: vec!["right".into(), "left".into()],
-        arm_joints: vec![ARM_DOF, ARM_DOF],
-        gripper_names: vec!["right".into(), "left".into()],
     }
 }
 
@@ -269,6 +254,15 @@ pub fn capture_logs() {
             .with_writer(Line::default)
             .init();
     });
+}
+
+/// How many lines logged so far hold every one of `texts`.
+pub fn lines_holding(texts: &[&str]) -> usize {
+    LOGGED
+        .borrow()
+        .iter()
+        .filter(|line| texts.iter().all(|text| line.contains(text)))
+        .count()
 }
 
 /// Waits until a line that holds `text` is logged, failing the test after
