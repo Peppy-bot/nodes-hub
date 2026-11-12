@@ -75,19 +75,23 @@ CORNERED = (
 )
 
 
-def admit_joints(layer, target, duration_s=0.0, tolerances=JOINT_TOLERANCES, timeout_s=2.0):
-    return layer._admit_arm_move(target, duration_s, tolerances, timeout_s)
+def admit_joints(
+    layer, target, duration_s=0.0, tolerances=JOINT_TOLERANCES, timeout_s=2.0, contact_gap_m=0.0
+):
+    return layer._admit_arm_move(target, duration_s, tolerances, timeout_s, contact_gap_m)
 
 
 def admit_path(layer, *waypoints, **fields):
     """Admit the execute_joint_path goal that joint_path_goal builds of
     `waypoints` and `fields`."""
     goal = joint_path_goal(*waypoints, **fields)
-    return layer._admit_joint_path(goal.arms, goal.duration_s, goal.settle_timeout_s)
+    return layer._admit_joint_path(
+        goal.arms, goal.duration_s, goal.settle_timeout_s, goal.contact_gap_m
+    )
 
 
-def admit_pose(layer, position, orientation, duration_s=0.0, settle=SETTLE):
-    return layer._admit_pose_move(position, orientation, duration_s, *settle)
+def admit_pose(layer, position, orientation, duration_s=0.0, settle=SETTLE, contact_gap_m=0.0):
+    return layer._admit_pose_move(position, orientation, duration_s, *settle, contact_gap_m)
 
 
 # The gripper moves below wait up to 2 s past the planned end of their travel
@@ -464,7 +468,7 @@ async def test_an_arm_move_completes_once_the_measured_joints_are_within_their_t
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    positions, _action_time = ctx.completed
+    positions, _ended_on_contact, _action_time = ctx.completed
     assert positions == list(arrived)
 
 
@@ -502,13 +506,13 @@ async def test_an_arm_move_outside_its_tolerances_at_the_timeout_fails_with_time
     end_s = plan.profile.duration_s
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
     # The follower never moves. Through the timeout the plan keeps
-    # commanding its end sample; the tick the timeout runs out publishes
-    # nothing and fails the plan.
+    # commanding its end sample; the tick the timeout runs out fails the plan
+    # and commands the arm where it stands.
     for since_end_s in (0.0, 1.0, 1.9):
         assert coordinator.arm_tick(end_s + since_end_s) == (0.5,) * 5
         coordinator.arm_published(True, (0.5,) * 5)
         assert not plan.done.is_set()
-    assert coordinator.arm_tick(end_s + 2.0 + 1e-9) is None
+    assert coordinator.arm_tick(end_s + 2.0 + 1e-9) == (0.0,) * 5
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
@@ -536,13 +540,13 @@ async def test_a_joint_path_outside_its_tolerances_at_the_timeout_fails_with_tim
     assert end_s == 0.5
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
     # The follower never moves. Through the timeout the plan keeps
-    # commanding its end sample; the tick the timeout runs out publishes
-    # nothing and fails the plan.
+    # commanding its end sample; the tick the timeout runs out fails the plan
+    # and commands the arm where it stands.
     for since_end_s in (0.0, 1.0, 1.9):
         assert coordinator.arm_tick(end_s + since_end_s) == (0.5,) * 5
         coordinator.arm_published(True, (0.5,) * 5)
         assert not plan.done.is_set()
-    assert coordinator.arm_tick(end_s + 2.0) is None
+    assert coordinator.arm_tick(end_s + 2.0) == (0.0,) * 5
     assert plan.done.is_set()
     await task
     # The message says how far the arm still stands from the target and how
@@ -567,7 +571,7 @@ async def test_a_stale_follower_reports_the_commanded_joints(follower_never_stal
     coordinator.measured_joints.clear()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)
-    positions, _action_time = ctx.completed
+    positions, _ended_on_contact, _action_time = ctx.completed
     assert positions == [0.5] * 5
 
 
@@ -1065,6 +1069,10 @@ ONE_ARM_ONCE = 'arms must name this robot\'s arm, "arm", once'
             {"settle_timeout_s": -0.001},
             "settle_timeout_s must be a number of seconds from 0 to 60",
         ),
+        (
+            {"contact_gap_m": -0.001},
+            "contact_gap_m must be 0 or a positive number of meters",
+        ),
     ],
     ids=[
         "unknown arm",
@@ -1080,6 +1088,7 @@ ONE_ARM_ONCE = 'arms must name this robot\'s arm, "arm", once'
         "absurd duration",
         "zero settle tolerance",
         "negative settle timeout",
+        "negative contact gap",
     ],
 )
 def test_a_joint_path_goal_this_robot_does_not_take_is_rejected(fields, refusal):
@@ -1593,6 +1602,7 @@ def test_unknown_limb_names_are_refused():
             duration_s=0.0,
             settle_tolerances_rad=[0.1] * 5,
             settle_timeout_s=2.0,
+            contact_gap_m=0.0,
         )
     )
     decision = layer.decide_arm_joints(module, PendingSlot())(request)
@@ -1652,6 +1662,7 @@ def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
             settle_position_tolerance_m=0.01,
             settle_orientation_tolerance_rad=0.2,
             settle_timeout_s=2.0,
+            contact_gap_m=0.0,
         )
     )
     gripper = SimpleNamespace(
@@ -1752,7 +1763,7 @@ async def test_a_pose_move_completes_once_the_measured_grasp_point_is_within_tol
     )
     assert plan.done.is_set()
     await task
-    position, _orientation, _t = ctx.completed
+    position, _orientation, _ended_on_contact, _t = ctx.completed
     assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
@@ -1766,7 +1777,9 @@ async def test_a_pose_move_outside_its_tolerance_at_the_timeout_fails_with_timeo
         coordinator, layer, kinematics, measured_at_end=(0.0,) * 5
     )
     assert not plan.done.is_set()
-    assert coordinator.arm_tick(plan.profile.duration_s + 2.0) is None
+    # The tick of the timeout fails the plan and commands the arm where it
+    # stands.
+    assert coordinator.arm_tick(plan.profile.duration_s + 2.0) == (0.0,) * 5
     assert plan.done.is_set()
     await task
     assert ctx.failed == (
@@ -1787,7 +1800,7 @@ async def test_a_stale_follower_reports_the_commanded_pose(follower_never_stale)
     # The last command of a finished plan is its end sample.
     coordinator.measured_joints.clear()
     await task
-    position, _orientation, _t = ctx.completed
+    position, _orientation, _ended_on_contact, _t = ctx.completed
     assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
@@ -1929,6 +1942,165 @@ async def test_a_settle_timeout_that_is_no_duration_is_refused(bad):
     assert coordinator.try_claim_arm()
 
 
+@pytest.mark.parametrize("bad", [-0.001, -math.inf, math.nan, math.inf])
+async def test_a_contact_gap_that_is_no_gap_is_refused(bad):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    refusal = "contact_gap_m must be 0 or a positive number of meters"
+    with pytest.raises(Refusal, match=refusal) as raised:
+        admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, contact_gap_m=bad)
+    assert raised.value.kind is FailureKind.REJECTED
+    with pytest.raises(Refusal, match=refusal) as raised:
+        admit_joints(layer, (0.1,) * 5, contact_gap_m=bad)
+    assert raised.value.kind is FailureKind.REJECTED
+    assert coordinator.try_claim_arm(), "a refused gap must not hold the slot"
+
+
+def tick_blocked_arm_plan_to_its_contact(coordinator, plan):
+    """Run the control ticks of an admitted arm plan with a contact gap, the
+    follower standing where the plan starts, up to the tick that finds the
+    arm on contact: a tick at each hundredth of a second of the profile, each
+    delivered but the last. Returns the command of the contact tick, whose
+    delivery the caller reports."""
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    ticks = int(plan.profile.duration_s * 100) + 1
+    for tick in range(1, ticks + 1):
+        command = coordinator.arm_tick(tick * 0.01)
+        if plan.ended_on_contact:
+            return command
+        coordinator.arm_published(True, command)
+    raise AssertionError("the plan met no contact before its planned end")
+
+
+def run_blocked_arm_plan_to_its_contact(coordinator, plan, stood):
+    """Run the control ticks that end an admitted arm plan with a contact gap
+    on contact, the follower standing at `stood`, where the plan starts: the
+    contact tick commands `stood` again, the hold of an arm on contact, and
+    the follower receives it."""
+    command = tick_blocked_arm_plan_to_its_contact(coordinator, plan)
+    assert command == stood
+    assert not plan.done.is_set(), "completion waits for delivery"
+    coordinator.arm_published(True, command)
+    assert plan.done.is_set()
+
+
+async def test_a_joint_move_an_object_blocks_completes_on_contact_where_the_arm_stands(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    stood = (0.0,) * 5
+    coordinator.measured_joints.set(stood)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0, contact_gap_m=0.001)
+    run_blocked_arm_plan_to_its_contact(coordinator, plan, stood)
+    ctx = FakeGoalContext()
+    await layer.drive_arm(ctx, plan)
+    positions, ended_on_contact, _action_time = ctx.completed
+    assert ended_on_contact
+    assert positions == list(stood)
+    assert ctx.failed is None and ctx.cancelled is None
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_joint_path_an_object_blocks_completes_on_contact_where_the_arm_stands(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    stood = (0.0,) * 5
+    coordinator.measured_joints.set(stood)
+    ctx, task, plan = await driving_path(
+        coordinator, layer, admit_path(layer, (0.5,) * 5, duration_s=1.0, contact_gap_m=0.001)
+    )
+    run_blocked_arm_plan_to_its_contact(coordinator, plan, stood)
+    await task
+    arms, _action_time = ctx.completed
+    [arm] = arms
+    assert arm.ended_on_contact
+    assert path_result_joints(arms) == list(stood)
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_pose_move_an_object_blocks_completes_on_contact_where_the_arm_stands(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    stood = (0.0,) * 5
+    coordinator.measured_joints.set(stood)
+    move = admit_pose(layer, (0.1, 0.0, 0.2), IDENTITY_QUAT, duration_s=1.0, contact_gap_m=0.001)
+    ctx = FakeGoalContext()
+    task = asyncio.create_task(layer.drive_pose(ctx, move, kinematics, kinematics))
+    plan = await installed_plan(coordinator)
+    run_blocked_arm_plan_to_its_contact(coordinator, plan, stood)
+    await task
+    position, _orientation, ended_on_contact, _t = ctx.completed
+    assert ended_on_contact
+    assert position == list(kinematics.forward_kinematics(stood)[0])
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_cancel_before_the_contact_command_is_delivered_ends_cancelled_with_no_contact(
+    follower_never_stale,
+):
+    kinematics = FakeKinematics()
+    coordinator, layer = make_layer(kinematics)
+    stood = (0.0,) * 5
+    coordinator.measured_joints.set(stood)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0, contact_gap_m=0.001)
+    # The contact tick has commanded the hold, and its delivery is pending
+    # when the caller cancels the goal.
+    command = tick_blocked_arm_plan_to_its_contact(coordinator, plan)
+    assert plan.ended_on_contact and not plan.done.is_set()
+    ctx = FakeGoalContext()
+    ctx.request_cancel()
+    await layer.drive_arm(ctx, plan)
+    reason, positions, ended_on_contact, _action_time = ctx.cancelled
+    assert reason == CANCELLED_BY_CALLER
+    assert not ended_on_contact, "a cancelled move did not end on contact"
+    assert positions == list(stood)
+    assert ctx.completed is None and ctx.failed is None
+    # The hold is delivered after the goal ended, and ends the debt.
+    coordinator.arm_published(True, command)
+    assert coordinator.arm_tick(1.0) is None
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_move_with_a_contact_gap_that_settles_says_no_contact(follower_never_stale):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = admit_joints(layer, (0.5,) * 5, 0.0, contact_gap_m=1.0)
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    coordinator.measured_joints.set((0.5,) * 5)
+    coordinator.arm_published(True, coordinator.arm_tick(plan.profile.duration_s))
+    assert plan.done.is_set()
+    ctx = FakeGoalContext()
+    await layer.drive_arm(ctx, plan)
+    _positions, ended_on_contact, _action_time = ctx.completed
+    assert not ended_on_contact
+
+
+async def test_a_cancelled_arm_move_commands_the_arm_where_it_stands(follower_never_stale):
+    coordinator, layer = make_layer()
+    stood = (0.0,) * 5
+    coordinator.measured_joints.set(stood)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0)
+    coordinator.arm_published(True, coordinator.arm_tick(0.0))
+    ahead = coordinator.arm_tick(0.5)
+    coordinator.arm_published(True, ahead)
+    assert ahead != stood, "the command ran ahead of the arm"
+    ctx = FakeGoalContext()
+    ctx.request_cancel()
+    await layer.drive_arm(ctx, plan)
+    reason, positions, ended_on_contact, _action_time = ctx.cancelled
+    assert reason == CANCELLED_BY_CALLER
+    assert positions == list(stood) and not ended_on_contact
+    # The goal has released the arm; the next tick still commands the arm
+    # where it stood, once.
+    assert coordinator.arm_tick(0.51) == stood
+    coordinator.arm_published(True, stood)
+    assert coordinator.arm_tick(0.52) is None
+
+
 async def test_an_unreachable_failure_names_the_way_on():
     kinematics = FakeKinematics()
     kinematics.corrupted = True
@@ -2034,7 +2206,7 @@ async def test_a_stopped_plan_ends_cancelled_with_the_stops_reason(follower_neve
     await driving
 
     assert ctx.completed is None
-    reason, positions, _action_time = ctx.cancelled
+    reason, positions, _ended_on_contact, _action_time = ctx.cancelled
     assert reason == "stopped: the operator asked"
     assert positions == [0.0] * 5
     assert coordinator.try_claim_arm(), "the goal released the arm"
@@ -2050,7 +2222,7 @@ async def test_a_goal_whose_sender_is_gone_ends_cancelled_with_that_reason(
     ctx.request_cancel(cause="sender_gone")
     await layer.drive_arm(ctx, plan)
 
-    reason, positions, _action_time = ctx.cancelled
+    reason, positions, _ended_on_contact, _action_time = ctx.cancelled
     assert reason == "its sender is gone"
     assert positions == [0.0] * 5
     assert plan.aborted
@@ -2139,7 +2311,7 @@ async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
-    reason, _position, _orientation, _t = ctx.cancelled
+    reason, _position, _orientation, _ended_on_contact, _t = ctx.cancelled
     assert reason == "stopped: the operator asked"
     assert coordinator._arm.plan is None, "nothing was installed after the stop"
     assert coordinator.try_claim_arm()
@@ -2157,7 +2329,7 @@ async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
-    reason, position, _orientation, _t = ctx.cancelled
+    reason, position, _orientation, _ended_on_contact, _t = ctx.cancelled
     assert reason == "stopped: the operator asked"
     assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
     assert kinematics.solve_calls == []
@@ -2239,8 +2411,9 @@ async def test_a_zero_settle_timeout_fails_an_arm_move_short_of_its_target_at_th
     plan = admit_joints(layer, (0.5,) * 5, 0.0, timeout_s=0.0)
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
     # The follower stands where it started as the plan ends: with no time
-    # to settle, the move fails at the planned end.
-    assert coordinator.arm_tick(plan.profile.duration_s) is None
+    # to settle, the move fails at the planned end, and that tick commands
+    # the arm where it stands.
+    assert coordinator.arm_tick(plan.profile.duration_s) == (0.0,) * 5
     assert plan.done.is_set()
     ctx = FakeGoalContext()
     await layer.drive_arm(ctx, plan)

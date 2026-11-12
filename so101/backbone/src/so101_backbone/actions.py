@@ -43,6 +43,7 @@ from peppygen.exposed_actions.limb_motion import execute_joint_path
 
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
+    NO_CONTACT_CHECK_M,
     ArmPlan,
     Coordinator,
     GripperPlan,
@@ -232,6 +233,8 @@ class JointPathMove:
     goal: _JointPathGoal
     # How the move ends past the planned end of its trajectory.
     settle: JointSettle
+    # The contact gap of the goal (m), 0 for no contact check.
+    contact_gap_m: float
     # The stop count at admission: a stop since ends the goal before it
     # moves, the planning included.
     stops_before: int
@@ -245,6 +248,8 @@ class PoseMove:
     goal: PoseGoal
     # How the move ends past the planned end of its trajectory.
     settle: PoseSettle
+    # The contact gap of the goal (m), 0 for no contact check.
+    contact_gap_m: float
     # The stop count at admission: a stop since ends the goal before it
     # moves, the solve included.
     stops_before: int
@@ -410,9 +415,10 @@ class ActionLayer:
         duration_s: float,
         settle_tolerances_rad: tuple[float, ...],
         settle_timeout_s: float,
+        contact_gap_m: float,
     ) -> ArmPlan:
         """Claim the arm's busy slot and install a move_arm_joints goal's
-        trajectory and settle, or raise Refusal."""
+        trajectory, settle and contact gap, or raise Refusal."""
         assert len(target) == len(ARM.joints)
         if not all(math.isfinite(p) for p in target):
             raise Refusal(FailureKind.REJECTED, "non-finite joint target")
@@ -422,18 +428,23 @@ class ActionLayer:
             raise Refusal(FailureKind.REJECTED, f"the target puts {outside}")
         target = self._limits.clamp(target)
         settle = _joint_settle(settle_tolerances_rad, settle_timeout_s)
-        return self._admit_trajectory(target, duration_s, settle)
+        contact_gap_m = _require_contact_gap(contact_gap_m)
+        return self._admit_trajectory(target, duration_s, settle, contact_gap_m)
 
     def _admit_trajectory(
-        self, target: tuple[float, ...], duration_s: float, settle: JointSettle
+        self,
+        target: tuple[float, ...],
+        duration_s: float,
+        settle: JointSettle,
+        contact_gap_m: float,
     ) -> ArmPlan:
         """Claim the arm's busy slot and install the trajectory to `target`
-        with `settle`, or raise Refusal. The claim happens last so a
-        refused goal never leaves the slot held."""
+        with `settle` and `contact_gap_m`, or raise Refusal. The claim
+        happens last so a refused goal never leaves the slot held."""
         anchor = self._claim_free_arm()
         try:
             profile = self._move_within_ceiling(anchor, target, duration_s, settle)
-            return self._coordinator.adopt_arm_plan(profile, settle)
+            return self._coordinator.adopt_arm_plan(profile, settle, contact_gap_m)
         except BaseException:
             # A failure between claim and adopt must not hold the slot.
             self._coordinator.release_arm()
@@ -458,6 +469,7 @@ class ActionLayer:
         arms: Sequence[execute_joint_path.GoalRequestDataArmsItem],
         duration_s: float,
         settle_timeout_s: float,
+        contact_gap_m: float,
     ) -> JointPathMove:
         """Claim the arm's busy slot for an execute_joint_path goal of
         `arms`, whose drive plans its path, or raise Refusal: the fields'
@@ -467,6 +479,7 @@ class ActionLayer:
         move = JointPathMove(
             goal=_joint_path_goal(arm, duration_s, self._limits),
             settle=_joint_settle(tuple(arm.settle_tolerances_rad), settle_timeout_s),
+            contact_gap_m=_require_contact_gap(contact_gap_m),
             stops_before=self._coordinator.stop_count,
         )
         self._claim_free_arm()
@@ -618,6 +631,7 @@ class ActionLayer:
         settle_position_tolerance_m: float,
         settle_orientation_tolerance_rad: float,
         settle_timeout_s: float,
+        contact_gap_m: float,
     ) -> PoseMove:
         """Validate and claim the arm; the verified IK solve runs in the
         drive task so a hard pose never stalls the event loop inside the
@@ -630,6 +644,7 @@ class ActionLayer:
             settle_position_tolerance_m,
             settle_orientation_tolerance_rad,
             settle_timeout_s,
+            contact_gap_m,
             self._coordinator.stop_count,
         )
         self._claim_free_arm()
@@ -661,7 +676,7 @@ class ActionLayer:
         (POSTURE_SETTLE), and reports the measured grasp point. It claims the
         arm alone, and sends the gripper no command."""
         _require_duration(duration_s, "duration_s")
-        return self._admit_trajectory(target, duration_s, POSTURE_SETTLE)
+        return self._admit_trajectory(target, duration_s, POSTURE_SETTLE, NO_CONTACT_CHECK_M)
 
     def _admit_home(self, target: tuple[float, ...], duration_s: float) -> HomeMove:
         """Claim the gripper and the arm for a move_to_home goal to `target`
@@ -731,6 +746,7 @@ class ActionLayer:
                     d.duration_s,
                     tuple(d.settle_tolerances_rad),
                     d.settle_timeout_s,
+                    d.contact_gap_m,
                 )
 
             return self._decide(module, admit, pending)
@@ -741,7 +757,9 @@ class ActionLayer:
         def decide(request):
             def admit():
                 d = request.data
-                return self._admit_joint_path(d.arms, d.duration_s, d.settle_timeout_s)
+                return self._admit_joint_path(
+                    d.arms, d.duration_s, d.settle_timeout_s, d.contact_gap_m
+                )
 
             return self._decide(execute_joint_path, admit, pending)
 
@@ -779,6 +797,7 @@ class ActionLayer:
                     d.settle_position_tolerance_m,
                     d.settle_orientation_tolerance_rad,
                     d.settle_timeout_s,
+                    d.contact_gap_m,
                 )
 
             return self._decide(module, admit, pending)
@@ -873,10 +892,10 @@ class ActionLayer:
 
     async def drive_arm(self, ctx, plan: ArmPlan) -> None:
         """Wait out the plan or a cancel, then end the goal with the measured
-        landing point."""
+        landing point and whether the plan ended on contact."""
 
         def results(action_time):
-            return list(self._final_arm_positions(plan)), action_time
+            return list(self._final_arm_positions(plan)), plan.ended_on_contact, action_time
 
         await self._drive_arm_plan(ctx, plan, results)
 
@@ -887,26 +906,29 @@ class ActionLayer:
         last, and the arm holds there while the path is planned (see
         _plan_joint_path). The goal ends with the arm's entry, its joints
         where it stands (see _standing_joints for a goal that a stop ends
-        before its plan), and fails, running none of the path, as
-        _plan_joint_path says."""
+        before its plan) and whether the path ended on contact, and fails,
+        running none of the path, as _plan_joint_path says."""
 
         async def plan_from(start):
             return await self._plan_joint_path(start, move.goal)
 
-        def results(joints, action_time):
+        def results(joints, ended_on_contact, action_time):
             arm = execute_joint_path.ResultArmsItem(
-                arm_name=ARM.name, final_joint_positions=list(joints)
+                arm_name=ARM.name,
+                final_joint_positions=list(joints),
+                ended_on_contact=ended_on_contact,
             )
             return [arm], action_time
 
         await self._drive_arm_move(
             ctx,
             move,
+            move.contact_gap_m,
             _PATH_MOVE_WORDS,
             self._measured_start,
             plan_from,
             results,
-            lambda start: results(self._standing_joints(start.held), 0.0),
+            lambda start: results(self._standing_joints(start.held), False, 0.0),
         )
 
     async def drive_posture(self, ctx, plan: ArmPlan, kinematics) -> None:
@@ -925,8 +947,8 @@ class ActionLayer:
         arm move to home and run it, as _drive_arm_move does. The arm moves
         only once the close completed, where the jaws stand, closed or on an
         item, and a goal with no close moves the arm at once. The arm move is
-        planned from where the arm stands then, and takes the requested
-        duration of `move`: the close adds its own time. The goal ends as
+        planned from where the arm stands then, has no contact check, and
+        takes the requested duration of `move`: the close adds its own time. The goal ends as
         drive_posture ends it: a completed or cancelled goal gives the grasp
         pose of the arm, from the joints that the follower measures at that
         time. Every end releases the arm."""
@@ -948,6 +970,7 @@ class ActionLayer:
         await self._drive_arm_move(
             ctx,
             move,
+            NO_CONTACT_CHECK_M,
             _HOME_MOVE_WORDS,
             self._coordinator.arm_anchor,
             plan_from,
@@ -992,29 +1015,32 @@ class ActionLayer:
         self,
         ctx,
         move: JointPathMove | PoseMove | HomeMove,
+        contact_gap_m: float,
         words: _MoveWords,
         find_start: Callable[[], _Start | None],
         plan_from: Callable[[_Start], Awaitable[JointTrajectory]],
-        results: Callable[[tuple[float, ...], float], tuple],
+        results: Callable[[tuple[float, ...], bool, float], tuple],
         unmoved_results: Callable[[_Start], tuple],
     ) -> None:
         """Plan `move` from `find_start()`, where it starts, or None without
-        fresh follower state, install the trajectory with the move's settle,
-        wait it out as _finish_plan does, and release the arm. A move with no
-        start fails with `resource_unavailable`. `plan_from(start)` plans the
-        trajectory, or raises Refusal with the kind and the message the goal
-        fails with, nothing installed; any other exception fails the goal with
-        `attempt_failed`, its message led by the planning of `words`, the
-        caller's name for it. A stop since admission ends the goal cancelled
+        fresh follower state, install the trajectory with the move's settle
+        and `contact_gap_m`, wait it out as _finish_plan does, and release
+        the arm. A move with no start fails with `resource_unavailable`.
+        `plan_from(start)` plans the trajectory, or raises Refusal with the
+        kind and the message the goal fails with, nothing installed; any
+        other exception fails the goal with `attempt_failed`, its message led
+        by the planning of `words`, the caller's name for it. A stop since
+        admission ends the goal cancelled
         with the stop's reason and `unmoved_results(start)`, nothing
         installed: a stop before the planning, and a stop during it whose
         planning gives a trajectory. A planning that raises fails the goal as
         above, whether or not a stop came during it. Otherwise the goal ends
-        with `results(joints, action_time)`: `joints` where the arm stands as
-        the goal ends (see _final_arm_positions), `action_time` the
-        wall-clock time of the action. Any other exception ahead of the wait
-        for the plan fails the goal with `attempt_failed`, its message led by
-        the goal of `words`."""
+        with `results(joints, ended_on_contact, action_time)`: `joints` where
+        the arm stands as the goal ends (see _final_arm_positions),
+        `ended_on_contact` whether the plan completed on contact,
+        `action_time` the wall-clock time of the action. Any other exception
+        ahead of the wait for the plan fails the goal with `attempt_failed`,
+        its message led by the goal of `words`."""
         try:
             start = find_start()
             if start is None:
@@ -1046,12 +1072,14 @@ class ActionLayer:
             if self._coordinator.stop_count != move.stops_before:
                 await end_stopped()
                 return
-            plan = self._coordinator.adopt_arm_plan(profile, move.settle)
+            plan = self._coordinator.adopt_arm_plan(profile, move.settle, contact_gap_m)
             await self._finish_plan(
                 ctx,
                 plan,
                 self._coordinator.abort_arm_plan,
-                lambda action_time: results(self._final_arm_positions(plan), action_time),
+                lambda action_time: results(
+                    self._final_arm_positions(plan), plan.ended_on_contact, action_time
+                ),
                 started,
             )
         except Exception as e:
@@ -1119,7 +1147,8 @@ class ActionLayer:
     async def drive_pose(self, ctx, move: PoseMove, solver, kinematics) -> None:
         """Solve the pose of `move` and run the move, as _drive_arm_move does;
         the goal ends with the grasp pose of the joints where the arm stands
-        (see _standing_pose for a goal that a stop ends before its plan).
+        (see _standing_pose for a goal that a stop ends before its plan) and
+        whether the move ended on contact.
         The solve runs off the event loop on a solver dedicated to
         point-to-point goals (the control tick's streaming solver is a
         separate instance). A pose with no plan fails the goal with
@@ -1128,18 +1157,19 @@ class ActionLayer:
         async def plan_from(anchor):
             return await self._plan_pose(solver, anchor, move.goal)
 
-        def results(joints, action_time):
+        def results(joints, ended_on_contact, action_time):
             position, orientation = kinematics.forward_kinematics(joints)
-            return list(position), list(orientation), action_time
+            return list(position), list(orientation), ended_on_contact, action_time
 
         await self._drive_arm_move(
             ctx,
             move,
+            move.contact_gap_m,
             _POSE_MOVE_WORDS,
             self._coordinator.arm_anchor,
             plan_from,
             results,
-            lambda _anchor: (*self._standing_pose(kinematics), 0.0),
+            lambda _anchor: (*self._standing_pose(kinematics), False, 0.0),
         )
 
     async def drive_gripper(self, ctx, plan: GripperPlan) -> None:
@@ -1231,11 +1261,12 @@ def _pose_move(
     position_tolerance_m: float,
     orientation_tolerance_rad: float,
     settle_timeout_s: float,
+    contact_gap_m: float,
     stops_before: int,
 ) -> PoseMove:
     """The move_arm goal `goal` settles into, admitted at stop count
-    `stops_before`, or Refusal: a tolerance that is no bar, or a timeout out of its
-    bound."""
+    `stops_before`, or Refusal: a tolerance that is no bar, a timeout out of
+    its bound, or a contact gap that is no gap."""
     settle = PoseSettle(
         position=goal.position,
         orientation=goal.orientation,
@@ -1245,7 +1276,12 @@ def _pose_move(
         ),
         timeout_s=_require_duration(settle_timeout_s, "settle_timeout_s"),
     )
-    return PoseMove(goal=goal, settle=settle, stops_before=stops_before)
+    return PoseMove(
+        goal=goal,
+        settle=settle,
+        contact_gap_m=_require_contact_gap(contact_gap_m),
+        stops_before=stops_before,
+    )
 
 
 def _the_arm_entry(
@@ -1343,6 +1379,16 @@ def _require_tolerance(value: float, field: str) -> float:
     it is positive and finite."""
     if not (math.isfinite(value) and value > 0.0):
         raise Refusal(FailureKind.REJECTED, f"{field} must be a positive number")
+    return value
+
+
+def _require_contact_gap(value: float) -> float:
+    """`value`, the meters the wire field contact_gap_m carries, 0 for no
+    contact check, or Refusal unless it is 0 or positive and finite."""
+    if not (math.isfinite(value) and value >= 0.0):
+        raise Refusal(
+            FailureKind.REJECTED, "contact_gap_m must be 0 or a positive number of meters"
+        )
     return value
 
 

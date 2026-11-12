@@ -207,6 +207,25 @@ async def feeding_measured(h, positions=MEASURED, opening=0.0) -> asyncio.Task:
     return feeder
 
 
+async def next_arm_setpoint_where(h, matches) -> list[float]:
+    """The positions of the next downstream arm setpoint that `matches`
+    accepts, each read bounded by TIMEOUT_S."""
+    while True:
+        setpoint = await asyncio.wait_for(
+            h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
+        )
+        if matches(setpoint.positions):
+            return setpoint.positions
+
+
+async def arm_commanded_back_to(h, stood) -> None:
+    """Read the downstream arm setpoints of a move that left the arm behind
+    at `stood` until one commands the arm there again: the setpoints first
+    run ahead of `stood`, then one lands on it."""
+    await next_arm_setpoint_where(h, lambda positions: positions != pytest.approx(stood))
+    await next_arm_setpoint_where(h, lambda positions: positions == pytest.approx(stood))
+
+
 async def test_the_joints_stream_passes_through_unchanged_and_relays_state():
     transparent = {f"max_joint_velocity_rad_s_{joint}": 1e9 for joint in range(1, 6)}
     async with started(parameters=make_parameters(**transparent)) as h:
@@ -399,6 +418,7 @@ async def test_move_arm_joints_completes_and_reports():
                 move_arm_joints_prod.GoalRequestData(
                     arm_name="arm", joint_positions=target, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -467,6 +487,7 @@ async def test_move_arm_joints_outside_its_tolerances_fails_with_timeout():
                     duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5,
                     settle_timeout_s=0.3,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -482,6 +503,38 @@ async def test_move_arm_joints_outside_its_tolerances_fails_with_timeout():
                 r"still 0\.200 rad from the target at joint [1-5], \d+\.\d s after the planned end",
                 result.failure.message,
             ), result.failure.message
+            # The failed move commands the arm where it stands.
+            await arm_commanded_back_to(h, MEASURED)
+        finally:
+            feeder.cancel()
+
+
+async def test_a_blocked_arm_completes_its_move_on_contact_and_is_commanded_where_it_stands():
+    async with started() as h:
+        feeder = await feeding_measured(h)
+        try:
+            # The mocked follower never leaves MEASURED, as an arm that an
+            # object blocks, 0.2 rad from every joint's target: its grasp
+            # point falls farther than the goal's contact gap behind the
+            # commanded one.
+            goal = await move_arm_joints_fx.send_goal(
+                h,
+                move_arm_joints_prod.GoalRequestData(
+                    arm_name="arm",
+                    joint_positions=[p + 0.2 for p in MEASURED],
+                    duration_s=0.0,
+                    settle_tolerances_rad=[0.1] * 5,
+                    settle_timeout_s=0.3,
+                    contact_gap_m=0.005,
+                ),
+                TIMEOUT_S,
+            )
+            assert goal.accepted
+            result = await goal.get_result(TIMEOUT_S)
+            assert result.status == move_arm_joints_fx.ResultStatus.COMPLETED
+            assert result.data.ended_on_contact
+            assert result.data.final_joint_positions == pytest.approx(MEASURED)
+            await arm_commanded_back_to(h, MEASURED)
         finally:
             feeder.cancel()
 
@@ -525,6 +578,7 @@ async def test_second_goal_is_refused_while_busy_and_a_cancel_ends_the_first():
                     duration_s=5.0,
                     settle_tolerances_rad=[0.1] * 5,
                     settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -534,6 +588,7 @@ async def test_second_goal_is_refused_while_busy_and_a_cancel_ends_the_first():
                 move_arm_joints_prod.GoalRequestData(
                     arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -572,6 +627,7 @@ async def test_a_goal_of_either_joint_member_is_refused_while_a_path_runs():
                 move_arm_joints_prod.GoalRequestData(
                     arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -596,6 +652,7 @@ async def test_goal_without_follower_state_is_refused():
             move_arm_joints_prod.GoalRequestData(
                 arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                 settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                contact_gap_m=0.0,
             ),
             TIMEOUT_S,
         )
@@ -843,6 +900,7 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -861,6 +919,7 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -878,6 +937,7 @@ async def test_out_of_limit_goal_is_refused():
             move_arm_joints_prod.GoalRequestData(
                 arm_name="arm", joint_positions=[9.0] * 5, duration_s=0.0,
                 settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                contact_gap_m=0.0,
             ),
             TIMEOUT_S,
         )
@@ -895,6 +955,7 @@ async def test_unknown_arm_name_is_refused():
             move_arm_joints_prod.GoalRequestData(
                 arm_name="left_arm", joint_positions=MEASURED, duration_s=0.0,
                 settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                contact_gap_m=0.0,
             ),
             TIMEOUT_S,
         )
@@ -1064,6 +1125,7 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
                     duration_s=5.0,
                     settle_tolerances_rad=[0.1] * 5,
                     settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -1102,6 +1164,7 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
                 move_arm_joints_prod.GoalRequestData(
                     arm_name="arm", joint_positions=MEASURED, duration_s=0.0,
                     settle_tolerances_rad=[0.1] * 5, settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )
@@ -1177,6 +1240,7 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable(follower_neve
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
                     settle_timeout_s=2.0,
+                    contact_gap_m=0.0,
                 ),
                 TIMEOUT_S,
             )

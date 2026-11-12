@@ -10,10 +10,22 @@ arm and the gripper claim independently, so a long arm move never freezes
 gripper teleop and vice versa. An arm plan owns the arm past the planned end
 of its trajectory: it keeps commanding its end sample until the measured
 joints, or the measured grasp point, stand within the goal's settle
-tolerance of the target, or the goal's settle timeout fails it. A gripper
-plan keeps commanding its target past the planned end of its travel until
-the jaws stand still, wherever they stand, or until the goal's settle
+tolerance of the target, or the goal's settle timeout fails it. An arm plan
+whose goal names a contact gap also completes on contact: on the tick the
+measured grasp point stands farther than the gap from the grasp point of the
+joints commanded last, as an arm that an object holds on its way does. A
+gripper plan keeps commanding its target past the planned end of its travel
+until the jaws stand still, wherever they stand, or until the goal's settle
 timeout, and completes either way.
+
+An arm plan that settled leaves the follower on its end sample. An arm plan
+that ended on contact, failed its settle, or was cut by a cancel or the stop
+once it had started leaves the arm owed a hold where it stands: a command of
+the joints the follower measures, clamped into the joint limits. A contact
+and a settle timeout command it on their own tick, and a cut on the next
+tick. Each tick with fresh follower state and no plan commands it again,
+from the joints measured then, until one such command is delivered; the
+follower then holds the arm there.
 
 Fresh follower state gates everything: with the measured stream stale no limb
 gets a setpoint, an active plan fails, and the standing command resets. The
@@ -21,8 +33,8 @@ first tick after any silence re-engages from the measured position, governed
 by the same caps, exactly like every other tick.
 
 The stop service ends every plan installed, whoever admitted it: each plan
-is cut where its stream stands, as a cancel cuts it, and carries the stop's
-message for its goal to end with. A plan the coordinator fails carries the
+is cut as a cancel cuts it, and carries the stop's message for its goal to
+end with. A plan the coordinator fails carries the
 failure kind and the message its goal fails with.
 """
 
@@ -189,6 +201,10 @@ class PoseSettle:
 # arm that an object holds short of the posture fails with `timeout`.
 POSTURE_SETTLE = JointSettle(tolerances_rad=(0.1,) * len(ARM.joints), timeout_s=2.0)
 
+# The contact gap (m) of a plan with no contact check, as a goal's
+# contact_gap_m names it: the plan ends by its settle alone.
+NO_CONTACT_CHECK_M = 0.0
+
 
 @dataclass
 class ArmPlan:
@@ -196,6 +212,10 @@ class ArmPlan:
     # How the plan ends past the planned end of its profile, judged on the
     # measured joints each tick.
     settle: JointSettle | PoseSettle
+    # The farthest (m) the measured grasp point may stand from the grasp
+    # point of the joints commanded last before the plan completes on
+    # contact, or NO_CONTACT_CHECK_M.
+    contact_gap_m: float
     done: asyncio.Event = field(default_factory=asyncio.Event)
     started_monotonic: float | None = None
     aborted: bool = False
@@ -208,6 +228,8 @@ class ArmPlan:
     # The stop service's message when it cut the plan: the goal ends as
     # cancelled with it.
     stopped: str | None = None
+    # Whether the plan completed on contact, the arm short of its target.
+    ended_on_contact: bool = False
 
     def last_sample(self, now: float) -> tuple[float, ...]:
         if self.frozen is not None:
@@ -319,6 +341,13 @@ class _LimbChannel(Generic[Command, Plan]):
     # Where the goal that holds the limb keeps it until its plan is
     # installed, or None.
     held: Command | None = None
+    # Whether the limb is owed a hold where it stands: a command of the
+    # position the follower measures. A plan that ended on contact, failed
+    # its settle or was cut once it had started leaves the debt, and the
+    # delivery of such a command pays it.
+    owes_hold: bool = False
+    # Whether this tick's command is that hold.
+    tick_hold: bool = False
     # The wire stamp to publish with this tick's setpoint: the leader's
     # capture time for streamed samples, None (meaning now) for plans.
     tick_stamp_s: float | None = None
@@ -336,6 +365,12 @@ class _LimbChannel(Generic[Command, Plan]):
         self.commanded = None
         self.delivered = None
 
+    def take_tick_hold(self) -> bool:
+        """Whether this tick's command is the hold the limb is owed,
+        cleared, for reporting the command's fate."""
+        taken, self.tick_hold = self.tick_hold, False
+        return taken
+
     def take_tick(self) -> tuple[Plan | None, Plan | None]:
         """The plan this tick's command came from and the plan it completes,
         both cleared, for reporting the command's fate."""
@@ -348,6 +383,7 @@ class _LimbChannel(Generic[Command, Plan]):
         """Clear what the last tick captured, before this tick computes."""
         self.tick_plan = None
         self.completing = None
+        self.tick_hold = False
         self.tick_stamp_s = None
 
 
@@ -462,15 +498,18 @@ class Coordinator:
     # ------------------------------------------------------------------- plans
 
     def adopt_arm_plan(
-        self, profile: JointTrajectory, settle: JointSettle | PoseSettle
+        self, profile: JointTrajectory, settle: JointSettle | PoseSettle, contact_gap_m: float
     ) -> ArmPlan:
-        """Install an admitted action's trajectory and its settle. Streamed
-        input already in flight must not re-target the arm when the plan
-        ends, so the arm's leader holders are dropped here and again at
-        release."""
+        """Install an admitted action's trajectory, its settle and its
+        contact gap. Streamed input already in flight must not re-target the
+        arm when the plan ends, so the arm's leader holders are dropped here
+        and again at release. The plan commands the arm from its first tick,
+        so it takes the place of the goal's hold and of a hold the arm is
+        still owed."""
         self._drop_arm_leader_input()
         self._arm.held = None
-        self._arm.plan = ArmPlan(profile=profile, settle=settle)
+        self._arm.owes_hold = False
+        self._arm.plan = ArmPlan(profile=profile, settle=settle, contact_gap_m=contact_gap_m)
         return self._arm.plan
 
     def hold_arm(self, joints: tuple[float, ...]) -> None:
@@ -489,12 +528,22 @@ class Coordinator:
         return self._gripper.plan
 
     def abort_arm_plan(self, plan: ArmPlan) -> None:
-        """Cut the trajectory: the stream goes silent at the sample where it
-        stood, so the follower keeps holding its last received setpoint."""
+        """Cut the trajectory. A plan that had started, cut while the
+        follower reports, leaves the arm owed a hold where it stands, which
+        the ticks from the next one on command (see arm_tick). A plan cut
+        before its first tick, or with no fresh follower state, owes nothing:
+        the stream goes silent, and the follower keeps holding its last
+        received setpoint. A cut plan did not end on contact: a cut that
+        lands between the tick of a contact and the delivery of its command
+        ends the goal cancelled, with no contact."""
         if self._arm.plan is plan:
             plan.frozen = plan.last_sample(time.monotonic())
             self._arm.commanded = plan.frozen
             self._arm.plan = None
+            seen = self.fresh_measured_joints() is not None
+            if plan.started_monotonic is not None and seen:
+                self._arm.owes_hold = True
+        plan.ended_on_contact = False
         plan.aborted = True
         plan.done.set()
 
@@ -531,8 +580,11 @@ class Coordinator:
         delivered, and an undelivered sample fails the plan it belonged to:
         wall clock alone never declares a goal done. The delivered value is
         passed rather than re-read, so an abort landing during the publish
-        cannot make the next step anchor on a sample nobody received."""
+        cannot make the next step anchor on a sample nobody received. A
+        delivered hold pays the hold the arm is owed, and an undelivered one
+        leaves it owed, for the next tick to command."""
         plan, completing = self._arm.take_tick()
+        hold = self._arm.take_tick_hold()
         if not delivered:
             # Plan or stream alike: an undelivered command must not stand as
             # the next anchor; the governor must measure its step from what
@@ -548,6 +600,8 @@ class Coordinator:
             return
         assert command is not None, "a delivered setpoint must name the value that went out"
         self._arm.delivered = command
+        if hold:
+            self._arm.owes_hold = False
         if plan is not None and completing is not None:
             completing.done.set()
 
@@ -615,7 +669,10 @@ class Coordinator:
 
     def arm_tick(self, now: float) -> tuple[float, ...] | None:
         """The joint setpoint to publish this tick, or None for silence. The
-        caller reports each returned setpoint's fate through arm_published."""
+        caller reports each returned setpoint's fate through arm_published.
+        With no plan installed, an arm that is owed a hold gets it on each
+        tick with fresh follower state, ahead of a goal's hold and of a
+        stream, until one is delivered."""
         self._arm.begin_tick()
         measured = self.fresh_measured_joints()
         plan = self._arm.plan
@@ -627,12 +684,17 @@ class Coordinator:
             if plan.started_monotonic is None:
                 plan.started_monotonic = now
             t = now - plan.started_monotonic
+            on_contact = self._stands_on_contact(plan, measured)
             self._arm.commanded = plan.profile.sample(t)
             self._arm.tick_plan = plan
             if plan.profile.done(t):
-                return self._end_arm_plan(plan, t, measured)
+                return self._end_arm_plan(plan, t, measured, on_contact)
+            if on_contact:
+                return self._complete_on_contact(plan, measured)
             return self._arm.commanded
 
+        if self._arm.owes_hold and measured is not None:
+            return self._command_where_it_stands(measured)
         if self._arm.busy:
             # A goal is in flight (or just ended, until release runs):
             # streamed input stays ignored so an action never fights a live
@@ -655,22 +717,62 @@ class Coordinator:
         self._arm.tick_stamp_s = self._leader_arm.wire_timestamp_s
         return self._arm.commanded
 
-    def _end_arm_plan(self, plan: ArmPlan, t_s: float, measured) -> tuple[float, ...] | None:
+    def _stands_on_contact(self, plan: ArmPlan, measured: tuple[float, ...]) -> bool:
+        """Whether the arm stands on contact for `plan`: the grasp point of
+        the `measured` joints farther than the plan's contact gap from the
+        grasp point of the joints commanded last. Never for a plan with no
+        contact check, nor while no command stands."""
+        commanded = self._arm.commanded
+        if plan.contact_gap_m == NO_CONTACT_CHECK_M or commanded is None:
+            return False
+        commanded_point, _ = self._kinematics.forward_kinematics(commanded)
+        measured_point, _ = self._kinematics.forward_kinematics(measured)
+        return math.dist(commanded_point, measured_point) > plan.contact_gap_m
+
+    def _command_where_it_stands(self, measured: tuple[float, ...]) -> tuple[float, ...]:
+        """Command the `measured` joints, clamped into the joint limits: the
+        setpoint that holds the arm where it stands. The arm is owed this
+        hold until arm_published reports one delivered."""
+        self._arm.owes_hold = True
+        self._arm.tick_hold = True
+        self._arm.commanded = self._limits.clamp(measured)
+        return self._arm.commanded
+
+    def _complete_arm_plan(self, plan: ArmPlan) -> None:
+        """Complete `plan` on the delivery of this tick's command."""
+        self._arm.plan = None
+        # Streamed input that arrived mid-plan must not re-target the arm on
+        # the very next tick; the leader re-engages fresh.
+        self._drop_arm_leader_input()
+        self._arm.completing = plan
+
+    def _complete_on_contact(self, plan: ArmPlan, measured) -> tuple[float, ...]:
+        """Complete `plan` on contact: this tick commands the arm where it
+        stands, and the plan completes on the delivery of that command. An
+        undelivered command fails the plan, as any undelivered sample of a
+        plan does, and the hold stays owed."""
+        plan.ended_on_contact = True
+        self._complete_arm_plan(plan)
+        return self._command_where_it_stands(measured)
+
+    def _end_arm_plan(
+        self, plan: ArmPlan, t_s: float, measured, on_contact: bool
+    ) -> tuple[float, ...]:
         """A tick at or after the planned end of `plan`, its end sample
-        commanded. The plan completes on the delivery of that sample when its
-        settle is met on the `measured` joints; it fails with `timeout` once
-        the settle has timed out, with the shortfall measured then, and that
-        tick publishes nothing; otherwise it keeps commanding the end
-        sample."""
+        commanded, in the order limb_motion gives the ends of a move. The
+        plan completes on the delivery of that sample when its settle is met
+        on the `measured` joints. Else it completes on contact when
+        `on_contact` says the arm stands on one. Else it fails with `timeout`
+        once the settle has timed out, with the shortfall measured then, and
+        that tick commands the arm where it stands. Otherwise it keeps
+        commanding the end sample."""
         settle = plan.settle
         shortfall = settle.shortfall(measured, plan.profile.end, self._kinematics)
         if shortfall is None:
-            self._arm.plan = None
-            # Streamed input that arrived mid-plan must not re-target the
-            # arm on the very next tick; the leader re-engages fresh.
-            self._drop_arm_leader_input()
-            self._arm.completing = plan
+            self._complete_arm_plan(plan)
             return self._arm.commanded
+        if on_contact:
+            return self._complete_on_contact(plan, measured)
         since_end_s = t_s - plan.profile.duration_s
         if since_end_s < settle.timeout_s:
             return self._arm.commanded
@@ -681,7 +783,7 @@ class Coordinator:
                 FailureKind.TIMEOUT, f"{shortfall}, {since_end_s:.1f} s after the planned end"
             ),
         )
-        return None
+        return self._command_where_it_stands(measured)
 
     def gripper_tick(self, now: float) -> float | None:
         """The opening to publish this tick, or None for silence. The caller
