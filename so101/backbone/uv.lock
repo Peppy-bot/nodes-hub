@@ -208,7 +208,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#15292894f5b22a50fb8c825decc60f0b4587bafd" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
 
 [[package]]
 name = "eigenpy"
@@ -446,7 +446,7 @@ wheels = [
 [[package]]
 name = "path-timing-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=path_timing_py#15292894f5b22a50fb8c825decc60f0b4587bafd" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=path_timing_py#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
 
 [[package]]
 name = "peppygen"
@@ -696,6 +696,20 @@ wheels = [
 ]
 
 [[package]]
+name = "robot-description-py"
+version = "0.1.0"
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
+
+[[package]]
+name = "so101"
+version = "0.1.0"
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
+dependencies = [
+    { name = "control-core-py" },
+    { name = "numpy" },
+]
+
+[[package]]
 name = "so101-backbone"
 version = "0.1.0"
 source = { editable = "." }
@@ -704,7 +718,9 @@ dependencies = [
     { name = "path-timing-py" },
     { name = "peppygen" },
     { name = "peppylib" },
-    { name = "so101-description", extra = ["kinematics"] },
+    { name = "placo" },
+    { name = "robot-description-py" },
+    { name = "so101" },
     { name = "workspace-core-py" },
 ]
 
@@ -720,7 +736,9 @@ requires-dist = [
     { name = "path-timing-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=path_timing_py" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
-    { name = "so101-description", extras = ["kinematics"], git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description" },
+    { name = "placo", specifier = ">=0.11.0,<0.12" },
+    { name = "robot-description-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py" },
+    { name = "so101", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101" },
     { name = "workspace-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py" },
 ]
 
@@ -728,20 +746,6 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
-]
-
-[[package]]
-name = "so101-description"
-version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#15292894f5b22a50fb8c825decc60f0b4587bafd" }
-dependencies = [
-    { name = "control-core-py" },
-    { name = "numpy" },
-]
-
-[package.optional-dependencies]
-kinematics = [
-    { name = "placo" },
 ]
 
 [[package]]
@@ -862,7 +866,7 @@ wheels = [
 [[package]]
 name = "workspace-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py#15292894f5b22a50fb8c825decc60f0b4587bafd" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=workspace_core_py#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
 
 [[package]]
 name = "zstandard"

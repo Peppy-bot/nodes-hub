@@ -36,14 +36,13 @@ from typing import Generic, TypeVar
 
 from control_core_py.runtime import Latch
 from path_timing_py import JointTrajectory
-from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
-from so101_description.limits import JointLimits
-from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
-from so101_description.transforms import relative_rotation_rad
-from so101_description.units import NUM_JOINTS
+from so101.staleness import COMMAND_SILENCE_LIMIT_S
+from so101.transforms import relative_rotation_rad
 
 from so101_backbone.failures import FailureKind
 from so101_backbone.governor import EEGovernor, rate_step
+from so101_backbone.limits import JointLimits
+from so101_backbone.model import ARM
 from so101_backbone.params import Config, UpstreamMode
 from so101_backbone.reach import ReachBall
 
@@ -188,7 +187,7 @@ class PoseSettle:
 # end of its trajectory: each measured joint within 0.1 rad of the posture, the
 # tolerance the robots' endpoint calls usual for a joint move, within 2 s. An
 # arm that an object holds short of the posture fails with `timeout`.
-POSTURE_SETTLE = JointSettle(tolerances_rad=(0.1,) * NUM_JOINTS, timeout_s=2.0)
+POSTURE_SETTLE = JointSettle(tolerances_rad=(0.1,) * len(ARM.joints), timeout_s=2.0)
 
 
 @dataclass
@@ -518,12 +517,12 @@ class Coordinator:
         if arm_plan is not None:
             arm_plan.stopped = message
             self.abort_arm_plan(arm_plan)
-            stopped.append(ARM_LIMB)
+            stopped.append(ARM.name)
         gripper_plan = self._gripper.plan
         if gripper_plan is not None:
             gripper_plan.stopped = message
             self.abort_gripper_plan(gripper_plan)
-            stopped.append(GRIPPER_LIMB)
+            stopped.append(ARM.gripper.name)
         return stopped
 
     def arm_published(self, delivered: bool, command: tuple[float, ...] | None) -> None:

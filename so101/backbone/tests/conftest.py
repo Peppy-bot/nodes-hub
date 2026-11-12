@@ -16,10 +16,10 @@ import math
 
 import pytest
 from peppygen.exposed_actions.limb_motion import execute_joint_path
-from so101_description.limits import JointLimits
 
 from so101_backbone.actions import ActionLayer
 from so101_backbone.coordinator import Coordinator
+from so101_backbone.limits import JointLimits
 from so101_backbone.params import Config, UpstreamMode
 from so101_backbone.reach import ReachBall
 

@@ -40,9 +40,6 @@ from typing import TypeVar
 from control_core_py.runtime import Latch, log
 from path_timing_py import JointTrajectory, distinct_joint_waypoints
 from peppygen.exposed_actions.limb_motion import execute_joint_path
-from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
-from so101_description.limits import JointLimits
-from so101_description.units import NUM_JOINTS
 
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
@@ -56,6 +53,8 @@ from so101_backbone.coordinator import (
     joint_past_tolerance,
 )
 from so101_backbone.failures import FailureKind, Refusal
+from so101_backbone.limits import JointLimits
+from so101_backbone.model import ARM
 from so101_backbone.params import Config
 
 # Backoff after a failed goal delivery, so a persistently broken action
@@ -86,8 +85,8 @@ _CLOSE_SETTLE_TIMEOUT_S = POSTURE_SETTLE.timeout_s
 _CLOSE_TRAVEL_TIMEOUT_S = 8.0
 
 # The refusals of a goal naming no limb of this robot.
-_UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM_LIMB}"'
-_UNKNOWN_GRIPPER_NAME = f'unknown gripper_name: this robot\'s gripper is "{GRIPPER_LIMB}"'
+_UNKNOWN_ARM_NAME = f'unknown arm_name: this robot\'s arm is "{ARM.name}"'
+_UNKNOWN_GRIPPER_NAME = f'unknown gripper_name: this robot\'s gripper is "{ARM.gripper.name}"'
 
 
 @dataclass(frozen=True)
@@ -414,7 +413,7 @@ class ActionLayer:
     ) -> ArmPlan:
         """Claim the arm's busy slot and install a move_arm_joints goal's
         trajectory and settle, or raise Refusal."""
-        assert len(target) == NUM_JOINTS
+        assert len(target) == len(ARM.joints)
         if not all(math.isfinite(p) for p in target):
             raise Refusal(FailureKind.REJECTED, "non-finite joint target")
         _require_duration(duration_s, "duration_s")
@@ -534,7 +533,7 @@ class ActionLayer:
         from `reference`, and how far it stands, or None while every joint
         is within it."""
         tolerance_rad = self._config.start_tolerance_rad
-        return joint_past_tolerance(joints, reference, (tolerance_rad,) * NUM_JOINTS)
+        return joint_past_tolerance(joints, reference, (tolerance_rad,) * len(ARM.joints))
 
     def _require_start_at_expected(
         self, measured: tuple[float, ...], expected: tuple[float, ...]
@@ -549,7 +548,7 @@ class ActionLayer:
         joint, error = past
         raise Refusal(
             FailureKind.PRECONDITION_FAILED,
-            f"{ARM_LIMB} stands {error:.3f} rad from expected_start_joint_positions at joint "
+            f"{ARM.name} stands {error:.3f} rad from expected_start_joint_positions at joint "
             f"{joint + 1}, past the {self._config.start_tolerance_rad:.3f} rad start "
             "tolerance; plan the path from where the arm stands",
         )
@@ -571,7 +570,7 @@ class ActionLayer:
         joint, error = past
         raise Refusal(
             FailureKind.PRECONDITION_FAILED,
-            f"{ARM_LIMB} stands {error:.3f} rad at joint {joint + 1} from where it stood when "
+            f"{ARM.name} stands {error:.3f} rad at joint {joint + 1} from where it stood when "
             f"the path was taken, past the {self._config.start_tolerance_rad:.3f} rad start "
             "tolerance; send the path again",
         )
@@ -896,7 +895,7 @@ class ActionLayer:
 
         def results(joints, action_time):
             arm = execute_joint_path.ResultArmsItem(
-                arm_name=ARM_LIMB, final_joint_positions=list(joints)
+                arm_name=ARM.name, final_joint_positions=list(joints)
             )
             return [arm], action_time
 
@@ -1173,7 +1172,7 @@ class ActionLayer:
         if measured is None:
             return [], [], []
         position, orientation = kinematics.forward_kinematics(measured)
-        return [ARM_LIMB], list(position), list(orientation)
+        return [ARM.name], list(position), list(orientation)
 
     def _standing_pose(self, kinematics) -> tuple[list[float], list[float]]:
         """Where the grasp point stands with no plan installed, as a move
@@ -1259,7 +1258,7 @@ def _the_arm_entry(
         _require_arm_name(entry.arm_name)
     if len(arms) != 1:
         raise Refusal(
-            FailureKind.REJECTED, f'arms must name this robot\'s arm, "{ARM_LIMB}", once'
+            FailureKind.REJECTED, f'arms must name this robot\'s arm, "{ARM.name}", once'
         )
     return arms[0]
 
@@ -1277,7 +1276,7 @@ def _joint_path_goal(
         raise Refusal(FailureKind.REJECTED, "waypoints is empty: give at least one waypoint")
     waypoints = []
     for number, waypoint in enumerate(sent, start=1):
-        assert len(waypoint) == NUM_JOINTS
+        assert len(waypoint) == len(ARM.joints)
         if not all(math.isfinite(p) for p in waypoint):
             raise Refusal(
                 FailureKind.REJECTED, f"waypoint {number} has a non-finite joint position"
@@ -1300,11 +1299,11 @@ def _expected_start(positions: tuple[float, ...]) -> tuple[float, ...] | None:
     position."""
     if not positions:
         return None
-    if len(positions) != NUM_JOINTS:
+    if len(positions) != len(ARM.joints):
         raise Refusal(
             FailureKind.REJECTED,
             f"expected_start_joint_positions has {len(positions)} joint positions: give one "
-            f"per joint of the arm, {NUM_JOINTS}, or none to skip the check",
+            f"per joint of the arm, {len(ARM.joints)}, or none to skip the check",
         )
     if not all(math.isfinite(p) for p in positions):
         raise Refusal(
@@ -1317,7 +1316,7 @@ def _joint_settle(tolerances_rad: tuple[float, ...], timeout_s: float) -> JointS
     """The settle of a move_arm_joints or execute_joint_path goal, or
     Refusal: a positive finite tolerance per joint of the arm, and a
     timeout."""
-    assert len(tolerances_rad) == NUM_JOINTS
+    assert len(tolerances_rad) == len(ARM.joints)
     if not all(math.isfinite(v) and v > 0.0 for v in tolerances_rad):
         raise Refusal(
             FailureKind.REJECTED, "each settle_tolerances_rad entry must be a positive number"
@@ -1393,12 +1392,12 @@ def _admit_limb(
 
 
 def _require_arm_name(arm_name: str) -> None:
-    if arm_name != ARM_LIMB:
+    if arm_name != ARM.name:
         raise Refusal(FailureKind.REJECTED, _UNKNOWN_ARM_NAME)
 
 
 def _require_gripper_name(gripper_name: str) -> None:
-    if gripper_name != GRIPPER_LIMB:
+    if gripper_name != ARM.gripper.name:
         raise Refusal(FailureKind.REJECTED, _UNKNOWN_GRIPPER_NAME)
 
 

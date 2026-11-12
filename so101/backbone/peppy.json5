@@ -1,9 +1,8 @@
 // so101_backbone: the upstream command is joints (joint_link) or an
 // end-effector pose (pose_link), never both: `upstream_mode` picks one per
 // instance and only that slot kind is subscribed. Poses are solved with
-// lerobot's placo-based kinematics against so101_description's embedded
-// kinematics URDF, the same bytes its postures and limits are verified
-// against.
+// placo's kinematics against the URDF of SO-101's model in
+// robot_description, the model its postures and limits are read from.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -52,6 +51,13 @@
         // this side.
         { name: "joint_link", tag: "v1", role: "leader", link_id: "arm", cardinality: "zero_or_one" },
         { name: "gripper_link", tag: "v1", role: "leader", link_id: "gripper", cardinality: "zero_or_one" },
+      ],
+      contracts: [
+        // The robot's model and its description. The backbone asks for them
+        // once its setup has returned, while it serves, until the initializer
+        // answers, and ends when the model is not so101 or the description's
+        // digest is not the one it was built with.
+        { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
       ],
     },
   },
@@ -168,6 +174,10 @@
         // and the reach of the last 32 surface heights is kept.
         { link_id: "workspace", name: "describe_workspace" },
         { link_id: "workspace", name: "check_positions" },
+      ],
+      consumes: [
+        { link_id: "robot_identity", name: "get_identity" },
+        { link_id: "robot_identity", name: "get_description" },
       ],
     },
   },

@@ -4,10 +4,10 @@ import itertools
 import math
 
 import pytest
-from so101_description import limits as limits_mod
-from so101_description.kinematics import Kinematics
-from so101_description.model import KINEMATICS_URDF_PATH
 
+from so101_backbone import limits as limits_mod
+from so101_backbone.kinematics import Kinematics
+from so101_backbone.model import DESCRIPTION, urdf_path
 from so101_backbone.reach import (
     REACH_MARGIN_M,
     ReachBall,
@@ -31,8 +31,8 @@ def test_outside_positions_project_onto_the_surface():
 
 
 def test_fit_covers_the_deployed_models_workspace():
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     ball = fit_reach_ball(kinematics, limits)
     # Every reachable sample sits inside the fit before its margin shrink,
     # pan included: the fit never sweeps pan, trusting the center's placement
@@ -77,8 +77,8 @@ def test_rolling_the_wrist_moves_the_grasp_point_off_the_pan_axis():
     # axis: rolling swings it, so a fit that held roll at zero would be
     # bounding a slice of the workspace and trusting an invariance the model
     # does not have.
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     ball = fit_reach_ball(kinematics, limits)
     lo, hi = limits.lower[4], limits.upper[4]
     reaches = [

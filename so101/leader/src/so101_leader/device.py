@@ -14,7 +14,7 @@ from typing import Protocol
 
 from control_core_py.device import DeviceThread, LatestSlot
 from control_core_py.runtime import Latch, RateMeter, log
-from so101_description.device import (
+from so101.device import (
     PositionSample,
     connect_calibrated,
     motor_positions,

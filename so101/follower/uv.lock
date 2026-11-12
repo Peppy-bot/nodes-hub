@@ -142,7 +142,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
 
 [[package]]
 name = "cuda-bindings"
@@ -176,37 +176,37 @@ wheels = [
 
 [package.optional-dependencies]
 cublas = [
-    { name = "nvidia-cublas", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cublas" },
 ]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-runtime" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cufft" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "sys_platform == 'linux'" },
+    { name = "nvidia-cufile" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-cupti" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-curand" },
 ]
 cusolver = [
-    { name = "nvidia-cusolver", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusolver" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cusparse" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvjitlink" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-cuda-nvrtc" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "nvidia-nvtx" },
 ]
 
 [[package]]
@@ -956,9 +956,9 @@ wheels = [
 ]
 
 [[package]]
-name = "so101-description"
+name = "so101"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description#3a159ce1a8b0d838ba5d2235de2e0639b05d39d5" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -973,7 +973,7 @@ dependencies = [
     { name = "lerobot", extra = ["feetech"] },
     { name = "peppygen" },
     { name = "peppylib" },
-    { name = "so101-description" },
+    { name = "so101" },
 ]
 
 [package.dev-dependencies]
@@ -988,7 +988,7 @@ requires-dist = [
     { name = "lerobot", extras = ["feetech"], specifier = ">=0.6,<0.7" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
-    { name = "so101-description", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101_description" },
+    { name = "so101", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=so101" },
 ]
 
 [package.metadata.requires-dev]

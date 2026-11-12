@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from control_core_py.params import require_positive, require_rate
-from so101_description.device import BUS_MAX_RATE_HZ
-from so101_description.units import NUM_JOINTS
+from so101.device import BUS_MAX_RATE_HZ
+
+from so101_backbone.model import ARM
 
 
 class UpstreamMode(Enum):
@@ -66,5 +67,5 @@ def _per_joint(params, prefix: str) -> tuple[float, ...]:
     arm's joint order, each positive and finite."""
     return tuple(
         require_positive(f"{prefix}_{i + 1}", getattr(params, f"{prefix}_{i + 1}"))
-        for i in range(NUM_JOINTS)
+        for i in range(len(ARM.joints))
     )

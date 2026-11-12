@@ -1,4 +1,4 @@
-"""Wire-input parsing beyond what so101_description covers: the leader's pose
+"""Wire-input parsing beyond what the so101 library covers: the leader's pose
 stream and the follower's state streams. Parse, don't validate: a pose
 setpoint either becomes a typed target or a SetpointError naming the fault,
 and a state message becomes the value it measures or None."""
@@ -8,8 +8,8 @@ from __future__ import annotations
 import math
 
 from control_core_py.runtime import SetpointError
-from so101_description import units
-from so101_description.transforms import PoseError, matrix_from_pose
+from so101 import units
+from so101.transforms import PoseError, matrix_from_pose
 
 
 def parse_pose_setpoint(position, orientation):
