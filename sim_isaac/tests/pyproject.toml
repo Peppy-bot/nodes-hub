@@ -49,5 +49,5 @@ dev = [
 package = false
 
 [tool.uv.sources]
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
-robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "67dd22f487e53c6f3f0121c10ad17e7773a5445c" }
+robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "67dd22f487e53c6f3f0121c10ad17e7773a5445c" }

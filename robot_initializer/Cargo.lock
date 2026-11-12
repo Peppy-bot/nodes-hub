@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -562,7 +562,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -3055,7 +3055,7 @@ dependencies = [
 [[package]]
 name = "robot_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
 dependencies = [
  "chain_kinematics",
  "roxmltree",

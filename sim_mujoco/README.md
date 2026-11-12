@@ -25,7 +25,7 @@ An `attach` goal is refused with `rejected` for a model with no entry, a name th
 
 ## Models
 
-A model is two entries of the same name and its MuJoCo model. `sim_robot_core` builds what a robot of the model is made of, whatever the engine, from the description its attach goal carries, its URDF and SRDF: its limbs under the names the robot answers to, the joints each moves, where each finger closes and opens, its cameras at their optical frames, and the posture it starts in, every arm at its ready state with its gripper closed. An attach whose description the engine's entry for the model does not fit is refused with `rejected`.
+A model is two entries of the same name and its MuJoCo model. `sim_robot_core` builds what a robot of the model is made of, whatever the engine, from the description its attach goal carries, its URDF and SRDF: its limbs under the names the robot answers to, the joints each moves, where each finger closes and opens, its cameras at their optical frames, and the posture it starts in, every arm at its home state with its gripper closed. An attach whose description the engine's entry for the model does not fit is refused with `rejected`.
 
 The MuJoCo model of every robot is the release of Waldo's catalogue that `sim_base_images/waldo_catalogue.py` pins, which the base image bakes under `PEPPY_ROBOT_ASSETS_DIR` (`/opt/robot_assets`): each robot's pinned tree with the files the release lays over it, and the release's `robots.json`. Waldo stands its robots from the same release, so both engines stand one model of each robot. From each robot's entry of `robots.json` the engine reads (`engine/catalogue_robots.py`):
 

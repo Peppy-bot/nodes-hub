@@ -42,7 +42,7 @@ STORE_URL = "https://waldo-assets.peppy.bot/"
 # 403; a named one gets through.
 USER_AGENT = "sim_base_images/waldo_catalogue.py"
 # The release that private-nodes-hub's waldo/web/public/assets/catalogue.lock.json pins.
-RELEASE_DIGEST = "e0219dab84efdf1f4783132eedc2e04a1ecab7e8039f697d420d245425bb06b7"
+RELEASE_DIGEST = "e99e9e59a2e9105e62d072a57002a3150e3fdfd04e1d4461fced7ff27853790e"
 RELEASE_INDEX = "index.json"
 ROBOTS = "robots.json"
 TREE_INDEX = "index.json"

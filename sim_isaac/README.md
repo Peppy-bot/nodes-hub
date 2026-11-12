@@ -123,7 +123,7 @@ goal carries, its URDF and SRDF, through `sim_robot_core`'s entry of that
 model, shared with the MuJoCo node: its limbs under the names the robot
 answers to, the joints each limb moves, where the gripper's closed and open
 states put each finger, its cameras at their optical frames, and the posture
-it starts in, every arm at its ready state with its gripper closed.
+it starts in, every arm at its home state with its gripper closed.
 `sim_robot_core` and `robot_description_py` are installed in the base image
 (`sim_base_images/requirements.isaac.txt`), pinned to one commit. An attach
 whose description the engine's entry for the model does not fit is refused

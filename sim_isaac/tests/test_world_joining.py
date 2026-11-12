@@ -62,14 +62,14 @@ def _model_starting_in(posture: dict, joints=("slide", "hinge")):
 
 
 class TestStartPosture:
-    def test_an_so101_starts_at_ready_and_is_held_there(self):
+    def test_an_so101_starts_at_its_home_state_and_is_held_there(self):
         world = world_module()
         stage, root = _so101_stage()
         so101 = known("so101")
 
         world.World._start_in_posture(root, so101)
 
-        # The arm at its ready state and the jaw closed.
+        # The arm at its home state and the jaw closed.
         posture = so101.entry.start_posture
         assert set(posture) == {*_ARM_JOINTS, "gripper"}
         for joint, position in posture.items():

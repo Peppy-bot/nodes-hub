@@ -187,7 +187,7 @@ wheels = [
 [[package]]
 name = "robot-description-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=1c80539a6b88f0f1566d3d7614f71ada8be9fcb1#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=67dd22f487e53c6f3f0121c10ad17e7773a5445c#67dd22f487e53c6f3f0121c10ad17e7773a5445c" }
 
 [[package]]
 name = "sim-mujoco-tests"
@@ -211,8 +211,8 @@ requires-dist = [
     { name = "mujoco", specifier = "==4.0.0" },
     { name = "numpy", specifier = "==2.5.4" },
     { name = "pyjson5", specifier = "==2.0.1" },
-    { name = "robot-description-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" },
-    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" },
+    { name = "robot-description-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=67dd22f487e53c6f3f0121c10ad17e7773a5445c" },
+    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=67dd22f487e53c6f3f0121c10ad17e7773a5445c" },
 ]
 
 [package.metadata.requires-dev]
@@ -221,7 +221,7 @@ dev = [{ name = "pytest", specifier = ">=8" }]
 [[package]]
 name = "sim-robot-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=1c80539a6b88f0f1566d3d7614f71ada8be9fcb1#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=67dd22f487e53c6f3f0121c10ad17e7773a5445c#67dd22f487e53c6f3f0121c10ad17e7773a5445c" }
 dependencies = [
     { name = "numpy" },
     { name = "pyjson5" },
