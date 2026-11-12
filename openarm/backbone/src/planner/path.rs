@@ -18,10 +18,11 @@
 //! of the step the governor allowed ([`commit_both`] plays the clocks of a
 //! path's two shares at one pace), so the arms stay on the path while the
 //! guard slows them and pass each waypoint together. A share is judged on
-//! each tick from the first at or after its planned end: it completes once
-//! its clock has played to the end and every joint stands within its
-//! tolerance, and fails with `timeout` `settle_timeout_s` after the planned
-//! end.
+//! each tick ([`verdict`]): from the first tick at or after its planned end
+//! it completes once its clock has played to the end and every joint stands
+//! within its tolerance; on any tick it completes on contact once an arm of
+//! its path stands past the goal's contact gap; and it fails with `timeout`
+//! `settle_timeout_s` after the planned end.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,7 +47,7 @@ use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::governor::{GuardAt, PathArms, PathBlocked};
 use crate::move_slot::SlotRelease;
 use crate::robot::{ARMS, DUAL_DOF, LIMBS};
-use crate::settle::{Settle, farthest_outside, joint_shortfall, verdict};
+use crate::settle::{ContactGap, Settle, farthest_outside, joint_shortfall, verdict};
 use crate::types::{DualJointVec, arm_joints, dual_joints};
 
 /// The outcome of a share whose goal was cancelled: the action ends its goal
@@ -116,14 +117,16 @@ pub struct JointPath {
 
 /// An execute_joint_path goal as [`start_path`] starts it: the path; the
 /// expected start of each arm, none for an arm whose start is not checked;
-/// the settle each arm's share ends by; where the shares report; and the
-/// release of the move slot of each arm, which the goal's admission claimed:
-/// dropping the goal frees them. The expected starts, the settle's tolerance
-/// and the releases are in the order of the path's arms.
+/// the settle each arm's share ends by; the contact gap the goal names for
+/// every arm; where the shares report; and the release of the move slot of
+/// each arm, which the goal's admission claimed: dropping the goal frees
+/// them. The expected starts, the settle's tolerance and the releases are in
+/// the order of the path's arms.
 pub struct PathGoal {
     pub path: JointPath,
     pub expected_starts: Vec<Option<JointVec>>,
     pub settle: Settle<Vec<f64>>,
+    pub contact: ContactGap,
     pub reply: ShareReply,
     pub move_slots: Vec<SlotRelease>,
 }
@@ -361,12 +364,14 @@ fn share_failure(failure: Failure, arm: ArmId, arms: PathArms) -> Failure {
 }
 
 /// One arm's share of a joint path: where it stands on the path, the arms
-/// the path moves, where the share reports, and the settle it ends by.
+/// the path moves, where the share reports, the settle it ends by, and the
+/// contact gap of the path's goal.
 pub(super) struct PathShare {
     stage: ShareStage,
     arms: PathArms,
     reply: ShareReply,
     settle: Settle<JointVec>,
+    contact: ContactGap,
     _move_slot: SlotRelease,
 }
 
@@ -417,6 +422,12 @@ impl ShareStart {
 }
 
 impl PathShare {
+    /// Whether the share's path runs: its arm follows it, where a share that
+    /// waits for the path's judgment still holds its arm's command.
+    pub(super) fn runs(&self) -> bool {
+        matches!(self.stage, ShareStage::Following(_))
+    }
+
     /// Fail the share of `planner`'s arm with `failure`, with no result.
     pub(super) fn fail(self, planner: &Planner, failure: Failure) {
         self.reply
@@ -439,6 +450,36 @@ impl PathShare {
         };
         let report = ShareReport::ended(planner.arm, outcome, planner, &measured, elapsed_s);
         self.reply.report(report, self.arms);
+    }
+}
+
+/// What a tick finds of the contact of a path's arms: whether the share's own
+/// arm stands on contact, and whether an arm of the path does. A contact of
+/// one arm ends every share of its path on that tick.
+#[derive(Clone, Copy)]
+pub(super) struct PathContact {
+    this_arm: bool,
+    on_the_path: bool,
+}
+
+impl PathContact {
+    /// The contact of a share whose path moves its arm alone.
+    pub(super) fn of_one(this_arm: bool) -> Self {
+        Self {
+            this_arm,
+            on_the_path: this_arm,
+        }
+    }
+
+    /// `outcome` as the share of this arm reports it: an end on contact
+    /// names whether the contact is this arm's own.
+    fn of_this_arm(self, outcome: Outcome) -> Outcome {
+        match outcome {
+            Outcome::Contact { .. } => Outcome::Contact {
+                this_arm: self.this_arm,
+            },
+            other => other,
+        }
     }
 }
 
@@ -501,14 +542,38 @@ impl Planner {
         self.proposed.map(|step| step.pace(governed))
     }
 
+    /// Whether the arm of a share that follows its path stands on contact on
+    /// the step it proposed this tick: its measured grasp point past the
+    /// goal's contact gap from the grasp point of the joints the step
+    /// started from ([`Planner::stands_on_contact`]).
+    pub(super) fn stands_on_path_contact(&self) -> bool {
+        let Mode::PathShare(PathShare {
+            stage: ShareStage::Following(_),
+            contact,
+            ..
+        }) = &self.mode
+        else {
+            return false;
+        };
+        self.proposed
+            .is_some_and(|step| self.stands_on_contact(*contact, &step.from, &step.measured))
+    }
+
     /// Adopt `governed`, play a joint path's clock on at `pace`, and end the
-    /// arm's share as its settle judges the arm the step was proposed at:
+    /// arm's share as [`verdict`] judges the arm the step was proposed at:
     /// settled once the arm stands within the tolerance of the path's end
-    /// with the path played to it, timed out once the settle timeout has
-    /// passed since the planned end, with the arm short of the end or with the
-    /// path unfinished, which the guard held back. The arm then holds the
-    /// governed setpoint.
-    pub(super) fn commit_paced(&mut self, governed: JointVec, pace: Option<Pace>) {
+    /// with the path played to it; on contact once an arm of the path stands
+    /// on one, as `contact` says; timed out once the settle timeout has
+    /// passed since the planned end, with the arm short of the end or with
+    /// the path unfinished, which the guard held back. A share that settled
+    /// holds the governed setpoint, and any other leaves its arm where it
+    /// stands ([`Planner::hold_where_it_stands`]).
+    pub(super) fn commit_paced(
+        &mut self,
+        governed: JointVec,
+        pace: Option<Pace>,
+        contact: PathContact,
+    ) {
         self.setpoint = governed;
         let (Some(step), Some(pace)) = (self.proposed.take(), pace) else {
             return;
@@ -523,11 +588,21 @@ impl Planner {
         };
         traj.advance(step.at, pace);
         let end = arm_joints(&traj.end(), self.arm);
-        let Some(outcome) = settle_outcome(&step.measured, &end, settle, traj.clock(), step.at)
-        else {
+        let judged = settle_outcome(
+            &step.measured,
+            &end,
+            contact.on_the_path,
+            settle,
+            traj.clock(),
+            step.at,
+        );
+        let Some(outcome) = judged.map(|outcome| contact.of_this_arm(outcome)) else {
             return;
         };
         let elapsed_s = traj.clock().elapsed_secs(step.at);
+        if outcome.ended_short() {
+            self.hold_where_it_stands(step.measured);
+        }
         if let Mode::PathShare(share) = std::mem::replace(&mut self.mode, Mode::Follow) {
             let report = ShareReport::ended(self.arm, outcome, self, &Ok(step.measured), elapsed_s);
             share.reply.report(report, share.arms);
@@ -535,11 +610,13 @@ impl Planner {
     }
 
     /// One tick of the arm's share of a joint path: end the share as its
-    /// reply's interruption says, holding where the arm already is; while the
-    /// path waits for its judgment, hold the arm's command where it stands;
-    /// once it runs, propose the arm's half of the path's next point. The
-    /// share settles in its commit ([`Planner::commit_paced`]). A terminal
-    /// drops `m` (and with it the slot release), releasing the move slot.
+    /// reply's interruption says, which leaves the arm where it stands once
+    /// its path runs and its command as it is before ([`Planner::end_move`]);
+    /// while the path waits for its judgment, hold the arm's command where it
+    /// stands; once it runs, propose the arm's half of the path's next point.
+    /// The share settles in its commit ([`Planner::commit_paced`]). A
+    /// terminal drops `m` (and with it the slot release), releasing the move
+    /// slot.
     pub(super) fn advance_path_share(
         &mut self,
         m: PathShare,
@@ -547,8 +624,9 @@ impl Planner {
         now: Instant,
     ) -> Advance {
         if let Some(outcome) = m.reply.interruption() {
+            let end = self.end_move(&outcome, self.setpoint, m.runs().then_some(measured_q));
             m.end(self, outcome, Ok(measured_q), now);
-            return Advance::ends_move(self.setpoint);
+            return end;
         }
         let origin = Origin::OnPath(m.arms);
         let traj = match &m.stage {
@@ -641,22 +719,24 @@ impl Planner {
 
 /// How a share with `settle` ends with the arm measuring `measured` against
 /// `end`, the path's end, its clock at `clock`, at `now`, as [`verdict`]
-/// judges it from the planned end on: settled once the arm stands within the
-/// tolerance with the clock played to the end, timed out once the timeout has
-/// passed since the planned end, with how far the arm stands from the end or
-/// with the path unfinished.
+/// judges it: settled, from the planned end on, once the arm stands within
+/// the tolerance with the clock played to the end; on contact when `contact`
+/// says the arm stands past the goal's contact gap; timed out once the
+/// timeout has passed since the planned end, with how far the arm stands
+/// from the end or with the path unfinished.
 fn settle_outcome(
     measured: &JointVec,
     end: &JointVec,
+    contact: bool,
     settle: &Settle<JointVec>,
     clock: &MotionClock,
     now: Instant,
 ) -> Option<Outcome> {
-    let shortfall = match joint_shortfall(measured, end, &settle.tolerance) {
+    let shortfall = || match joint_shortfall(measured, end, &settle.tolerance) {
         None if !clock.is_complete() => Some(PATH_UNFINISHED.to_string()),
         shortfall => shortfall,
     };
-    verdict(shortfall, planned_end(clock), now, settle.timeout).map(Outcome::from)
+    verdict(shortfall, contact, planned_end(clock), now, settle.timeout).map(Outcome::from)
 }
 
 /// Start `goal` on every arm its path names at once, or fail it before any
@@ -684,6 +764,7 @@ pub fn start_path(
         path,
         expected_starts,
         settle,
+        contact,
         reply,
         move_slots,
     } = goal;
@@ -741,6 +822,7 @@ pub fn start_path(
                     .expect("a tolerance for each arm of the path"),
                 timeout: settle.timeout,
             },
+            contact,
             _move_slot: move_slot,
         });
     }
@@ -1036,6 +1118,8 @@ fn slower(a: Pace, b: Pace) -> Pace {
 /// trajectory, play their clocks on at one pace, the smaller of the two arms'
 /// shares of their steps, so the two clocks stay together. The governor
 /// scales the step of a path of both arms as one, so the two shares agree.
+/// The two shares are judged on one reading of the contact of both arms, so
+/// the contact of one arm ends both on that tick.
 pub fn commit_both(planners: &mut PerArm<Planner, ARMS>, governed: &PerArm<JointVec, ARMS>) {
     let shared = on_one_path(planners)
         .then(|| {
@@ -1048,11 +1132,20 @@ pub fn commit_both(planners: &mut PerArm<Planner, ARMS>, governed: &PerArm<Joint
                 .reduce(slower)
                 .expect("a robot of one arm or more")
         });
-    for arm in PerArm::<(), ARMS>::ids() {
-        match shared {
-            Some(pace) => planners[arm].commit_paced(governed[arm], Some(pace)),
-            None => planners[arm].commit(governed[arm]),
+    let Some(pace) = shared else {
+        for arm in PerArm::<(), ARMS>::ids() {
+            planners[arm].commit(governed[arm]);
         }
+        return;
+    };
+    let on_contact = PerArm::<_, ARMS>::from_fn(|arm| planners[arm].stands_on_path_contact());
+    let on_the_path = on_contact.iter().any(|on_contact| *on_contact);
+    for arm in PerArm::<(), ARMS>::ids() {
+        let contact = PathContact {
+            this_arm: on_contact[arm],
+            on_the_path,
+        };
+        planners[arm].commit_paced(governed[arm], Some(pace), contact);
     }
 }
 
@@ -1132,15 +1225,24 @@ mod tests {
     /// One tick of both planners at `now`, each arm measuring where it was
     /// governed last, with no goal queued.
     async fn tick_both(planners: &mut PerArm<Planner, ARMS>, now: Instant) -> PerArm<Tick, ARMS> {
+        let measured = PerArm::from_fn(|arm| planners[arm].setpoint());
+        tick_both_measuring(planners, &measured, now).await
+    }
+
+    /// One tick of both planners at `now`, each arm measuring its joints in
+    /// `measured`, with no goal queued.
+    async fn tick_both_measuring(
+        planners: &mut PerArm<Planner, ARMS>,
+        measured: &PerArm<JointVec, ARMS>,
+        now: Instant,
+    ) -> PerArm<Tick, ARMS> {
         let (_goal_tx, mut goals) = mpsc::channel(1);
         let move_slot = MoveSlot::default();
         let mut ticks = Vec::new();
         for arm in PerArm::<(), ARMS>::ids() {
-            let planner = &mut planners[arm];
-            let measured = planner.setpoint();
             ticks.push(
-                planner
-                    .tick(measured, None, &mut goals, &move_slot, now)
+                planners[arm]
+                    .tick(measured[arm], None, &mut goals, &move_slot, now)
                     .await,
             );
         }
@@ -2553,5 +2655,345 @@ mod tests {
                 LIMBS.arm_name(arm)
             );
         }
+    }
+
+    /// Play the path of `planners` from `t0`, a tick each cycle period, the
+    /// governor letting every step through, each arm measuring what
+    /// `measured` gives for the joints both arms are commanded to, until a
+    /// share reports: the report, and the joints the arms were commanded to
+    /// on each tick, the tick of the report last.
+    async fn play_to_a_report(
+        planners: &mut PerArm<Planner, ARMS>,
+        done_rx: &mut mpsc::Receiver<ShareReport>,
+        measured: impl Fn(&PerArm<JointVec, ARMS>) -> PerArm<JointVec, ARMS>,
+        t0: Instant,
+    ) -> (ShareReport, Vec<PerArm<JointVec, ARMS>>) {
+        let period = plan_config().cycle_period;
+        let mut commands = Vec::new();
+        for k in 1..=1000 {
+            let commanded = PerArm::from_fn(|arm| planners[arm].setpoint());
+            let ticks = tick_both_measuring(planners, &measured(&commanded), t0 + period * k).await;
+            commit_both(planners, &ticks.map(|_, tick| tick.candidate));
+            commands.push(commanded);
+            if let Ok(report) = done_rx.try_recv() {
+                return (report, commands);
+            }
+        }
+        panic!("no share reported in 1000 ticks of its path");
+    }
+
+    /// Tick both planners from `at`, a cycle period apart, each arm
+    /// measuring its joints in `stood` and the governor letting every step
+    /// through, until each command stands on its arm's joints in `stood`,
+    /// within 100 ticks.
+    async fn commands_come_to(
+        planners: &mut PerArm<Planner, ARMS>,
+        stood: &PerArm<JointVec, ARMS>,
+        at: Instant,
+    ) {
+        let period = plan_config().cycle_period;
+        for k in 1..=100 {
+            if PerArm::<(), ARMS>::ids().all(|arm| planners[arm].setpoint() == stood[arm]) {
+                return;
+            }
+            let ticks = tick_both_measuring(planners, stood, at + period * k).await;
+            commit_both(planners, &ticks.map(|_, tick| tick.candidate));
+        }
+        panic!("the commands did not come to where the arms stand in 100 ticks");
+    }
+
+    /// A share whose arm stands short of its path's end at the settle
+    /// timeout holds the arm where it stands. Here the arm never leaves its
+    /// start, as an arm that an object blocks, while the command plays the
+    /// path. From the `timeout` on the command moves to the joints the arm
+    /// measures.
+    #[tokio::test]
+    async fn a_share_that_times_out_holds_its_arm_where_it_stands() {
+        let mut planners = planners_holding(BOTH_HELD);
+        let arms = order(&["left_arm"]);
+        let move_slots = claimed(&arms);
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let t0 = Instant::now();
+        start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
+
+        let (report, commands) =
+            play_to_a_report(&mut planners, &mut done_rx, |_| BOTH_HELD, t0).await;
+        assert!(
+            matches!(&report.outcome, Outcome::Failed(failure) if failure.kind == FailureKind::Timeout),
+            "an arm that stands short cannot settle: {:?}",
+            report.outcome
+        );
+        let commanded = commands.last().expect("the tick of the report");
+        assert_ne!(
+            commanded[LEFT], BOTH_HELD[LEFT],
+            "the command ran ahead of the arm"
+        );
+        assert!(!move_slots[LEFT].is_claimed(), "the failure frees the arm");
+        let ended_at = t0 + plan_config().cycle_period * commands.len() as u32;
+        commands_come_to(&mut planners, &BOTH_HELD, ended_at).await;
+        let later = ended_at + Duration::from_secs(60);
+        let ticks = tick_both_measuring(&mut planners, &BOTH_TO, later).await;
+        assert_eq!(
+            ticks[LEFT].candidate, BOTH_HELD[LEFT],
+            "the arm holds where it stood"
+        );
+    }
+
+    /// A path that waits for its judgment leaves a hold standing, and the
+    /// hold goes on when the path never runs. Here the left arm's share of
+    /// a path times out with the arm at its start; a second path is taken
+    /// while the command is on its way back, waits a tick for its judgment,
+    /// and is refused. The command then comes to where the arm stands.
+    #[tokio::test]
+    async fn a_hold_stands_while_a_path_waits_and_goes_on_when_the_path_never_runs() {
+        let mut planners = planners_holding(BOTH_HELD);
+        let arms = order(&["left_arm"]);
+        let move_slots = claimed(&arms);
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let t0 = Instant::now();
+        start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
+        let (report, commands) =
+            play_to_a_report(&mut planners, &mut done_rx, |_| BOTH_HELD, t0).await;
+        assert!(matches!(report.outcome, Outcome::Failed(_)));
+        let period = plan_config().cycle_period;
+        let ended_at = t0 + period * commands.len() as u32;
+        let on_the_way = planners[LEFT].setpoint();
+        assert_ne!(
+            on_the_way, BOTH_HELD[LEFT],
+            "the command is on its way back"
+        );
+
+        assert!(
+            move_slots[LEFT].claim(),
+            "the next goal's admission claims the arm"
+        );
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let second = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let measured = measured_at_setpoints(&planners);
+        let judgment = start_path(&mut planners, second, &measured).expect("the path is taken");
+        let waiting = tick_both_measuring(&mut planners, &BOTH_HELD, ended_at + period).await;
+        let waiting = waiting.map(|_, tick| tick.candidate);
+        commit_both(&mut planners, &waiting);
+        assert_eq!(
+            waiting[LEFT], on_the_way,
+            "the waiting share holds the command"
+        );
+        let verdict = judge_path(
+            &judgment.plan,
+            judgment.arms,
+            &test_guard(&planners),
+            &mut Refusing,
+            &NO_STOP,
+        );
+        let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &measured, ended_at);
+        assert!(matches!(resumed, Resumed::Done), "the refused path ends");
+        assert!(matches!(
+            outcome(done_rx.try_recv()),
+            Some(Outcome::Failed(_))
+        ));
+        commands_come_to(&mut planners, &BOTH_HELD, ended_at + period).await;
+    }
+
+    /// The joints the tests' right arm measures while it follows its
+    /// commands: 0.001 rad behind `commanded` at its first joint.
+    fn trailing(commanded: JointVec) -> JointVec {
+        let mut measured = commanded;
+        measured[0] -= 0.001;
+        measured
+    }
+
+    /// The contact gap of the path goals below that ask for a contact check.
+    const GAP_M: f64 = 0.01;
+
+    /// The goal of a path of both arms to [`BOTH_TO`], as fast as the limits
+    /// run it, with the contact gap [`GAP_M`].
+    fn path_goal_with_a_gap(reply: ShareReply, move_slots: &PerArm<MoveSlot, ARMS>) -> PathGoal {
+        let arms = order(&["left_arm", "right_arm"]);
+        PathGoal {
+            contact: ContactGap::of(PositiveFinite::parse(GAP_M).expect("a positive gap")),
+            ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, move_slots)
+        }
+    }
+
+    /// A path whose goal names a contact gap ends on the contact of the arm
+    /// that an object blocks. Here the left arm never leaves its start and
+    /// the right arm follows its commands. The path ends on the first tick
+    /// the left arm's commanded grasp point stands past the gap from its
+    /// measured one, before the path's planned end. Both shares end on that
+    /// tick, the left one on its own contact, and each arm holds where it
+    /// stands: its command moves to the joints it measures, the right arm's
+    /// behind its last command.
+    #[tokio::test]
+    async fn a_path_ends_on_the_contact_of_one_arm_and_each_arm_holds_where_it_stands() {
+        let mut planners = planners_holding(BOTH_HELD);
+        let move_slots = claimed(&order(&["left_arm", "right_arm"]));
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let t0 = Instant::now();
+        let goal = path_goal_with_a_gap(reply, &move_slots);
+        start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
+        let planned_end = planned_end(path_of(&planners[LEFT]).clock());
+        let measured = |commanded: &PerArm<JointVec, ARMS>| {
+            PerArm::new([BOTH_HELD[LEFT], trailing(commanded[RIGHT])])
+        };
+
+        let (report, commands) = play_to_a_report(&mut planners, &mut done_rx, measured, t0).await;
+        assert_eq!(report.arm, LEFT);
+        assert_eq!(report.outcome, Outcome::Contact { this_arm: true });
+        assert_eq!(report.joints, BOTH_HELD[LEFT]);
+        let other = done_rx
+            .try_recv()
+            .expect("the right share ends on that tick");
+        assert_eq!(other.arm, RIGHT);
+        assert_eq!(other.outcome, Outcome::Contact { this_arm: false });
+        assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
+
+        let period = plan_config().cycle_period;
+        let ended_at = t0 + period * u32::try_from(commands.len()).expect("a count of ticks");
+        assert!(ended_at < planned_end, "the contact ends the path early");
+        let grasp_point = |q: &JointVec| planners[LEFT].world_ee_pose(q).translation.vector;
+        let left_gaps_m: Vec<f64> = commands
+            .iter()
+            .map(|commanded| (grasp_point(&commanded[LEFT]) - grasp_point(&BOTH_HELD[LEFT])).norm())
+            .collect();
+        let (on_contact, before) = left_gaps_m.split_last().expect("the tick of the report");
+        assert!(*on_contact > GAP_M, "{on_contact} m on the tick of the end");
+        assert!(
+            before.iter().all(|&apart_m| apart_m <= GAP_M),
+            "the path ends on the first tick past the gap: {before:?}"
+        );
+
+        let last = commands.last().expect("the tick of the report");
+        let stood = PerArm::new([BOTH_HELD[LEFT], trailing(last[RIGHT])]);
+        commands_come_to(&mut planners, &stood, ended_at).await;
+    }
+
+    /// The contact of one arm comes before the settle timeout of the other.
+    /// Here both arms follow their commands 0.02 rad behind at a joint, past
+    /// their settle tolerance and inside the gap, to the tick the settle
+    /// times out. On that tick the left arm measures at its start, past the
+    /// gap: both shares end on the left arm's contact, and none times out.
+    #[tokio::test]
+    async fn the_contact_of_one_arm_ends_the_other_share_before_its_timeout() {
+        let mut planners = planners_holding(BOTH_HELD);
+        let move_slots = claimed(&order(&["left_arm", "right_arm"]));
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let t0 = Instant::now();
+        let goal = path_goal_with_a_gap(reply, &move_slots);
+        start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
+        let timed_out = planned_end(path_of(&planners[LEFT]).clock())
+            + test_settle(&order(&["left_arm"])).timeout;
+        let short = |commanded: JointVec| {
+            let mut measured = commanded;
+            measured[3] -= 0.02;
+            measured
+        };
+        let period = plan_config().cycle_period;
+        let mut k = 0;
+        loop {
+            k += 1;
+            let at = t0 + period * k;
+            let commanded: PerArm<JointVec, ARMS> = PerArm::from_fn(|arm| planners[arm].setpoint());
+            let left = if at >= timed_out {
+                BOTH_HELD[LEFT]
+            } else {
+                short(commanded[LEFT])
+            };
+            let measured = PerArm::new([left, short(commanded[RIGHT])]);
+            let ticks = tick_both_measuring(&mut planners, &measured, at).await;
+            commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
+            if at >= timed_out {
+                break;
+            }
+            assert!(done_rx.try_recv().is_err(), "the shares settle on");
+        }
+        let reports = [done_rx.try_recv(), done_rx.try_recv()].map(|report| {
+            let report = report.expect("both shares end on the tick of the contact");
+            (report.arm, report.outcome)
+        });
+        assert_eq!(
+            reports,
+            [
+                (LEFT, Outcome::Contact { this_arm: true }),
+                (RIGHT, Outcome::Contact { this_arm: false })
+            ]
+        );
+    }
+
+    /// A path with a contact gap whose arms follow their commands runs to
+    /// its end and settles: the path travels many times the gap, and no arm
+    /// stands past it from its command.
+    #[tokio::test]
+    async fn a_path_with_a_contact_gap_that_nothing_blocks_settles() {
+        let mut planners = planners_holding(BOTH_HELD);
+        let move_slots = claimed(&order(&["left_arm", "right_arm"]));
+        let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
+        let t0 = Instant::now();
+        let goal = path_goal_with_a_gap(reply, &move_slots);
+        start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
+        let grasp_point = |q: &JointVec| planners[LEFT].world_ee_pose(q).translation.vector;
+        let travel_m = (grasp_point(&BOTH_TO[LEFT]) - grasp_point(&BOTH_HELD[LEFT])).norm();
+        assert!(travel_m > 5.0 * GAP_M, "the path travels {travel_m} m");
+
+        let follows = |commanded: &PerArm<JointVec, ARMS>| *commanded;
+        let (report, _) = play_to_a_report(&mut planners, &mut done_rx, follows, t0).await;
+        assert_eq!(report.outcome, Outcome::Complete);
+        let other = done_rx.try_recv().expect("both shares settle on one tick");
+        assert_eq!(other.outcome, Outcome::Complete);
+    }
+
+    /// A share that waits for its path's judgment has moved no command: a
+    /// cancel or a stop that ends it leaves its arm's command where it is,
+    /// though the arm measures elsewhere.
+    #[tokio::test]
+    async fn a_share_that_ends_before_its_path_plays_leaves_its_command() {
+        let elsewhere = lagging_left();
+        let at = Instant::now();
+        let period = plan_config().cycle_period;
+        let measured = PerArm::new([elsewhere, BOTH_HELD[RIGHT]]);
+
+        let (mut planners, _judgment, _verdict, mut done_rx) =
+            left_path_measured_at(BOTH_HELD[LEFT], &[BOTH_TO], Duration::from_secs(1));
+        let stopped = planners[LEFT]
+            .stop_active("stopped: operator", Ok(elsewhere), at)
+            .await;
+        assert!(stopped, "the share was in flight");
+        assert!(matches!(
+            outcome(done_rx.try_recv()),
+            Some(Outcome::Cancelled(_))
+        ));
+        for k in 1..=3 {
+            let ticks = tick_both_measuring(&mut planners, &measured, at + period * k).await;
+            let candidates = ticks.map(|_, tick| tick.candidate);
+            commit_both(&mut planners, &candidates);
+            assert_eq!(
+                candidates[LEFT], BOTH_HELD[LEFT],
+                "the stop moves no command"
+            );
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut planners = planners_holding(BOTH_HELD);
+        let arms = order(&["left_arm"]);
+        let move_slots = claimed(&arms);
+        let (reply, mut done_rx) = share_reply(&cancelled);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let at_setpoints = measured_at_setpoints(&planners);
+        start_path(&mut planners, goal, &at_setpoints).expect("the path starts");
+        cancelled.store(true, Ordering::Release);
+        for k in 1..=3 {
+            let ticks = tick_both_measuring(&mut planners, &measured, at + period * k).await;
+            let candidates = ticks.map(|_, tick| tick.candidate);
+            commit_both(&mut planners, &candidates);
+            assert_eq!(
+                candidates[LEFT], BOTH_HELD[LEFT],
+                "the cancel moves no command"
+            );
+        }
+        assert!(matches!(
+            outcome(done_rx.try_recv()),
+            Some(Outcome::Cancelled(_))
+        ));
     }
 }

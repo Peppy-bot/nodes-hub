@@ -30,14 +30,14 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::actions::{
-    ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free, move_seconds_from_wire,
-    tolerance_from_wire,
+    ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free, contact_gap_from_wire,
+    move_seconds_from_wire, tolerance_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
 use crate::move_slot::MoveSlot;
 use crate::planner::{ArmMoveRequest, Goal, JointReply, PlanCheck};
-use crate::settle::{PoseTolerance, Settle};
+use crate::settle::{ContactGap, PoseTolerance, Settle};
 use crate::streams::LeaderActivity;
 use crate::types::{orientation_from_wire, position_from_wire};
 
@@ -89,11 +89,12 @@ fn arm_move_request(
     })
 }
 
-/// A `move_arm` goal parsed off the wire: the move to plan, and the settle it
-/// asks for.
+/// A `move_arm` goal parsed off the wire: the move to plan, the settle it
+/// asks for, and its contact gap.
 struct MoveArmGoal {
     request: ArmMoveRequest,
     settle: Settle<PoseTolerance>,
+    contact: ContactGap,
 }
 
 fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGoal, String> {
@@ -106,17 +107,19 @@ fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGo
     Ok(MoveArmGoal {
         request,
         settle: Settle { tolerance, timeout },
+        contact: contact_gap_from_wire(d.contact_gap_m)?,
     })
 }
 
 /// A `move_arm_joints` goal parsed off the wire: a finite target inside the
-/// arm's joint limits ([`take_targets`]), the duration, and the settle it
-/// asks for.
+/// arm's joint limits ([`take_targets`]), the duration, the settle it asks
+/// for, and its contact gap.
 struct JointMoveRequest {
     arm: ArmId,
     target: JointVec,
     duration: Duration,
     settle: Settle<JointVec>,
+    contact: ContactGap,
 }
 
 fn joint_move_request(
@@ -139,6 +142,7 @@ fn joint_move_request(
         target,
         duration,
         settle,
+        contact: contact_gap_from_wire(d.contact_gap_m)?,
     })
 }
 
@@ -179,6 +183,7 @@ pub async fn run_move_arm_joints(
                 reply: JointReply::MoveArmJoints {
                     ctx: Box::new(ctx),
                     settle: request.settle,
+                    contact: request.contact,
                 },
             })
             .await
@@ -217,13 +222,17 @@ pub async fn run_move_arm(
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let MoveArmGoal { request, settle } =
-            move_arm_goal(&ctx.request().data).expect("validated on accept");
+        let MoveArmGoal {
+            request,
+            settle,
+            contact,
+        } = move_arm_goal(&ctx.request().data).expect("validated on accept");
         let arm = request.arm;
         if goal_txs[arm]
             .send(Goal::Cartesian {
                 request,
                 settle,
+                contact,
                 ctx: Box::new(ctx),
             })
             .await
@@ -340,6 +349,7 @@ mod tests {
             duration_s: 1.0,
             settle_tolerances_rad: [0.01; ARM_DOF],
             settle_timeout_s: 1.0,
+            contact_gap_m: 0.0,
         };
         let farther_out = elbow.lo - 1.1 * TARGET_SLACK;
         goal.joint_positions[3] = farther_out;

@@ -31,7 +31,8 @@ use tracing::error;
 
 use crate::actions::arm::joint_tolerances_from_wire;
 use crate::actions::{
-    ARM_WORDS, check_limb_free, claim_slots, collect_ends, move_seconds_from_wire,
+    ARM_WORDS, check_limb_free, claim_slots, collect_ends, contact_gap_from_wire,
+    move_seconds_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
@@ -39,16 +40,17 @@ use crate::move_slot::MoveSlot;
 use crate::planner::{
     JointPath, Outcome, PathGoal, PathOrder, ShareReply, ShareReport, cancelled_reason,
 };
-use crate::settle::Settle;
+use crate::settle::{ContactGap, Settle};
 use crate::streams::LeaderActivity;
 
 /// An `execute_joint_path` goal parsed off the wire: the path, the expected
-/// start of each arm, and the settle each arm's share ends by, the last two
-/// in the order of the path's arms.
+/// start of each arm and the settle each arm's share ends by, these two in
+/// the order of the path's arms, and the goal's contact gap.
 struct ExecuteJointPathGoal {
     path: JointPath,
     expected_starts: Vec<Option<JointVec>>,
     settle: Settle<Vec<f64>>,
+    contact: ContactGap,
 }
 
 /// An `execute_joint_path` goal as the path of its arms, in the order of
@@ -104,6 +106,7 @@ fn execute_joint_path_goal(
             tolerance,
             timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
         },
+        contact: contact_gap_from_wire(d.contact_gap_m)?,
     })
 }
 
@@ -182,8 +185,8 @@ enum PathEnd {
 /// in the order they came back, and `cancel`, the reason of the goal's own
 /// cancel. A goal whose every arm reported ends cancelled for its own cancel
 /// whatever the shares say, then cancelled for the stop's reason when the
-/// stop ended a share; otherwise it completes when every share completed,
-/// and fails with the failure that came back first. A share that fails
+/// stop ended a share; otherwise it completes when every share completed or
+/// ended on a contact, and fails with the failure that came back first. A share that fails
 /// reports before the shares its failure ends, so that failure is the one
 /// that ended the path. A goal one of whose arms never reported fails as a
 /// planner that dropped the move. A goal that completes or ends cancelled
@@ -215,19 +218,36 @@ fn summarize(arms: &ArmOrder, reports: Vec<ShareReport>, cancel: Option<String>)
 }
 
 /// The result of a goal that completes or ends cancelled with `reports`: each
-/// arm's joints in their order, and the time since the path started.
+/// arm's joints in their order with whether its own contact ended the move,
+/// and the time since the path started.
 fn path_result(reports: &[ShareReport]) -> (Vec<ExecuteJointPathResultArmsItem>, f64) {
     let arms = reports
         .iter()
         .map(|report| ExecuteJointPathResultArmsItem {
             arm_name: LIMBS.arm_name(report.arm).to_string(),
             final_joint_positions: report.joints,
+            ended_on_contact: report.outcome.ended_on_contact(),
         })
         .collect();
     let action_time = reports
         .iter()
         .map(|report| report.elapsed_s)
         .fold(0.0, f64::max);
+    (arms, action_time)
+}
+
+/// The result of a goal that ends cancelled with `reports`: as
+/// [`path_result`] gives it, and with no arm on contact, as limb_motion has a
+/// cancelled move say.
+fn cancelled_path_result(reports: &[ShareReport]) -> (Vec<ExecuteJointPathResultArmsItem>, f64) {
+    let (arms, action_time) = path_result(reports);
+    let arms = arms
+        .into_iter()
+        .map(|arm| ExecuteJointPathResultArmsItem {
+            ended_on_contact: false,
+            ..arm
+        })
+        .collect();
     (arms, action_time)
 }
 
@@ -259,6 +279,7 @@ async fn run_path(
         path,
         expected_starts,
         settle,
+        contact,
     } = goal;
     let arms = path.arms.clone();
     let shares = arms.ids().len();
@@ -273,6 +294,7 @@ async fn run_path(
         path,
         expected_starts,
         settle,
+        contact,
         reply: ShareReply {
             done_tx,
             cancelled: cancelled.clone(),
@@ -339,7 +361,7 @@ pub async fn run_execute_joint_path(
                     ctx.complete(arms, action_time).await
                 }
                 PathEnd::Cancelled(reason, reports) => {
-                    let (arms, action_time) = path_result(&reports);
+                    let (arms, action_time) = cancelled_path_result(&reports);
                     let reason = path_cancel_reason(reason, &reports);
                     ctx.complete_cancelled(reason, arms, action_time).await
                 }
@@ -357,6 +379,8 @@ mod tests {
     use crate::test_support::{LEFT, RIGHT};
 
     use execute_joint_path::{GoalArmsItem, GoalArmsItemWaypointsItem, GoalRequestData};
+
+    use control_core::positive_finite::PositiveFinite;
 
     use crate::failure::stale_failure;
     use crate::planner::OTHER_SHARE_FAILED;
@@ -414,6 +438,7 @@ mod tests {
                 .collect(),
             duration_s: 1.0,
             settle_timeout_s: 0.5,
+            contact_gap_m: 0.0,
         }
     }
 
@@ -545,6 +570,27 @@ mod tests {
         let mut late = goal(&both, &waypoints, None);
         late.settle_timeout_s = -1.0;
         assert!(refusal(late).starts_with("settle_timeout_s must be"));
+        let mut negative_gap = goal(&both, &waypoints, None);
+        negative_gap.contact_gap_m = -0.005;
+        assert_eq!(
+            refusal(negative_gap),
+            "contact_gap_m must be 0 or a positive number of meters"
+        );
+    }
+
+    /// The goal's contact gap is the gap of every arm of its path, and a gap
+    /// of 0 asks for no contact check.
+    #[test]
+    fn the_contact_gap_of_a_goal_is_parsed_off_its_one_field() {
+        let both = ["left_arm", "right_arm"];
+        let mut request = goal(&both, &[joints(0.10, 0.12)], None);
+        let parsed = |request: &GoalRequestData| {
+            execute_joint_path_goal(request, &limits()).expect("a goal within the limits")
+        };
+        assert_eq!(parsed(&request).contact, ContactGap::NONE);
+        request.contact_gap_m = 0.005;
+        let gap = PositiveFinite::parse(0.005).expect("a positive gap");
+        assert_eq!(parsed(&request).contact, ContactGap::of(gap));
     }
 
     /// A goal on an arm whose follower is stale, that a leader streams, or
@@ -698,6 +744,50 @@ mod tests {
             summarize(&right_first, stopped_reports, Some(caller.clone())),
             PathEnd::Cancelled(reason, _) if reason == caller
         ));
+
+        // The left arm's contact completes the goal for both arms, and the
+        // result says whose contact it was.
+        let contact_reports = vec![
+            report(LEFT, Outcome::Contact { this_arm: true }, left, true),
+            report(RIGHT, Outcome::Contact { this_arm: false }, right, true),
+        ];
+        let PathEnd::Completed(reports) = summarize(&right_first, contact_reports.clone(), None)
+        else {
+            panic!("a contact completes the goal");
+        };
+        let on_contact: Vec<(String, bool)> = path_result(&reports)
+            .0
+            .into_iter()
+            .map(|arm| (arm.arm_name, arm.ended_on_contact))
+            .collect();
+        assert_eq!(
+            on_contact,
+            [
+                ("right_arm".to_string(), false),
+                ("left_arm".to_string(), true)
+            ]
+        );
+        assert!(
+            path_result(&completed)
+                .0
+                .iter()
+                .all(|arm| !arm.ended_on_contact),
+            "a path that settled ended on no contact"
+        );
+        // The goal's own cancel wins over the shares, and a cancelled goal
+        // says no arm ended on contact.
+        let PathEnd::Cancelled(_, reports) =
+            summarize(&right_first, contact_reports, Some(caller.clone()))
+        else {
+            panic!("the goal's own cancel ends it cancelled");
+        };
+        assert!(
+            cancelled_path_result(&reports)
+                .0
+                .iter()
+                .all(|arm| !arm.ended_on_contact),
+            "a cancelled goal ended on no contact"
+        );
 
         let failure = Failure::new(FailureKind::Timeout, "left_arm: still short");
         let one_failed = vec![
