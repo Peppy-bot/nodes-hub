@@ -13,7 +13,7 @@ use control_core::latched_log::LatchedLog;
 use control_core::pacer::Pacer;
 use control_core::receiving::receive;
 use control_core::throttle::Throttle;
-use openarm_description::ARM_DOF;
+use openarm_can::ARM_DOF;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::backbone;
 use peppylib::runtime::CancellationToken;

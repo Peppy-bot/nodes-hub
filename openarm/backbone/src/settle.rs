@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use openarm_description::ARM_DOF;
+use srs_model::ARM_DOF;
 use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
 

@@ -30,9 +30,9 @@ use std::time::{Duration, Instant};
 use control_core::path_timing::{JointTrajectory, MIN_JOINT_CHANGE_RAD, RoundedPath};
 use control_core::time::ticks_within;
 use control_core::timing::{MotionClock, Pace};
-use openarm_description::{ARM_DOF, ArmOrder, ArmPair, DUAL_DOF, Side};
-use srs_model::JointVec;
+use robot_description::{ArmId, PerArm};
 use srs_model::chain_kinematics::clamp_into;
+use srs_model::{ARM_DOF, JointVec};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
@@ -41,9 +41,11 @@ use super::{
     planned_end,
 };
 use crate::actions::MAX_MOVE_DURATION_S;
+use crate::arm_order::ArmOrder;
 use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::governor::{GuardAt, PathArms, PathBlocked};
 use crate::move_slot::SlotRelease;
+use crate::robot::{ARMS, DUAL_DOF, LIMBS};
 use crate::settle::{Settle, farthest_outside, joint_shortfall, verdict};
 use crate::types::{DualJointVec, arm_joints, dual_joints};
 
@@ -80,22 +82,22 @@ pub trait PathGuard: Send {
 /// arms the governor steps along the path as one, and a share's failure in
 /// the words of the goal.
 pub trait PathOrder {
-    /// `failure` of the arm on `side` in a goal of these arms, as
+    /// `failure` of the arm `arm` in a goal of these arms, as
     /// [`share_failure`] gives it.
-    fn failure_of(&self, side: Side, failure: Failure) -> Failure;
+    fn failure_of(&self, arm: ArmId, failure: Failure) -> Failure;
 
     /// The arms the governor steps along the path as one.
     fn path_arms(&self) -> PathArms;
 }
 
 impl PathOrder for ArmOrder {
-    fn failure_of(&self, side: Side, failure: Failure) -> Failure {
-        share_failure(failure, side, self.path_arms())
+    fn failure_of(&self, arm: ArmId, failure: Failure) -> Failure {
+        share_failure(failure, arm, self.path_arms())
     }
 
     fn path_arms(&self) -> PathArms {
-        match self.sides() {
-            [side] => PathArms::One(*side),
+        match self.ids() {
+            [arm] => PathArms::One(*arm),
             _ => PathArms::Both,
         }
     }
@@ -130,13 +132,18 @@ impl PathGoal {
     /// End the goal before its path starts, cancelled by the stop service for
     /// `reason`: each arm reports the joints `measured` gives it, as an arm
     /// move stopped before it starts does, and its move slot is freed.
-    pub fn stop(self, reason: &str, measured: &ArmPair<Measurement>, planners: &ArmPair<Planner>) {
-        for &side in self.path.arms.sides() {
+    pub fn stop(
+        self,
+        reason: &str,
+        measured: &PerArm<Measurement, ARMS>,
+        planners: &PerArm<Planner, ARMS>,
+    ) {
+        for &arm in self.path.arms.ids() {
             let report = ShareReport::ended(
-                side,
+                arm,
                 Outcome::Cancelled(reason.to_string()),
-                &planners[side],
-                &measured[side],
+                &planners[arm],
+                &measured[arm],
                 0.0,
             );
             self.reply.send(report);
@@ -243,20 +250,18 @@ impl PathJudgment {
 
     /// Whether a share of the path still waits for this judgment: none does
     /// once its goal's cancel, the stop or a stale follower ended it.
-    pub fn is_awaited(&self, planners: &ArmPair<Planner>) -> bool {
-        Side::BOTH
-            .into_iter()
-            .any(|side| planners[side].awaits(self.id))
+    pub fn is_awaited(&self, planners: &PerArm<Planner, ARMS>) -> bool {
+        PerArm::<(), ARMS>::ids().any(|arm| planners[arm].awaits(self.id))
     }
 }
 
-/// How the share of the arm on `side` ended: its outcome, and what its
+/// How the share of the arm `arm` ended: its outcome, and what its
 /// arm's result gives when the goal completes or ends cancelled: the joints
 /// [`Planner::reported_joints`] reports for `measured`, the arm's
 /// measurement when the share ended, and the seconds since its path started.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShareReport {
-    pub side: Side,
+    pub arm: ArmId,
     pub outcome: Outcome,
     pub joints: JointVec,
     pub measured: Measurement,
@@ -264,18 +269,18 @@ pub struct ShareReport {
 }
 
 impl ShareReport {
-    /// The report of the share of `planner`'s arm on `side` that ended on
+    /// The report of the share of `planner`'s arm `arm` that ended on
     /// `outcome`, the arm measuring `measured`, `elapsed_s` after its path
     /// started.
     fn ended(
-        side: Side,
+        arm: ArmId,
         outcome: Outcome,
         planner: &Planner,
         measured: &Measurement,
         elapsed_s: f64,
     ) -> Self {
         Self {
-            side,
+            arm,
             outcome,
             joints: planner.reported_joints(measured),
             measured: *measured,
@@ -288,7 +293,7 @@ impl ShareReport {
     /// for: the joints commanded last.
     fn failed(planner: &Planner, failure: Failure) -> Self {
         Self::ended(
-            planner.side,
+            planner.arm,
             Outcome::Failed(failure),
             planner,
             &Err(Unmeasured::NotYet),
@@ -327,7 +332,7 @@ impl ShareReply {
         let outcome = match report.outcome {
             Outcome::Failed(failure) => {
                 self.failed.store(true, Ordering::Release);
-                Outcome::Failed(share_failure(failure, report.side, arms))
+                Outcome::Failed(share_failure(failure, report.arm, arms))
             }
             other => other,
         };
@@ -338,19 +343,19 @@ impl ShareReply {
     /// each arm of the path, and each share reports once, so the send finds
     /// room while the action waits.
     fn send(&self, report: ShareReport) {
-        let side = report.side;
+        let arm = LIMBS.arm_name(report.arm);
         if self.done_tx.try_send(report).is_err() {
-            error!("{side}: the action of the joint path stopped waiting for its shares");
+            error!("{arm}: the action of the joint path stopped waiting for its shares");
         }
     }
 }
 
-/// `failure` of the share of the arm on `side` in a path of `arms`: labelled
+/// `failure` of the share of the arm `arm` in a path of `arms`: labelled
 /// with the arm's name on a path of both arms, and as it is on a path of
 /// one, whose goal names that arm.
-fn share_failure(failure: Failure, side: Side, arms: PathArms) -> Failure {
+fn share_failure(failure: Failure, arm: ArmId, arms: PathArms) -> Failure {
     match arms {
-        PathArms::Both => failure.labelled(side.arm_name()),
+        PathArms::Both => failure.labelled(LIMBS.arm_name(arm)),
         PathArms::One(_) => failure,
     }
 }
@@ -392,22 +397,22 @@ struct ShareStart {
 }
 
 impl ShareStart {
-    /// Fail the path where the arm on `side` measures `measured` on the tick
+    /// Fail the path where the arm `arm` measures `measured` on the tick
     /// the path starts, `run` clamped into its joint limits: farther than
     /// `tolerance` in a joint from the goal's expected start, as the
     /// coordinator checks it when it takes the goal, or `run` farther than
     /// that from where it measured then ([`check_start`]).
     fn check_run_start(
         &self,
-        side: Side,
+        arm: ArmId,
         measured: &JointVec,
         run: &JointVec,
         tolerance: f64,
     ) -> Result<(), Failure> {
         if let Some(expected) = &self.expected {
-            check_start(side, StartCheck::Expected, expected, measured, tolerance)?;
+            check_start(arm, StartCheck::Expected, expected, measured, tolerance)?;
         }
-        check_start(side, StartCheck::Taken, &self.taken, run, tolerance)
+        check_start(arm, StartCheck::Taken, &self.taken, run, tolerance)
     }
 }
 
@@ -432,7 +437,7 @@ impl PathShare {
             ShareStage::Awaiting { .. } => 0.0,
             ShareStage::Following(traj) => traj.clock().elapsed_secs(now),
         };
-        let report = ShareReport::ended(planner.side, outcome, planner, &measured, elapsed_s);
+        let report = ShareReport::ended(planner.arm, outcome, planner, &measured, elapsed_s);
         self.reply.report(report, self.arms);
     }
 }
@@ -517,15 +522,14 @@ impl Planner {
             return;
         };
         traj.advance(step.at, pace);
-        let end = arm_joints(&traj.end(), self.side);
+        let end = arm_joints(&traj.end(), self.arm);
         let Some(outcome) = settle_outcome(&step.measured, &end, settle, traj.clock(), step.at)
         else {
             return;
         };
         let elapsed_s = traj.clock().elapsed_secs(step.at);
         if let Mode::PathShare(share) = std::mem::replace(&mut self.mode, Mode::Follow) {
-            let report =
-                ShareReport::ended(self.side, outcome, self, &Ok(step.measured), elapsed_s);
+            let report = ShareReport::ended(self.arm, outcome, self, &Ok(step.measured), elapsed_s);
             share.reply.report(report, share.arms);
         }
     }
@@ -557,7 +561,7 @@ impl Planner {
             }
             ShareStage::Following(traj) => traj,
         };
-        let target = arm_joints(&traj.sample(now), self.side);
+        let target = arm_joints(&traj.sample(now), self.arm);
         Advance {
             target,
             next_mode: Mode::PathShare(m),
@@ -672,9 +676,9 @@ fn settle_outcome(
 /// it, and [`resume_judged_path`] starts the shares on the judgment, judges
 /// the path again from where the arms stand, or fails them.
 pub fn start_path(
-    planners: &mut ArmPair<Planner>,
+    planners: &mut PerArm<Planner, ARMS>,
     goal: PathGoal,
-    measured: &ArmPair<Measurement>,
+    measured: &PerArm<Measurement, ARMS>,
 ) -> Result<PathJudgment, Failure> {
     let PathGoal {
         path,
@@ -686,27 +690,26 @@ pub fn start_path(
     let arms = &path.arms;
     let path_arms = arms.path_arms();
     let starts = arms
-        .sides()
+        .ids()
         .iter()
         .zip(&expected_starts)
-        .map(|(&side, expected)| {
-            let planner = &planners[side];
+        .map(|(&arm, expected)| {
+            let planner = &planners[arm];
             if planner.moving() {
                 let busy = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
-                return Err(arms.failure_of(side, busy));
+                return Err(arms.failure_of(arm, busy));
             }
-            let measured = measured[side].map_err(|_| arms.failure_of(side, stale_failure()))?;
+            let measured = measured[arm].map_err(|_| arms.failure_of(arm, stale_failure()))?;
             if let Some(expected) = expected {
                 let tolerance = planner.cfg.start_tolerance_rad;
-                check_start(side, StartCheck::Expected, expected, &measured, tolerance)?;
+                check_start(arm, StartCheck::Expected, expected, &measured, tolerance)?;
             }
             Ok(clamp_into(&planner.cfg.limits, &measured))
         })
         .collect::<Result<Vec<JointVec>, Failure>>()?;
-    let joined = |of: &dyn Fn(&Planner) -> JointVec| {
-        dual_joints(&ArmPair::from_fn(|side| of(&planners[side])))
-    };
-    let held = ArmPair::from_fn(|side| planners[side].setpoint);
+    let joined =
+        |of: &dyn Fn(&Planner) -> JointVec| dual_joints(&PerArm::from_fn(|arm| of(&planners[arm])));
+    let held = PerArm::from_fn(|arm| planners[arm].setpoint);
     let start = arms.placed(&starts.concat(), &held);
     let plan = PathPlan {
         waypoints: std::iter::once(dual_joints(&start))
@@ -721,12 +724,12 @@ pub fn start_path(
         duration: path.duration,
     };
     let id = JudgmentId::next();
-    for ((&side, move_slot), expected) in arms.sides().iter().zip(move_slots).zip(expected_starts) {
-        planners[side].mode = Mode::PathShare(PathShare {
+    for ((&arm, move_slot), expected) in arms.ids().iter().zip(move_slots).zip(expected_starts) {
+        planners[arm].mode = Mode::PathShare(PathShare {
             stage: ShareStage::Awaiting {
                 judgment: id,
                 start: ShareStart {
-                    taken: start[side],
+                    taken: start[arm],
                     expected,
                 },
             },
@@ -734,7 +737,7 @@ pub fn start_path(
             reply: reply.clone(),
             settle: Settle {
                 tolerance: arms
-                    .joints_of(&settle.tolerance, side)
+                    .joints_of(&settle.tolerance, arm)
                     .expect("a tolerance for each arm of the path"),
                 timeout: settle.timeout,
             },
@@ -830,15 +833,14 @@ pub enum Resumed {
 /// A share its goal's cancel, the stop or a stale follower already ended
 /// waits for nothing, so the verdict leaves it.
 pub fn resume_judged_path(
-    planners: &mut ArmPair<Planner>,
+    planners: &mut PerArm<Planner, ARMS>,
     judgment: &PathJudgment,
     verdict: &Result<(), Failure>,
-    measured: &ArmPair<Measurement>,
+    measured: &PerArm<Measurement, ARMS>,
     now: Instant,
 ) -> Resumed {
-    let awaited: Vec<(Side, ShareStart)> = Side::BOTH
-        .into_iter()
-        .filter_map(|side| Some((side, planners[side].awaited_start(judgment.id)?)))
+    let awaited: Vec<(ArmId, ShareStart)> = PerArm::<(), ARMS>::ids()
+        .filter_map(|arm| Some((arm, planners[arm].awaited_start(judgment.id)?)))
         .collect();
     if awaited.is_empty() {
         return Resumed::Done;
@@ -849,22 +851,22 @@ pub fn resume_judged_path(
     }
     let measured_at_start = awaited
         .iter()
-        .map(|&(side, start)| Some((side, start, measured[side].ok()?)))
-        .collect::<Option<Vec<(Side, ShareStart, JointVec)>>>();
+        .map(|&(arm, start)| Some((arm, start, measured[arm].ok()?)))
+        .collect::<Option<Vec<(ArmId, ShareStart, JointVec)>>>();
     let Some(measured_at_start) = measured_at_start else {
         return Resumed::AwaitsMeasurement;
     };
-    let run_starts: Vec<(Side, JointVec)> = measured_at_start
+    let run_starts: Vec<(ArmId, JointVec)> = measured_at_start
         .iter()
-        .map(|&(side, _, at)| (side, clamp_into(&planners[side].cfg.limits, &at)))
+        .map(|&(arm, _, at)| (arm, clamp_into(&planners[arm].cfg.limits, &at)))
         .collect();
     let refused =
         measured_at_start
             .iter()
             .zip(&run_starts)
-            .find_map(|(&(side, start, at), (_, run))| {
-                let tolerance = planners[side].cfg.start_tolerance_rad;
-                start.check_run_start(side, &at, run, tolerance).err()
+            .find_map(|(&(arm, start, at), (_, run))| {
+                let tolerance = planners[arm].cfg.start_tolerance_rad;
+                start.check_run_start(arm, &at, run, tolerance).err()
             });
     if let Some(failure) = refused {
         fail_awaiting_shares(planners, judgment.id, &failure);
@@ -873,23 +875,23 @@ pub fn resume_judged_path(
     let path_start = judgment.plan.start();
     let still_moving = run_starts
         .iter()
-        .filter_map(|&(side, run)| {
-            let judged = arm_joints(&path_start, side);
+        .filter_map(|&(arm, run)| {
+            let judged = arm_joints(&path_start, arm);
             let (joint, off) = farthest_outside(&run, &judged, &[RUN_START_SLACK_RAD; ARM_DOF])?;
-            Some((side, joint, off))
+            Some((arm, joint, off))
         })
         .max_by(|a, b| a.2.total_cmp(&b.2));
-    if let Some((side, joint, off)) = still_moving {
-        if judgment.judgments >= max_path_judgments(planners[side].cfg.cycle_period) {
-            let failure = unsettled(side, joint, off, judgment.judgments);
+    if let Some((arm, joint, off)) = still_moving {
+        if judgment.judgments >= max_path_judgments(planners[arm].cfg.cycle_period) {
+            let failure = unsettled(arm, joint, off, judgment.judgments);
             fail_awaiting_shares(planners, judgment.id, &failure);
             return Resumed::Done;
         }
-        let run_start = ArmPair::from_fn(|side| {
+        let run_start = PerArm::from_fn(|arm| {
             run_starts
                 .iter()
-                .find_map(|&(named, run)| (named == side).then_some(run))
-                .unwrap_or_else(|| arm_joints(&path_start, side))
+                .find_map(|&(named, run)| (named == arm).then_some(run))
+                .unwrap_or_else(|| arm_joints(&path_start, arm))
         });
         return Resumed::JudgeAgain(Box::new(judgment.again_from(dual_joints(&run_start))));
     }
@@ -901,21 +903,21 @@ pub fn resume_judged_path(
         traj.clock().duration().as_secs_f64(),
         judgment.judgments
     );
-    for &(side, _) in &run_starts {
-        planners[side].start_awaited(judgment.id, &traj, arm_joints(&path_start, side));
+    for &(arm, _) in &run_starts {
+        planners[arm].start_awaited(judgment.id, &traj, arm_joints(&path_start, arm));
     }
     Resumed::Done
 }
 
-/// The failure of a path whose arm on `side` still stands `off` rad from
+/// The failure of a path whose arm `arm` still stands `off` rad from
 /// the start of its last of `judgments` judgments at `joint`, counted from 0.
-fn unsettled(side: Side, joint: usize, off: f64, judgments: u32) -> Failure {
+fn unsettled(arm: ArmId, joint: usize, off: f64, judgments: u32) -> Failure {
     Failure::new(
         FailureKind::PreconditionFailed,
         format!(
             "{} still moved {off:.3} rad at joint {} while its path was judged {judgments} \
              times; let the arm settle and send the path again",
-            side.arm_name(),
+            LIMBS.arm_name(arm),
             joint + 1
         ),
     )
@@ -923,9 +925,13 @@ fn unsettled(side: Side, joint: usize, off: f64, judgments: u32) -> Failure {
 
 /// End each arm's share that waits for `judgment` with `failure`
 /// ([`Planner::fail_awaited`]).
-fn fail_awaiting_shares(planners: &mut ArmPair<Planner>, judgment: JudgmentId, failure: &Failure) {
-    for side in Side::BOTH {
-        planners[side].fail_awaited(judgment, failure);
+fn fail_awaiting_shares(
+    planners: &mut PerArm<Planner, ARMS>,
+    judgment: JudgmentId,
+    failure: &Failure,
+) {
+    for arm in PerArm::<(), ARMS>::ids() {
+        planners[arm].fail_awaited(judgment, failure);
     }
 }
 
@@ -940,13 +946,13 @@ enum StartCheck {
     Taken,
 }
 
-/// Fail the path where the arm on `side` stands at `joints`, farther than
+/// Fail the path where the arm `arm` stands at `joints`, farther than
 /// `tolerance` from `reference`, what `check` compares with, in a joint,
 /// naming the arm and the joint farthest past it, counted from 1 in the
 /// arm's joint order, and what to do: plan the path from where the arm
 /// stands, or send it again once the arm moved while it was planned.
 fn check_start(
-    side: Side,
+    arm: ArmId,
     check: StartCheck,
     reference: &JointVec,
     joints: &JointVec,
@@ -955,7 +961,7 @@ fn check_start(
     let Some((joint, off)) = farthest_outside(joints, reference, &[tolerance; ARM_DOF]) else {
         return Ok(());
     };
-    let (arm, joint) = (side.arm_name(), joint + 1);
+    let (arm, joint) = (LIMBS.arm_name(arm), joint + 1);
     let message = match check {
         StartCheck::Expected => format!(
             "{arm} stands {off:.3} rad from expected_start_joint_positions at joint {joint}, past \
@@ -993,28 +999,31 @@ pub(super) fn check_move_time<const N: usize>(
 }
 
 /// Whether both planners hold their shares of one path of both arms.
-fn on_one_path(planners: &ArmPair<Planner>) -> bool {
+fn on_one_path(planners: &PerArm<Planner, ARMS>) -> bool {
     planners
         .iter()
         .all(|planner| planner.path_arms() == Some(PathArms::Both))
 }
 
 /// `candidates`, the shares of a path of both arms stepped one share along
-/// their proposed steps along the path: the smaller of the shares each arm's
-/// chase took, so the step through both arms' joints keeps its line whatever
+/// their proposed steps along the path: the smallest of the shares each arm's
+/// chase took, so the step through every arm's joints keeps its line whatever
 /// caps one arm's chase. Any other candidates as they are.
 pub fn chase_together(
-    planners: &ArmPair<Planner>,
-    candidates: ArmPair<JointVec>,
-) -> ArmPair<JointVec> {
+    planners: &PerArm<Planner, ARMS>,
+    candidates: PerArm<JointVec, ARMS>,
+) -> PerArm<JointVec, ARMS> {
     if !on_one_path(planners) {
         return candidates;
     }
-    let (Some(left), Some(right)) = (planners.left.proposed, planners.right.proposed) else {
+    let Some(proposed) = PerArm::from_fn(|arm| planners[arm].proposed).transpose() else {
         return candidates;
     };
-    let share = slower(left.pace(&candidates.left), right.pace(&candidates.right));
-    ArmPair::new(left, right).map(|_, step| step.along(share))
+    let share = PerArm::<(), ARMS>::ids()
+        .map(|arm| proposed[arm].pace(&candidates[arm]))
+        .reduce(slower)
+        .expect("a robot of one arm or more");
+    proposed.map(|_, step| step.along(share))
 }
 
 /// The slower of two paces.
@@ -1027,18 +1036,22 @@ fn slower(a: Pace, b: Pace) -> Pace {
 /// trajectory, play their clocks on at one pace, the smaller of the two arms'
 /// shares of their steps, so the two clocks stay together. The governor
 /// scales the step of a path of both arms as one, so the two shares agree.
-pub fn commit_both(planners: &mut ArmPair<Planner>, governed: &ArmPair<JointVec>) {
+pub fn commit_both(planners: &mut PerArm<Planner, ARMS>, governed: &PerArm<JointVec, ARMS>) {
     let shared = on_one_path(planners)
         .then(|| {
-            let paces = ArmPair::from_fn(|side| planners[side].pace_of(&governed[side]));
-            paces.left.zip(paces.right)
+            PerArm::<_, ARMS>::from_fn(|arm| planners[arm].pace_of(&governed[arm])).transpose()
         })
         .flatten()
-        .map(|(left, right)| slower(left, right));
-    for side in Side::BOTH {
+        .map(|paces| {
+            paces
+                .into_iter()
+                .reduce(slower)
+                .expect("a robot of one arm or more")
+        });
+    for arm in PerArm::<(), ARMS>::ids() {
         match shared {
-            Some(pace) => planners[side].commit_paced(governed[side], Some(pace)),
-            None => planners[side].commit(governed[side]),
+            Some(pace) => planners[arm].commit_paced(governed[arm], Some(pace)),
+            None => planners[arm].commit(governed[arm]),
         }
     }
 }
@@ -1046,6 +1059,7 @@ pub fn commit_both(planners: &mut ArmPair<Planner>, governed: &ArmPair<JointVec>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{LEFT, RIGHT};
 
     use std::sync::atomic::AtomicBool;
 
@@ -1062,10 +1076,10 @@ mod tests {
 
     /// Where the path tests take the arms from [`BOTH_HELD`], inside v1's
     /// limits: the left shoulder 0.4 rad out, the right elbow 0.1 rad in.
-    const BOTH_TO: ArmPair<JointVec> = ArmPair {
-        left: [0.0, -1.2, 0.0, 1.2, 0.0, 0.0, 0.0],
-        right: [0.0, 0.8, 0.0, 1.3, 0.0, 0.0, 0.0],
-    };
+    const BOTH_TO: PerArm<JointVec, ARMS> = PerArm::new([
+        [0.0, -1.2, 0.0, 1.2, 0.0, 0.0, 0.0],
+        [0.0, 0.8, 0.0, 1.3, 0.0, 0.0, 0.0],
+    ]);
 
     /// The order of the arms `arm_names` names.
     fn order(arm_names: &[&str]) -> ArmOrder {
@@ -1073,8 +1087,8 @@ mod tests {
     }
 
     /// Both arms' planners, each holding its arm at `held`.
-    fn planners_holding(held: ArmPair<JointVec>) -> ArmPair<Planner> {
-        ArmPair::from_fn(|side| planner_holding(side, held[side]))
+    fn planners_holding(held: PerArm<JointVec, ARMS>) -> PerArm<Planner, ARMS> {
+        PerArm::from_fn(|arm| planner_holding(arm, held[arm]))
     }
 
     /// The outcome of the report `received` holds.
@@ -1087,13 +1101,13 @@ mod tests {
     /// the slots of its arms in `move_slots`.
     fn path_goal(
         arms: &ArmOrder,
-        to: &ArmPair<JointVec>,
+        to: &PerArm<JointVec, ARMS>,
         duration: Duration,
         reply: ShareReply,
-        move_slots: &ArmPair<MoveSlot>,
+        move_slots: &PerArm<MoveSlot, ARMS>,
     ) -> PathGoal {
-        path_goal_through(arms, &[*to], duration, test_settle(arms), reply, |side| {
-            &move_slots[side]
+        path_goal_through(arms, &[*to], duration, test_settle(arms), reply, |arm| {
+            &move_slots[arm]
         })
     }
 
@@ -1101,7 +1115,7 @@ mod tests {
     /// held, and judge its path at once with `checker`: the failure of the
     /// start, or of the judgment.
     fn start(
-        planners: &mut ArmPair<Planner>,
+        planners: &mut PerArm<Planner, ARMS>,
         goal: PathGoal,
         checker: &mut dyn PathGuard,
         now: Instant,
@@ -1117,12 +1131,12 @@ mod tests {
 
     /// One tick of both planners at `now`, each arm measuring where it was
     /// governed last, with no goal queued.
-    async fn tick_both(planners: &mut ArmPair<Planner>, now: Instant) -> ArmPair<Tick> {
+    async fn tick_both(planners: &mut PerArm<Planner, ARMS>, now: Instant) -> PerArm<Tick, ARMS> {
         let (_goal_tx, mut goals) = mpsc::channel(1);
         let move_slot = MoveSlot::default();
         let mut ticks = Vec::new();
-        for side in Side::BOTH {
-            let planner = &mut planners[side];
+        for arm in PerArm::<(), ARMS>::ids() {
+            let planner = &mut planners[arm];
             let measured = planner.setpoint();
             ticks.push(
                 planner
@@ -1131,7 +1145,7 @@ mod tests {
             );
         }
         let [left, right]: [Tick; 2] = ticks.try_into().ok().expect("a tick per arm");
-        ArmPair::new(left, right)
+        PerArm::new([left, right])
     }
 
     /// The trajectory through both arms' joints whose share `planner`
@@ -1157,7 +1171,7 @@ mod tests {
             order(&["right_arm", "left_arm"]).path_arms(),
             PathArms::Both
         );
-        assert_eq!(order(&["left_arm"]).path_arms(), PathArms::One(Side::Left));
+        assert_eq!(order(&["left_arm"]).path_arms(), PathArms::One(LEFT));
     }
 
     // --- Starting a path ----------------------------------------------------
@@ -1165,7 +1179,7 @@ mod tests {
     /// Where the tests' left arm measures when its setpoint lags it: 0.3 rad
     /// past [`BOTH_HELD`] at its first and third joints, inside v1's limits.
     fn lagging_left() -> JointVec {
-        let mut lagging = BOTH_HELD.left;
+        let mut lagging = BOTH_HELD[LEFT];
         lagging[0] += 0.3;
         lagging[2] += 0.3;
         lagging
@@ -1177,10 +1191,10 @@ mod tests {
     /// reports.
     fn left_path_measured_at(
         left: JointVec,
-        waypoints: &[ArmPair<JointVec>],
+        waypoints: &[PerArm<JointVec, ARMS>],
         settle: Duration,
     ) -> (
-        ArmPair<Planner>,
+        PerArm<Planner, ARMS>,
         PathJudgment,
         Result<(), Failure>,
         mpsc::Receiver<ShareReport>,
@@ -1193,10 +1207,10 @@ mod tests {
             timeout: settle,
             ..test_settle(&arms)
         };
-        let goal = path_goal_through(&arms, waypoints, Duration::ZERO, settle, reply, |side| {
-            &move_slots[side]
+        let goal = path_goal_through(&arms, waypoints, Duration::ZERO, settle, reply, |arm| {
+            &move_slots[arm]
         });
-        let measured = ArmPair::new(Ok(left), Ok(BOTH_HELD.right));
+        let measured = PerArm::new([Ok(left), Ok(BOTH_HELD[RIGHT])]);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
         let verdict = judge_path(
             &judgment.plan,
@@ -1209,8 +1223,8 @@ mod tests {
     }
 
     /// The left arm measuring `left`, the right arm where the tests hold it.
-    fn left_measuring(left: JointVec) -> ArmPair<Measurement> {
-        ArmPair::new(Ok(left), Ok(BOTH_HELD.right))
+    fn left_measuring(left: JointVec) -> PerArm<Measurement, ARMS> {
+        PerArm::new([Ok(left), Ok(BOTH_HELD[RIGHT])])
     }
 
     /// A path starts at the joints each arm it names measures, the arm it
@@ -1235,7 +1249,7 @@ mod tests {
             let measured = left_measuring(lagging);
             let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
             let t0 = Instant::now();
-            let start = dual_joints(&ArmPair::new(lagging, BOTH_HELD.right));
+            let start = dual_joints(&PerArm::new([lagging, BOTH_HELD[RIGHT]]));
             assert_eq!(judgment.plan.trajectory(t0).sample(t0), start);
 
             let ticks = tick_both(&mut planners, t0).await;
@@ -1257,13 +1271,13 @@ mod tests {
                 resume_judged_path(&mut planners, &judgment, &verdict, &measured, judged_at);
             assert!(matches!(resumed, Resumed::Done), "the path starts");
             assert_eq!(
-                planners.left.setpoint(),
+                planners[LEFT].setpoint(),
                 lagging,
                 "the command moves onto the path's run start"
             );
-            assert_eq!(planners.right.setpoint(), BOTH_HELD.right);
-            assert_eq!(path_of(&planners.left).clock().motion_start(), judged_at);
-            assert_eq!(path_of(&planners.left).sample(judged_at), start);
+            assert_eq!(planners[RIGHT].setpoint(), BOTH_HELD[RIGHT]);
+            assert_eq!(path_of(&planners[LEFT]).clock().motion_start(), judged_at);
+            assert_eq!(path_of(&planners[LEFT]).sample(judged_at), start);
         }
     }
 
@@ -1274,9 +1288,9 @@ mod tests {
     #[tokio::test]
     async fn every_command_of_a_started_path_lies_on_the_path_from_the_measured_start() {
         let lagging = lagging_left();
-        let mut turn = BOTH_TO.left;
+        let mut turn = BOTH_TO[LEFT];
         turn[3] -= 0.2;
-        let waypoints = [BOTH_TO, ArmPair::new(turn, BOTH_TO.right)];
+        let waypoints = [BOTH_TO, PerArm::new([turn, BOTH_TO[RIGHT]])];
         let (mut planners, judgment, verdict, _done_rx) =
             left_path_measured_at(lagging, &waypoints, Duration::from_secs(1));
         let started = Instant::now();
@@ -1287,19 +1301,19 @@ mod tests {
         let tick = plan_config().cycle_period;
         let mut commanded = Vec::new();
         for k in 0..2000 {
-            if !planners.left.moving() {
+            if !planners[LEFT].moving() {
                 break;
             }
             let ticks = tick_both(&mut planners, started + tick * k).await;
             commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
-            commanded.push(planners.left.setpoint());
+            commanded.push(planners[LEFT].setpoint());
         }
-        assert!(!planners.left.moving(), "the path ends");
-        assert_eq!(planners.left.setpoint(), turn, "at its last waypoint");
+        assert!(!planners[LEFT].moving(), "the path ends");
+        assert_eq!(planners[LEFT].setpoint(), turn, "at its last waypoint");
 
         let corners: Vec<Vec<f64>> = std::iter::once(lagging)
-            .chain(waypoints.iter().map(|w| w.left))
-            .map(|left| dual_joints(&ArmPair::new(left, BOTH_HELD.right)).to_vec())
+            .chain(waypoints.iter().map(|w| w[LEFT]))
+            .map(|left| dual_joints(&PerArm::new([left, BOTH_HELD[RIGHT]])).to_vec())
             .collect();
         let spacing = PositiveFinite::parse(1e-4).expect("a positive spacing");
         let path = RoundedPath::joint_path(&corners);
@@ -1309,7 +1323,7 @@ mod tests {
             .map(|&s| path.at(s))
             .collect();
         for (k, q) in commanded.iter().enumerate() {
-            let at = dual_joints(&ArmPair::new(*q, BOTH_HELD.right));
+            let at = dual_joints(&PerArm::new([*q, BOTH_HELD[RIGHT]]));
             let off = drawn
                 .windows(2)
                 .map(|w| distance_to_segment(&at, &w[0], &w[1]))
@@ -1331,9 +1345,9 @@ mod tests {
         let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &measured, started);
         assert!(matches!(resumed, Resumed::Done), "the path starts");
         let tick = plan_config().cycle_period;
-        let end = started + path_of(&planners.left).clock().duration();
+        let end = started + path_of(&planners[LEFT]).clock().duration();
         let mut k = 0;
-        while planners.left.moving() {
+        while planners[LEFT].moving() {
             let now = started + tick * k;
             assert!(
                 now < end + tick,
@@ -1351,8 +1365,8 @@ mod tests {
     /// planners holding [`BOTH_HELD`], and judged at once: the planners, the
     /// judgment and its verdict.
     fn both_path_measured_at(
-        measured: ArmPair<JointVec>,
-    ) -> (ArmPair<Planner>, PathJudgment, Result<(), Failure>) {
+        measured: PerArm<JointVec, ARMS>,
+    ) -> (PerArm<Planner, ARMS>, PathJudgment, Result<(), Failure>) {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm", "right_arm"]);
         let move_slots = claimed(&arms);
@@ -1379,9 +1393,9 @@ mod tests {
     #[tokio::test]
     async fn the_arms_of_a_path_of_both_start_it_together_on_their_measured_start() {
         let mut start = BOTH_HELD;
-        start.left[0] += 0.3;
-        start.left[2] += 0.1;
-        start.right[3] += 0.1;
+        start[LEFT][0] += 0.3;
+        start[LEFT][2] += 0.1;
+        start[RIGHT][3] += 0.1;
         let (mut planners, judgment, verdict) = both_path_measured_at(start);
         let t0 = Instant::now();
         let tick = plan_config().cycle_period;
@@ -1399,15 +1413,15 @@ mod tests {
         let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &measured, judged_at);
         assert!(matches!(resumed, Resumed::Done), "the path starts");
         assert_eq!(
-            ArmPair::from_fn(|side| planners[side].setpoint()),
+            PerArm::from_fn(|arm| planners[arm].setpoint()),
             start,
             "both commands move onto the path's run start"
         );
-        for side in Side::BOTH {
-            assert_eq!(path_of(&planners[side]).clock().motion_start(), judged_at);
+        for arm in PerArm::<(), ARMS>::ids() {
+            assert_eq!(path_of(&planners[arm]).clock().motion_start(), judged_at);
         }
         assert_eq!(
-            path_of(&planners.left).sample(judged_at),
+            path_of(&planners[LEFT]).sample(judged_at),
             dual_joints(&start)
         );
     }
@@ -1419,8 +1433,8 @@ mod tests {
     #[tokio::test]
     async fn an_arm_moved_off_the_path_start_while_judged_fails_the_path() {
         let (mut planners, judgment, verdict, mut done_rx) =
-            left_path_measured_at(BOTH_HELD.left, &[BOTH_TO], Duration::from_secs(1));
-        let mut moved = BOTH_HELD.left;
+            left_path_measured_at(BOTH_HELD[LEFT], &[BOTH_TO], Duration::from_secs(1));
+        let mut moved = BOTH_HELD[LEFT];
         moved[1] += 0.02;
         let resumed = resume_judged_path(
             &mut planners,
@@ -1430,7 +1444,7 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(resumed, Resumed::Done), "the path ends");
-        assert!(!planners.left.moving(), "before it plays");
+        assert!(!planners[LEFT].moving(), "before it plays");
         assert_eq!(
             outcome(done_rx.try_recv()),
             Some(Outcome::Failed(Failure::new(
@@ -1454,7 +1468,7 @@ mod tests {
         let arms = order(&["left_arm"]);
         let move_slots = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let mut expected = BOTH_HELD.left;
+        let mut expected = BOTH_HELD[LEFT];
         expected[1] += 0.006;
         let goal = PathGoal {
             expected_starts: vec![Some(expected)],
@@ -1469,7 +1483,7 @@ mod tests {
             &mut OpenGuard,
             &NO_STOP,
         );
-        let mut moved = BOTH_HELD.left;
+        let mut moved = BOTH_HELD[LEFT];
         moved[1] -= 0.006;
         let resumed = resume_judged_path(
             &mut planners,
@@ -1479,10 +1493,10 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(resumed, Resumed::Done), "the path ends");
-        assert!(!planners.left.moving(), "before it plays");
+        assert!(!planners[LEFT].moving(), "before it plays");
         assert_eq!(
-            planners.left.setpoint(),
-            BOTH_HELD.left,
+            planners[LEFT].setpoint(),
+            BOTH_HELD[LEFT],
             "the command holds"
         );
         assert_eq!(
@@ -1500,9 +1514,9 @@ mod tests {
     /// they stand as often as the resume asks: how many times the path was
     /// judged, and how the shares came out of the last resume.
     fn judge_until_resumed(
-        planners: &mut ArmPair<Planner>,
+        planners: &mut PerArm<Planner, ARMS>,
         mut judgment: PathJudgment,
-        measured: &ArmPair<Measurement>,
+        measured: &PerArm<Measurement, ARMS>,
         checker: &mut dyn PathGuard,
         now: Instant,
     ) -> (u32, Resumed) {
@@ -1527,7 +1541,7 @@ mod tests {
     /// is judged again.
     #[tokio::test]
     async fn an_arm_moving_while_its_path_is_judged_runs_the_path_from_where_it_then_measures() {
-        let taken = BOTH_HELD.left;
+        let taken = BOTH_HELD[LEFT];
         let mut moved = taken;
         moved[1] -= 0.008;
         let (mut planners, judgment, verdict, _done_rx) =
@@ -1540,32 +1554,32 @@ mod tests {
             panic!("the path is judged again from where the arm stands");
         };
         assert_eq!(
-            planners.left.setpoint(),
-            BOTH_HELD.left,
+            planners[LEFT].setpoint(),
+            BOTH_HELD[LEFT],
             "the command holds"
         );
-        assert_eq!(arm_joints(&again.plan.start(), Side::Left), moved);
+        assert_eq!(arm_joints(&again.plan.start(), LEFT), moved);
         let (judged, resumed) =
             judge_until_resumed(&mut planners, *again, &measured, &mut OpenGuard, started);
         assert!(matches!(resumed, Resumed::Done), "the path starts");
         assert_eq!(judged, 1, "judged once more");
         assert_eq!(
-            planners.left.setpoint(),
+            planners[LEFT].setpoint(),
             moved,
             "the command moves onto where the arm measures"
         );
         assert_eq!(
-            arm_joints(&path_of(&planners.left).sample(started), Side::Left),
+            arm_joints(&path_of(&planners[LEFT]).sample(started), LEFT),
             moved,
             "the path runs from there"
         );
         let tick = plan_config().cycle_period;
         let mut k = 0;
-        while planners.left.moving() {
+        while planners[LEFT].moving() {
             let ticks = tick_both(&mut planners, started + tick * k).await;
             commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
             assert!(
-                planners.left.setpoint()[1] <= moved[1],
+                planners[LEFT].setpoint()[1] <= moved[1],
                 "tick {k} steps the command back toward where the goal was taken"
             );
             k += 1;
@@ -1579,7 +1593,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_of_both_arms_one_of_which_moved_while_judged_runs_from_where_both_measure() {
         let mut moved = BOTH_HELD;
-        moved.right[3] += 0.005;
+        moved[RIGHT][3] += 0.005;
         let (mut planners, judgment, verdict) = both_path_measured_at(BOTH_HELD);
         let now = Instant::now();
         let measured = moved.map(|_, q| Ok(q));
@@ -1592,9 +1606,9 @@ mod tests {
         let (_, resumed) =
             judge_until_resumed(&mut planners, *again, &measured, &mut OpenGuard, now);
         assert!(matches!(resumed, Resumed::Done), "the path starts");
-        assert_eq!(ArmPair::from_fn(|side| planners[side].setpoint()), moved);
-        assert_eq!(path_of(&planners.left).sample(now), dual_joints(&moved));
-        assert_eq!(path_of(&planners.right).sample(now), dual_joints(&moved));
+        assert_eq!(PerArm::from_fn(|arm| planners[arm].setpoint()), moved);
+        assert_eq!(path_of(&planners[LEFT]).sample(now), dual_joints(&moved));
+        assert_eq!(path_of(&planners[RIGHT]).sample(now), dual_joints(&moved));
     }
 
     #[test]
@@ -1615,13 +1629,13 @@ mod tests {
     async fn an_arm_that_will_not_settle_fails_its_path_after_its_settle_window() {
         for (period_ms, last) in [(10, 20), (4, 50)] {
             let (mut planners, mut judgment, mut verdict, mut done_rx) =
-                left_path_measured_at(BOTH_HELD.left, &[BOTH_TO], Duration::from_secs(1));
-            for side in Side::BOTH {
-                planners[side].cfg.cycle_period = Duration::from_millis(period_ms);
+                left_path_measured_at(BOTH_HELD[LEFT], &[BOTH_TO], Duration::from_secs(1));
+            for arm in PerArm::<(), ARMS>::ids() {
+                planners[arm].cfg.cycle_period = Duration::from_millis(period_ms);
             }
             let now = Instant::now();
             let swung = |k: u32| {
-                let mut q = BOTH_HELD.left;
+                let mut q = BOTH_HELD[LEFT];
                 q[0] += if k.is_multiple_of(2) { 0.004 } else { -0.004 };
                 left_measuring(q)
             };
@@ -1642,10 +1656,10 @@ mod tests {
             }
             let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &swung(last), now);
             assert!(matches!(resumed, Resumed::Done), "the path ends");
-            assert!(!planners.left.moving(), "before it plays");
+            assert!(!planners[LEFT].moving(), "before it plays");
             assert_eq!(
-                planners.left.setpoint(),
-                BOTH_HELD.left,
+                planners[LEFT].setpoint(),
+                BOTH_HELD[LEFT],
                 "the command holds"
             );
             assert_eq!(
@@ -1671,18 +1685,18 @@ mod tests {
     #[tokio::test]
     async fn a_path_the_caps_run_past_60_s_from_its_run_start_fails_rejected() {
         let mut planners = planners_holding(BOTH_HELD);
-        for side in Side::BOTH {
-            planners[side].cfg.max_joint_velocity_rad_s = [0.5; ARM_DOF];
-            planners[side].cfg.start_tolerance_rad = 1.0;
+        for arm in PerArm::<(), ARMS>::ids() {
+            planners[arm].cfg.max_joint_velocity_rad_s = [0.5; ARM_DOF];
+            planners[arm].cfg.start_tolerance_rad = 1.0;
         }
-        let shoulder = planners.left.cfg.limits[0];
+        let shoulder = planners[LEFT].cfg.limits[0];
         assert!(shoulder.lo < -3.0 && shoulder.hi > 1.0, "{shoulder:?}");
         let swung = |q0: f64| {
             let mut q = BOTH_HELD;
-            q.left[0] = q0;
+            q[LEFT][0] = q0;
             q
         };
-        let waypoints: Vec<ArmPair<JointVec>> = (0..8)
+        let waypoints: Vec<PerArm<JointVec, ARMS>> = (0..8)
             .map(|k| swung(if k % 2 == 0 { 1.0 } else { -3.0 }))
             .collect();
         let arms = order(&["left_arm"]);
@@ -1694,7 +1708,7 @@ mod tests {
             Duration::ZERO,
             test_settle(&arms),
             reply,
-            |side| &move_slots[side],
+            |arm| &move_slots[arm],
         );
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
@@ -1711,7 +1725,7 @@ mod tests {
             &NO_STOP,
         );
         assert_eq!(verdict, Ok(()), "the judgment lets the path run");
-        let behind = left_measuring(swung(-0.9).left);
+        let behind = left_measuring(swung(-0.9)[LEFT]);
         let Resumed::JudgeAgain(again) =
             resume_judged_path(&mut planners, &judgment, &verdict, &behind, Instant::now())
         else {
@@ -1725,10 +1739,10 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(resumed, Resumed::Done), "the path ends");
-        assert!(!planners.left.moving(), "before it plays");
+        assert!(!planners[LEFT].moving(), "before it plays");
         assert_eq!(
-            planners.left.setpoint(),
-            BOTH_HELD.left,
+            planners[LEFT].setpoint(),
+            BOTH_HELD[LEFT],
             "the command holds"
         );
         let Some(Outcome::Failed(failure)) = outcome(done_rx.try_recv()) else {
@@ -1746,23 +1760,23 @@ mod tests {
     }
 
     /// A path starts at the measured joints clamped into the joint limits:
-    /// an elbow measuring just under its floor starts the path at the floor,
-    /// where its command moves, and the path's first leg moves the arm. So
-    /// does an elbow 0.03 rad under its floor, past the 0.01 rad start
+    /// an elbow measuring just under its lower limit starts the path at the
+    /// limit, where its command moves, and the path's first leg moves the arm.
+    /// So does an elbow 0.03 rad under its lower limit, past the 0.01 rad start
     /// tolerance: once the path is planned, the arm's measured joints,
     /// clamped as the start was, stand at the start.
     #[tokio::test]
     async fn a_path_starts_at_the_measured_joints_clamped_into_the_limits() {
-        let floor = planners_holding(BOTH_HELD).left.cfg.limits[3].lo;
+        let lower = planners_holding(BOTH_HELD)[LEFT].cfg.limits[3].lo;
         for below in [0.004, 0.03] {
-            let mut under = BOTH_HELD.left;
-            under[3] = floor - below;
+            let mut under = BOTH_HELD[LEFT];
+            under[3] = lower - below;
             let mut clamped = under;
-            clamped[3] = floor;
+            clamped[3] = lower;
             let (mut planners, judgment, verdict, mut done_rx) =
                 left_path_measured_at(under, &[BOTH_TO], Duration::from_secs(1));
             let started = Instant::now();
-            let start = dual_joints(&ArmPair::new(clamped, BOTH_HELD.right));
+            let start = dual_joints(&PerArm::new([clamped, BOTH_HELD[RIGHT]]));
             assert_eq!(judgment.plan.trajectory(started).sample(started), start);
             let measured = left_measuring(under);
             let resumed =
@@ -1772,7 +1786,7 @@ mod tests {
                 "{below} rad under: the path starts"
             );
             assert_eq!(
-                planners.left.setpoint(),
+                planners[LEFT].setpoint(),
                 clamped,
                 "{below} rad under: the command moves onto the clamped start"
             );
@@ -1786,7 +1800,7 @@ mod tests {
                 commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
             }
             assert_ne!(
-                planners.left.setpoint(),
+                planners[LEFT].setpoint(),
                 clamped,
                 "{below} rad under: the first leg moves the arm"
             );
@@ -1821,15 +1835,18 @@ mod tests {
         let [(checked, from, to)] = &guard.0[..] else {
             panic!("the guard checks the path once: {:?}", guard.0);
         };
-        assert_eq!(*checked, PathArms::One(Side::Left));
+        assert_eq!(*checked, PathArms::One(LEFT));
         assert_eq!(from[..], dual_joints(&BOTH_HELD));
         assert_eq!(
             to[..],
-            dual_joints(&ArmPair::new(BOTH_TO.left, BOTH_HELD.right))
+            dual_joints(&PerArm::new([BOTH_TO[LEFT], BOTH_HELD[RIGHT]]))
         );
-        assert_eq!(planners.left.path_arms(), Some(PathArms::One(Side::Left)));
-        assert!(!planners.right.moving(), "the right arm is not on the path");
-        assert!(move_slots.left.is_claimed() && !move_slots.right.is_claimed());
+        assert_eq!(planners[LEFT].path_arms(), Some(PathArms::One(LEFT)));
+        assert!(
+            !planners[RIGHT].moving(),
+            "the right arm is not on the path"
+        );
+        assert!(move_slots[LEFT].is_claimed() && !move_slots[RIGHT].is_claimed());
     }
 
     /// A share whose arm stands within its settle tolerance of the path's
@@ -1842,7 +1859,7 @@ mod tests {
         let move_slots = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let mut to = BOTH_HELD;
-        to.left[0] += 0.005;
+        to[LEFT][0] += 0.005;
         let second = Duration::from_secs(1);
         let goal = path_goal(&arms, &to, second, reply, &move_slots);
         let start_at = Instant::now();
@@ -1862,7 +1879,7 @@ mod tests {
                 "still short of the end of its path, 1.0 s after the planned end"
             )))
         );
-        assert!(!move_slots.left.is_claimed(), "the failure frees the arm");
+        assert!(!move_slots[LEFT].is_claimed(), "the failure frees the arm");
     }
 
     /// A share is judged from the first tick at or after its planned end:
@@ -1884,14 +1901,14 @@ mod tests {
                 tolerance: vec![0.01; ARM_DOF],
                 timeout,
             };
-            let goal = path_goal_through(&arms, &[BOTH_TO], second, settle, reply, |side| {
-                &move_slots[side]
+            let goal = path_goal_through(&arms, &[BOTH_TO], second, settle, reply, |arm| {
+                &move_slots[arm]
             });
             let t0 = Instant::now();
             start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
             let mut ended = None;
             for k in 0..150 {
-                let measured = planners.left.setpoint();
+                let measured = planners[LEFT].setpoint();
                 let ticks = tick_both(&mut planners, t0 + tick * k).await;
                 commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
                 if let Ok(report) = done_rx.try_recv() {
@@ -1916,11 +1933,12 @@ mod tests {
         let arms = order(&["right_arm", "left_arm"]);
         let expecting = |right: Option<JointVec>, left: Option<JointVec>| vec![right, left];
         let measured_off = |by: f64| {
-            let mut right = BOTH_HELD.right;
+            let mut right = BOTH_HELD[RIGHT];
             right[2] += by;
-            ArmPair::new(Ok(BOTH_HELD.left), Ok(right))
+            PerArm::new([Ok(BOTH_HELD[LEFT]), Ok(right)])
         };
-        let try_start = |expected_starts: Vec<Option<JointVec>>, measured: ArmPair<Measurement>| {
+        let try_start = |expected_starts: Vec<Option<JointVec>>,
+                         measured: PerArm<Measurement, ARMS>| {
             let mut planners = planners_holding(BOTH_HELD);
             let move_slots = claimed(&arms);
             let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
@@ -1929,12 +1947,12 @@ mod tests {
                 ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots)
             };
             let started = start_path(&mut planners, goal, &measured).map(|_| ());
-            let moving = ArmPair::from_fn(|side| planners[side].moving());
+            let moving = PerArm::from_fn(|arm| planners[arm].moving());
             let held = move_slots.map(|_, slot| slot.is_claimed());
             assert!(done_rx.try_recv().is_err(), "no share ends at its start");
             (started, moving, held)
         };
-        let both_expected = expecting(Some(BOTH_HELD.right), Some(BOTH_HELD.left));
+        let both_expected = expecting(Some(BOTH_HELD[RIGHT]), Some(BOTH_HELD[LEFT]));
 
         let (failed, moving, held) = try_start(both_expected.clone(), measured_off(0.1));
         assert_eq!(
@@ -1945,18 +1963,18 @@ mod tests {
                  the 0.010 rad start tolerance; plan the path from where the arm stands"
             ))
         );
-        assert_eq!(moving, ArmPair::new(false, false), "no arm moves");
+        assert_eq!(moving, PerArm::new([false, false]), "no arm moves");
         assert_eq!(
             held,
-            ArmPair::new(false, false),
+            PerArm::new([false, false]),
             "the failure frees both arms"
         );
 
         let (started, moving, _) = try_start(both_expected, measured_off(0.005));
         assert_eq!(started, Ok(()), "an arm within the tolerance starts");
-        assert_eq!(moving, ArmPair::new(true, true));
+        assert_eq!(moving, PerArm::new([true, true]));
 
-        let (started, _, _) = try_start(expecting(None, Some(BOTH_HELD.left)), measured_off(0.5));
+        let (started, _, _) = try_start(expecting(None, Some(BOTH_HELD[LEFT])), measured_off(0.5));
         assert_eq!(
             started,
             Ok(()),
@@ -1978,45 +1996,42 @@ mod tests {
 
         let both = order(&["left_arm", "right_arm"]);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let second_slots = ArmPair::from_fn(|_| MoveSlot::default());
+        let second_slots = PerArm::from_fn(|_| MoveSlot::default());
         let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, &second_slots);
         let failed = start(&mut planners, goal, &mut OpenGuard, Instant::now());
         assert_eq!(
             failed,
             Err(
                 Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT)
-                    .labelled(Side::Left.arm_name())
+                    .labelled(LIMBS.arm_name(LEFT))
             )
         );
-        assert!(!planners.right.moving(), "the right arm does not start");
+        assert!(!planners[RIGHT].moving(), "the right arm does not start");
         assert!(running.try_recv().is_err(), "the move in flight goes on");
-        assert!(running_slots.left.is_claimed(), "and holds its slot");
+        assert!(running_slots[LEFT].is_claimed(), "and holds its slot");
 
         let mut planners = planners_holding(BOTH_HELD);
         let move_slots = claimed(&both);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, &move_slots);
-        let measured = ArmPair::new(Ok(BOTH_HELD.left), Err(Unmeasured::Stale));
+        let measured = PerArm::new([Ok(BOTH_HELD[LEFT]), Err(Unmeasured::Stale)]);
         let failed = start_path(&mut planners, goal, &measured).map(|_| ());
-        assert_eq!(
-            failed,
-            Err(stale_failure().labelled(Side::Right.arm_name()))
-        );
-        assert!(!planners.left.moving() && !planners.right.moving());
+        assert_eq!(failed, Err(stale_failure().labelled(LIMBS.arm_name(RIGHT))));
+        assert!(!planners[LEFT].moving() && !planners[RIGHT].moving());
         assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
 
         let mut planners = planners_holding(BOTH_HELD);
         let move_slots = claimed(&left);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&left, &BOTH_TO, Duration::ZERO, reply, &move_slots);
-        let measured = ArmPair::new(Err(Unmeasured::Stale), Ok(BOTH_HELD.right));
+        let measured = PerArm::new([Err(Unmeasured::Stale), Ok(BOTH_HELD[RIGHT])]);
         let failed = start_path(&mut planners, goal, &measured).map(|_| ());
         assert_eq!(
             failed,
             Err(stale_failure()),
             "a goal of one arm names its arm"
         );
-        assert!(!move_slots.left.is_claimed());
+        assert!(!move_slots[LEFT].is_claimed());
     }
 
     /// A path the guard would hold short fails with `unreachable`, running none
@@ -2032,9 +2047,9 @@ mod tests {
         let unreachable = Failure::new(FailureKind::Unreachable, ARMS_WOULD_MEET);
         let started = start(&mut planners, goal, &mut Refusing, Instant::now());
         assert_eq!(started, Err(unreachable.clone()));
-        assert!(!planners.left.moving() && !planners.right.moving());
+        assert!(!planners[LEFT].moving() && !planners[RIGHT].moving());
         assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
-        for _ in Side::BOTH {
+        for _ in PerArm::<(), ARMS>::ids() {
             assert_eq!(
                 outcome(done_rx.try_recv()),
                 Some(Outcome::Failed(unreachable.clone()))
@@ -2052,7 +2067,7 @@ mod tests {
             waypoints: (0..=100)
                 .map(|k| {
                     let mut arms = BOTH_HELD;
-                    arms.left[1] -= if k % 2 == 1 { 0.8 } else { 0.0 };
+                    arms[LEFT][1] -= if k % 2 == 1 { 0.8 } else { 0.0 };
                     dual_joints(&arms)
                 })
                 .collect(),
@@ -2062,7 +2077,7 @@ mod tests {
         };
         let judged = judge_path(
             &plan,
-            PathArms::One(Side::Left),
+            PathArms::One(LEFT),
             &test_guard(&planners),
             &mut Refusing,
             &NO_STOP,
@@ -2114,16 +2129,22 @@ mod tests {
     /// running: a joint move runs on and reports nothing.
     #[tokio::test]
     async fn failing_a_path_share_leaves_a_joint_move_running() {
-        let mut planner = planner_holding(Side::Left, BOTH_HELD.left);
+        let mut planner = planner_holding(LEFT, BOTH_HELD[LEFT]);
         let (goal_tx, mut goals) = mpsc::channel(1);
         let move_slot = claimed_move_slot();
         let (done_tx, mut done_rx) = mpsc::channel(1);
         goal_tx
-            .send(Goal::posture_share(BOTH_TO.left, done_tx))
+            .send(Goal::posture_share(BOTH_TO[LEFT], done_tx))
             .await
             .expect("queue the goal");
         planner
-            .tick(BOTH_HELD.left, None, &mut goals, &move_slot, Instant::now())
+            .tick(
+                BOTH_HELD[LEFT],
+                None,
+                &mut goals,
+                &move_slot,
+                Instant::now(),
+            )
             .await;
         assert!(planner.moving(), "the joint move runs");
         planner.fail_path_share(stale_failure());
@@ -2172,10 +2193,10 @@ mod tests {
         let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &held, judged_at);
         assert!(matches!(resumed, Resumed::Done), "the path starts");
         assert!(on_one_path(&planners), "both shares follow the path");
-        let clock = path_of(&planners.left).clock();
+        let clock = path_of(&planners[LEFT]).clock();
         assert_eq!(clock.motion_start(), judged_at);
         assert_eq!(
-            path_of(&planners.left).sample(judged_at),
+            path_of(&planners[LEFT]).sample(judged_at),
             dual_joints(&BOTH_HELD),
             "the path starts where the arms held"
         );
@@ -2186,10 +2207,10 @@ mod tests {
         let goal = path_goal(&arms, &BOTH_TO, second, reply, &move_slots);
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
-        for side in Side::BOTH {
+        for arm in PerArm::<(), ARMS>::ids() {
             assert!(
-                planners[side]
-                    .stop_active("stopped: operator", Ok(BOTH_HELD[side]), t0)
+                planners[arm]
+                    .stop_active("stopped: operator", Ok(BOTH_HELD[arm]), t0)
                     .await,
                 "a share waiting for its judgment is a move in flight"
             );
@@ -2198,7 +2219,7 @@ mod tests {
                 report.outcome,
                 Outcome::Cancelled("stopped: operator".to_string())
             );
-            assert_eq!(report.joints, BOTH_HELD[side], "with the joints measured");
+            assert_eq!(report.joints, BOTH_HELD[arm], "with the joints measured");
             assert_eq!(report.elapsed_s, 0.0, "its path never started");
         }
         assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
@@ -2217,7 +2238,7 @@ mod tests {
             "no share waits for the judgment"
         );
         assert!(
-            !planners.left.moving() && !planners.right.moving(),
+            !planners[LEFT].moving() && !planners[RIGHT].moving(),
             "the judgment of a stopped path moves nothing"
         );
     }
@@ -2231,14 +2252,14 @@ mod tests {
         let arms = order(&["left_arm", "right_arm"]);
         let first = BOTH_TO;
         let mut moved_on = first;
-        moved_on.left[0] += 0.3;
-        moved_on.right[3] += 0.2;
+        moved_on[LEFT][0] += 0.3;
+        moved_on[RIGHT][3] += 0.2;
         let mut right_only = first;
-        right_only.right[3] += 0.1;
+        right_only[RIGHT][3] += 0.1;
         let last = moved_on;
         // The speed (rad/s) of each arm and of both together, at the tick of
         // the path's trajectory nearest `second`.
-        let speeds_at_second = async |second: ArmPair<JointVec>| {
+        let speeds_at_second = async |second: PerArm<JointVec, ARMS>| {
             let mut planners = planners_holding(BOTH_HELD);
             let move_slots = claimed(&arms);
             let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
@@ -2248,11 +2269,11 @@ mod tests {
                 Duration::ZERO,
                 test_settle(&arms),
                 reply,
-                |side| &move_slots[side],
+                |arm| &move_slots[arm],
             );
             let t0 = Instant::now();
             start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
-            let traj = path_of(&planners.left);
+            let traj = path_of(&planners[LEFT]);
             let tick = Duration::from_millis(1);
             let ticks = traj.clock().duration().div_duration_f64(tick).ceil() as u32;
             let at = |k: u32| traj.sample(t0 + tick * k);
@@ -2292,8 +2313,8 @@ mod tests {
         );
 
         let mut near = first;
-        near.left[1] += 0.0008;
-        near.right[2] -= 0.0008;
+        near[LEFT][1] += 0.0008;
+        near[RIGHT][2] -= 0.0008;
         let (left, right, both) = speeds_at_second(near).await;
         assert!(
             both < 0.01,
@@ -2318,28 +2339,28 @@ mod tests {
         let goal = path_goal(&arms, &BOTH_TO, second, reply, &move_slots);
         let t0 = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
-        let held = BOTH_HELD.left;
-        let first = propose(&mut planners.left, t0).await;
-        planners.left.commit(first);
+        let held = BOTH_HELD[LEFT];
+        let first = propose(&mut planners[LEFT], t0).await;
+        planners[LEFT].commit(first);
         let tenth = Duration::from_millis(100);
-        let proposed = propose(&mut planners.left, t0 + tenth).await;
-        planners.left.commit(held);
-        let again = propose(&mut planners.left, t0 + 2 * tenth).await;
+        let proposed = propose(&mut planners[LEFT], t0 + tenth).await;
+        planners[LEFT].commit(held);
+        let again = propose(&mut planners[LEFT], t0 + 2 * tenth).await;
         assert_eq!(again, proposed, "a held step plays nothing");
         let half: JointVec = std::array::from_fn(|i| held[i] + 0.5 * (again[i] - held[i]));
-        planners.left.commit(half);
-        let next = propose(&mut planners.left, t0 + 3 * tenth).await;
+        planners[LEFT].commit(half);
+        let next = propose(&mut planners[LEFT], t0 + 3 * tenth).await;
         let fresh = JointTrajectory::through(
             &[
                 dual_joints(&BOTH_HELD),
-                dual_joints(&ArmPair::new(BOTH_TO.left, BOTH_HELD.right)),
+                dual_joints(&PerArm::new([BOTH_TO[LEFT], BOTH_HELD[RIGHT]])),
             ],
             &[plan_config().max_joint_velocity_rad_s[0]; DUAL_DOF],
             &[plan_config().max_joint_acceleration_rad_s2[0]; DUAL_DOF],
             second,
             t0,
         );
-        let want = arm_joints(&fresh.sample(t0 + Duration::from_millis(150)), Side::Left);
+        let want = arm_joints(&fresh.sample(t0 + Duration::from_millis(150)), LEFT);
         for i in 0..ARM_DOF {
             assert!(
                 (next[i] - want[i]).abs() <= 1e-9,
@@ -2364,9 +2385,9 @@ mod tests {
     /// How far both arms' setpoints, together, stand off the straight path
     /// through both arms' joints from [`BOTH_HELD`] to [`BOTH_TO`], the path
     /// of one waypoint the tests start from there.
-    fn off_the_path_of_both(planners: &ArmPair<Planner>) -> f64 {
+    fn off_the_path_of_both(planners: &PerArm<Planner, ARMS>) -> f64 {
         let (from, to) = (dual_joints(&BOTH_HELD), dual_joints(&BOTH_TO));
-        let at = dual_joints(&ArmPair::from_fn(|side| planners[side].setpoint()));
+        let at = dual_joints(&PerArm::from_fn(|arm| planners[arm].setpoint()));
         let run: DualJointVec = std::array::from_fn(|i| to[i] - from[i]);
         let share = (0..DUAL_DOF)
             .map(|i| (at[i] - from[i]) * run[i])
@@ -2394,32 +2415,28 @@ mod tests {
         let start_at = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, start_at).expect("the move starts");
         assert!(on_one_path(&planners));
-        let on_the_path = |planners: &ArmPair<Planner>| {
+        let on_the_path = |planners: &PerArm<Planner, ARMS>| {
             let off = off_the_path_of_both(planners);
             assert!(off <= 1e-12, "the arms stand {off} rad off their path");
         };
 
         let at = start_at + Duration::from_millis(100);
         let ticks = tick_both(&mut planners, at).await;
-        assert!(
-            Side::BOTH
-                .into_iter()
-                .all(|side| ticks[side].on_path == Some(PathArms::Both))
-        );
-        let halves = ArmPair::from_fn(|side| -> JointVec {
-            let held = planners[side].setpoint();
-            std::array::from_fn(|i| (held[i] + ticks[side].candidate[i]) / 2.0)
+        assert!(PerArm::<(), ARMS>::ids().all(|arm| ticks[arm].on_path == Some(PathArms::Both)));
+        let halves = PerArm::from_fn(|arm| -> JointVec {
+            let held = planners[arm].setpoint();
+            std::array::from_fn(|i| (held[i] + ticks[arm].candidate[i]) / 2.0)
         });
         commit_both(&mut planners, &halves);
         on_the_path(&planners);
         let later = at + Duration::from_millis(50);
         assert_eq!(
-            path_of(&planners.left).sample(later),
-            path_of(&planners.right).sample(later),
+            path_of(&planners[LEFT]).sample(later),
+            path_of(&planners[RIGHT]).sample(later),
             "both shares play at one pace"
         );
         assert!(
-            path_of(&planners.left).sample(later) != path_of(&planners.left).sample(at),
+            path_of(&planners[LEFT]).sample(later) != path_of(&planners[LEFT]).sample(at),
             "the clock moved on"
         );
 
@@ -2432,8 +2449,8 @@ mod tests {
             on_the_path(&planners);
             if on_one_path(&planners) {
                 assert_eq!(
-                    path_of(&planners.left).sample(now),
-                    path_of(&planners.right).sample(now),
+                    path_of(&planners[LEFT]).sample(now),
+                    path_of(&planners[RIGHT]).sample(now),
                     "both shares play at one pace"
                 );
             }
@@ -2443,7 +2460,7 @@ mod tests {
             now += Duration::from_millis(10);
         }
         assert_eq!(outcomes, [Outcome::Complete, Outcome::Complete]);
-        assert_eq!(ArmPair::from_fn(|side| planners[side].setpoint()), BOTH_TO);
+        assert_eq!(PerArm::from_fn(|arm| planners[arm].setpoint()), BOTH_TO);
         assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
     }
 
@@ -2455,27 +2472,30 @@ mod tests {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm", "right_arm"]);
         let mut to = BOTH_TO;
-        to.left[1] = BOTH_HELD.left[1] - 1.0;
+        to[LEFT][1] = BOTH_HELD[LEFT][1] - 1.0;
         let move_slots = claimed(&arms);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&arms, &to, Duration::ZERO, reply, &move_slots);
         let start_at = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, start_at).expect("the move starts");
         let ticks = tick_both(&mut planners, start_at + Duration::from_millis(400)).await;
-        let shares = |candidates: &ArmPair<JointVec>| {
-            ArmPair::from_fn(|side| {
-                planners[side]
+        let shares = |candidates: &PerArm<JointVec, ARMS>| {
+            PerArm::<_, ARMS>::from_fn(|arm| {
+                planners[arm]
                     .proposed
                     .expect("a share proposes its step")
-                    .pace(&candidates[side])
+                    .pace(&candidates[arm])
             })
         };
         let chased = ticks.map(|_, tick| tick.candidate);
         let alone = shares(&chased);
-        assert!(alone.left < alone.right, "the left share's chase is capped");
+        assert!(
+            alone[LEFT] < alone[RIGHT],
+            "the left share's chase is capped"
+        );
         let together = shares(&chase_together(&planners, chased));
-        assert!((together.left.get() - alone.left.get()).abs() < 1e-12);
-        assert!((together.right.get() - together.left.get()).abs() < 1e-12);
+        assert!((together[LEFT].get() - alone[LEFT].get()).abs() < 1e-12);
+        assert!((together[RIGHT].get() - together[LEFT].get()).abs() < 1e-12);
     }
 
     /// A share that fails ends the other on its next tick, which holds its
@@ -2497,12 +2517,12 @@ mod tests {
             started(&Arc::new(AtomicBool::new(false))).await;
         let ticks = tick_both(&mut planners, start_at + Duration::from_millis(200)).await;
         commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
-        planners.right.fail_active(stale_failure()).await;
+        planners[RIGHT].fail_active(stale_failure()).await;
         let Some(Outcome::Failed(stale)) = outcome(done_rx.try_recv()) else {
             panic!("the stale share fails");
         };
-        assert_eq!(stale, stale_failure().labelled(Side::Right.arm_name()));
-        let held_left = planners.left.setpoint();
+        assert_eq!(stale, stale_failure().labelled(LIMBS.arm_name(RIGHT)));
+        let held_left = planners[LEFT].setpoint();
         let tick = tick_both(&mut planners, start_at + Duration::from_millis(300)).await;
         let Some(Outcome::Failed(ended)) = outcome(done_rx.try_recv()) else {
             panic!("the other share fails");
@@ -2510,23 +2530,28 @@ mod tests {
         assert_eq!(
             ended,
             Failure::new(FailureKind::AttemptFailed, OTHER_SHARE_FAILED)
-                .labelled(Side::Left.arm_name())
+                .labelled(LIMBS.arm_name(LEFT))
         );
-        assert_eq!(tick.left.candidate, held_left, "the other arm holds");
+        assert_eq!(tick[LEFT].candidate, held_left, "the other arm holds");
         assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let (mut planners, mut done_rx, _move_slots) = started(&cancelled).await;
         tick_both(&mut planners, start_at + Duration::from_millis(100)).await;
-        let held = ArmPair::from_fn(|side| planners[side].setpoint());
+        let held: PerArm<_, ARMS> = PerArm::from_fn(|arm| planners[arm].setpoint());
         cancelled.store(true, Ordering::Release);
         let ticks = tick_both(&mut planners, start_at + Duration::from_millis(200)).await;
-        for side in Side::BOTH {
+        for arm in PerArm::<(), ARMS>::ids() {
             assert_eq!(
                 outcome(done_rx.try_recv()),
                 Some(Outcome::Cancelled(SHARE_CANCELLED.to_string()))
             );
-            assert_eq!(ticks[side].candidate, held[side], "{side} holds");
+            assert_eq!(
+                ticks[arm].candidate,
+                held[arm],
+                "{} holds",
+                LIMBS.arm_name(arm)
+            );
         }
     }
 }

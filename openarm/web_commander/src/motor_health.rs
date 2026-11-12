@@ -2,13 +2,12 @@
 //! the motor_health slot (zero_or_more; the launcher wires the arm and
 //! gripper instances), attributes each report through the observed limb
 //! slots, parses it into per-motor readings, and hands it to the owner keyed
-//! by side, so the panel can badge each motor and banner an overloading
+//! by arm, so the panel can badge each motor and banner an overloading
 //! component.
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::motor_health::motor_health;
 use peppygen::paired_topics::{
@@ -19,11 +18,13 @@ use peppygen::paired_topics::{
 };
 use peppylib::messaging::ProducerRef;
 use peppylib::runtime::CancellationToken;
+use robot_description::{ArmId, PerArm};
 use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::consumer::{self, HEALTH_STALE_AFTER, parse_timestamp_validity};
 use crate::owner::Feedback;
+use crate::robot::ARMS;
 use crate::state::{HealthLevel, HealthReport, Limb, MotorHealthReading};
 
 /// Whether this deployment binds any motor_health producer.
@@ -73,29 +74,40 @@ pub async fn run(
     .await;
 }
 
-type HealthSources = [(ProducerRef, Side, Limb); 4];
+/// Each observed limb's producer, with the arm it belongs to and which limb of
+/// the arm it is.
+type HealthSources = Vec<(ProducerRef, ArmId, Limb)>;
 
 fn observed_sources(runner: &NodeRunner) -> peppygen::Result<HealthSources> {
-    Ok([
-        (left_arm::source(runner)?.producer, Side::Left, Limb::Arm),
-        (right_arm::source(runner)?.producer, Side::Right, Limb::Arm),
-        (
-            left_gripper::source(runner)?.producer,
-            Side::Left,
-            Limb::Gripper,
-        ),
-        (
-            right_gripper::source(runner)?.producer,
-            Side::Right,
-            Limb::Gripper,
-        ),
-    ])
+    let arms = PerArm::new([
+        left_arm::source(runner)?.producer,
+        right_arm::source(runner)?.producer,
+    ]);
+    let grippers = PerArm::new([
+        left_gripper::source(runner)?.producer,
+        right_gripper::source(runner)?.producer,
+    ]);
+    Ok(sources_of(arms, grippers))
+}
+
+/// The sources of each arm's producer and its gripper's, in place order.
+fn sources_of(
+    arms: PerArm<ProducerRef, ARMS>,
+    grippers: PerArm<ProducerRef, ARMS>,
+) -> HealthSources {
+    let limbs = |producers: PerArm<ProducerRef, ARMS>, limb: Limb| {
+        producers.map(move |arm, producer| (producer, arm, limb))
+    };
+    limbs(arms, Limb::Arm)
+        .into_iter()
+        .chain(limbs(grippers, Limb::Gripper))
+        .collect()
 }
 
 /// Match the full wire identity to exactly one observed limb.
-fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Limb), String> {
+fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(ArmId, Limb), String> {
     let mut matches = sources.iter().filter(|(source, _, _)| source == producer);
-    let Some((_, side, limb)) = matches.next() else {
+    let Some((_, arm, limb)) = matches.next() else {
         return Err(format!(
             "producer {producer:?} is outside this panel's observed limbs; wire motor_health to the observed followers"
         ));
@@ -105,7 +117,7 @@ fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Li
             "producer {producer:?} fills multiple observed limbs; bind each limb to its own follower"
         ));
     }
-    Ok((*side, *limb))
+    Ok((*arm, *limb))
 }
 
 /// Parse one wire report into the owner feedback it routes to: a producing
@@ -114,7 +126,7 @@ fn classify(sources: &HealthSources, producer: &ProducerRef) -> Result<(Side, Li
 /// motor-count-length with finite values, and a timestamp not already past the
 /// aging window.
 ///
-/// The observed slot supplies the side and kind; its producer must match the
+/// The observed slot supplies the arm and kind; its producer must match the
 /// report's machine and instance. Vector lengths must match that limb's kind.
 fn parse_report(
     sources: &HealthSources,
@@ -123,14 +135,14 @@ fn parse_report(
     clock_now: SystemTime,
     received_at: Instant,
 ) -> Result<Feedback, String> {
-    let (side, limb) = classify(sources, producer)?;
+    let (arm, limb) = classify(sources, producer)?;
     match limb {
         Limb::Arm => Ok(Feedback::ArmMotorHealth {
-            side,
+            arm,
             health: Box::new(parse_component(msg, clock_now, received_at)?),
         }),
         Limb::Gripper => Ok(Feedback::GripperMotorHealth {
-            side,
+            arm,
             health: parse_component(msg, clock_now, received_at)?,
         }),
     }
@@ -198,7 +210,8 @@ mod tests {
     use super::*;
     use crate::consumer::TIMESTAMP_SKEW_ALLOWANCE;
     use crate::state::{ArmHealth, GripperHealth};
-    use openarm_description::ARM_DOF;
+    use crate::test_support::{LEFT, RIGHT};
+    use srs_model::ARM_DOF;
     use std::time::Duration;
 
     fn msg() -> motor_health::Message {
@@ -221,39 +234,42 @@ mod tests {
     }
 
     fn sources() -> HealthSources {
-        [
-            (ProducerRef::new("core", "left_arm"), Side::Left, Limb::Arm),
-            (
-                ProducerRef::new("core", "right_arm"),
-                Side::Right,
-                Limb::Arm,
-            ),
-            (
-                ProducerRef::new("core", "left_gripper"),
-                Side::Left,
-                Limb::Gripper,
-            ),
-            (
-                ProducerRef::new("core", "right_gripper"),
-                Side::Right,
-                Limb::Gripper,
-            ),
-        ]
+        let core = |instance| ProducerRef::new("core", instance);
+        sources_of(
+            PerArm::new([core("left_arm"), core("right_arm")]),
+            PerArm::new([core("left_gripper"), core("right_gripper")]),
+        )
     }
 
     /// Unwrap an arm parse, panicking on any other routing.
-    fn arm(feedback: Feedback) -> (Side, ArmHealth) {
+    fn arm(feedback: Feedback) -> (ArmId, ArmHealth) {
         match feedback {
-            Feedback::ArmMotorHealth { side, health } => (side, *health),
+            Feedback::ArmMotorHealth { arm, health } => (arm, *health),
             _ => panic!("routed off the arm slot"),
         }
     }
 
-    fn gripper(feedback: Feedback) -> (Side, GripperHealth) {
+    fn gripper(feedback: Feedback) -> (ArmId, GripperHealth) {
         match feedback {
-            Feedback::GripperMotorHealth { side, health } => (side, health),
+            Feedback::GripperMotorHealth { arm, health } => (arm, health),
             _ => panic!("routed off the gripper slot"),
         }
+    }
+
+    #[test]
+    fn each_arm_and_its_gripper_is_its_own_source() {
+        assert_eq!(
+            sources()
+                .into_iter()
+                .map(|(producer, arm, limb)| (producer.instance_id, arm, limb))
+                .collect::<Vec<_>>(),
+            [
+                ("left_arm".to_string(), LEFT, Limb::Arm),
+                ("right_arm".to_string(), RIGHT, Limb::Arm),
+                ("left_gripper".to_string(), LEFT, Limb::Gripper),
+                ("right_gripper".to_string(), RIGHT, Limb::Gripper),
+            ]
+        );
     }
 
     #[test]
@@ -288,8 +304,8 @@ mod tests {
 
     #[test]
     fn a_full_report_transposes_every_vector_per_motor() {
-        let (side, health) = arm(parse_fresh("right_arm", &msg()).unwrap());
-        assert_eq!(side, Side::Right);
+        let (from, health) = arm(parse_fresh("right_arm", &msg()).unwrap());
+        assert_eq!(from, RIGHT);
         for (i, reading) in health.readings.iter().enumerate() {
             assert_eq!(reading.level, HealthLevel::Nominal);
             assert_eq!(reading.effort_fraction_rated, Some(0.10 + 0.01 * i as f64));
@@ -312,8 +328,8 @@ mod tests {
         m.effort_fraction_peak = vec![];
         m.driver_temp_c = vec![];
         m.winding_temp_c = vec![];
-        let (side, health) = arm(parse_fresh("left_arm", &m).unwrap());
-        assert_eq!(side, Side::Left);
+        let (from, health) = arm(parse_fresh("left_arm", &m).unwrap());
+        assert_eq!(from, LEFT);
         for reading in &health.readings {
             assert_eq!(reading.effort_fraction_rated, None);
             assert_eq!(reading.effort_fraction_rated_sustained, None);
@@ -435,8 +451,8 @@ mod tests {
             driver_temp_c: vec![41.0],
             winding_temp_c: vec![37.0],
         };
-        let (side, health) = gripper(parse_fresh("left_gripper", &m).unwrap());
-        assert_eq!(side, Side::Left);
+        let (from, health) = gripper(parse_fresh("left_gripper", &m).unwrap());
+        assert_eq!(from, LEFT);
         let [reading] = health.readings;
         assert_eq!(reading.level, HealthLevel::Warning);
         assert_eq!(reading.effort_fraction_rated, Some(0.4));

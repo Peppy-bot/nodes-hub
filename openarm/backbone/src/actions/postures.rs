@@ -33,9 +33,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use openarm_description::{ArmPair, JointPosture, Side};
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::{NodeRunner, Result};
+use robot_description::{ArmId, PerArm};
+use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
@@ -49,16 +50,17 @@ use crate::failure::{Failure, FailureKind};
 use crate::gripper_move::GripperGoal;
 use crate::move_slot::MoveSlot;
 use crate::planner::{Goal, JointReply, Outcome, PostureShare, Unmeasured};
+use crate::robot::{ARMS, LIMBS};
 use crate::streams::LeaderActivity;
 use crate::types::{arm_pose_arrays, limb_names};
 
 /// What a posture action needs of one kind of limb, the arms or the
-/// grippers, by side: the queue that takes its goals, its move slots, and
+/// grippers, by arm: the queue that takes its goals, its move slots, and
 /// its leaders.
 pub struct Limbs<G> {
-    pub goal_txs: ArmPair<mpsc::Sender<G>>,
-    pub move_slots: ArmPair<MoveSlot>,
-    pub activity: ArmPair<LeaderActivity>,
+    pub goal_txs: PerArm<mpsc::Sender<G>, ARMS>,
+    pub move_slots: PerArm<MoveSlot, ARMS>,
+    pub activity: PerArm<LeaderActivity, ARMS>,
 }
 
 // Written by hand: a derive would ask for goals that clone, and each field
@@ -84,9 +86,9 @@ impl<G> Limbs<G> {
     /// the second claim unwinds the first, so a refusal never leaves a slot
     /// held.
     fn claim_both(&self, words: &LimbWords) -> std::result::Result<(), Failure> {
-        claim_slots(&Side::BOTH, &self.move_slots).map_err(|side| {
-            let message = format!("the {side} {}", words.busy);
-            Failure::new(FailureKind::PreconditionFailed, message)
+        let arms: Vec<ArmId> = PerArm::<(), ARMS>::ids().collect();
+        claim_slots(&arms, &self.move_slots).map_err(|arm| {
+            Failure::new(FailureKind::PreconditionFailed, words.busy).labelled((words.limb)(arm))
         })
     }
 
@@ -117,7 +119,7 @@ impl<G> Limbs<G> {
 fn admit_posture(
     duration_s: f64,
     arms: &Limbs<Goal>,
-    arms_fresh: &ArmPair<Arc<AtomicBool>>,
+    arms_fresh: &PerArm<Arc<AtomicBool>, ARMS>,
     grippers: Option<&Limbs<GripperGoal>>,
 ) -> std::result::Result<(), Failure> {
     move_seconds_from_wire("duration_s", duration_s)
@@ -235,25 +237,21 @@ async fn run_shares<G>(
     action: &str,
     ctx: &impl PostureGoal,
     limbs: &Limbs<G>,
-    goal_of: impl Fn(Side, PostureShare) -> G,
+    goal_of: impl Fn(ArmId, PostureShare) -> G,
     cancelled: &Arc<AtomicBool>,
 ) -> Shares {
     let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(2);
     let mut pending = 0usize;
-    for side in Side::BOTH {
+    for arm in PerArm::<(), ARMS>::ids() {
         let share = PostureShare {
             done_tx: done_tx.clone(),
             cancelled: cancelled.clone(),
         };
-        if limbs.goal_txs[side]
-            .send(goal_of(side, share))
-            .await
-            .is_err()
-        {
+        if limbs.goal_txs[arm].send(goal_of(arm, share)).await.is_err() {
             // The limb's runner is gone; release the claim its goal would
             // have held.
-            limbs.move_slots[side].release();
-            error!("{action}: {side} goal channel closed");
+            limbs.move_slots[arm].release();
+            error!("{action}: {} goal channel closed", LIMBS.arm_name(arm));
             continue;
         }
         pending += 1;
@@ -267,7 +265,7 @@ async fn run_shares<G>(
 /// - close `grippers`, when the goal has some. A close that does not
 ///   complete ends the goal there, and the arms, which no planner took, are
 ///   freed;
-/// - move both arms to `posture` over `duration`. A stop that came since the
+/// - move each arm to its `posture` over `duration`. A stop that came since the
 ///   admission of the goal, the time of the close included, marked the arms'
 ///   move slots, and each planner ends its share cancelled when it takes it.
 async fn run_posture(
@@ -275,7 +273,7 @@ async fn run_posture(
     ctx: &impl PostureGoal,
     arms: &Limbs<Goal>,
     grippers: Option<&Limbs<GripperGoal>>,
-    posture: fn(Side) -> JointPosture,
+    posture: &PerArm<JointVec, ARMS>,
     duration: Duration,
 ) -> PostureEnd {
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -287,8 +285,8 @@ async fn run_posture(
             return closed;
         }
     }
-    let arm_goal = |side, share| Goal::Joint {
-        target: posture(side),
+    let arm_goal = |arm, share| Goal::Joint {
+        target: posture[arm],
         duration,
         reply: JointReply::Posture(share),
     };
@@ -296,8 +294,8 @@ async fn run_posture(
     summarize(&moves, ctx.cancel_reason(), &ARM_SHARES)
 }
 
-/// The poses a posture result gives: the grasp pose of each arm in
-/// [`Side::BOTH`] order, or none.
+/// The poses a posture result gives: the grasp pose of each arm in place
+/// order, or none.
 #[derive(Debug)]
 struct ArmPoses {
     arm_names: Vec<String>,
@@ -307,7 +305,7 @@ struct ArmPoses {
 
 /// What the coordinator answers when the goal asks for the grasp pose of
 /// each arm, or why it did not answer.
-type GraspAnswer = std::result::Result<ArmPair<GraspMeasurement>, String>;
+type GraspAnswer = std::result::Result<PerArm<GraspMeasurement, ARMS>, String>;
 
 /// Ask the coordinator for the grasp pose of each arm, measured when it
 /// serves the request.
@@ -325,17 +323,18 @@ async fn measure_grasps(requests: &mpsc::Sender<CoordinatorRequest>) -> GraspAns
 /// - the coordinator did not answer;
 /// - the seed wait is not over, so the robot has not measured every limb;
 /// - the follower of an arm stopped reporting.
-fn measured_poses(answer: GraspAnswer) -> std::result::Result<ArmPair<Isometry3<f64>>, String> {
+fn measured_poses(
+    answer: GraspAnswer,
+) -> std::result::Result<PerArm<Isometry3<f64>, ARMS>, String> {
     let grasps = answer?;
-    let pose = |side: Side| {
-        let arm = side.arm_name();
-        let grasp: GraspMeasurement = grasps[side];
+    let pose = |arm: ArmId| {
+        let grasp: GraspMeasurement = grasps[arm];
         grasp.map_err(|unmeasured| match unmeasured {
             Unmeasured::NotYet => "the robot has not measured every limb yet".to_string(),
-            Unmeasured::Stale => format!("{arm} stopped reporting its joints"),
+            Unmeasured::Stale => format!("{} stopped reporting its joints", LIMBS.arm_name(arm)),
         })
     };
-    ArmPair::from_fn(pose).transpose()
+    PerArm::from_fn(pose).transpose()
 }
 
 /// The poses of a posture result from `answer`: every arm's grasp pose, or
@@ -365,14 +364,15 @@ fn arm_poses(answer: GraspAnswer, action: &str) -> ArmPoses {
 /// Expand one posture action's run loop: expose it, admit each goal
 /// ([`admit_posture`]), run it ([`run_posture`]) and end it: a goal that
 /// completes or ends cancelled gives the grasp poses that the coordinator
-/// measures then. `arms_fresh` tells whether the followers of the arms
-/// deliver fresh state. `grippers` are the grippers that the action closes
+/// measures then. `posture` is each arm's posture the action moves it to.
+/// `arms_fresh` tells whether the followers of the arms deliver fresh state.
+/// `grippers` are the grippers that the action closes
 /// ahead of the arms, or `None` for an action that sends them no command.
 /// One goal at a time; a goal arriving mid-move waits unread until this one
 /// ends, then claims the freed limbs. Written once here because the two
 /// generated action modules carry distinct types with an identical surface.
 macro_rules! posture_runner {
-    ($fn_name:ident, $action:ident, $name:literal, $posture:expr) => {
+    ($fn_name:ident, $action:ident, $name:literal) => {
         impl PostureGoal for $action::GoalContext {
             fn cancel_signal(&self) -> impl Future<Output = ()> {
                 $action::GoalContext::cancel_signal(self)
@@ -386,7 +386,8 @@ macro_rules! posture_runner {
         pub async fn $fn_name(
             runner: Arc<NodeRunner>,
             arms: Limbs<Goal>,
-            arms_fresh: ArmPair<Arc<AtomicBool>>,
+            posture: PerArm<JointVec, ARMS>,
+            arms_fresh: PerArm<Arc<AtomicBool>, ARMS>,
             grippers: Option<Limbs<GripperGoal>>,
             requests: mpsc::Sender<CoordinatorRequest>,
         ) -> Result<()> {
@@ -411,7 +412,7 @@ macro_rules! posture_runner {
                     .expect("validated on accept");
 
                 let end =
-                    run_posture($name, &ctx, &arms, grippers.as_ref(), $posture, duration).await;
+                    run_posture($name, &ctx, &arms, grippers.as_ref(), &posture, duration).await;
                 let ended = match end {
                     PostureEnd::Failed(failure) => {
                         ctx.fail(failure.kind.into(), failure.message).await
@@ -440,43 +441,35 @@ macro_rules! posture_runner {
     };
 }
 
-posture_runner!(
-    run_move_to_ready,
-    move_to_ready,
-    "move_to_ready",
-    openarm_description::ready
-);
-posture_runner!(
-    run_move_to_home,
-    move_to_home,
-    "move_to_home",
-    openarm_description::home
-);
+posture_runner!(run_move_to_ready, move_to_ready, "move_to_ready");
+posture_runner!(run_move_to_home, move_to_home, "move_to_home");
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use robot_description::states;
     use srs_model::nalgebra::Vector3;
 
     use crate::gripper_move::{EffortCap, GripperReply};
-    use crate::test_support::bundled_arm;
+    use crate::robot::LIMBS;
+    use crate::test_support::{LEFT, RIGHT, V2, postures};
 
     /// The limbs of one kind, each with no leader and a free move slot, and
     /// the queues that take their goals.
-    fn limbs<G>() -> (Limbs<G>, ArmPair<mpsc::Receiver<G>>) {
-        let (goal_txs, queues) = ArmPair::from_fn(|_| mpsc::channel(1)).unzip();
+    fn limbs<G>() -> (Limbs<G>, PerArm<mpsc::Receiver<G>, ARMS>) {
+        let (goal_txs, queues) = PerArm::from_fn(|_| mpsc::channel(1)).unzip();
         let limbs = Limbs {
             goal_txs,
-            move_slots: ArmPair::from_fn(|_| MoveSlot::default()),
-            activity: ArmPair::from_fn(|_| LeaderActivity::default()),
+            move_slots: PerArm::from_fn(|_| MoveSlot::default()),
+            activity: PerArm::from_fn(|_| LeaderActivity::default()),
         };
         (limbs, queues)
     }
 
     /// The followers of both arms, each delivering fresh state.
-    fn fresh_arms() -> ArmPair<Arc<AtomicBool>> {
-        ArmPair::from_fn(|_| Arc::new(AtomicBool::new(true)))
+    fn fresh_arms() -> PerArm<Arc<AtomicBool>, ARMS> {
+        PerArm::from_fn(|_| Arc::new(AtomicBool::new(true)))
     }
 
     /// [`admit_posture`] on a robot whose arms deliver fresh state.
@@ -495,16 +488,16 @@ mod tests {
     }
 
     /// Which move slots of `limbs` a goal holds.
-    fn held<G>(limbs: &Limbs<G>) -> ArmPair<bool> {
-        ArmPair::from_fn(|side| limbs.move_slots[side].is_claimed())
+    fn held<G>(limbs: &Limbs<G>) -> PerArm<bool, ARMS> {
+        PerArm::from_fn(|arm| limbs.move_slots[arm].is_claimed())
     }
 
     fn refused(kind: FailureKind, message: &str) -> std::result::Result<(), Failure> {
         Err(Failure::new(kind, message))
     }
 
-    const NONE_HELD: ArmPair<bool> = ArmPair::new(false, false);
-    const BOTH_HELD: ArmPair<bool> = ArmPair::new(true, true);
+    const NONE_HELD: PerArm<bool, ARMS> = PerArm::new([false, false]);
+    const BOTH_HELD: PerArm<bool, ARMS> = PerArm::new([true, true]);
 
     #[test]
     fn a_goal_that_closes_no_gripper_claims_both_arms_alone() {
@@ -524,8 +517,8 @@ mod tests {
     #[test]
     fn a_busy_arm_refuses_the_goal_by_name_and_no_refused_slot_stays_held() {
         for (busy, message) in [
-            (Side::Left, "the left arm is already executing a motion"),
-            (Side::Right, "the right arm is already executing a motion"),
+            (LEFT, "left_arm: arm is already executing a motion"),
+            (RIGHT, "right_arm: arm is already executing a motion"),
         ] {
             let (arms, grippers) = (admitted_limbs(), admitted_limbs());
             assert!(arms.move_slots[busy].claim());
@@ -533,7 +526,7 @@ mod tests {
                 admit(1.0, &arms, Some(&grippers)),
                 refused(FailureKind::PreconditionFailed, message)
             );
-            let other_move = ArmPair::from_fn(|side| side == busy);
+            let other_move = PerArm::from_fn(|arm| arm == busy);
             assert_eq!(held(&arms), other_move, "the other move keeps its arm");
             assert_eq!(held(&grippers), NONE_HELD);
         }
@@ -542,8 +535,8 @@ mod tests {
     #[test]
     fn a_busy_gripper_refuses_the_goal_by_name_and_no_refused_slot_stays_held() {
         for (busy, message) in [
-            (Side::Left, "the left gripper is already executing a move"),
-            (Side::Right, "the right gripper is already executing a move"),
+            (LEFT, "left_gripper: gripper is already executing a move"),
+            (RIGHT, "right_gripper: gripper is already executing a move"),
         ] {
             let (arms, grippers) = (admitted_limbs(), admitted_limbs());
             assert!(grippers.move_slots[busy].claim());
@@ -551,7 +544,7 @@ mod tests {
                 admit(1.0, &arms, Some(&grippers)),
                 refused(FailureKind::PreconditionFailed, message)
             );
-            let other_move = ArmPair::from_fn(|side| side == busy);
+            let other_move = PerArm::from_fn(|arm| arm == busy);
             assert_eq!(held(&grippers), other_move, "the other move keeps it");
             assert_eq!(held(&arms), NONE_HELD);
         }
@@ -563,7 +556,7 @@ mod tests {
     fn a_leader_streaming_a_gripper_refuses_the_goal_that_closes_it() {
         let arms = admitted_limbs();
         let mut grippers = admitted_limbs::<GripperGoal>();
-        grippers.activity[Side::Right] = LeaderActivity::streaming_always();
+        grippers.activity[RIGHT] = LeaderActivity::streaming_always();
         assert_eq!(
             admit(1.0, &arms, Some(&grippers)),
             refused(FailureKind::LeaderStreaming, GRIPPER_WORDS.leader_streaming)
@@ -578,7 +571,7 @@ mod tests {
     #[test]
     fn an_arm_with_no_fresh_state_refuses_the_goal() {
         let arms_fresh = fresh_arms();
-        arms_fresh[Side::Right].store(false, Ordering::Release);
+        arms_fresh[RIGHT].store(false, Ordering::Release);
         for grippers in [None, Some(admitted_limbs::<GripperGoal>())] {
             let arms = admitted_limbs();
             assert_eq!(
@@ -597,26 +590,26 @@ mod tests {
     fn an_arm_refuses_the_goal_ahead_of_a_gripper() {
         let mut arms = admitted_limbs();
         let mut grippers = admitted_limbs::<GripperGoal>();
-        arms.activity[Side::Left] = LeaderActivity::streaming_always();
-        grippers.activity[Side::Left] = LeaderActivity::streaming_always();
+        arms.activity[LEFT] = LeaderActivity::streaming_always();
+        grippers.activity[LEFT] = LeaderActivity::streaming_always();
         assert_eq!(
             admit(1.0, &arms, Some(&grippers)),
             refused(FailureKind::LeaderStreaming, ARM_WORDS.leader_streaming)
         );
 
         let (arms, grippers) = (admitted_limbs(), admitted_limbs::<GripperGoal>());
-        assert!(arms.move_slots[Side::Left].claim());
-        assert!(grippers.move_slots[Side::Left].claim());
+        assert!(arms.move_slots[LEFT].claim());
+        assert!(grippers.move_slots[LEFT].claim());
         let ready = admit(1.0, &arms, None);
         assert_eq!(
             ready,
             refused(
                 FailureKind::PreconditionFailed,
-                "the left arm is already executing a motion"
+                "left_arm: arm is already executing a motion"
             )
         );
         assert_eq!(admit(1.0, &arms, Some(&grippers)), ready);
-        let other_moves = ArmPair::new(true, false);
+        let other_moves = PerArm::new([true, false]);
         assert_eq!(held(&arms), other_moves, "the other move keeps its arm");
         assert_eq!(held(&grippers), other_moves, "the other move keeps it");
     }
@@ -650,19 +643,19 @@ mod tests {
         }
     }
 
-    /// The share of the gripper close that `queue` holds, and the side it
+    /// The share of the gripper close that `queue` holds, and the arm it
     /// names. The close goes to a closed gripper and keeps its effort cap.
-    async fn next_close(queue: &mut mpsc::Receiver<GripperGoal>) -> (Side, PostureShare) {
+    async fn next_close(queue: &mut mpsc::Receiver<GripperGoal>) -> (ArmId, PostureShare) {
         let goal = queue.recv().await.expect("a gripper close");
         assert_eq!((goal.opening, goal.effort), (0.0, EffortCap::Kept));
         match goal.reply {
-            GripperReply::Close { side, share } => (side, share),
+            GripperReply::Close { arm, share } => (arm, share),
             GripperReply::MoveGripper(_) => panic!("a move_gripper goal, not a close"),
         }
     }
 
     /// The share of the arm move that `queue` holds, and its target.
-    async fn next_arm_move(queue: &mut mpsc::Receiver<Goal>) -> (JointPosture, PostureShare) {
+    async fn next_arm_move(queue: &mut mpsc::Receiver<Goal>) -> (JointVec, PostureShare) {
         match queue.recv().await.expect("an arm move") {
             Goal::Joint {
                 target,
@@ -674,25 +667,25 @@ mod tests {
     }
 
     /// Whether no goal waits on either queue.
-    fn both_empty<G>(queues: &mut ArmPair<mpsc::Receiver<G>>) -> bool {
-        Side::BOTH.into_iter().all(|side| {
+    fn both_empty<G>(queues: &mut PerArm<mpsc::Receiver<G>, ARMS>) -> bool {
+        PerArm::<(), ARMS>::ids().all(|arm| {
             matches!(
-                queues[side].try_recv(),
+                queues[arm].try_recv(),
                 Err(mpsc::error::TryRecvError::Empty)
             )
         })
     }
 
-    /// End the close of the gripper on each side with `outcome_of` its side,
+    /// End the close of the gripper on each arm with `outcome_of` its arm,
     /// once both closes are queued.
     async fn end_closes(
-        queues: &mut ArmPair<mpsc::Receiver<GripperGoal>>,
-        outcome_of: impl Fn(Side) -> Outcome,
+        queues: &mut PerArm<mpsc::Receiver<GripperGoal>, ARMS>,
+        outcome_of: impl Fn(ArmId) -> Outcome,
     ) {
-        for expected in Side::BOTH {
-            let (side, share) = next_close(&mut queues[expected]).await;
-            assert_eq!(side, expected);
-            share.report(side.gripper_name(), outcome_of(side)).await;
+        for expected in PerArm::<(), ARMS>::ids() {
+            let (arm, share) = next_close(&mut queues[expected]).await;
+            assert_eq!(arm, expected);
+            share.report(LIMBS.gripper_name(arm), outcome_of(arm)).await;
         }
     }
 
@@ -703,27 +696,28 @@ mod tests {
         let (arms, mut arm_queues) = limbs();
         let (grippers, mut gripper_queues) = limbs();
         assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
+        let home = postures(V2, states::HOME);
         let run = run_posture(
             "move_to_home",
             &Uncancelled,
             &arms,
             Some(&grippers),
-            openarm_description::home,
+            &home,
             Duration::ZERO,
         );
         let robot = async {
-            let (side, left_close) = next_close(&mut gripper_queues.left).await;
-            assert_eq!(side, Side::Left);
-            let (side, right_close) = next_close(&mut gripper_queues.right).await;
-            assert_eq!(side, Side::Right);
+            let (arm, left_close) = next_close(&mut gripper_queues[LEFT]).await;
+            assert_eq!(arm, LEFT);
+            let (arm, right_close) = next_close(&mut gripper_queues[RIGHT]).await;
+            assert_eq!(arm, RIGHT);
             left_close.report("left_gripper", Outcome::Complete).await;
             tokio::task::yield_now().await;
             assert!(both_empty(&mut arm_queues), "an arm moved ahead of a close");
             right_close.report("right_gripper", Outcome::Complete).await;
-            for side in Side::BOTH {
-                let (target, share) = next_arm_move(&mut arm_queues[side]).await;
-                assert_eq!(target, openarm_description::home(side));
-                share.report(side, Outcome::Complete).await;
+            for arm in PerArm::<(), ARMS>::ids() {
+                let (target, share) = next_arm_move(&mut arm_queues[arm]).await;
+                assert_eq!(target, postures(V2, states::HOME)[arm]);
+                share.report(LIMBS.arm_name(arm), Outcome::Complete).await;
             }
         };
         let (end, ()) = tokio::join!(run, robot);
@@ -735,41 +729,43 @@ mod tests {
     async fn a_goal_that_closes_no_gripper_moves_the_arms_at_once() {
         let (arms, mut arm_queues) = limbs();
         assert_eq!(admit(0.0, &arms, None), Ok(()));
+        let ready = postures(V2, states::READY);
         let run = run_posture(
             "move_to_ready",
             &Uncancelled,
             &arms,
             None,
-            openarm_description::ready,
+            &ready,
             Duration::ZERO,
         );
         let robot = async {
-            for side in Side::BOTH {
-                let (target, share) = next_arm_move(&mut arm_queues[side]).await;
-                assert_eq!(target, openarm_description::ready(side));
-                share.report(side, Outcome::Complete).await;
+            for arm in PerArm::<(), ARMS>::ids() {
+                let (target, share) = next_arm_move(&mut arm_queues[arm]).await;
+                assert_eq!(target, postures(V2, states::READY)[arm]);
+                share.report(LIMBS.arm_name(arm), Outcome::Complete).await;
             }
         };
         let (end, ()) = tokio::join!(run, robot);
         assert_eq!(end, PostureEnd::Completed);
     }
 
-    /// The end of a goal whose closes end with `outcome_of` their side, for
+    /// The end of a goal whose closes end with `outcome_of` their arm, for
     /// the cancel that `ctx` gives. The arms get no move, and the goal frees
     /// them.
     async fn end_of_a_close_that_ends(
         ctx: &impl PostureGoal,
-        outcome_of: impl Fn(Side) -> Outcome,
+        outcome_of: impl Fn(ArmId) -> Outcome,
     ) -> PostureEnd {
         let (arms, mut arm_queues) = limbs();
         let (grippers, mut gripper_queues) = limbs();
         assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
+        let home = postures(V2, states::HOME);
         let run = run_posture(
             "move_to_home",
             ctx,
             &arms,
             Some(&grippers),
-            openarm_description::home,
+            &home,
             Duration::ZERO,
         );
         let (end, ()) = tokio::join!(run, end_closes(&mut gripper_queues, outcome_of));
@@ -786,9 +782,12 @@ mod tests {
             FailureKind::ResourceUnavailable,
             "the follower stopped reporting",
         );
-        let outcome_of = |side| match side {
-            Side::Left => Outcome::Complete,
-            Side::Right => Outcome::Failed(stale.clone()),
+        let outcome_of = |arm| {
+            if arm == LEFT {
+                Outcome::Complete
+            } else {
+                Outcome::Failed(stale.clone())
+            }
         };
         assert_eq!(
             end_of_a_close_that_ends(&Uncancelled, outcome_of).await,
@@ -828,23 +827,24 @@ mod tests {
         let (arms, _arm_queues) = limbs();
         let (grippers, mut gripper_queues) = limbs();
         assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
+        let home = postures(V2, states::HOME);
         let run = run_posture(
             "move_to_home",
             &CancelledByCaller,
             &arms,
             Some(&grippers),
-            openarm_description::home,
+            &home,
             Duration::ZERO,
         );
         let robot = async {
-            for expected in Side::BOTH {
-                let (side, share) = next_close(&mut gripper_queues[expected]).await;
+            for expected in PerArm::<(), ARMS>::ids() {
+                let (arm, share) = next_close(&mut gripper_queues[expected]).await;
                 while share.cancel_reason().is_none() {
                     tokio::task::yield_now().await;
                 }
                 let reason = share.cancel_reason().expect("the cancel reached the close");
                 share
-                    .report(side.gripper_name(), Outcome::Cancelled(reason))
+                    .report(LIMBS.gripper_name(arm), Outcome::Cancelled(reason))
                     .await;
             }
         };
@@ -860,12 +860,13 @@ mod tests {
         let (grippers, gripper_queues) = limbs();
         drop(gripper_queues);
         assert_eq!(admit(0.0, &arms, Some(&grippers)), Ok(()));
+        let home = postures(V2, states::HOME);
         let end = run_posture(
             "move_to_home",
             &Uncancelled,
             &arms,
             Some(&grippers),
-            openarm_description::home,
+            &home,
             Duration::ZERO,
         )
         .await;
@@ -881,55 +882,16 @@ mod tests {
         assert_eq!(held(&arms), NONE_HELD);
     }
 
-    #[test]
-    fn both_postures_sit_inside_both_generations_joint_limits() {
-        // The planner sends postures unclamped, so an out-of-limit posture
-        // would reach the arms; this pin, against the same floored model the
-        // planner clamps with, is what stands in for a clamp. The description
-        // pins the same against its own floored joint_limits; this covers the
-        // srs_model arm actually used.
-        use openarm_description::{HardwareVersion, JointPosture, home, ready};
-        for version in [HardwareVersion::V1, HardwareVersion::V2] {
-            for side in Side::BOTH {
-                let model = bundled_arm(version, side);
-                let limits = model.limits();
-                let postures = [
-                    (
-                        "ready",
-                        ready as fn(openarm_description::Side) -> JointPosture,
-                    ),
-                    ("home", home),
-                ];
-                for (name, posture) in postures {
-                    let q_all = posture(side);
-                    for (j, (&q, limit)) in q_all.iter().zip(&limits).enumerate() {
-                        assert!(
-                            q >= limit.lo && q <= limit.hi,
-                            "{version:?} {} {name} j{}: {q} outside [{}, {}]",
-                            side,
-                            j + 1,
-                            limit.lo,
-                            limit.hi
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// A grasp pose that tells the arms apart. y is 0.2 m on the left and
     /// -0.2 m on the right. Each turns about z by its own y in radians.
-    fn grasp_of(side: Side) -> Isometry3<f64> {
-        let y = match side {
-            Side::Left => 0.2,
-            Side::Right => -0.2,
-        };
+    fn grasp_of(arm: ArmId) -> Isometry3<f64> {
+        let y = if arm == LEFT { 0.2 } else { -0.2 };
         Isometry3::new(Vector3::new(0.3, y, 0.25), Vector3::new(0.0, 0.0, y))
     }
 
     /// The coordinator's answer with each arm measured at [`grasp_of`].
     fn both_measured() -> GraspAnswer {
-        Ok(ArmPair::from_fn(|side| Ok(grasp_of(side))))
+        Ok(PerArm::from_fn(|arm| Ok(grasp_of(arm))))
     }
 
     /// An arm's share that failed with `kind` and `message`.
@@ -967,7 +929,7 @@ mod tests {
     fn a_failed_arm_fails_the_goal_with_its_failure() {
         let stale = Failure::new(
             FailureKind::ResourceUnavailable,
-            "right: the follower stopped reporting",
+            "right_arm: the follower stopped reporting",
         );
         let outcomes = [Outcome::Complete, Outcome::Failed(stale.clone())];
         assert_eq!(arms_end(2, &outcomes, None), PostureEnd::Failed(stale));
@@ -1020,17 +982,20 @@ mod tests {
     #[test]
     fn two_failures_report_the_first_received() {
         let outcomes = [
-            failed(FailureKind::AttemptFailed, "left: IK failed mid-trajectory"),
+            failed(
+                FailureKind::AttemptFailed,
+                "left_arm: IK failed mid-trajectory",
+            ),
             failed(
                 FailureKind::ResourceUnavailable,
-                "right: the follower stopped reporting",
+                "right_arm: the follower stopped reporting",
             ),
         ];
         assert_eq!(
             arms_end(2, &outcomes, None),
             PostureEnd::Failed(Failure::new(
                 FailureKind::AttemptFailed,
-                "left: IK failed mid-trajectory"
+                "left_arm: IK failed mid-trajectory"
             ))
         );
     }
@@ -1062,7 +1027,7 @@ mod tests {
             Outcome::Complete,
             failed(
                 FailureKind::AttemptFailed,
-                "right: IK failed mid-trajectory",
+                "right_arm: IK failed mid-trajectory",
             ),
         ];
         for outcomes in [&completed[..], &one_failed[..], &stopped_outcomes()[..]] {
@@ -1078,7 +1043,7 @@ mod tests {
     #[test]
     fn the_posture_poses_come_in_arm_name_order() {
         let poses = arm_poses(both_measured(), "move_to_ready");
-        let (positions, orientations) = arm_pose_arrays(&ArmPair::from_fn(grasp_of));
+        let (positions, orientations) = arm_pose_arrays(&PerArm::from_fn(grasp_of));
         assert_eq!(poses.arm_names, ["left_arm", "right_arm"]);
         assert_eq!(poses.positions, positions);
         assert_eq!(poses.orientations, orientations);
@@ -1101,17 +1066,14 @@ mod tests {
     fn an_arm_without_a_measured_pose_empties_the_posture_arrays() {
         let unmeasured = [
             (
-                Ok(ArmPair::new(
+                Ok(PerArm::new([
                     Err(Unmeasured::NotYet),
                     Err(Unmeasured::NotYet),
-                )),
+                ])),
                 "the robot has not measured every limb yet",
             ),
             (
-                Ok(ArmPair::new(
-                    Ok(grasp_of(Side::Left)),
-                    Err(Unmeasured::Stale),
-                )),
+                Ok(PerArm::new([Ok(grasp_of(LEFT)), Err(Unmeasured::Stale)])),
                 "right_arm stopped reporting its joints",
             ),
             (

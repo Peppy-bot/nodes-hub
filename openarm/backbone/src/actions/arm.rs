@@ -16,13 +16,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::robot::{ARMS, arm_in};
 use control_core::positive_finite::PositiveFinite;
 use control_core::serving;
-use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
 use peppylib::runtime::CancellationToken;
+use robot_description::{ArmId, PerArm};
+use srs_model::ARM_DOF;
 use srs_model::{JointVec, Limit, take_targets};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
@@ -72,7 +74,7 @@ fn arm_move_request(
     duration_s: f64,
 ) -> std::result::Result<ArmMoveRequest, String> {
     let goal_pose_has = |reason| format!("goal pose has {reason}");
-    let side = Side::from_arm_name(arm_name).map_err(|e| e.to_string())?;
+    let arm = arm_in("arm_name", arm_name)?;
     let position = position_from_wire(position).map_err(goal_pose_has)?;
     let orientation = orientation
         .map(orientation_from_wire)
@@ -80,7 +82,7 @@ fn arm_move_request(
         .map_err(goal_pose_has)?;
     let duration = move_seconds_from_wire("duration_s", duration_s)?;
     Ok(ArmMoveRequest {
-        side,
+        arm,
         position,
         orientation,
         duration,
@@ -111,7 +113,7 @@ fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGo
 /// arm's joint limits ([`take_targets`]), the duration, and the settle it
 /// asks for.
 struct JointMoveRequest {
-    side: Side,
+    arm: ArmId,
     target: JointVec,
     duration: Duration,
     settle: Settle<JointVec>,
@@ -119,21 +121,21 @@ struct JointMoveRequest {
 
 fn joint_move_request(
     d: &move_arm_joints::GoalRequestData,
-    limits: &ArmPair<[Limit; ARM_DOF]>,
+    limits: &PerArm<[Limit; ARM_DOF], ARMS>,
 ) -> std::result::Result<JointMoveRequest, String> {
-    let side = Side::from_arm_name(&d.arm_name).map_err(|e| e.to_string())?;
+    let arm = arm_in("arm_name", &d.arm_name)?;
     if !d.joint_positions.iter().all(|v| v.is_finite()) {
         return Err("non-finite joint target".to_string());
     }
     let duration = move_seconds_from_wire("duration_s", d.duration_s)?;
-    let target = take_targets(&limits[side], &d.joint_positions)
+    let target = take_targets(&limits[arm], &d.joint_positions)
         .map_err(|outside| format!("the target puts {outside}"))?;
     let settle = Settle {
         tolerance: joint_tolerances_from_wire(d.settle_tolerances_rad)?,
         timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
     };
     Ok(JointMoveRequest {
-        side,
+        arm,
         target,
         duration,
         settle,
@@ -144,11 +146,11 @@ fn joint_move_request(
 /// planner. The planner releases the move slot when the move ends.
 pub async fn run_move_arm_joints(
     runner: Arc<NodeRunner>,
-    goal_txs: ArmPair<mpsc::Sender<Goal>>,
-    move_slots: ArmPair<MoveSlot>,
-    fresh: ArmPair<Arc<AtomicBool>>,
-    activity: ArmPair<LeaderActivity>,
-    limits: ArmPair<[Limit; ARM_DOF]>,
+    goal_txs: PerArm<mpsc::Sender<Goal>, ARMS>,
+    move_slots: PerArm<MoveSlot, ARMS>,
+    fresh: PerArm<Arc<AtomicBool>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
+    limits: PerArm<[Limit; ARM_DOF], ARMS>,
 ) -> Result<()> {
     let mut handle = move_arm_joints::ActionHandle::expose(&runner).await?;
     loop {
@@ -157,8 +159,8 @@ pub async fn run_move_arm_joints(
                 let admitted = joint_move_request(&req.data, &limits)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|request| {
-                        let side = request.side;
-                        admit_limb(&fresh[side], &activity[side], &move_slots[side], &ARM_WORDS)
+                        let arm = request.arm;
+                        admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)
                     });
                 Ok(match admitted {
                     Ok(()) => move_arm_joints::GoalDecision::accept(),
@@ -169,8 +171,8 @@ pub async fn run_move_arm_joints(
         let Some(ctx) = accepted else { return Ok(()) };
         let request =
             joint_move_request(&ctx.request().data, &limits).expect("validated on accept");
-        let side = request.side;
-        if goal_txs[side]
+        let arm = request.arm;
+        if goal_txs[arm]
             .send(Goal::Joint {
                 target: request.target,
                 duration: request.duration,
@@ -182,7 +184,7 @@ pub async fn run_move_arm_joints(
             .await
             .is_err()
         {
-            move_slots[side].release();
+            move_slots[arm].release();
             error!("move_arm_joints: coordinator channel closed");
             return Ok(());
         }
@@ -193,10 +195,10 @@ pub async fn run_move_arm_joints(
 /// arm's planner, which plans IK along the path and runs it governed.
 pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
-    goal_txs: ArmPair<mpsc::Sender<Goal>>,
-    move_slots: ArmPair<MoveSlot>,
-    fresh: ArmPair<Arc<AtomicBool>>,
-    activity: ArmPair<LeaderActivity>,
+    goal_txs: PerArm<mpsc::Sender<Goal>, ARMS>,
+    move_slots: PerArm<MoveSlot, ARMS>,
+    fresh: PerArm<Arc<AtomicBool>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
 ) -> Result<()> {
     let mut handle = move_arm::ActionHandle::expose(&runner).await?;
     loop {
@@ -205,8 +207,8 @@ pub async fn run_move_arm(
                 let admitted = move_arm_goal(&req.data)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|goal| {
-                        let side = goal.request.side;
-                        admit_limb(&fresh[side], &activity[side], &move_slots[side], &ARM_WORDS)
+                        let arm = goal.request.arm;
+                        admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)
                     });
                 Ok(match admitted {
                     Ok(()) => move_arm::GoalDecision::accept(),
@@ -217,8 +219,8 @@ pub async fn run_move_arm(
         let Some(ctx) = accepted else { return Ok(()) };
         let MoveArmGoal { request, settle } =
             move_arm_goal(&ctx.request().data).expect("validated on accept");
-        let side = request.side;
-        if goal_txs[side]
+        let arm = request.arm;
+        if goal_txs[arm]
             .send(Goal::Cartesian {
                 request,
                 settle,
@@ -227,7 +229,7 @@ pub async fn run_move_arm(
             .await
             .is_err()
         {
-            move_slots[side].release();
+            move_slots[arm].release();
             error!("move_arm: coordinator channel closed");
             return Ok(());
         }
@@ -245,8 +247,8 @@ pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     token: CancellationToken,
     requests: mpsc::Sender<CoordinatorRequest>,
-    fresh: ArmPair<Arc<AtomicBool>>,
-    activity: ArmPair<LeaderActivity>,
+    fresh: PerArm<Arc<AtomicBool>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
 ) {
     serving::serve("check_arm_move", token.cancelled(), || {
         check_arm_move::handle_requests(&runner, |req| {
@@ -261,16 +263,16 @@ pub async fn run_check_arm_move(
 /// fields would get.
 fn check_plan(
     requests: &mpsc::Sender<CoordinatorRequest>,
-    fresh: &ArmPair<Arc<AtomicBool>>,
-    activity: &ArmPair<LeaderActivity>,
+    fresh: &PerArm<Arc<AtomicBool>, ARMS>,
+    activity: &PerArm<LeaderActivity, ARMS>,
     d: &check_arm_move::RequestData,
 ) -> std::result::Result<check_arm_move::Response, Failure> {
     let request = arm_move_request(&d.arm_name, d.position, d.orientation, d.duration_s)
         .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
-    let side = request.side;
+    let arm = request.arm;
     check_limb_free(
-        fresh[side].load(Ordering::Acquire),
-        activity[side].streaming(),
+        fresh[arm].load(Ordering::Acquire),
+        activity[arm].streaming(),
         &ARM_WORDS,
     )?;
     let (reply, answer) = oneshot::channel();
@@ -294,6 +296,11 @@ fn check_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use robot_description::states;
+    use srs_model::TARGET_SLACK;
+
+    use crate::robot::LIMBS;
+    use crate::test_support::{LEFT, V2, postures};
 
     use hegel::TestCase;
     use hegel::generators as gs;
@@ -319,35 +326,45 @@ mod tests {
         }
     }
 
-    /// An elbow measured a hair under its floor, as a world saved at Home
-    /// can hold it, is taken at its floor; one farther under it is refused
-    /// with the joint, its position and its limits.
+    /// An elbow measured a hair under its lower limit, as a world saved with
+    /// the arm straight can hold it, is taken at its limit; one farther under
+    /// it is refused with the joint, its position and its limits.
     #[test]
     fn a_joint_target_a_hair_outside_its_limits_is_taken_at_the_limit_and_one_farther_out_refused()
     {
-        let limits = ArmPair::from_fn(|side| {
-            crate::test_support::bundled_arm(openarm_description::HardwareVersion::V2, side)
-                .limits()
-        });
+        let limits = PerArm::from_fn(|arm| crate::test_support::bundled_arm(V2, arm).limits());
+        let elbow = limits[LEFT][3];
         let mut goal = move_arm_joints::GoalRequestData {
-            arm_name: "left_arm".to_string(),
-            joint_positions: openarm_description::home(Side::Left),
+            arm_name: LIMBS.arm_name(LEFT).to_string(),
+            joint_positions: postures(V2, states::HOME)[LEFT],
             duration_s: 1.0,
             settle_tolerances_rad: [0.01; ARM_DOF],
             settle_timeout_s: 1.0,
         };
-        goal.joint_positions[3] = 0.0489;
+        let farther_out = elbow.lo - 1.1 * TARGET_SLACK;
+        goal.joint_positions[3] = farther_out;
         assert_eq!(
-            joint_move_request(&goal, &limits).err().as_deref(),
-            Some("the target puts joint 4 at 0.0489 rad, outside its limits [0.05, 2.4435]")
+            joint_move_request(&goal, &limits).err(),
+            Some(format!(
+                "the target puts joint 4 at {farther_out} rad, outside its limits [{}, {}]",
+                elbow.lo, elbow.hi
+            ))
         );
-        for position in [0.0499925, 0.05, 0.0491] {
+        for position in [
+            elbow.lo - TARGET_SLACK / 2.0,
+            elbow.lo,
+            elbow.lo - 0.9 * TARGET_SLACK,
+        ] {
             goal.joint_positions[3] = position;
             let taken = joint_move_request(&goal, &limits).unwrap().target;
-            assert_eq!(taken[3], 0.05, "{position}");
+            assert_eq!(taken[3], elbow.lo, "{position}");
         }
-        goal.joint_positions[3] = 0.4;
-        assert_eq!(joint_move_request(&goal, &limits).unwrap().target[3], 0.4);
+        let inside = (elbow.lo + elbow.hi) / 2.0;
+        goal.joint_positions[3] = inside;
+        assert_eq!(
+            joint_move_request(&goal, &limits).unwrap().target[3],
+            inside
+        );
     }
 
     #[test]

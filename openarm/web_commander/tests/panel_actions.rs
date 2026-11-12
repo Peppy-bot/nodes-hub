@@ -6,20 +6,19 @@
 //! (= cancel with save), and result; Finish must call the recorder's
 //! finish_session service.
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
 use std::time::Duration;
 
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 use peppygen::mock::deps::limb_motion::{move_arm_joints, move_gripper};
 use peppygen::mock::deps::recorder::{finish_session, record_episode};
 
 const PANEL_PORT: u16 = 18634;
 
-/// Well inside the v2 URDF ranges (j2's range is only ±~0.17 rad, and j4 must
-/// sit above the elbow's singularity floor), so the panel's clamp passes them
+/// Inside the v2 left arm's URDF ranges, so the panel's clamp passes them
 /// through verbatim.
 const TARGET_JOINTS: [f64; 7] = [0.1, 0.1, -0.2, 0.9, 0.1, -0.1, 0.0];
 
@@ -34,14 +33,11 @@ const GRIPPER_SETTLE_TIMEOUT_S: f64 = 0.8;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
-    let (harness, mut mocks) = Harness::start_with(
-        Config {
-            parameters: Some(helpers::test_parameters(PANEL_PORT)),
-            recorder_instances: 1,
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (harness, mut mocks) = helpers::start(Config {
+        parameters: Some(helpers::test_parameters(PANEL_PORT)),
+        recorder_instances: 1,
+        ..Config::default()
+    })
     .await?;
 
     let mut ws = helpers::WsClient::connect(PANEL_PORT).await;
@@ -58,7 +54,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     // --- fire_arm -> move_arm_joints goal on the limb_motion producer --------
     let command = serde_json::json!({
         "cmd": "fire_arm",
-        "side": "left",
+        "arm": "left_arm",
         "joints": TARGET_JOINTS,
         "duration_s": 0.0,
         "settle_tolerance_rad": SETTLE_TOLERANCE_RAD,
@@ -97,7 +93,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     let active = pending.accept().await?;
 
     ws.snapshot_until(Duration::from_secs(10), "left move in flight", |s| {
-        s["left_arm"]["in_flight"] == true
+        helpers::arm(s, "left_arm")["arm"]["in_flight"] == true
     })
     .await;
 
@@ -109,10 +105,10 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
         })
         .await?;
     ws.snapshot_until(Duration::from_secs(15), "left move done", |s| {
-        s["left_arm"]["in_flight"] == false
+        helpers::arm(s, "left_arm")["arm"]["in_flight"] == false
             && s["status"]
                 .as_str()
-                .is_some_and(|t| t.contains("move_arm_joints (left): success"))
+                .is_some_and(|t| t.contains("move_arm_joints (left_arm): success"))
     })
     .await;
 
@@ -120,7 +116,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     ws.send_text(
         &serde_json::json!({
             "cmd": "fire_gripper",
-            "side": "left",
+            "arm": "left_arm",
             "position": GRIPPER_OPENING,
             "settle_timeout_s": GRIPPER_SETTLE_TIMEOUT_S,
         })
@@ -148,7 +144,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     ws.snapshot_until(
         Duration::from_secs(10),
         "left gripper move in flight",
-        |s| s["left_gripper"]["in_flight"] == true,
+        |s| helpers::arm(s, "left_arm")["gripper"]["in_flight"] == true,
     )
     .await;
     active
@@ -159,10 +155,10 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
         })
         .await?;
     ws.snapshot_until(Duration::from_secs(15), "left gripper move done", |s| {
-        s["left_gripper"]["in_flight"] == false
+        helpers::arm(s, "left_arm")["gripper"]["in_flight"] == false
             && s["status"]
                 .as_str()
-                .is_some_and(|t| t.contains("move_gripper (left): success"))
+                .is_some_and(|t| t.contains("move_gripper (left_gripper): success"))
     })
     .await;
 

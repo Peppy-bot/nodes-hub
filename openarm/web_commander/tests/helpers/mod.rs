@@ -1,9 +1,10 @@
-//! Shared plumbing for the integration tests: launch parameters and a minimal
-//! WebSocket client for the commander's real operator surface (the HTTP+WS
-//! panel). No WS client crate is in the node's dependency set, so this speaks
+//! Shared plumbing for the integration tests: launch parameters, the node's
+//! boot with its robot's initializer answering, and a minimal WebSocket
+//! client for the commander's real operator surface (the HTTP+WS panel). No
+//! WS client crate is in the node's dependency set, so this speaks
 //! just enough RFC 6455 for the panel's unfragmented text frames.
 //!
-//! NOTE: each test binary boots the node at most once. `ui::init_limits`
+//! NOTE: each test binary boots the node at most once. `limits::init_limits`
 //! asserts it runs exactly once per process, so a second `Harness::start` in
 //! the same binary would panic; every tests/*.rs file therefore holds exactly
 //! one booting test.
@@ -11,9 +12,17 @@
 
 use std::time::Duration;
 
-use peppygen::fixtures::harness::Harness;
+use control_core::fault::Fault;
+use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+/// The model of the tests' robot, as its initializer names it.
+pub const MODEL: &str = "openarm_v2";
+
+/// How long the robot's initializer mock waits for the node to ask for the
+/// robot's model.
+const IDENTITY_BUDGET: Duration = Duration::from_secs(30);
 
 /// How long one handshake attempt may take before it is retried.
 const HANDSHAKE_BUDGET: Duration = Duration::from_secs(5);
@@ -35,7 +44,6 @@ pub fn test_parameters(port: u16) -> peppygen::Parameters {
         command_rate_hz: 50,
         d_safe: 0.02,
         d_stop: 0.005,
-        hardware_version: "v2".to_string(),
         http_host: "127.0.0.1".to_string(),
         http_port: port,
         joint_jog_acceleration_rad_s2: 10.0,
@@ -226,6 +234,17 @@ impl WsClient {
     }
 }
 
+/// The snapshot's entry for the arm named `name`: the arm, its gripper, its
+/// deadman and its health. Null when the snapshot names no such arm, so a
+/// predicate over it reads false.
+pub fn arm<'a>(snapshot: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    static NO_ARM: serde_json::Value = serde_json::Value::Null;
+    snapshot["arms"]
+        .as_array()
+        .and_then(|arms| arms.iter().find(|entry| entry["name"] == name))
+        .unwrap_or(&NO_ARM)
+}
+
 /// Element-wise approximate equality for joint vectors crossing the wire.
 pub fn approx_eq(actual: &[f64], expected: &[f64]) -> bool {
     actual.len() == expected.len()
@@ -233,6 +252,44 @@ pub fn approx_eq(actual: &[f64], expected: &[f64]) -> bool {
             .iter()
             .zip(expected)
             .all(|(a, b)| (a - b).abs() < 1e-9)
+}
+
+/// Boots the node over the harness as `config` binds it, with the fault that
+/// ends it once its setup has returned. Nothing answers the node's ask for the
+/// robot's model.
+pub async fn boot(config: Config) -> peppygen::Result<(Harness, Mocks, Fault)> {
+    let fault = Fault::default();
+    let raised = fault.clone();
+    let (harness, mocks) = Harness::start_with(config, move |params, runner| {
+        openarm_web_commander::setup(params, runner, raised)
+    })
+    .await?;
+    Ok((harness, mocks, fault))
+}
+
+/// Answers the node's ask for the robot's model with `model`.
+pub async fn answer_identity(mocks: &Mocks, model: &str) -> peppygen::Result<()> {
+    use peppygen::mock::deps::robot_identity::get_identity::ResponseData;
+    mocks
+        .deps
+        .robot_identity
+        .get_identity
+        .next_request(IDENTITY_BUDGET)
+        .await?
+        .respond(ResponseData {
+            robot: "alpha".to_owned(),
+            model: model.to_owned(),
+            core_node: "harness".to_owned(),
+        })
+        .await
+}
+
+/// Boots the node over the harness as `config` binds it, its robot's
+/// initializer naming [`MODEL`].
+pub async fn start(config: Config) -> peppygen::Result<(Harness, Mocks)> {
+    let (harness, mocks, _fault) = boot(config).await?;
+    answer_identity(&mocks, MODEL).await?;
+    Ok((harness, mocks))
 }
 
 /// Waits for the node's `setup` to return, failing the test after

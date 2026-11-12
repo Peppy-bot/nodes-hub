@@ -18,17 +18,18 @@ use std::time::{Duration, Instant};
 
 use control_core::receiving::{Tagged, receive, tagged};
 use control_core::throttle::Throttle;
-use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::collision_ctrl::governor_control as collision_ctrl_governor_control;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
+use robot_description::{ArmId, PerArm};
 use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
+use crate::robot::{ARMS, LIMBS};
 use crate::types::pose_from_wire;
 use crate::upstream::Upstream;
 
@@ -70,7 +71,7 @@ pub struct GripperState {
 
 /// Parses one paired arm's inbound joint_states payload. This backbone drives
 /// fixed 7-joint arms whose followers always measure velocity, so a message
-/// must carry exactly [`openarm_description::ARM_DOF`] positions with matching velocities,
+/// must carry exactly [`ARM_DOF`] positions with matching velocities,
 /// all finite; the generic contract's empty-velocities form is deliberately
 /// rejected here rather than half-accepted.
 fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmState, &'static str> {
@@ -93,7 +94,7 @@ fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmSta
     })
 }
 
-/// Parses one commanded arm setpoint: exactly [`openarm_description::ARM_DOF`] finite
+/// Parses one commanded arm setpoint: exactly [`ARM_DOF`] finite
 /// positions. The wire's velocities and efforts are not parsed: the backbone
 /// plans its own velocity shaping over the governed position stream.
 fn parse_joint_command(positions: Vec<f64>) -> Result<Upstream, &'static str> {
@@ -147,6 +148,13 @@ fn parse_gripper_state(
         effort,
         max_effort,
     })
+}
+
+/// The arms the `left_*` and the `right_*` pairing slots serve, in that order:
+/// the first and the second arm, as the robot's limb names place `left_arm`
+/// and `right_arm`.
+fn slot_arms() -> [ArmId; ARMS] {
+    PerArm::from_fn(|arm| arm).into_array()
 }
 
 /// Subscribe both of a pairing's slots, naming the stream if either fails.
@@ -210,13 +218,13 @@ impl LeaderActivity {
     }
 }
 
-/// Receive a paired stream until `cancelled` resolves or either side's
-/// subscription closes, keeping the latest well-formed message per side:
-/// `next_message` selects over both sides' subscriptions, so whichever side
+/// Receive a paired stream until `cancelled` resolves or either arm's
+/// subscription closes, keeping the latest well-formed message per arm:
+/// `next_message` selects over both arms' subscriptions, so whichever arm
 /// delivers next wins and the other stays queued in its own subscription.
 ///
 /// This is the whole receive policy, in one place: a well-formed message
-/// replaces that side's latest and, on a leader's stream, notes the leader's
+/// replaces that arm's latest and, on a leader's stream, notes the leader's
 /// activity, and a malformed one is dropped with a throttled reason and
 /// drives no arm. Receive errors take control_core's receive policy. Each
 /// generated slot has its own message type and the subscriptions share no
@@ -224,24 +232,35 @@ impl LeaderActivity {
 async fn follow_pair<Raw, Parsed>(
     what: &'static str,
     cancelled: impl Future<Output = ()>,
-    next_message: impl AsyncFnMut() -> Result<Option<(Side, Raw)>, Tagged<Side, peppygen::Error>>,
+    mut next_message: impl AsyncFnMut() -> Result<Option<(ArmId, Raw)>, Tagged<ArmId, peppygen::Error>>,
     parse: impl Fn(Raw) -> Result<Parsed, &'static str>,
-    latest: ArmPair<watch::Sender<Option<Parsed>>>,
-    activity: Option<ArmPair<LeaderActivity>>,
+    latest: PerArm<watch::Sender<Option<Parsed>>, ARMS>,
+    activity: Option<PerArm<LeaderActivity, ARMS>>,
 ) {
     let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     let stream = what.to_owned();
-    receive(what, cancelled, next_message, async move |(side, raw)| {
+    let named_errors = async move || {
+        next_message()
+            .await
+            .map_err(|Tagged { tag, error }| Tagged {
+                tag: LIMBS.arm_name(tag),
+                error,
+            })
+    };
+    receive(what, cancelled, named_errors, async move |(arm, raw)| {
         match parse(raw) {
             Ok(parsed) => {
-                latest[side].send_replace(Some(parsed));
+                latest[arm].send_replace(Some(parsed));
                 if let Some(activity) = &activity {
-                    activity[side].note();
+                    activity[arm].note();
                 }
             }
             Err(reason) => {
                 if reject_warn.admit() {
-                    warn!("{stream}: dropping {side} message with {reason}");
+                    warn!(
+                        "{stream}: dropping {} message with {reason}",
+                        LIMBS.arm_name(arm)
+                    );
                 }
             }
         }
@@ -251,15 +270,16 @@ async fn follow_pair<Raw, Parsed>(
 }
 
 /// Receive both arms' upstream pose streams forever, keeping the latest
-/// well-formed pose per side. The Cartesian mirror of
+/// well-formed pose per arm. The Cartesian mirror of
 /// [`run_joint_command_listener`]; `upstream_mode` spawns exactly one of the
 /// two.
 pub async fn run_pose_command_listener(
     runner: Arc<NodeRunner>,
-    latest: ArmPair<watch::Sender<Option<Upstream>>>,
-    activity: ArmPair<LeaderActivity>,
+    latest: PerArm<watch::Sender<Option<Upstream>>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
 ) {
     const WHAT: &str = "upstream pose_setpoints";
+    let [left_arm, right_arm] = slot_arms();
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
         leader_left_arm_pose::pose_setpoints::subscribe(&runner),
@@ -273,8 +293,8 @@ pub async fn run_pose_command_listener(
         WHAT,
         runner.cancellation_token().cancelled(),
         async move || tokio::select! {
-            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
-            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
+            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
+            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
         },
         |(position, orientation)| parse_pose_command(position, orientation),
         latest,
@@ -285,15 +305,16 @@ pub async fn run_pose_command_listener(
 
 /// Receive both upstream arm setpoint streams forever (the leading node's
 /// joint_link command direction), keeping the latest well-formed message per
-/// side. The slot IS the side (a pairing delivers only its one peer), so there
+/// arm. The slot IS the arm (a pairing delivers only its one peer), so there
 /// is no id demux. Whichever slot delivers next wins the select; the other
-/// stays queued in its own subscription, so neither side can starve the other.
+/// stays queued in its own subscription, so neither arm can starve the other.
 pub async fn run_joint_command_listener(
     runner: Arc<NodeRunner>,
-    latest: ArmPair<watch::Sender<Option<Upstream>>>,
-    activity: ArmPair<LeaderActivity>,
+    latest: PerArm<watch::Sender<Option<Upstream>>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
 ) {
     const WHAT: &str = "upstream joint_setpoints";
+    let [left_arm, right_arm] = slot_arms();
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
         leader_left_arm::joint_setpoints::subscribe(&runner),
@@ -308,8 +329,8 @@ pub async fn run_joint_command_listener(
         runner.cancellation_token().cancelled(),
         async move || {
             tokio::select! {
-                r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| msg.positions))),
-                r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| msg.positions))),
+                r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| msg.positions))),
+                r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| msg.positions))),
             }
         },
         parse_joint_command,
@@ -320,14 +341,15 @@ pub async fn run_joint_command_listener(
 }
 
 /// Receive both upstream gripper setpoint streams forever, keeping the latest
-/// well-formed command per side. The 1-DOF mirror of
+/// well-formed command per arm. The 1-DOF mirror of
 /// [`run_joint_command_listener`].
 pub async fn run_gripper_command_listener(
     runner: Arc<NodeRunner>,
-    latest: ArmPair<watch::Sender<Option<GripperCommand>>>,
-    activity: ArmPair<LeaderActivity>,
+    latest: PerArm<watch::Sender<Option<GripperCommand>>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
 ) {
     const WHAT: &str = "upstream gripper_setpoints";
+    let [left_arm, right_arm] = slot_arms();
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
         leader_left_gripper::gripper_setpoints::subscribe(&runner),
@@ -341,8 +363,8 @@ pub async fn run_gripper_command_listener(
         WHAT,
         runner.cancellation_token().cancelled(),
         async move || tokio::select! {
-            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
-            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
+            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
+            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
         },
         |(opening, max_effort)| parse_gripper_command(opening, max_effort),
         latest,
@@ -352,15 +374,16 @@ pub async fn run_gripper_command_listener(
 }
 
 /// Receive both paired arms' measured state forever (the joint_link
-/// back-channel), keeping the latest per side. The governor anchors only on its
+/// back-channel), keeping the latest per arm. The governor anchors only on its
 /// exclusive command-loop peers: a stray broadcast producer cannot pose as an
 /// arm. Non-finite states are dropped so the coordinator never anchors a
 /// trajectory or a governor query on a bad measurement.
 pub async fn run_joint_state_listener(
     runner: Arc<NodeRunner>,
-    latest: ArmPair<watch::Sender<Option<ArmState>>>,
+    latest: PerArm<watch::Sender<Option<ArmState>>, ARMS>,
 ) {
     const WHAT: &str = "joint_states";
+    let [left_arm, right_arm] = slot_arms();
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
         left_arm::joint_states::subscribe(&runner),
@@ -374,8 +397,8 @@ pub async fn run_joint_state_listener(
         WHAT,
         runner.cancellation_token().cancelled(),
         async move || tokio::select! {
-            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
-            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
+            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
+            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
         },
         |(positions, velocities)| parse_joint_state(positions, velocities),
         latest,
@@ -385,14 +408,15 @@ pub async fn run_joint_state_listener(
 }
 
 /// Receive both paired grippers' measured aperture forever (the gripper_link
-/// back-channel), keeping the latest opening fraction per side. The collision
+/// back-channel), keeping the latest opening fraction per arm. The collision
 /// model reads finger positions only from these exclusive command-loop peers,
 /// so a stray broadcast producer cannot spoof the modeled fingers.
 pub async fn run_gripper_state_listener(
     runner: Arc<NodeRunner>,
-    latest: ArmPair<watch::Sender<Option<GripperState>>>,
+    latest: PerArm<watch::Sender<Option<GripperState>>, ARMS>,
 ) {
     const WHAT: &str = "gripper_states";
+    let [left_arm, right_arm] = slot_arms();
     let Some((mut left, mut right)) = subscribe_pair(
         WHAT,
         left_gripper::gripper_states::subscribe(&runner),
@@ -406,8 +430,8 @@ pub async fn run_gripper_state_listener(
         WHAT,
         runner.cancellation_token().cancelled(),
         async move || tokio::select! {
-            r = left.next() => tagged(Side::Left, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
-            r = right.next() => tagged(Side::Right, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
+            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
+            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
         },
         |(opening, effort, max_effort)| parse_gripper_state(opening, effort, max_effort),
         latest,
@@ -462,7 +486,7 @@ pub async fn run_governor_config_listener(
 mod tests {
     use super::*;
 
-    use openarm_description::ARM_DOF;
+    use srs_model::ARM_DOF;
     use srs_model::nalgebra::{Isometry3, Vector3};
 
     #[test]

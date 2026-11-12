@@ -1,8 +1,8 @@
 //! The boundary every consumed feed crosses: the shared consumer loops for
 //! owner-feedback topics (receive from a bound-set subscription, parse each
 //! message or drop it with a throttled warn, and forward the parsed feedback
-//! to the state owner; or receive a two-sided observed feed and forward each
-//! side's measurement), and the policy those loops and the alerts listener
+//! to the state owner; or receive a per-arm observed feed and forward each
+//! arm's measurement), and the policy those loops and the alerts listener
 //! judge a message by: how often a rejection warns, how long a report stays
 //! renderable, and which wire timestamps arrive already too old.
 
@@ -12,13 +12,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use control_core::receiving::{Tagged, receive, tagged};
 use control_core::throttle::Throttle;
-use openarm_description::Side;
 use peppylib::messaging::ProducerRef;
 use peppylib::runtime::CancellationToken;
+use robot_description::{ArmId, PerArm};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
 use crate::owner::Feedback;
+use crate::robot::ARMS;
 use crate::state::Validity;
 
 /// How often a listener may warn about a producer it is rejecting: enough to
@@ -115,11 +116,17 @@ pub async fn forward_parsed<M>(
     .await;
 }
 
-/// One slot of a two-sided observed feed: the name of the slot, for the log,
-/// and the side whose follower it observes.
+/// One slot of a per-arm observed feed: the name of the slot, for the log,
+/// and the arm whose follower it observes.
+#[derive(Clone, Copy)]
 pub struct ObservedSlot {
     pub name: &'static str,
-    pub side: Side,
+    pub arm: ArmId,
+}
+
+/// The observed slots of a per-arm feed, from each arm's slot name in place order.
+pub fn observed_slots(names: PerArm<&'static str, ARMS>) -> PerArm<ObservedSlot, ARMS> {
+    names.map(|arm, name| ObservedSlot { name, arm })
 }
 
 impl fmt::Display for ObservedSlot {
@@ -128,12 +135,12 @@ impl fmt::Display for ObservedSlot {
     }
 }
 
-/// One receive of a two-sided observed feed: a message with its slot, `None`
+/// One receive of a per-arm observed feed: a message with its slot, `None`
 /// once a slot's observation closes, or a receive error tagged with its slot.
 pub type ObservedReceive<M> =
     Result<Option<(ObservedSlot, M)>, Tagged<ObservedSlot, Box<peppygen::Error>>>;
 
-/// One receive on `slot`'s subscription of a two-sided observed feed, tagged
+/// One receive on `slot`'s subscription of a per-arm observed feed, tagged
 /// with the slot through [`tagged`]. A closed observation is logged with
 /// `closed`, the words that name what stops, and ends the feed.
 pub fn observed<M>(
@@ -147,11 +154,11 @@ pub fn observed<M>(
     tagged(slot, received.map_err(Box::new))
 }
 
-/// Report a two-sided observed feed to the owner until `token` cancels,
-/// either slot's observation closes, or the owner is gone: `next_message`
-/// selects over both slots' subscriptions through [`observed`], so whichever
-/// slot delivers next wins and the other stays queued in its own
-/// subscription, and `to_feedback` turns one slot's message into owner
+/// Report a per-arm observed feed to the owner until `token` cancels,
+/// any slot's observation closes, or the owner is gone: `next_message`
+/// selects over every slot's subscription through [`observed`], so whichever
+/// slot delivers next wins and the others stay queued in their own
+/// subscriptions, and `to_feedback` turns one slot's message into owner
 /// feedback, or drops it with its own warning.
 pub async fn forward_observed<M>(
     topic: &'static str,
@@ -184,10 +191,11 @@ pub fn forwarded(sent: Result<(), mpsc::error::SendError<Feedback>>) -> ControlF
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support;
 
     const LEFT: ObservedSlot = ObservedSlot {
         name: "observed_left_arm",
-        side: Side::Left,
+        arm: test_support::LEFT,
     };
 
     /// The error of a receive whose message did not decode.
@@ -209,13 +217,13 @@ mod tests {
             panic!("the message comes through");
         };
         assert_eq!(
-            (slot.name, slot.side, message),
-            ("observed_left_arm", Side::Left, 7)
+            (slot.name, slot.arm, message),
+            ("observed_left_arm", test_support::LEFT, 7)
         );
         let Err(error) = observed::<()>(LEFT, "observation closed", Err(receive_error())) else {
             panic!("the error comes through");
         };
-        assert_eq!(error.tag.side, Side::Left);
+        assert_eq!(error.tag.arm, test_support::LEFT);
         assert_eq!(
             error.to_string(),
             format!("observed_left_arm: {}", receive_error())

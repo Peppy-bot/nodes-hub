@@ -22,7 +22,8 @@
       // waypoints (started by the coordinator, each arm's planner playing the
       // path on its own clock, the two at one pace), one gripper to an
       // opening (run by the coordinator). arm_name and gripper_name address
-      // the side: left_arm / right_arm and left_gripper / right_gripper.
+      // the limb by the name the robot's description gives it, which names its
+      // pairing slots below: left_arm / right_arm and left_gripper / right_gripper.
       { name: "limb_motion", tag: "v1", link_id: "limb_motion" },
       // The governor proximity readout, published for any consumer that
       // binds the capability (the panel's readout, an MCP resource).
@@ -46,6 +47,15 @@
     depends_on: {
       contracts: [
         { name: "robot_ready", tag: "v1", link_id: "robot_init" },
+        // The robot's model, whose bundled description (URDF and SRDF) the arm
+        // models, the self-collision model and the camera mounts are built from,
+        // and the Ready and Home postures the posture moves go to come from. The
+        // backbone asks for it once its setup has returned, until the initializer
+        // answers, and holds the digest of the description the initializer serves
+        // to the one it was built with. A model whose arms are not left_arm and
+        // right_arm of seven joints, each with its gripper, ends the node naming
+        // the models that are.
+        { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
         // Runtime governor controls: an optional backbone feature, since not
         // every leader can produce them. A vacant slot leaves the launch-time
         // band standing.
@@ -77,20 +87,20 @@
         // role, streams the governed joint setpoint down each slot's
         // joint_setpoints, and reads that arm's measured state back on the slot's
         // joint_states (the governor's d_now and the trajectory anchor); the slot
-        // scopes both directions, so no per-side demux and no other producer can
+        // scopes both directions, so no per-limb demux and no other producer can
         // drive an arm or pose as its state. Optional like the gripper slots
         // below, established at this instance's start (launcher `links:`).
         // Each downstream slot takes its limb's own name, the one the robot
         // answers to in limb_motion and limb_state: a simulation engine learns
-        // which limb a pair drives from the name of the link on this side.
+        // which limb a pair drives from the name of the link on this end.
         { name: "joint_link", tag: "v1", role: "leader", link_id: "left_arm", cardinality: "zero_or_one" },
         { name: "joint_link", tag: "v1", role: "leader", link_id: "right_arm", cardinality: "zero_or_one" },
         // The exclusive command loop with each gripper: the backbone plays the
         // leader role, streams the governed opening down each slot's
         // gripper_setpoints, and reads that gripper's measured aperture back on
         // the slot's gripper_states; the slot scopes both directions, so no
-        // per-side demux and no other producer can pose as the fingers.
-        // Optional: the backbone boots with either gripper unpaired (that side's
+        // per-limb demux and no other producer can pose as the fingers.
+        // Optional: the backbone boots with either gripper unpaired (that gripper's
         // governed openings go nowhere and no aperture arrives, so streaming
         // stays gated) and each pair is established at this instance's start
         // (launcher `links:`).
@@ -102,7 +112,7 @@
   interfaces: {
     actions: {
       // The backbone's move actions: the per-arm and gripper moves are
-      // addressed by side name, the posture moves take the whole robot. The
+      // addressed by limb name, the posture moves take the whole robot. The
       // backbone runs each move itself (trajectory + governor + governed
       // stream); progress is observed on the state streams. Discrete goals
       // that return a result, distinct from the streamed setpoints on the
@@ -191,7 +201,7 @@
         { link_id: "left_gripper", name: "gripper_states" },
         { link_id: "right_gripper", name: "gripper_states" },
         // The leading node's raw setpoints, one slot per limb (the slot is
-        // the side, so no id demux). Only the kind `upstream_mode` names is
+        // the limb, so no id demux). Only the kind `upstream_mode` names is
         // subscribed.
         { link_id: "leader_left_arm", name: "joint_setpoints" },
         { link_id: "leader_right_arm", name: "joint_setpoints" },
@@ -227,6 +237,8 @@
       ],
       consumes: [
         { link_id: "robot_init", name: "is_ready" },
+        { link_id: "robot_identity", name: "get_identity" },
+        { link_id: "robot_identity", name: "get_description" },
         // The perception camera's field of view, depth model and depth
         // range, asked at each workspace request when a camera is linked.
         { link_id: "perception_geometry", name: "get_color_intrinsics" },
@@ -240,11 +252,6 @@
       def_file: "apptainer.def"
     },
     parameters: {
-      // Which OpenArm hardware generation the arms are: "v1" or "v2". Selects the embedded
-      // description (openarm_description) the srs_model arms and the self-collision
-      // model, its torso regions included, are built from. The wrong generation
-      // mis-models the arms, so the launcher says which.
-      hardware_version: "string",
       // Which upstream command kind this instance follows: "joints"
       // (joint_link: panel, KER) or "pose" (pose_link: a Cartesian leader).
       // Only the named kind is subscribed; a leader linked to the other kind
@@ -266,12 +273,8 @@
       // ramps linearly. Separating motion is never throttled (recovery from a
       // tangle is always allowed). Require 0 < d_stop_m < d_safe_m. The collision
       // model was validated against the launchers' values, so an approach throttles
-      // within d_safe_m. With those values:
-      // - On v1, the home pose sits outside the band, so it is unthrottled.
-      // - On v2 with both grippers fully open, the jaws at home sit under d_stop_m
-      //   against the torso, and the governor holds both arms short of home.
-      //   move_to_home closes the grippers before the arms move (README,
-      //   "Actions"), so the jaws leave the band first.
+      // within d_safe_m. With those values the home pose sits outside the band on
+      // v1 and on v2, the grippers at any opening, so it is unthrottled.
       d_stop_m: "f64",
       d_safe_m: "f64",
       // Governor state at launch, before the first governor_control message.

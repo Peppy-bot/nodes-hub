@@ -265,7 +265,7 @@ mod tests {
     use control_core::motor_health::HealthLevel;
     use openarm_can::MotorStatus;
 
-    /// DM4310 datasheet figures, the gripper motor on both hardware versions.
+    /// DM4310 datasheet figures, the gripper motor of both models.
     fn datasheet_ratings() -> Ratings {
         Ratings::new(3.0, 7.0).expect("datasheet figures are valid")
     }

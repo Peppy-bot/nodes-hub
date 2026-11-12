@@ -16,19 +16,13 @@ use control_core::motor_health::{
 use control_core::pacer::Pacer;
 use control_core::throttle::Throttle;
 use control_core::time;
-use openarm_can::{ArmCan, ArmState, EffectiveRatings, MotorParam};
-use openarm_description::ARM_DOF;
+use openarm_can::{ARM_DOF, ArmCan, ArmState, EffectiveRatings, MotorParam};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::alerts::alerts as alerts_topic;
 use peppygen::emitted_topics::motor_health::motor_health;
 use peppylib::runtime::CancellationToken;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
-
-/// `ARM_MOTOR_TYPES` below is indexed by this crate's joint numbering; the two
-/// crates declare their DOF independently, so a skew would be an
-/// out-of-bounds panic mid-bring-up rather than a compile error without this.
-const _: () = assert!(openarm_can::ARM_MOTOR_TYPES.len() == ARM_DOF);
 
 /// Axes whose motor reports a full scale the decode table disagrees with.
 ///

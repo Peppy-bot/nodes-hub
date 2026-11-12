@@ -4,7 +4,7 @@
 //! The announcement is what the daemon turns into the URLs an operator opens,
 //! so this test reads the panel's address the way the daemon does.
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use peppygen::NodeRunner;
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 use tokio::net::TcpListener;
 
 /// The node's log, captured in memory.
@@ -86,13 +86,10 @@ async fn a_held_panel_port_moves_the_panel_and_the_log_says_where() -> peppygen:
 
     // The launch names the held port. Booting at all is the first assertion:
     // the node binds during setup, so a port it cannot take would refuse here.
-    let (harness, _mocks) = Harness::start_with(
-        Config {
-            parameters: Some(helpers::test_parameters(taken.port())),
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (harness, _mocks) = helpers::start(Config {
+        parameters: Some(helpers::test_parameters(taken.port())),
+        ..Config::default()
+    })
     .await?;
 
     let bound = await_announcement(harness.node_runner()).await;
@@ -124,7 +121,7 @@ async fn a_held_panel_port_moves_the_panel_and_the_log_says_where() -> peppygen:
     let snapshot = ws
         .next_snapshot(Duration::from_secs(10), "snapshot from the moved panel")
         .await;
-    assert_eq!(snapshot["left_enabled"], false);
+    assert_eq!(helpers::arm(&snapshot, "left_arm")["enabled"], false);
     assert_eq!(snapshot["health"]["bound"], false);
 
     // The holder kept its port throughout.

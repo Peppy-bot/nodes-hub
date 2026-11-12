@@ -200,7 +200,7 @@ async fn preempt_signal(preempt: Option<&GoalToken>) {
 }
 
 /// Whether the goal succeeded, and the status line naming `action` on the
-/// `label` side: every line opens with `{action} ({label})`, `completed`
+/// limb named `label`: every line opens with `{action} ({label})`, `completed`
 /// words a success after `: `, and the rest share one wording.
 pub fn summarize<D>(
     action: &str,

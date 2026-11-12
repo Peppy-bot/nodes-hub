@@ -241,10 +241,10 @@ mod tests {
 
     #[test]
     fn a_well_formed_set_parses_including_an_empty_one() {
-        let parsed = parse(vec![item("left arm j2", 2), item("left arm j5", 1)]);
+        let parsed = parse(vec![item("left_arm j2", 2), item("left_arm j5", 1)]);
         assert!(parsed.refused.is_none());
         assert_eq!(parsed.set.alerts.len(), 2);
-        assert_eq!(parsed.set.alerts[0].source, "left arm j2");
+        assert_eq!(parsed.set.alerts[0].source, "left_arm j2");
         assert_eq!(parsed.set.alerts[0].severity, AlertSeverity::Critical);
         assert_eq!(parsed.set.alerts[1].severity, AlertSeverity::Warning);
         assert!(parse(Vec::new()).set.alerts.is_empty());
@@ -252,9 +252,9 @@ mod tests {
 
     #[test]
     fn two_kinds_on_one_source_both_parse() {
-        let mut other = item("left arm j2", 1);
+        let mut other = item("left_arm j2", 1);
         other.kind = "encoder".to_string();
-        let parsed = parse(vec![item("left arm j2", 2), other]);
+        let parsed = parse(vec![item("left_arm j2", 2), other]);
         assert!(parsed.refused.is_none(), "{:?}", parsed.refused);
         assert_eq!(parsed.set.alerts.len(), 2, "identity is (source, kind)");
     }
@@ -263,24 +263,24 @@ mod tests {
     fn a_bad_entry_is_dropped_and_the_rest_of_the_set_stands() {
         // A producer's one bad entry must not blank the motors it reported
         // correctly: the operator needs the fault that is real.
-        for bad in [item("", 3), item("left arm j9", 0), item("left arm j9", 4)] {
-            let parsed = parse(vec![bad, item("left arm j5", 3)]);
+        for bad in [item("", 3), item("left_arm j9", 0), item("left_arm j9", 4)] {
+            let parsed = parse(vec![bad, item("left_arm j5", 3)]);
             assert!(parsed.refused.is_some(), "the entry is reported");
             assert_eq!(parsed.set.alerts.len(), 1, "the good entry stands");
-            assert_eq!(parsed.set.alerts[0].source, "left arm j5");
+            assert_eq!(parsed.set.alerts[0].source, "left_arm j5");
         }
-        let mut no_kind = item("left arm j9", 3);
+        let mut no_kind = item("left_arm j9", 3);
         no_kind.kind = String::new();
-        let parsed = parse(vec![no_kind, item("left arm j5", 3)]);
+        let parsed = parse(vec![no_kind, item("left_arm j5", 3)]);
         assert!(parsed.refused.is_some());
         assert_eq!(parsed.set.alerts.len(), 1);
     }
 
     #[test]
     fn a_repeated_identity_keeps_the_first_entry() {
-        let mut second = item("left arm j2", 1);
+        let mut second = item("left_arm j2", 1);
         second.message = "later".to_string();
-        let parsed = parse(vec![item("left arm j2", 2), second]);
+        let parsed = parse(vec![item("left_arm j2", 2), second]);
         assert!(parsed.refused.is_some());
         assert_eq!(parsed.set.alerts.len(), 1);
         assert_eq!(
@@ -333,7 +333,7 @@ mod tests {
         let clock_now = SystemTime::now();
         let msg = alerts::Message {
             timestamp: clock_now - ALERT_STALE_AFTER - Duration::from_secs(1),
-            active: vec![item("left arm j2", 2)],
+            active: vec![item("left_arm j2", 2)],
         };
         assert!(parse_alert_set(&msg, clock_now, Instant::now()).is_err());
     }

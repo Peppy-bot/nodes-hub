@@ -397,7 +397,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "camera_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "libc",
 ]
@@ -467,7 +467,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -561,7 +561,7 @@ dependencies = [
 [[package]]
 name = "collision_geometry"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
@@ -622,7 +622,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2497,9 +2497,9 @@ dependencies = [
  "camera_core",
  "control_core",
  "hegeltest",
- "openarm_description",
  "peppygen",
  "peppylib",
+ "robot_description",
  "self_collision_model",
  "srs_model",
  "tempfile",
@@ -2507,17 +2507,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "urdf-rs",
  "workspace_core",
-]
-
-[[package]]
-name = "openarm_description"
-version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
-dependencies = [
- "srs_model",
- "urdf-rs",
 ]
 
 [[package]]
@@ -3264,6 +3254,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "robot_description"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
+dependencies = [
+ "chain_kinematics",
+ "roxmltree",
+ "sha2",
+ "thiserror 2.0.21",
+ "urdf-rs",
+]
+
+[[package]]
 name = "ron"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3274,6 +3276,15 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -3538,14 +3549,12 @@ dependencies = [
 [[package]]
 name = "self_collision_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "chain_kinematics",
  "collision_geometry",
- "openarm_description",
- "so101_description",
+ "robot_description",
  "thiserror 2.0.21",
- "urdf-rs",
 ]
 
 [[package]]
@@ -3840,14 +3849,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 
 [[package]]
-name = "so101_description"
-version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
-dependencies = [
- "urdf-rs",
-]
-
-[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3895,10 +3896,11 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
+ "robot_description",
  "thiserror 2.0.21",
  "urdf-rs",
 ]
@@ -5008,9 +5010,12 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "workspace_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#715c69ef22e5bd9ffa0fb96e0f70999d10cfc3b7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#1c80539a6b88f0f1566d3d7614f71ada8be9fcb1"
 dependencies = [
  "camera_core",
+ "collision_geometry",
+ "robot_description",
+ "self_collision_model",
  "thiserror 2.0.21",
 ]
 

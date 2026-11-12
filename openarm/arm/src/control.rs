@@ -15,13 +15,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use openarm_description::ARM_DOF;
 use peppygen::NodeRunner;
 use peppylib::runtime::CancellationToken;
 use srs_model::{JointVec, Limit};
 use tokio::sync::oneshot;
 use tracing::{error, info};
 
+use control_core::fault::Fault;
 use control_core::motor_health::{NOT_DRIVING_ESCALATE_AFTER, Ratings};
 use control_core::pacer::Pacer;
 use control_core::sync::lock_ignoring_poison;
@@ -31,11 +31,10 @@ use crate::drive;
 use crate::friction;
 use crate::health::Monitor;
 use crate::stream::{GovernedSetpoint, MeasuredState, StreamWiring};
-use openarm_can::{ArmCan, CanErrorThrottle, ReceivePass};
+use openarm_can::{ARM_DOF, ArmCan, CanErrorThrottle, ReceivePass};
 
-/// Set when the loop stops on a hard fault, so main can exit non-zero after
-/// the shutdown hooks have run and the daemon records the instance as failed
-/// rather than finished.
+/// Set when the loop stops on a hard fault: is_ready answers not ready from then
+/// on, while the fault the loop raises ends the node.
 pub static HARD_FAULT: AtomicBool = AtomicBool::new(false);
 
 const CONTEXT: &str = "arm control";
@@ -57,7 +56,7 @@ pub struct ControlConfig {
     pub kp: JointVec,
     pub kd: JointVec,
     pub cycle_period: Duration,
-    /// This hardware generation's friction constants.
+    /// The friction constants of the arm's model.
     pub friction: friction::Params,
     /// Joint position limits, parsed from the URDF, the final guard clamp applied
     /// to every governed setpoint before it reaches the motors.
@@ -68,12 +67,21 @@ pub struct ControlConfig {
     pub ratings: [Ratings; ARM_DOF],
 }
 
+/// How the control loop reports to the node: `started` once the loop runs,
+/// `stopped` once a stop has disabled the motors, and `fault` for a hard fault,
+/// which ends the node.
+pub struct Signals {
+    pub started: oneshot::Sender<()>,
+    pub stopped: oneshot::Sender<()>,
+    pub fault: Fault,
+}
+
 /// Spawn the arm's control and supervise it. `run_control` is the sole motor
 /// writer, so a fire-and-forget spawn would let a panic pass unobserved, leaving
 /// the node up with the motors uncontrolled and no control loop. The supervisor
 /// watches the control task and, if it ever stops, cancels the node so it restarts
-/// under supervision instead of serving blind. `shutdown_tx` is signalled once a
-/// clean stop has disabled the motors, so the shutdown hook in `node` can then
+/// under supervision instead of serving blind. `signals.stopped` is signalled once
+/// a clean stop has disabled the motors, so the shutdown hook in `node` can then
 /// release the lock.
 pub fn spawn(
     runner: &NodeRunner,
@@ -81,20 +89,19 @@ pub fn spawn(
     cfg: ControlConfig,
     model: srs_model::Arm,
     wiring: StreamWiring,
-    shutdown_tx: oneshot::Sender<()>,
-    started_tx: oneshot::Sender<()>,
+    signals: Signals,
 ) {
     let token = runner.cancellation_token().clone();
+    let fault = signals.fault.clone();
     let control = tokio::spawn(run_control(
         arm.clone(),
         cfg,
         model,
         wiring,
         token.clone(),
-        shutdown_tx,
-        started_tx,
+        signals,
     ));
-    tokio::spawn(supervise(control, arm, token));
+    tokio::spawn(supervise(control, arm, token, fault));
 }
 
 /// Watch the sole motor-writer task. A clean stop returns `Ok` after the loop has
@@ -106,11 +113,15 @@ async fn supervise(
     control: tokio::task::JoinHandle<()>,
     arm: Arc<Mutex<ArmCan>>,
     token: CancellationToken,
+    fault: Fault,
 ) {
     if let Err(join_error) = control.await {
         error!(%join_error, "control loop terminated unexpectedly; disabling motors");
         disable_motors(&arm);
         HARD_FAULT.store(true, Ordering::SeqCst);
+        fault.raise(format!("the control loop terminated: {join_error}"), || {
+            token.cancel()
+        });
     }
     token.cancel();
 }
@@ -120,18 +131,22 @@ async fn supervise(
 /// the feedforward at that setpoint's velocity, holding the measured pose until the
 /// first governed setpoint arrives or whenever the stream is empty, and the setpoint's
 /// position once its stream goes silent. On cancellation it disables the motors and
-/// signals `shutdown_tx`.
+/// signals `signals.stopped`.
 async fn run_control(
     arm: Arc<Mutex<ArmCan>>,
     cfg: ControlConfig,
     model: srs_model::Arm,
     wiring: StreamWiring,
     token: CancellationToken,
-    shutdown_tx: oneshot::Sender<()>,
-    started_tx: oneshot::Sender<()>,
+    signals: Signals,
 ) {
+    let Signals {
+        started,
+        stopped,
+        fault,
+    } = signals;
     let mut pacer =
-        Pacer::new(cfg.cycle_period).expect("parse_config's period_from_hz refuses a zero period");
+        Pacer::new(cfg.cycle_period).expect("parse_launch's period_from_hz refuses a zero period");
     let receive = ReceivePass::new(cfg.cycle_period);
     let mut can_errors = CanErrorThrottle::new(cfg.cycle_period);
     let mut monitor = Monitor::new(cfg.ratings, cfg.cycle_period);
@@ -143,7 +158,7 @@ async fn run_control(
     if token.is_cancelled() {
         return;
     }
-    let _ = started_tx.send(());
+    let _ = started.send(());
     loop {
         let (state, read) = read_state(&arm, receive);
         let (q, qdot) = (state.positions, state.velocities);
@@ -169,9 +184,8 @@ async fn run_control(
                 // node without commanding this tick. The post-loop path below
                 // disables the motors, and is_ready drops via the HARD_FAULT
                 // latch.
-                error!("{reason}; stopping node");
                 HARD_FAULT.store(true, Ordering::SeqCst);
-                token.cancel();
+                fault.raise(format!("{reason}; stopping node"), || token.cancel());
                 break;
             }
         }
@@ -209,7 +223,7 @@ async fn run_control(
     // aware park is the backbone's responsibility (it sees both arms); the arm on its own
     // must not drive to a fixed pose, because a collision-blind straight joint path
     // could command the two arms into each other. The shutdown hook in `node`
-    // awaits `shutdown_tx` so the lock is released only after the motors are off.
+    // awaits `stopped` so the lock is released only after the motors are off.
     info!("control loop stopping: disabling motors");
     disable_motors(&arm);
     tokio::time::sleep(POST_DISABLE_SLEEP).await;
@@ -221,7 +235,7 @@ async fn run_control(
     }
     // A dropped receiver (the shutdown hook in `node` has exited) is fine;
     // nothing to do.
-    let _ = shutdown_tx.send(());
+    let _ = stopped.send(());
     info!("control loop stopped (motors disabled)");
 }
 
@@ -367,16 +381,18 @@ fn read_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openarm_description::{HardwareVersion, Side};
 
     /// A posture of the v2 right arm, bent at the elbow and inside its limits.
     const POSE: JointVec = [0.15, 0.4, -0.48, 0.95, 0.1, 0.1, 0.1];
     /// A commanded velocity on every joint.
     const DQ: JointVec = [0.3, -0.2, 0.25, 0.4, -0.5, 0.2, 0.1];
 
+    /// The v2's right arm, the second of its description.
     fn v2_arm() -> srs_model::Arm {
-        HardwareVersion::V2
-            .arm_model(Side::Right)
+        let description = robot_description::model("openarm_v2")
+            .expect("a bundled model")
+            .description();
+        srs_model::Arm::from_description(&description, &description.arms()[1])
             .expect("build the arm from the bundled URDF")
     }
 
@@ -389,8 +405,14 @@ mod tests {
         }
     }
 
+    /// The friction constants of the arms of `model`.
+    fn friction_of(model: &str) -> friction::Params {
+        let (_, friction) = friction::DRIVEN_MODELS.model(model).expect("driven");
+        friction
+    }
+
     fn v2_friction() -> friction::Params {
-        friction::params(HardwareVersion::V2)
+        friction_of("openarm_v2")
     }
 
     /// Gravity at `q`, with Coriolis and v2's friction at `dq`.
@@ -424,26 +446,23 @@ mod tests {
     }
 
     #[test]
-    fn a_tick_feeds_the_friction_of_its_generation() {
+    fn a_tick_feeds_the_friction_of_its_model() {
         let model = v2_arm();
         let limits = model.limits();
         let setpoint = arrived(POSE, DQ);
         let tick_with = |version| {
             tick_command(
                 &model,
-                &friction::params(version),
+                &friction_of(version),
                 &POSE,
                 Some(setpoint),
                 &limits,
                 setpoint.received,
             )
         };
-        let v1 = friction::torques(&friction::params(HardwareVersion::V1), &DQ);
+        let v1 = friction::torques(&friction_of("openarm_v1"), &DQ);
         let v2 = friction::torques(&v2_friction(), &DQ);
-        let (from_v1, from_v2) = (
-            tick_with(HardwareVersion::V1),
-            tick_with(HardwareVersion::V2),
-        );
+        let (from_v1, from_v2) = (tick_with("openarm_v1"), tick_with("openarm_v2"));
         for i in 0..ARM_DOF {
             let difference = from_v2.ff_tau[i] - from_v1.ff_tau[i];
             assert!((difference - (v2[i] - v1[i])).abs() < 1e-12, "joint {i}");

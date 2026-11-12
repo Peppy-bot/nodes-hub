@@ -6,7 +6,7 @@ use std::f64::consts::PI;
 use std::time::Duration;
 
 use control_core::filters::ButterworthFilter;
-use openarm_description::ARM_DOF;
+use srs_model::ARM_DOF;
 use srs_model::JointVec;
 
 /// MoveIt Servo's default first-order low-pass coefficient

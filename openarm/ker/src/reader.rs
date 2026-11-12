@@ -8,15 +8,15 @@
 //! checksums, silence) clears the sample, backs off and reconnects.
 //!
 //! One EngageLatch per session is constructed here: the four publish tasks all
-//! read the engagement it folds into each sample, so a side's arm and gripper
+//! read the engagement it folds into each sample, so an arm and its gripper
 //! always agree. The policy itself lives in engage.
 
 use std::time::{Duration, Instant};
 
 use control_core::report_once::ReportOnce;
 use control_core::time::block_until_unless_cancelled;
-use openarm_description::{ARM_DOF, ArmPair, HardwareVersion};
 use peppylib::runtime::CancellationToken;
+use robot_description::PerArm;
 use tokio::sync::{oneshot, watch};
 use tracing::{error, info, warn};
 
@@ -25,6 +25,7 @@ use crate::mapping::{ChannelMap, GripperOpenFraction, MappedFrame};
 use crate::protocol::{
     CMD_PING, CMD_STANDBY, CMD_STREAM, Deframer, FrameLayout, KerFrame, PingParse, Schema,
 };
+use crate::robot::{ARM_DOF, ARMS};
 use crate::transport::{self, KerTransport, TransportConfig};
 
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(3);
@@ -48,15 +49,15 @@ const _: () = assert!(MAX_HANDSHAKE_BUFFER > crate::protocol::MAX_PING_RESPONSE_
 /// arm while fresh.
 #[derive(Debug, Clone)]
 pub struct KerSample {
-    pub joints: ArmPair<[f64; ARM_DOF]>,
-    pub gripper_openings: ArmPair<f64>,
-    pub engaged: ArmPair<bool>,
+    pub joints: PerArm<[f64; ARM_DOF], ARMS>,
+    pub gripper_openings: PerArm<f64, ARMS>,
+    pub engaged: PerArm<bool, ARMS>,
     pub received_at: Instant,
 }
 
 impl KerSample {
     /// One mapped frame plus the engagement the latch folded in.
-    fn from_mapped(mapped: MappedFrame, engaged: ArmPair<bool>, received_at: Instant) -> Self {
+    fn from_mapped(mapped: MappedFrame, engaged: PerArm<bool, ARMS>, received_at: Instant) -> Self {
         Self {
             joints: mapped.joints,
             gripper_openings: mapped.gripper_openings,
@@ -68,7 +69,8 @@ impl KerSample {
 
 pub struct ReaderConfig {
     pub transport: TransportConfig,
-    pub version: HardwareVersion,
+    /// Each follower arm's joint limits, which clamp the mapped joints.
+    pub limits: PerArm<[[f64; 2]; ARM_DOF], ARMS>,
     pub engage_trigger_opening: EngageTriggerOpening,
     pub gripper_open_fraction: GripperOpenFraction,
     pub stale_timeout: Duration,
@@ -215,7 +217,7 @@ fn connect(
 ) -> Result<Connected, SessionEnd> {
     let (schema, leftover) = handshake(transport, token)?;
     let layout = FrameLayout::try_new(&schema).map_err(|e| SessionEnd::Fatal(e.to_string()))?;
-    let channels = ChannelMap::for_device(cfg.version, &schema.metadata, layout.angle_count())
+    let channels = ChannelMap::for_device(cfg.limits, &schema.metadata, layout.angle_count())
         .map_err(|e| SessionEnd::Fatal(e.to_string()))?;
     info!(
         "KER connected: fw {} hw {} updated {} ({} channels)",
@@ -391,12 +393,12 @@ fn format_raw(frame: &KerFrame) -> String {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use openarm_description::Side;
-
     use super::*;
     use crate::engage::fixtures::{BOTH_ENGAGED, NEITHER_ENGAGED, STALE, engage_trigger_opening};
-    use crate::mapping::fixtures::{CHANNELS, SQUEEZE_DEG, TRIGGER, numbered_frame, probe_radians};
+    use crate::mapping::fixtures::{SQUEEZE_DEG, TRIGGER, channels, numbered_frame, probe_radians};
     use crate::protocol::fixtures::{ping_response_for, stream_packet};
+    use crate::robot::LIMBS;
+    use crate::robot::fixtures::{LEFT, RIGHT, follower_limits};
 
     const OPEN_FRACTION: f64 = 0.5;
     /// How long a session test waits for what it expects, and then for the
@@ -406,16 +408,16 @@ mod tests {
     /// A frame with both triggers released, every other channel numbered.
     fn released_frame() -> Vec<f32> {
         let mut angles = numbered_frame();
-        angles[TRIGGER.right] = 0.0;
-        angles[TRIGGER.left] = 0.0;
+        angles[TRIGGER[RIGHT]] = 0.0;
+        angles[TRIGGER[LEFT]] = 0.0;
         angles
     }
 
     /// A frame with both triggers at their stops.
     fn squeezed_frame() -> Vec<f32> {
         let mut angles = released_frame();
-        angles[TRIGGER.right] = SQUEEZE_DEG.right as f32;
-        angles[TRIGGER.left] = SQUEEZE_DEG.left as f32;
+        angles[TRIGGER[RIGHT]] = SQUEEZE_DEG[RIGHT] as f32;
+        angles[TRIGGER[LEFT]] = SQUEEZE_DEG[LEFT] as f32;
         angles
     }
 
@@ -441,7 +443,7 @@ mod tests {
         fn new(script: Vec<Vec<f32>>) -> Self {
             Self {
                 hardware: "2.0.0",
-                channels: CHANNELS,
+                channels: channels(),
                 script,
                 frames_sent: 0,
                 chunk_size: usize::MAX,
@@ -517,7 +519,7 @@ mod tests {
     fn reader_config() -> ReaderConfig {
         ReaderConfig {
             transport: TransportConfig::Usb,
-            version: HardwareVersion::V2,
+            limits: follower_limits(),
             engage_trigger_opening: engage_trigger_opening(),
             gripper_open_fraction: GripperOpenFraction::try_from(OPEN_FRACTION).expect("in range"),
             stale_timeout: STALE,
@@ -595,17 +597,18 @@ mod tests {
         // Released triggers: nothing engages, and each gripper rests at the
         // open fraction.
         assert_eq!(sample.engaged, NEITHER_ENGAGED);
-        assert_eq!(sample.gripper_openings.left, OPEN_FRACTION);
-        assert_eq!(sample.gripper_openings.right, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings[LEFT], OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings[RIGHT], OPEN_FRACTION);
         // Each arm reads its own channels, end to end through the session.
         let frame = released_frame();
-        for (side, first_channel) in [(Side::Right, 0), (Side::Left, 8)] {
+        for (arm, first_channel) in [(RIGHT, 0), (LEFT, 8)] {
             for (j, expected) in probe_radians(&frame, first_channel).into_iter().enumerate() {
                 assert!(
-                    (sample.joints[side][j] - expected).abs() < 1e-12,
-                    "{side:?} j{}: {} != {expected}",
+                    (sample.joints[arm][j] - expected).abs() < 1e-12,
+                    "{} j{}: {} != {expected}",
+                    LIMBS.arm_name(arm),
                     j + 1,
-                    sample.joints[side][j]
+                    sample.joints[arm][j]
                 );
             }
         }
@@ -614,18 +617,18 @@ mod tests {
     #[test]
     fn each_gripper_follows_its_own_trigger() {
         // Left half squeezed, right released: the two openings must differ, so
-        // a side swap anywhere from the channel to the sample fails here.
+        // an arm swap anywhere from the channel to the sample fails here.
         let mut angles = released_frame();
-        angles[TRIGGER.left] = SQUEEZE_DEG.left as f32 / 2.0;
+        angles[TRIGGER[LEFT]] = SQUEEZE_DEG[LEFT] as f32 / 2.0;
         let run = run_one(FakeKer::new(vec![angles]));
 
         let sample = run.sample.expect("a frame arrived");
         assert!(
-            (sample.gripper_openings.left - OPEN_FRACTION * 0.5).abs() < 1e-12,
+            (sample.gripper_openings[LEFT] - OPEN_FRACTION * 0.5).abs() < 1e-12,
             "left: {}",
-            sample.gripper_openings.left
+            sample.gripper_openings[LEFT]
         );
-        assert_eq!(sample.gripper_openings.right, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings[RIGHT], OPEN_FRACTION);
     }
 
     #[test]
@@ -642,7 +645,7 @@ mod tests {
             sample.engaged, BOTH_ENGAGED,
             "a squeeze after a run of open frames engages both arms"
         );
-        assert_eq!(sample.gripper_openings.left, 0.0, "a full squeeze closes");
+        assert_eq!(sample.gripper_openings[LEFT], 0.0, "a full squeeze closes");
     }
 
     #[test]
@@ -659,7 +662,7 @@ mod tests {
         let sample = run
             .sample
             .expect("a split packet still reaches the channel");
-        assert_eq!(sample.gripper_openings.left, OPEN_FRACTION);
+        assert_eq!(sample.gripper_openings[LEFT], OPEN_FRACTION);
     }
 
     #[test]
@@ -725,7 +728,7 @@ mod tests {
             "a session opening under a held trigger must not engage"
         );
         assert_eq!(
-            sample.gripper_openings.left, 0.0,
+            sample.gripper_openings[LEFT], 0.0,
             "the gripper still follows"
         );
     }
@@ -751,7 +754,7 @@ mod tests {
     #[test]
     fn a_session_refuses_a_device_streaming_too_few_channels() {
         let mut ker = FakeKer::new(vec![released_frame()]);
-        ker.channels = CHANNELS - 1;
+        ker.channels = channels() - 1;
         let run = run_one(ker);
 
         let SessionEnd::Fatal(reason) = run.report.end else {
