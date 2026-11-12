@@ -24,10 +24,9 @@ dependencies = [
     # What the engine shares with every other one: the registry, the four
     # slots, the model entries and the camera configuration.
     "sim_robot_core",
-    # The hardware's source of truth the SO-101 model is held to
-    # (test_so101_model.py): joint names, URDF limits, the tool frame, the
-    # start posture and the wrist camera.
-    "so101_description",
+    # The robots' descriptions, which a robot's entry is built from and each
+    # model of the release is held to (test_release_models.py).
+    "robot_description_py",
 ]
 
 [dependency-groups]
@@ -39,5 +38,5 @@ dev = ["pytest>=8"]
 package = false
 
 [tool.uv.sources]
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "e4222a3bf8e48d6dac01b8b6a3f693a823ce6626" }
-so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "so101_description", rev = "e4222a3bf8e48d6dac01b8b6a3f693a823ce6626" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "67dd22f487e53c6f3f0121c10ad17e7773a5445c" }
+robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "67dd22f487e53c6f3f0121c10ad17e7773a5445c" }

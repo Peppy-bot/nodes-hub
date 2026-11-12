@@ -2,8 +2,7 @@
 //! the control loop. The gripper's policy, across the arm's joints, so both
 //! ends of the robot respond to a limp motor the same way.
 
-use openarm_can::MotorStatus;
-use openarm_description::ARM_DOF;
+use openarm_can::{ARM_DOF, MotorStatus};
 use tracing::warn;
 
 /// What one tick's motor statuses require of the loop.

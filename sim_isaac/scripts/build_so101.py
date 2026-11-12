@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
-"""Build the SO-101's Isaac Sim stage from its upstream MuJoCo model.
+"""Build the SO-101's Isaac Sim stage from its MuJoCo model.
 
-so101_description, the hardware's source of truth, carries a URDF of the arm's
-joints and its links' collision meshes: no visual mesh, no inertia. The geometry
-comes from MuJoCo Menagerie's robotstudio_so101 (Apache-2.0) at the commit
-sim_base_images/so101_model.lock.json pins, the same files the MuJoCo node
-bakes and Waldo's catalogue names, so the three engines stand the same robot.
+SO-101's description in robot_description carries a URDF of the arm's joints
+and its links' collision meshes: no visual mesh, no inertia. The geometry
+comes from the SO-101's MuJoCo model in the release of Waldo's catalogue that
+sim_base_images/waldo_catalogue.py pins: MuJoCo Menagerie's robotstudio_so101
+(Apache-2.0) with the files Waldo lays over it, the model the MuJoCo node
+bakes and Waldo loads, so the three engines stand the same robot.
 
-MuJoCo compiles the upstream MJCF, and the stage is written from the
-compiled model: every body that carries a joint becomes a link prim under
-the URDF's link name at its pose in the zero configuration, with the body's
-mass and inertia, its visual meshes and its collision shapes; every hinge
-becomes a revolute joint between two links with a position drive; the base
-is fixed to the world by the articulation's root joint. Bodies with no joint
-of their own (upstream's base and its camera mount) are fused into the link
-they are rigid with. Where upstream and the description differ the
-description wins: each joint's limits are the URDF's, and the tool frame
-`gripper_frame_link` is the URDF's fixed joint.
+The description is the SO-101's model in robot_description_py, its URDF
+and its SRDF. MuJoCo compiles the upstream MJCF, and the stage is
+written from the compiled model: every body that carries a joint becomes a
+link prim at its pose in the zero configuration, with the body's mass and
+inertia, its visual meshes and its collision shapes, under the name of the
+URDF link that the URDF joint of the same name places (the world body, which
+the fixed base folds into, is the URDF's root link); every hinge becomes a
+revolute joint between two links with a position drive; the base is fixed
+to the world by the articulation's root joint. Bodies with no joint of their
+own (upstream's base and its camera mount) are fused into the link they are
+rigid with. Where upstream and the description differ the description wins:
+each joint's limits are the URDF's, and the tool frame is the URDF's fixed
+joint that places the grasp link of the SRDF's arm, `gripper_frame_link`.
 
-CPU only: it needs the `mujoco`, `usd-core` and `numpy` wheels, no Isaac Sim.
+CPU only: it needs the `mujoco`, `usd-core`, `numpy` and
+`robot_description_py` packages, no Isaac Sim.
 
-    python3 build_so101.py --model <staged upstream directory> \\
-        --urdf <so101_kinematics.urdf> --lock <so101_model.lock.json> \\
-        --output <directory> [--archive <bundle.tar.gz>]
+    python3 build_so101.py --release <staged release> --output <directory> \\
+        [--archive <bundle.tar.gz>]
+
+`--release` is a directory `waldo_catalogue.py fetch <directory> --robot so101`
+staged, which holds the SO-101's model under so101/.
 
 `--archive` packs the output directory into the bundle the Isaac base image
 downloads: entries sorted, owners and times zeroed, so the same directory
 packs to the same bytes and the bundle is published under its own SHA-256.
-The directory holds the stage and a manifest of what built it: the digests of
-this script, of the URDF and of the lock, and the versions of the tools. So
-the bundle's bytes change with any of them, also when the stage's do not.
+The directory holds the stage and a manifest of what built it: the release
+and the tree the model came from, the digest of this script, the digest
+robot_description_py gives the SO-101's model (its URDF, its SRDF and its
+collision meshes), and the versions of the tools. So the bundle's bytes
+change with any of them, also when the stage's do not.
 """
 
 from __future__ import annotations
@@ -48,27 +57,18 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
+import robot_description_py
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, Vt
 
+# The SO-101 of the release, whose model directory the builder reads.
+ROBOT_ID = "so101"
 STAGE_FILENAME = "so101.usd"
 MANIFEST_FILENAME = "bundle_manifest.json"
 ROBOT_PATH = "/so101"
 JOINTS_PATH = f"{ROBOT_PATH}/joints"
 LOOKS_PATH = f"{ROBOT_PATH}/Looks"
 ROOT_JOINT = "root_joint"
-TOOL_FRAME_JOINT = "gripper_frame_joint"
-
-# Upstream's bodies under the URDF's link names. MuJoCo folds the fixed base
-# into the world body, so the world body's geoms are the base link's.
-LINK_OF_BODY = {
-    "world": "base_link",
-    "shoulder": "shoulder_link",
-    "upper_arm": "upper_arm_link",
-    "lower_arm": "lower_arm_link",
-    "wrist": "wrist_link",
-    "gripper": "gripper_link",
-    "moving_jaw_so101_v1": "moving_jaw_so101_v1_link",
-}
+# Upstream's base body, which MuJoCo folds into the world body.
 BASE_BODY = "base"
 
 # Upstream's geom groups: what is drawn, and what collides.
@@ -85,45 +85,78 @@ ARTICULATION_VELOCITY_ITERATIONS = 1
 
 @dataclass(frozen=True)
 class UrdfJoint:
-    lower: float
-    upper: float
+    """A joint of the URDF: the link it hangs from, the link it places, and
+    where it places it in the parent's frame."""
 
-
-@dataclass(frozen=True)
-class ToolFrame:
     parent_link: str
     child_link: str
     xyz: tuple[float, float, float]
     rpy: tuple[float, float, float]
 
 
-def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+@dataclass(frozen=True)
+class Description:
+    """What the builder takes of the SO-101's description: the digest of its
+    model, the limits of each joint its arm and its gripper move, every joint
+    of the URDF by name, the URDF's root link, and the tool frame, the fixed
+    joint that places the arm's grasp link."""
+
+    digest: str
+    limits: dict[str, robot_description_py.JointLimits]
+    joints: dict[str, UrdfJoint]
+    root_link: str
+    tool: UrdfJoint
 
 
-def read_urdf(path: Path) -> tuple[dict[str, UrdfJoint], ToolFrame]:
-    """The description's joint limits by joint name, and its tool frame."""
-    root = ET.parse(path).getroot()
-    limits: dict[str, UrdfJoint] = {}
-    tool = None
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _urdf_joint(joint: ET.Element) -> UrdfJoint:
+    origin = joint.find("origin")
+    return UrdfJoint(
+        parent_link=joint.find("parent").get("link"),
+        child_link=joint.find("child").get("link"),
+        xyz=tuple(float(v) for v in origin.get("xyz").split()),
+        rpy=tuple(float(v) for v in origin.get("rpy").split()),
+    )
+
+
+def read_description() -> Description:
+    """The SO-101's description as robot_description_py bundles it. The
+    bindings give the arm, its gripper and the joint limits; ElementTree
+    reads what they do not: each joint's parent, child and origin."""
+    model = robot_description_py.model(ROBOT_ID)
+    described = model.description()
+    (arm,) = described.arms
+    moved = (*arm.joints, *(finger.joint for finger in arm.gripper.fingers))
     # Direct children only: transmission blocks nest limitless <joint> stubs
     # under the same names.
-    for joint in root.findall("joint"):
-        name = joint.get("name")
-        if joint.get("type") == "revolute":
-            limit = joint.find("limit")
-            limits[name] = UrdfJoint(float(limit.get("lower")), float(limit.get("upper")))
-        if name == TOOL_FRAME_JOINT:
-            origin = joint.find("origin")
-            tool = ToolFrame(
-                parent_link=joint.find("parent").get("link"),
-                child_link=joint.find("child").get("link"),
-                xyz=tuple(float(v) for v in origin.get("xyz").split()),
-                rpy=tuple(float(v) for v in origin.get("rpy").split()),
-            )
-    if tool is None:
-        raise ValueError(f"{path} has no {TOOL_FRAME_JOINT}")
-    return limits, tool
+    elements = ET.fromstring(model.urdf).findall("joint")
+    joints = {joint.get("name"): _urdf_joint(joint) for joint in elements}
+    (root_link,) = {joint.parent_link for joint in joints.values()} - {
+        joint.child_link for joint in joints.values()
+    }
+    (tool,) = [joint for joint in joints.values() if joint.child_link == arm.grasp_link]
+    return Description(
+        digest=model.digest,
+        limits={joint: described.joint_limits(joint) for joint in moved},
+        joints=joints,
+        root_link=root_link,
+        tool=tool,
+    )
+
+
+def links_of_bodies(model: mujoco.MjModel, description: Description) -> dict[str, str]:
+    """The URDF link each body of the compiled model is, by the body's name.
+    MuJoCo folds the fixed base into the world body, which is the URDF's
+    root link, and the body a hinge moves is the link the URDF's joint of the
+    same name places."""
+    links = {model.body(0).name: description.root_link}
+    for joint_id in range(model.njnt):
+        body = model.body(int(model.jnt_bodyid[joint_id])).name
+        links[body] = description.joints[model.joint(joint_id).name].child_link
+    return links
 
 
 def quat_from_rpy(rpy: tuple[float, float, float]) -> np.ndarray:
@@ -220,6 +253,14 @@ def define_geom(stage, parent: str, name: str, model, geom_id: int, materials: d
         prim = capsule.GetPrim()
         set_pose(prim, pos, quat)
         approximation = None
+    elif kind == mujoco.mjtGeom.mjGEOM_CYLINDER:
+        cylinder = UsdGeom.Cylinder.Define(stage, path)
+        cylinder.CreateRadiusAttr(float(size[0]))
+        cylinder.CreateHeightAttr(2.0 * float(size[1]))
+        cylinder.CreateAxisAttr(UsdGeom.Tokens.z)
+        prim = cylinder.GetPrim()
+        set_pose(prim, pos, quat)
+        approximation = None
     else:
         raise ValueError(f"geom {geom_id} has a type this builder does not write: {kind}")
     if visual:
@@ -230,9 +271,7 @@ def define_geom(stage, parent: str, name: str, model, geom_id: int, materials: d
         UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr(approximation)
 
 
-def define_link(stage, model, data, body_id: int, base_inertial, materials: dict) -> str:
-    body = model.body(body_id)
-    link = LINK_OF_BODY[body.name]
+def define_link(stage, model, data, body_id: int, link: str, base_inertial, materials: dict) -> str:
     path = f"{ROBOT_PATH}/{link}"
     prim = UsdGeom.Xform.Define(stage, path).GetPrim()
     set_pose(prim, data.xpos[body_id], data.xquat[body_id])
@@ -265,7 +304,7 @@ def define_link(stage, model, data, body_id: int, base_inertial, materials: dict
     return path
 
 
-def define_joint(stage, model, joint_id: int, limits: dict[str, UrdfJoint]) -> None:
+def define_joint(stage, model, joint_id: int, links: dict[str, str], limits: dict) -> None:
     joint = model.joint(joint_id)
     if int(model.jnt_type[joint_id]) != mujoco.mjtJoint.mjJNT_HINGE:
         raise ValueError(f"joint '{joint.name}' is not a hinge")
@@ -276,8 +315,8 @@ def define_joint(stage, model, joint_id: int, limits: dict[str, UrdfJoint]) -> N
     parent = int(model.body_parentid[child])
     limit = limits[joint.name]
     prim = UsdPhysics.RevoluteJoint.Define(stage, f"{JOINTS_PATH}/{joint.name}")
-    prim.CreateBody0Rel().SetTargets([f"{ROBOT_PATH}/{LINK_OF_BODY[model.body(parent).name]}"])
-    prim.CreateBody1Rel().SetTargets([f"{ROBOT_PATH}/{LINK_OF_BODY[model.body(child).name]}"])
+    prim.CreateBody0Rel().SetTargets([f"{ROBOT_PATH}/{links[model.body(parent).name]}"])
+    prim.CreateBody1Rel().SetTargets([f"{ROBOT_PATH}/{links[model.body(child).name]}"])
     prim.CreateAxisAttr(UsdPhysics.Tokens.z)
     # The joint frame is the child body's, moved to the joint's anchor: in the
     # parent it sits where the zero configuration puts the child.
@@ -298,10 +337,10 @@ def define_joint(stage, model, joint_id: int, limits: dict[str, UrdfJoint]) -> N
     drive.CreateTargetPositionAttr(0.0)
 
 
-def define_root_joint(stage) -> None:
+def define_root_joint(stage, root_link: str) -> None:
     """Fixes the base to the world and roots the articulation there."""
     joint = UsdPhysics.FixedJoint.Define(stage, f"{ROBOT_PATH}/{ROOT_JOINT}")
-    joint.CreateBody1Rel().SetTargets([f"{ROBOT_PATH}/{LINK_OF_BODY['world']}"])
+    joint.CreateBody1Rel().SetTargets([f"{ROBOT_PATH}/{root_link}"])
     prim = joint.GetPrim()
     UsdPhysics.ArticulationRootAPI.Apply(prim)
     prim.CreateAttribute("physxArticulation:enabledSelfCollisions", Sdf.ValueTypeNames.Bool).Set(
@@ -315,13 +354,12 @@ def define_root_joint(stage) -> None:
     ).Set(ARTICULATION_VELOCITY_ITERATIONS)
 
 
-def define_tool_frame(stage, tool: ToolFrame) -> None:
+def define_tool_frame(stage, tool: UrdfJoint) -> None:
     prim = UsdGeom.Xform.Define(stage, f"{ROBOT_PATH}/{tool.parent_link}/{tool.child_link}")
     set_pose(prim.GetPrim(), tool.xyz, quat_from_rpy(tool.rpy))
 
 
-def build_stage(model_dir: Path, urdf: Path, output: Path) -> Path:
-    limits, tool = read_urdf(urdf)
+def build_stage(model_dir: Path, description: Description, output: Path) -> Path:
     model = compile_model(model_dir, fuse=True)
     unfused = compile_model(model_dir, fuse=False)
     base = unfused.body(BASE_BODY).id
@@ -331,12 +369,18 @@ def build_stage(model_dir: Path, urdf: Path, output: Path) -> Path:
         unfused.body_iquat[base],
         unfused.body_inertia[base],
     )
-    bodies = [model.body(i).name for i in range(model.nbody)]
-    if bodies != list(LINK_OF_BODY):
-        raise ValueError(f"upstream's bodies are {bodies}, and this builder knows {list(LINK_OF_BODY)}")
     joints = [model.joint(i).name for i in range(model.njnt)]
-    if sorted(joints) != sorted(limits):
-        raise ValueError(f"upstream's joints are {joints}, and the URDF's are {sorted(limits)}")
+    if sorted(joints) != sorted(description.limits):
+        raise ValueError(
+            f"upstream's joints are {joints}, and the description's are {sorted(description.limits)}"
+        )
+    links = links_of_bodies(model, description)
+    bodies = [model.body(i).name for i in range(model.nbody)]
+    if sorted(bodies) != sorted(links):
+        raise ValueError(
+            f"upstream's bodies are {bodies}, and the ones the world and its hinges make links of "
+            f"are {sorted(links)}"
+        )
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
@@ -352,29 +396,30 @@ def build_stage(model_dir: Path, urdf: Path, output: Path) -> Path:
     UsdGeom.Scope.Define(stage, JOINTS_PATH)
     materials: dict = {}
     for body_id in range(model.nbody):
-        define_link(stage, model, data, body_id, base_inertial, materials)
+        define_link(stage, model, data, body_id, links[bodies[body_id]], base_inertial, materials)
     for joint_id in range(model.njnt):
-        define_joint(stage, model, joint_id, limits)
-    define_root_joint(stage)
-    define_tool_frame(stage, tool)
+        define_joint(stage, model, joint_id, links, description.limits)
+    define_root_joint(stage, description.root_link)
+    define_tool_frame(stage, description.tool)
     stage.GetRootLayer().Save()
     return path
 
 
-def write_manifest(output: Path, stage_path: Path, model_dir: Path, urdf: Path, lock: Path) -> None:
-    pinned = json.loads(lock.read_text())
+def model_source(release: Path) -> dict:
+    """The release a staged SO-101 model came from and the tree of it."""
+    index = json.loads((release / "index.json").read_text())
+    robots = json.loads((release / "robots.json").read_text())
+    (tree,) = [robot["tree"] for robot in robots if robot["id"] == ROBOT_ID]
+    return {"release": index["prefix"], "tree": tree, "license": "Apache-2.0"}
+
+
+def write_manifest(output: Path, stage_path: Path, release: Path, description: Description) -> None:
     manifest = {
         "version": 1,
         "stage": STAGE_FILENAME,
-        "source": {
-            "repository": pinned["repository"],
-            "commit": pinned["commit"],
-            "directory": pinned["directory"],
-            "lock_sha256": sha256(lock),
-            "license": "Apache-2.0",
-        },
-        "description": {"urdf": urdf.name, "sha256": sha256(urdf)},
-        "builder": {"script": Path(__file__).name, "sha256": sha256(Path(__file__))},
+        "source": model_source(release),
+        "description": {"model": ROBOT_ID, "digest": description.digest},
+        "builder": {"script": Path(__file__).name, "sha256": sha256(Path(__file__).read_bytes())},
         "tools": {
             "mujoco": mujoco.__version__,
             "usd": ".".join(str(v) for v in Usd.GetVersion()),
@@ -382,8 +427,8 @@ def write_manifest(output: Path, stage_path: Path, model_dir: Path, urdf: Path, 
             "python": sys.version.split()[0],
         },
         "files": {
-            STAGE_FILENAME: sha256(stage_path),
-            "LICENSE": sha256(model_dir / "LICENSE"),
+            STAGE_FILENAME: sha256(stage_path.read_bytes()),
+            "LICENSE": sha256((release / ROBOT_ID / "LICENSE").read_bytes()),
         },
     }
     (output / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2) + "\n")
@@ -406,22 +451,22 @@ def pack(directory: Path, archive: Path) -> str:
         fileobj=target, mode="wb", mtime=0, filename=""
     ) as compressed:
         compressed.write(buffer.getvalue())
-    return sha256(archive)
+    return sha256(archive.read_bytes())
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--model", type=Path, required=True, help="the staged upstream directory")
-    parser.add_argument("--urdf", type=Path, required=True, help="so101_kinematics.urdf")
-    parser.add_argument("--lock", type=Path, required=True, help="so101_model.lock.json")
+    parser.add_argument("--release", type=Path, required=True, help="the staged release of Waldo's catalogue")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--archive", type=Path, help="pack the output into this .tar.gz")
     args = parser.parse_args(argv)
-    stage_path = build_stage(args.model, args.urdf, args.output)
-    (args.output / "LICENSE").write_bytes((args.model / "LICENSE").read_bytes())
-    write_manifest(args.output, stage_path, args.model, args.urdf, args.lock)
+    model = args.release / ROBOT_ID
+    description = read_description()
+    stage_path = build_stage(model, description, args.output)
+    (args.output / "LICENSE").write_bytes((model / "LICENSE").read_bytes())
+    write_manifest(args.output, stage_path, args.release, description)
     print(f"{stage_path}: {stage_path.stat().st_size} bytes")
     if args.archive is not None:
         print(f"{args.archive}: sha256 {pack(args.output, args.archive)}")

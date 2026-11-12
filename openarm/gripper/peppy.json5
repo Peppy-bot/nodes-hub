@@ -1,7 +1,8 @@
-// Instantiate openarm_gripper twice, one per side, with a distinct
-// `gripper_id`. `hardware_version` selects the generation: v1.0 runs MIT
-// position hold, v2.0 runs POS_FORCE. This is a root component node;
-// openarm_backbone depends on it, not the other way around.
+// A robot runs openarm_gripper once per gripper, each instance with its own
+// `gripper_id`. The model the robot's initializer names selects the mechanism:
+// v1.0's parallel jaws run MIT position hold, v2.0's pinch fingers run
+// POS_FORCE. This is a root component
+// node; openarm_backbone depends on it, not the other way around.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -12,7 +13,12 @@
       "It drives both hardware generations: the v1.0 parallel jaws (a position hold, no force control) and the v2.0 pinch fingers (a speed limit, a grip force limit and force feedback). It follows the opening setpoints of openarm_backbone over a gripper_link pairing and streams back the measured opening, the grip effort and the effort limit. It has no motion logic of its own. It also reports its readiness, the health of its motor, and alerts from that health.",
     ],
     implements: [
-      // Per-component readiness for a real robot's robot_initializer.
+      // Per-component readiness for a real robot's robot_initializer. The
+      // initializer tells the gripper the robot's model (set_model): the
+      // gripper configures for it, then enables the motor in that model's
+      // control mode, and is ready once the follow loop is serving. A model
+      // whose gripper at `gripper_id` this node does not drive gets an error
+      // reply naming the models it drives, and ends the node.
       { name: "component_ready", tag: "v1", link_id: "ready" },
       // Per-motor condition telemetry: the gripper is the same DM motor as
       // every arm joint, with the same fault behaviour mid-grasp.
@@ -46,6 +52,7 @@
     },
     services: {
       exposes: [
+        { link_id: "ready", name: "set_model" },
         { link_id: "ready", name: "is_ready" },
       ],
     },
@@ -59,14 +66,11 @@
       mount_paths: ["/tmp/peppy_instance_locks"],
     },
     parameters: {
+      // The gripper this instance drives: the place of its arm among the arms of the
+      // model's description, counted from 0. A refusal of a gripper_id, at the first
+      // set_model call, names each place with its gripper.
       gripper_id: "u8",
       can_interface: "string",
-      // Which OpenArm hardware generation this gripper drives: "v1" or "v2". Selects
-      // the motor's control mode and this side's opening geometry (the v2 fingers are
-      // mechanically mirrored, the v1 jaws are not). Required, not defaulted: the wrong
-      // generation would command the motor in the wrong mode and the wrong direction,
-      // so the launcher must be explicit. Same values the arm's `hardware_version` takes.
-      hardware_version: "string",
       // Hardware-loop rate (Hz). Pick deliberately per deployment.
       control_rate_hz: "u32",
       // POS_FORCE absolute speed limit (rad/s at the motor), read by the v2 command

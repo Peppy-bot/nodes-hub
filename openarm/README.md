@@ -4,9 +4,9 @@
 
 | Component | What it does |
 |---|---|
-| [`robot_initializer`](../robot_initializer) | the node every robot uses: joins a simulation as this robot's model, answers who the robot is on `get_identity` and the park pose of each arm on `get_guide`, and aggregates per-limb readiness into `is_ready` |
-| [`openarm_arm`](./arm) | drives one arm side (7 joints) |
-| [`openarm_gripper`](./gripper) | drives one gripper side (v1.0 prismatic or v2.0 pinch, by `hardware_version`) |
+| [`robot_initializer`](../robot_initializer) | the node every robot uses: joins a simulation as this robot's model, answers who the robot is on `get_identity`, the URDF and SRDF of its model on `get_description` and the park pose of each arm on `get_guide`, and aggregates per-limb readiness into `is_ready` |
+| [`openarm_arm`](./arm) | drives one arm (7 joints), the one its `arm_id` places among its model's arms |
+| [`openarm_gripper`](./gripper) | drives one gripper (v1.0 prismatic or v2.0 pinch, by the model the initializer names), the one its `gripper_id` places among its model's grippers |
 | [`sim_mujoco`](../sim_mujoco) | MuJoCo simulation: stands any number of robots, of any model it carries, in one composed scene |
 | [`sim_isaac`](../sim_isaac) | Isaac Sim simulation: stands any number of robots, of any model it carries, in one scene |
 | `waldo` | Waldo simulation: stands any number of robots' limbs in one world, with a Bevy browser viewer; lives in the separate `private-nodes-hub` repository, not in this hub |
@@ -120,7 +120,7 @@ peppy node add /path/to/ws/nodes-hub/openarm/arm -sb --idle-timeout 1800
 peppy node add /path/to/ws/nodes-hub/openarm/gripper -sb --idle-timeout 1800
 ```
 
-Both hardware generations run the same nodes; the launcher's `hardware_version` argument selects which one each arm and gripper drives.
+Both hardware generations run the same nodes. The robot's initializer takes the model, `openarm_v1` or `openarm_v2`, as its `model` argument and hands it to every other node of the robot: the backbone, the browser panel and the KER read it from the initializer's `robot_identity`, and each arm and gripper driver opens its CAN interface as it starts, so a missing or down interface fails the launch, then takes the model from the initializer's first `set_model` call, configures for it, and only then enables its motors. A driver whose model it does not drive answers that call with an error naming the models it drives, and stops.
 
 After changing a node's code, rebuild it by re-running the same command with `--force` added.
 
@@ -141,7 +141,7 @@ none and every robot joins it. These are separate sessions:
 ```sh
 # Physical v2 with the web commander.
 peppy stack launch physical
-peppy stack join openarm:alpha --with v2
+peppy stack join openarm:alpha --with openarm_v2
 
 # Simulated v2 with the web commander; more robots join the same simulation.
 peppy stack launch openarm_simulation                 # Waldo
@@ -150,7 +150,7 @@ peppy stack launch openarm_simulation --with isaac_sim
 peppy stack join openarm_sim:bravo --set-arguments commander_inst.http_port=8766
 ```
 
-Every simulation also stands a v1 (`--with v1` on the join), each catalogue
+Every simulation also stands a v1 (`--with openarm_v1` on the join), each catalogue
 carrying both generations. A copy selects its own recorder (`lerobot_recorder`), camera rig
 (`cameras_sim` for rendered v2 cameras) and robot commander (`web_commander`,
 `ker_commander`, or `none`, which the stack's headset leads when the stack
@@ -163,8 +163,8 @@ Physical robots join `physical`, each on its own machine:
 
 ```sh
 peppy stack launch physical
-peppy stack join openarm:alpha@jetson-1 --with v2
-peppy stack join openarm:bravo@jetson-2 --with v1
+peppy stack join openarm:alpha@jetson-1 --with openarm_v2
+peppy stack join openarm:bravo@jetson-2 --with openarm_v1
 peppy stack list
 peppy stack remove bravo
 peppy stack reset --federated

@@ -29,7 +29,8 @@ use control_core::chase::{chase_along, chase_step};
 use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
 use control_core::positive_finite::PositiveFinite;
 use control_core::timing::MotionClock;
-use openarm_description::{ARM_DOF, Side};
+use robot_description::ArmId;
+use srs_model::ARM_DOF;
 use srs_model::chain_kinematics::{EeCaps, StepLimits, clamp_into, rate_step_toward};
 use srs_model::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use srs_model::{Arm, JointVec, Limit, plan_line};
@@ -39,6 +40,7 @@ use tracing::{error, info};
 use crate::failure::{Failure, FailureKind};
 use crate::governor::{HandBasis, PathArms};
 use crate::move_slot::{ARM_BUSY, MoveSlot, SlotRelease};
+use crate::robot::LIMBS;
 use crate::settle::{PoseTolerance, Settle, Verdict, joint_shortfall, pose_shortfall, verdict};
 use crate::types::world_pose_arrays;
 use crate::upstream::Upstream;
@@ -76,7 +78,7 @@ const ANOTHER_MOVE_IN_FLIGHT: &str = "another move is in flight";
 const POSTURE_CANCELLED: &str = "its posture goal was cancelled";
 
 /// Per-arm static configuration for the planner (the motion limits relocated
-/// from the arm). Cloned per side.
+/// from the arm). Cloned per arm.
 #[derive(Clone)]
 pub struct PlanConfig {
     pub cycle_period: Duration,
@@ -112,7 +114,7 @@ pub type Measurement = Result<JointVec, Unmeasured>;
 const COMMANDED_JOINTS_NOTE: &str = "the result comes from the joints commanded last";
 
 /// How a move ended. A posture share reports it to the posture action that
-/// sent it, the failure labelled with the side of its arm.
+/// sent it, the failure labelled with the name of its arm.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     /// The move ran to its end, and an arm move with a settle settled.
@@ -217,10 +219,10 @@ impl JointReply {
         measured: Measurement,
         elapsed_s: f64,
     ) {
-        let side = planner.side;
+        let arm = planner.arm;
         let ctx = match self {
             Self::MoveArmJoints { ctx, .. } => ctx,
-            Self::Posture(share) => return share.report(side, outcome).await,
+            Self::Posture(share) => return share.report(LIMBS.arm_name(arm), outcome).await,
         };
         let joints = planner.reported_joints(&measured);
         let ended = match outcome {
@@ -232,20 +234,24 @@ impl JointReply {
             Outcome::Failed(failure) => ctx.fail(failure.kind.into(), failure.message).await,
         };
         if let Err(e) = ended {
-            error!("{}: move_arm_joints end: {e}", side);
+            error!("{}: move_arm_joints end: {e}", LIMBS.arm_name(arm));
         }
     }
 
-    /// Fail the move of the arm on `side` with `failure`, which reports no
+    /// Fail the move of the arm `arm` with `failure`, which reports no
     /// joints.
-    async fn fail(self, side: Side, failure: Failure) {
+    async fn fail(self, arm: ArmId, failure: Failure) {
         match self {
             Self::MoveArmJoints { ctx, .. } => {
                 if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
-                    error!("{}: move_arm_joints end: {e}", side);
+                    error!("{}: move_arm_joints end: {e}", LIMBS.arm_name(arm));
                 }
             }
-            Self::Posture(share) => share.report(side, Outcome::Failed(failure)).await,
+            Self::Posture(share) => {
+                share
+                    .report(LIMBS.arm_name(arm), Outcome::Failed(failure))
+                    .await
+            }
         }
     }
 }
@@ -260,7 +266,7 @@ impl PostureShare {
     }
 
     /// Report how the share of `limb` ended, its failure labelled with the
-    /// limb: the side of an arm, or the name of a gripper.
+    /// limb: the name of an arm or of a gripper.
     pub async fn report(self, limb: impl std::fmt::Display, outcome: Outcome) {
         let outcome = match outcome {
             Outcome::Failed(failure) => Outcome::Failed(failure.labelled(&limb)),
@@ -277,7 +283,7 @@ impl PostureShare {
 /// same meaning, and both refuse the same values with the same words.
 #[derive(Clone, Copy, Debug)]
 pub struct ArmMoveRequest {
-    pub side: Side,
+    pub arm: ArmId,
     pub position: Translation3<f64>,
     /// `None` asks for the position alone, at the turn the hand holds.
     pub orientation: Option<UnitQuaternion<f64>>,
@@ -317,7 +323,7 @@ impl Goal {
     /// caller's concern.
     pub async fn fail(self, failure: Failure, planner: &Planner) {
         match self {
-            Goal::Joint { reply, .. } => reply.fail(planner.side, failure).await,
+            Goal::Joint { reply, .. } => reply.fail(planner.arm, failure).await,
             Goal::Cartesian { ctx, .. } => planner.fail_cartesian(&ctx, failure).await,
         }
     }
@@ -407,7 +413,7 @@ impl Advance {
 }
 
 pub struct Planner {
-    side: Side,
+    arm: ArmId,
     model: Arm,
     cfg: PlanConfig,
     mode: Mode,
@@ -425,9 +431,9 @@ impl Planner {
     /// Start holding zero with no producer locked. The coordinator seeds the real
     /// held pose from the first measured state (via [`Planner::commit`]) before any
     /// setpoint is published, so this initial value is never streamed.
-    pub fn new(side: Side, model: Arm, cfg: PlanConfig) -> Self {
+    pub fn new(arm: ArmId, model: Arm, cfg: PlanConfig) -> Self {
         Self {
-            side,
+            arm,
             model,
             stream_smoothing: StreamSmoothing::new(cfg.cycle_period),
             cfg,
@@ -447,11 +453,10 @@ impl Planner {
     }
 
     /// Seed the held setpoint from the arm's first measured pose, clamped into the
-    /// joint limits. A power-up pose parked past a soft limit (e.g. the elbow below
-    /// its one-sided lower bound, hard against the boundary singularity) would
-    /// otherwise anchor the backbone off-limit while the arm clamps every command back to
-    /// the limit, leaving the backbone's held setpoint disagreeing with the arm's actual
-    /// pose. Clamping the seed keeps the two consistent from the first tick.
+    /// joint limits, the limits the arm clamps every command into: a power-up pose
+    /// parked past a limit (e.g. the elbow a hair below its lower limit, the straight
+    /// arm) seeds the setpoint at that limit, so the backbone's held setpoint and the
+    /// arm's pose agree from the first tick.
     pub fn seed_from_measured(&mut self, measured: JointVec) {
         self.setpoint = clamp_into(&self.cfg.limits, &measured);
     }
@@ -570,7 +575,7 @@ impl Planner {
     pub async fn fail_active(&mut self, failure: Failure) {
         match std::mem::replace(&mut self.mode, Mode::Follow) {
             Mode::Follow => {}
-            Mode::JointMove(JointMove { reply, .. }) => reply.fail(self.side, failure).await,
+            Mode::JointMove(JointMove { reply, .. }) => reply.fail(self.arm, failure).await,
             Mode::CartesianMove(m) => self.fail_cartesian(&m.ctx, failure).await,
             Mode::PathShare(m) => m.fail(self, failure),
         }
@@ -822,10 +827,10 @@ impl Planner {
                     JointReply::Posture(_) => ("posture move", RAISE_THE_JOINT_LIMITS),
                 };
                 if let Err(failure) = path::check_move_time(&traj, what, remedy) {
-                    reply.fail(self.side, failure).await;
+                    reply.fail(self.arm, failure).await;
                     return Mode::Follow;
                 }
-                info!("{}: joint move start", self.side);
+                info!("{}: joint move start", LIMBS.arm_name(self.arm));
                 Mode::JointMove(JointMove {
                     traj,
                     reply,
@@ -872,7 +877,7 @@ impl Planner {
         }
         info!(
             "{}: move_arm start, duration={:.3}s",
-            self.side,
+            LIMBS.arm_name(self.arm),
             traj.clock().duration().as_secs_f64(),
         );
         Mode::CartesianMove(CartesianMove {
@@ -909,14 +914,14 @@ impl Planner {
             Outcome::Failed(failure) => return self.fail_cartesian(ctx, failure).await,
         };
         if let Err(e) = ended {
-            error!("{}: move_arm end: {e}", self.side);
+            error!("{}: move_arm end: {e}", LIMBS.arm_name(self.arm));
         }
     }
 
     /// Fail a Cartesian goal with `failure`, with no result.
     async fn fail_cartesian(&self, ctx: &move_arm::GoalContext, failure: Failure) {
         if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
-            error!("{}: move_arm end: {e}", self.side);
+            error!("{}: move_arm end: {e}", LIMBS.arm_name(self.arm));
         }
     }
 }
@@ -955,10 +960,15 @@ pub(crate) fn cancelled_reason(reason: String, measured: &Measurement) -> String
 mod tests {
     use super::*;
 
+    use robot_description::{PerArm, states};
+    use srs_model::ELBOW;
+    use srs_model::chain_kinematics::{PRECISION_M, PRECISION_RAD, pose_miss};
     use srs_model::nalgebra::{UnitQuaternion, Vector3};
 
+    use crate::robot::ARMS;
     use crate::test_support::{
-        POSE_TEST_Q, bundled_arm, claimed_move_slot, plan_config, planner_holding,
+        LEFT, POSE_TEST_Q, RIGHT, V1, V2, bundled_arm, claimed_move_slot, plan_config,
+        planner_holding, postures,
     };
 
     /// The slack the stream test reads its arrival against.
@@ -968,10 +978,10 @@ mod tests {
     };
 
     /// A `move_arm` request to `target`, as fast as the limits allow; a planner reads
-    /// no side off it.
+    /// no arm off it.
     fn request_to(target: Isometry3<f64>) -> ArmMoveRequest {
         ArmMoveRequest {
-            side: Side::Left,
+            arm: LEFT,
             position: target.translation,
             orientation: Some(target.rotation),
             duration: Duration::ZERO,
@@ -984,8 +994,8 @@ mod tests {
 
     /// A planner over the bundled V1 left arm, with permissive test limits.
     fn test_planner(held: JointVec) -> Planner {
-        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
-        let mut planner = Planner::new(Side::Left, model, plan_config());
+        let model = bundled_arm(V1, LEFT);
+        let mut planner = Planner::new(LEFT, model, plan_config());
         planner.commit(held);
         planner
     }
@@ -994,11 +1004,11 @@ mod tests {
     /// clamps into model limits, so an off-limit seed would make the tests
     /// measure the seed correction instead of the motion.
     fn pose_planner() -> Planner {
-        planner_holding(Side::Left, POSE_TEST_Q)
+        planner_holding(LEFT, POSE_TEST_Q)
     }
 
     /// The failure of a follower gone stale fails the move with its kind,
-    /// labelled with the side, and frees the slot.
+    /// labelled with the arm, and frees the slot.
     #[tokio::test]
     async fn failing_the_active_move_fails_it_and_frees_the_move_slot() {
         let mut planner = test_planner([0.0; ARM_DOF]);
@@ -1021,7 +1031,10 @@ mod tests {
         );
         planner.fail_active(stale.clone()).await;
         let outcome = done_rx.recv().await.expect("the failed move must report");
-        assert_eq!(outcome, Outcome::Failed(stale.clone().labelled(Side::Left)));
+        assert_eq!(
+            outcome,
+            Outcome::Failed(stale.clone().labelled(LIMBS.arm_name(LEFT)))
+        );
         assert!(!move_slot.is_claimed(), "the failure releases the slot");
         // With nothing active the failure is a no-op.
         planner.fail_active(stale).await;
@@ -1112,9 +1125,9 @@ mod tests {
     async fn a_posture_move_past_the_ceiling_fails_before_the_arm_moves_and_asks_for_higher_limits()
     {
         let held = [0.0; ARM_DOF];
-        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
+        let model = bundled_arm(V1, LEFT);
         let mut planner = Planner::new(
-            Side::Left,
+            LEFT,
             model,
             PlanConfig {
                 // 0.5 rad at 0.001 rad/s takes 500 s.
@@ -1197,7 +1210,7 @@ mod tests {
         assert_eq!(failure.kind, FailureKind::Timeout);
         assert_eq!(
             failure.message,
-            "left: still 0.500 rad from the target at joint 1, 2.0 s after the planned end"
+            "left_arm: still 0.500 rad from the target at joint 1, 2.0 s after the planned end"
         );
         assert_eq!(planner.setpoint(), held, "the arm never left its pose");
         assert!(!move_slot.is_claimed(), "the end releases the slot");
@@ -1253,19 +1266,22 @@ mod tests {
 
     /// The rest posture puts each grasp point lower and closer to the
     /// column than the working posture does. This is true on both
-    /// generations and both sides. On openarm_v2, the grasp points are at
+    /// generations and both arms. On openarm_v2, the grasp points are at
     /// the numbers that the description's joints give.
     #[test]
     fn the_home_grasp_points_sit_lower_and_closer_in_than_ready() {
-        use openarm_description::{HardwareVersion, home, ready};
         let horizontal = |pose: &Isometry3<f64>| pose.translation.x.hypot(pose.translation.y);
-        for version in [HardwareVersion::V1, HardwareVersion::V2] {
-            for side in Side::BOTH {
-                let model = bundled_arm(version, side);
-                let planner = Planner::new(side, model, plan_config());
-                let r = planner.world_ee_pose(&ready(side));
-                let h = planner.world_ee_pose(&home(side));
-                let label = format!("{version:?} {}", side);
+        for model_id in [V1, V2] {
+            let (ready, home) = (
+                postures(model_id, states::READY),
+                postures(model_id, states::HOME),
+            );
+            for arm in PerArm::<(), ARMS>::ids() {
+                let model = bundled_arm(model_id, arm);
+                let planner = Planner::new(arm, model, plan_config());
+                let r = planner.world_ee_pose(&ready[arm]);
+                let h = planner.world_ee_pose(&home[arm]);
+                let label = format!("{model_id} {}", LIMBS.arm_name(arm));
                 assert!(
                     h.translation.z < r.translation.z,
                     "{label}: home z {} is not below ready z {}",
@@ -1287,7 +1303,10 @@ mod tests {
             [0.3996, -0.2830, 0.5662],
             [-0.2328, 0.6283, -0.2398, 0.7025],
         );
-        let right_home = ([0.0174, -0.1535, 0.1024], [0.0, 0.9997, 0.0, 0.0250]);
+        let right_home = (
+            [0.0174, -0.2070, 0.1048],
+            [-0.0011, 0.9987, -0.0450, 0.0250],
+        );
         // The left arm's grasp point is the mirror of the right arm's across
         // the x-z plane. y changes sign, and so do x and z of the quaternion.
         let mirror =
@@ -1300,25 +1319,27 @@ mod tests {
             let off_rad = pose.rotation.angle_to(&expected);
             off_m < 1e-3 && off_rad < 5e-3
         };
-        for side in Side::BOTH {
-            let (ready_grasp, home_grasp) = match side {
-                Side::Right => (right_ready, right_home),
-                Side::Left => (mirror(right_ready), mirror(right_home)),
+        let (ready, home) = (postures(V2, states::READY), postures(V2, states::HOME));
+        for arm in PerArm::<(), ARMS>::ids() {
+            let (ready_grasp, home_grasp) = if arm == RIGHT {
+                (right_ready, right_home)
+            } else {
+                (mirror(right_ready), mirror(right_home))
             };
-            let model = bundled_arm(HardwareVersion::V2, side);
-            let planner = Planner::new(side, model, plan_config());
-            let r = planner.world_ee_pose(&ready(side));
-            let h = planner.world_ee_pose(&home(side));
+            let model = bundled_arm(V2, arm);
+            let planner = Planner::new(arm, model, plan_config());
+            let r = planner.world_ee_pose(&ready[arm]);
+            let h = planner.world_ee_pose(&home[arm]);
             assert!(
                 at(&r, ready_grasp),
                 "v2 {} ready grasp point at {:?}",
-                side,
+                LIMBS.arm_name(arm),
                 world_pose_arrays(&r)
             );
             assert!(
                 at(&h, home_grasp),
                 "v2 {} home grasp point at {:?}",
-                side,
+                LIMBS.arm_name(arm),
                 world_pose_arrays(&h)
             );
         }
@@ -1356,7 +1377,7 @@ mod tests {
         let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
         assert_eq!(
             second_rx.try_recv().expect("the second goal ends at once"),
-            Outcome::Failed(failure.labelled(Side::Left))
+            Outcome::Failed(failure.labelled(LIMBS.arm_name(LEFT)))
         );
         assert!(running_rx.try_recv().is_err(), "the first move runs on");
         assert!(move_slot.is_claimed(), "the first move holds the slot");
@@ -1445,31 +1466,23 @@ mod tests {
 
     #[test]
     fn seed_from_measured_clamps_a_below_limit_pose_to_the_joint_limits() {
-        // Build the real arm: the elbow (j4, index 3) carries a one-sided lower bound
-        // of ~0.05 (the singularity floor `HardwareVersion::arm_model` applies), hard against the
-        // boundary singularity. A power-up pose with the elbow below it must seed at the
-        // limit, not off it.
-        let model = bundled_arm(openarm_description::HardwareVersion::V1, Side::Left);
+        // Build the real arm: the elbow (j4, index 3) has its lower limit at the
+        // straight arm. A power-up pose with the elbow below it must seed at the limit,
+        // not off it.
+        let model = bundled_arm(V1, LEFT);
         let limits = model.limits();
         let cfg = PlanConfig {
             limits,
             ..plan_config()
         };
-        let mut planner = Planner::new(Side::Left, model, cfg);
+        let mut planner = Planner::new(LEFT, model, cfg);
 
         let mut measured = [0.0; ARM_DOF];
         measured[3] = -0.2; // elbow below its lower limit
         planner.seed_from_measured(measured);
 
         let seeded = planner.setpoint();
-        assert_eq!(
-            seeded[3], limits[3].lo,
-            "elbow seeds at its lower limit, off the singularity"
-        );
-        assert!(
-            seeded[3] >= 0.04,
-            "vendored URDF elbow lower limit is ~0.05"
-        );
+        assert_eq!(seeded[3], limits[3].lo, "elbow seeds at its lower limit");
         assert_eq!(seeded[0], 0.0, "an in-range joint is untouched");
     }
 
@@ -1582,8 +1595,8 @@ mod tests {
     #[test]
     fn a_consumed_command_holds_the_move_endpoint_until_a_newer_one() {
         // The move -> Follow handoff at the command-watch seam. While a move
-        // holds the side's move slot, the coordinator's
-        // `consume_streams_of_busy_sides` clears the side's command watch
+        // holds the arm's move slot, the coordinator's
+        // `consume_streams_of_busy_arms` clears the arm's command watch
         // (`send_replace(None)`) every tick, so Follow holds at the move's
         // endpoint instead of chasing the pre-move streamed target, until a
         // command that arrives after the clear. This locks the contract Follow
@@ -1639,8 +1652,8 @@ mod tests {
     // has a plan once the goal leaves it out, ending at the turn the hand starts with.
     #[test]
     fn a_position_alone_keeps_the_turn_the_hand_starts_with() {
-        let held = openarm_description::ready(Side::Right);
-        let mut planner = launcher_planner(Side::Right, held);
+        let held = postures(V2, states::READY)[RIGHT];
+        let mut planner = launcher_planner(RIGHT, held);
         let start = planner.world_ee_pose(&held);
         let target = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
@@ -1663,8 +1676,8 @@ mod tests {
     // A 1 cm lift takes under a second at the launcher's limits.
     #[test]
     fn a_one_centimeter_line_takes_under_a_second() {
-        let held = openarm_description::ready(Side::Right);
-        let mut planner = launcher_planner(Side::Right, held);
+        let held = postures(V2, states::READY)[RIGHT];
+        let mut planner = launcher_planner(RIGHT, held);
         let mut lift = planner.world_ee_pose(&held);
         lift.translation.vector.z += 0.01;
         let checked = planner.check_cartesian(&request_to(lift));
@@ -1678,8 +1691,8 @@ mod tests {
     // before it: it takes the time of the states it keeps.
     #[test]
     fn a_line_rests_at_no_near_repeat_of_its_walk() {
-        let held = openarm_description::ready(Side::Right);
-        let planner = launcher_planner(Side::Right, held);
+        let held = postures(V2, states::READY)[RIGHT];
+        let planner = launcher_planner(RIGHT, held);
         let moved = |by: f64| {
             let mut q = held;
             q[0] += by;
@@ -1728,7 +1741,7 @@ mod tests {
         const WRIST_BEND: usize = 5;
         let start_q: JointVec = [1.139, 1.678, 0.169, 1.339, 0.789, 0.142, 0.120];
         let goal_q: JointVec = [0.827, 1.185, -0.038, 0.856, 1.044, -0.204, 0.530];
-        let mut planner = launcher_planner(Side::Right, start_q);
+        let mut planner = launcher_planner(RIGHT, start_q);
         let target = planner.world_ee_pose(&goal_q);
         let walk = plan_line(&planner.model, &target, start_q).expect("the line tracks");
         assert!(walk[0][WRIST_BEND] * walk[walk.len() - 1][WRIST_BEND] < 0.0);
@@ -1745,8 +1758,8 @@ mod tests {
     // velocity limit and the joint limits.
     #[tokio::test]
     async fn a_pose_stream_crosses_the_wrist_where_no_line_tracks() {
-        let side = Side::Right;
-        let model = bundled_arm(openarm_description::HardwareVersion::V2, side);
+        let arm = RIGHT;
+        let model = bundled_arm(V2, arm);
         let max_joint_velocity_rad_s = [
             16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
         ];
@@ -1761,7 +1774,7 @@ mod tests {
         const WRIST_BEND: usize = 5;
         let start_q: JointVec = [-0.223, 1.600, 0.543, 0.543, 0.768, 0.205, -0.354];
         let goal_q: JointVec = [-0.541, 1.614, 0.364, 0.160, 1.046, -0.227, -0.532];
-        let mut planner = Planner::new(side, model, cfg);
+        let mut planner = Planner::new(arm, model, cfg);
         planner.commit(start_q);
         let target = planner.world_ee_pose(&goal_q);
         let checked = planner.check_cartesian(&request_to(target));
@@ -1802,9 +1815,8 @@ mod tests {
     // its size over the sweep.
     #[test]
     fn a_streamed_pose_arriving_every_second_tick_is_followed_smoothly() {
-        use openarm_description::ready;
-        let side = Side::Right;
-        let model = bundled_arm(openarm_description::HardwareVersion::V2, side);
+        let arm = RIGHT;
+        let model = bundled_arm(V2, arm);
         let cfg = PlanConfig {
             max_joint_velocity_rad_s: [
                 16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
@@ -1813,8 +1825,8 @@ mod tests {
             limits: model.limits(),
             ..plan_config()
         };
-        let start_q = ready(side);
-        let mut planner = Planner::new(side, model, cfg);
+        let start_q = postures(V2, states::READY)[arm];
+        let mut planner = Planner::new(arm, model, cfg);
         planner.commit(start_q);
         let start = planner.world_ee_pose(&start_q);
         let dt = planner.cfg.cycle_period.as_secs_f64();
@@ -1855,16 +1867,16 @@ mod tests {
     ];
     const LAUNCHER_ACCELERATION_RAD_S2: JointVec = [0.5; ARM_DOF];
 
-    /// A planner of the v2 arm on `side` at the launcher's limits, holding `held`.
-    fn launcher_planner(side: Side, held: JointVec) -> Planner {
-        let model = bundled_arm(openarm_description::HardwareVersion::V2, side);
+    /// A planner of the v2 arm `arm` at the launcher's limits, holding `held`.
+    fn launcher_planner(arm: ArmId, held: JointVec) -> Planner {
+        let model = bundled_arm(V2, arm);
         let cfg = PlanConfig {
             max_joint_velocity_rad_s: LAUNCHER_VELOCITY_RAD_S,
             max_joint_acceleration_rad_s2: LAUNCHER_ACCELERATION_RAD_S2,
             limits: model.limits(),
             ..plan_config()
         };
-        let mut planner = Planner::new(side, model, cfg);
+        let mut planner = Planner::new(arm, model, cfg);
         planner.commit(held);
         planner
     }
@@ -1898,6 +1910,64 @@ mod tests {
         }
     }
 
+    /// The trajectory `planner` plays a line's `walk` on, sampled each control period
+    /// from `t0` to a period past its end.
+    fn line_ticks(planner: &Planner, walk: &[JointVec], t0: Instant) -> Vec<JointVec> {
+        let period = planner.cfg.cycle_period;
+        let trajectory = planner.line_trajectory(walk, Duration::ZERO, t0);
+        let count = trajectory.clock().duration().as_nanos() / period.as_nanos() + 2;
+        (0..count as u32)
+            .map(|k| trajectory.sample(t0 + period * k))
+            .collect()
+    }
+
+    // The straight line from Ready out to where the right arm stands straight, its
+    // elbow at its lower limit, and the line back in to Ready: chain_kinematics'
+    // search walks both, the plan check finds a plan for the line out, the walk
+    // lands the hand on the straight arm's pose within the precision a line holds,
+    // and each tick of the trajectory the planner plays the walk on moves each joint
+    // by no more than its velocity limit takes in a control period. At the straight
+    // arm the hand's reach changes with the square of the elbow's bend, so the
+    // search lands there with the elbow 0.011 rad off straight (measured, v2).
+    #[test]
+    fn a_line_through_the_straight_arm_steps_within_the_velocity_limits() {
+        let arm = RIGHT;
+        let ready = postures(V2, states::READY)[arm];
+        let mut planner = launcher_planner(arm, ready);
+        let mut straight = ready;
+        straight[ELBOW] = planner.cfg.limits[ELBOW].lo;
+        let out_to = planner.world_ee_pose(&straight);
+        let checked = planner.check_cartesian(&request_to(out_to));
+        assert!(
+            matches!(checked, Ok(PlanCheck::Reachable(_))),
+            "{checked:?}"
+        );
+        let out =
+            plan_line(&planner.model, &out_to, ready).expect("a line out to the straight arm");
+        let reached = *out.last().expect("a walk holds its seed");
+        let landed = pose_miss(&planner.world_ee_pose(&reached), &out_to);
+        assert!(
+            landed.position_m <= PRECISION_M && landed.orientation_rad <= PRECISION_RAD,
+            "the line lands {landed:?} from the straight arm's pose"
+        );
+        let back = plan_line(&planner.model, &planner.world_ee_pose(&ready), reached)
+            .expect("a line back in to Ready");
+        let walk: Vec<JointVec> = out.iter().chain(&back[1..]).copied().collect();
+        let ticks = line_ticks(&planner, &walk, Instant::now());
+        let period_s = planner.cfg.cycle_period.as_secs_f64();
+        let limits = planner.cfg.max_joint_velocity_rad_s;
+        for (k, w) in ticks.windows(2).enumerate() {
+            let steps = w[1].iter().zip(&w[0]).map(|(to, from)| (to - from).abs());
+            for (i, (step, limit)) in steps.zip(limits).enumerate() {
+                let bound = limit * period_s;
+                assert!(
+                    step <= bound * (1.0 + 1e-6),
+                    "joint {i} steps {step} rad at tick {k}, past its {bound} rad"
+                );
+            }
+        }
+    }
+
     /// A drawn posture of `planner`'s arm, away from the ends of its joints' ranges.
     fn drawn_posture(tc: &hegel::TestCase, limits: &[Limit; ARM_DOF]) -> JointVec {
         std::array::from_fn(|i| {
@@ -1915,12 +1985,12 @@ mod tests {
     // move and a joint path through the trajectory their ticks sample.
     #[hegel::test(test_cases = 30, seed = Some(14))]
     fn every_action_stays_within_the_joint_limits(tc: hegel::TestCase) {
-        let side = if tc.draw(hegel::generators::booleans()) {
-            Side::Right
+        let arm = if tc.draw(hegel::generators::booleans()) {
+            RIGHT
         } else {
-            Side::Left
+            LEFT
         };
-        let limits = bundled_arm(openarm_description::HardwareVersion::V2, side).limits();
+        let limits = bundled_arm(V2, arm).limits();
         let start = drawn_posture(&tc, &limits);
         let target = drawn_posture(&tc, &limits);
         let period = plan_config().cycle_period;
@@ -1932,7 +2002,7 @@ mod tests {
             .build()
             .expect("a runtime")
             .block_on(async {
-                let mut planner = launcher_planner(side, start);
+                let mut planner = launcher_planner(arm, start);
                 let (done_tx, _done_rx) = mpsc::channel(1);
                 let (goal_tx, mut goals) = mpsc::channel(1);
                 let move_slot = claimed_move_slot();
@@ -1987,7 +2057,7 @@ mod tests {
         assert_within_launcher_limits(&ticks_of(&path), period_s);
 
         // A pose move to where a nearby posture puts the grasp point.
-        let planner = launcher_planner(side, start);
+        let planner = launcher_planner(arm, start);
         let nearby: JointVec = std::array::from_fn(|i| start[i] + 0.1 * (target[i] - start[i]));
         let goal = planner.world_ee_pose(&nearby);
         let Some(walk) = plan_line(&planner.model, &goal, start) else {

@@ -1,11 +1,13 @@
 # openarm_web_commander
 
-The browser control panel for the OpenArm (either hardware generation). It serves
-a page on port 8765 by default, with three interaction modes:
+The browser control panel for the OpenArm (either model). It serves a page on
+port 8765 by default, with one card per arm and one per gripper, each titled
+with the name the wire carries (`left_arm`, `left_gripper`, ...), and three
+interaction modes:
 
-- **Streaming**: deadman-gated live control. Enabling a side streams its arm and
-  gripper setpoints continuously on that side's joint_link / gripper_link
-  pairing slots. Per-arm controls: seven joint sliders, toward which the joint
+- **Streaming**: deadman-gated live control. Enabling an arm streams its joint
+  and gripper setpoints continuously on its joint_link / gripper_link pairing
+  slots. Per-arm controls: seven joint sliders, toward which the joint
   target ramps under the jog's speed and acceleration limits, and the gripper
   slider. The world-frame x/y/z sliders and the orientation arcball read the
   pose of the joint target here.
@@ -25,7 +27,7 @@ a page on port 8765 by default, with three interaction modes:
   20 mm and 0.15 rad, and send what the operator types; the backbone refuses a
   value out of its range with `rejected`. The status line shows each refusal
   and failure as its failure kind and message, such as `backbone refused the
-  goal: leader_streaming: ...` or `move_arm (left) failed: unreachable: ...`,
+  goal: leader_streaming: ...` or `move_arm (left_arm) failed: unreachable: ...`,
   and a cancelled move with its reason. The gripper card's **settle timeout
   (s)**, prefilled 2 s, is the longest the backbone waits after the commanded
   travel for the jaws to stand still. The move then reports where the jaws
@@ -37,15 +39,21 @@ a page on port 8765 by default, with three interaction modes:
   to dense joint trajectories at bringup (reachability, joint limits, and
   velocity budgets are asserted there), and streamed through the same governed
   wire as live jogs. Playback starts with a smooth lead-in from the held
-  target, and every gesture ends back at the Ready pose; while a gesture holds
-  a side, that side cannot be enabled or fired.
+  target, and every gesture ends back at each arm's ready posture; while a
+  gesture holds an arm, that arm cannot be enabled or fired.
 
 The governor row streams the operator's collision-avoidance toggle, distance
 band, and EE speed cap to the backbone on `governor_control`, and the proximity
-readout mirrors the backbone's closest-pair report. Slider ranges come from the
-generation's description (`hardware_version` parameter): arm limits parse from
-the bundled URDF with the elbow held off its singularity floor, and the gripper
-axis is the opening fraction (0 closed, 1 open). The UI won't let you ask for an
+readout mirrors the backbone's closest-pair report. Slider ranges, the Home Pose
+and Ready Pose presets and the gestures' anchors come from the description of
+the robot's model, which the panel asks the robot's initializer for on its
+`robot_identity` link: the arm limits are the URDF's, the presets are the
+SRDF's `home` and `ready` states, and the gripper axis is the opening fraction
+(0 closed, 1 open). The panel binds its page during setup and serves it once
+the initializer has named the model, asking again each second until it
+answers, since the initializer may start after the panel. A model whose arms
+are not the panel's ends the node with an error that names the served model
+and the models of the panel's shape. The UI won't let you ask for an
 angle the arm can't physically reach, and closing the page drops every deadman
 and stops any playing gesture.
 
@@ -68,17 +76,19 @@ peppy stack launch openarm_simulation --with mujoco
 ```
 
 You can also run it against a manually assembled stack. Every declared slot
-must be linked at start: the `limb_motion` and `collision_status` slots to the
-backbone instance (the discrete moves and the proximity feed), and each per-side
-state slot to that side's arm or gripper instance (sim followers here, the
+must be linked at start: the `robot_identity` slot to the robot's initializer,
+the `limb_motion` and `collision_status` slots to the backbone instance (the
+discrete moves and the proximity feed), and each per-arm
+state slot to that arm's or gripper's instance (sim followers here, the
 drivers on real hardware). The required parameters have no defaults, so they
 are supplied too:
 
 ```sh
 peppy node run openarm_web_commander:v1 \
-    command_rate_hz=100 hardware_version=v2 max_stream_ee_velocity_m_s=0.5 \
+    command_rate_hz=100 max_stream_ee_velocity_m_s=0.5 \
     joint_jog_acceleration_rad_s2=10.0 joint_jog_velocity_rad_s=1.0 \
     collision_governor_enabled=true d_stop=0.005 d_safe=0.02 \
+    --link robot_identity@init_inst \
     --link limb_motion@backbone_inst \
     --link collision_status@backbone_inst \
     --link left_arm@backbone_inst/leader_left_arm \
@@ -118,7 +128,7 @@ Each arm takes one discrete move at a time and one gesture plays at a time; wait
 for the badge to flip back to idle (or press Stop) before firing again.
 
 **A gesture refuses to start**
-Its sides must be disabled, idle, and measured: turn off streaming for the
+Its arms must be disabled, idle, and measured: turn off streaming for the
 involved arms and wait for state feedback to arrive.
 
 **The panel is not on port 8765**

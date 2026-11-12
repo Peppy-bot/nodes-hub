@@ -5,10 +5,8 @@ import time
 import pytest
 from conftest import MEASURED, FakeKinematics, gripper_step, make_coordinator
 from path_timing_py import JointTrajectory
-from so101_description import limits as limits_mod
-from so101_description.kinematics import Kinematics
-from so101_description.model import KINEMATICS_URDF_PATH
 
+from so101_backbone import limits as limits_mod
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
     GRIPPER_STILL_BAND,
@@ -21,6 +19,8 @@ from so101_backbone.coordinator import (
     PoseSettle,
 )
 from so101_backbone.failures import FailureKind
+from so101_backbone.kinematics import Kinematics
+from so101_backbone.model import DESCRIPTION, urdf_path
 from so101_backbone.params import UpstreamMode
 
 # A settle that every measured arm meets: the plan ends at the planned end of
@@ -811,8 +811,8 @@ def test_a_stream_holds_the_linear_cap_and_the_velocity_limit_on_the_real_arm(
     # velocity limit. The margin covers one tick's curvature, the arc the tip travels off
     # the chord the cap sized.
     rng = random.Random(seed)
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     velocity, cap, dt = (10.0,) * 5, 0.25, 0.01
     c = make_coordinator(
         kinematics,

@@ -1,44 +1,48 @@
-//! The panel's joint ranges, resolved once from the generation's description:
-//! the single source for the sliders' bounds (through the snapshot) and for
+//! The panel's joint ranges, resolved once from the robot's description: the
+//! single source for the sliders' bounds (through the snapshot) and for
 //! clamping incoming commands.
 
-use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
-use srs_model::JointVec;
+use robot_description::{ArmId, PerArm};
+use srs_model::{ARM_DOF, JointVec};
 
-/// A second `init_limits` call, which would be a second generation's ranges
+use crate::robot::ARMS;
+
+/// A second `init_limits` call, which would be a second description's ranges
 /// arriving after the first were already handed out.
 #[derive(Debug, thiserror::Error)]
 #[error("init_limits must run exactly once")]
 pub struct LimitsAlreadySet;
 
-/// Joint ranges from the generation's bundled URDF plus the unitless gripper
+/// Each arm's joint ranges from the description plus the unitless gripper
 /// opening range.
 #[derive(Clone, Copy)]
 struct JointLimits {
     gripper: [f64; 2],
-    arms: ArmPair<[[f64; 2]; ARM_DOF]>,
+    arms: PerArm<[[f64; 2]; ARM_DOF], ARMS>,
 }
 
 impl JointLimits {
-    fn resolve(version: HardwareVersion) -> Self {
+    /// The panel's ranges of arms whose joints take `arms`.
+    fn resolve(arms: PerArm<[[f64; 2]; ARM_DOF], ARMS>) -> Self {
         Self {
             gripper: [0.0, 1.0],
-            arms: ArmPair::from_fn(|side| version.joint_limits(side)),
+            arms,
         }
     }
 }
 
 static LIMITS: std::sync::OnceLock<JointLimits> = std::sync::OnceLock::new();
 
-/// Resolve the panel's clamp/display ranges from the generation's description:
-/// arm joints via its `joint_limits` (URDF limits with the elbow held off its
-/// singularity floor, matching the backbone's clamp); the gripper is the
-/// unitless opening fraction [0, 1] on every generation. Must run before the
-/// UI serves, and exactly once: a second call would be a second generation's
-/// ranges arriving after the first were already handed out.
-pub fn init_limits(version: HardwareVersion) -> std::result::Result<(), LimitsAlreadySet> {
+/// Resolve the panel's clamp/display ranges from each arm's joint limits, `arms`, the
+/// description's: the ranges the backbone clamps into; the gripper is the unitless
+/// opening fraction [0, 1] on every model. Must run before the UI serves, and exactly
+/// once: a second call would be a second description's ranges arriving after the first
+/// were already handed out.
+pub fn init_limits(
+    arms: PerArm<[[f64; 2]; ARM_DOF], ARMS>,
+) -> std::result::Result<(), LimitsAlreadySet> {
     LIMITS
-        .set(JointLimits::resolve(version))
+        .set(JointLimits::resolve(arms))
         .map_err(|_| LimitsAlreadySet)
 }
 
@@ -48,15 +52,15 @@ fn joint_limits() -> &'static JointLimits {
         .expect("init_limits must run before the UI serves")
 }
 
-/// The per-joint `[min, max]` ranges (rad) of `side`'s arm; commands clamp into
-/// them and the sliders bound against them.
-pub(crate) fn arm_limits(side: Side) -> &'static [[f64; 2]; ARM_DOF] {
-    &joint_limits().arms[side]
+/// The per-joint `[min, max]` ranges (rad) of `arm`; commands clamp into them
+/// and the sliders bound against them.
+pub(crate) fn arm_limits(arm: ArmId) -> &'static [[f64; 2]; ARM_DOF] {
+    &joint_limits().arms[arm]
 }
 
-/// The per-joint `[min, max]` ranges (rad) of both arms, the ranges
-/// [`arm_limits`] gives per side; the gesture bake keeps its tracks in them.
-pub(crate) fn arm_ranges() -> &'static ArmPair<[[f64; 2]; ARM_DOF]> {
+/// The per-joint `[min, max]` ranges (rad) of every arm, the ranges
+/// [`arm_limits`] gives per arm; the gesture bake keeps its tracks in them.
+pub(crate) fn arm_ranges() -> &'static PerArm<[[f64; 2]; ARM_DOF], ARMS> {
     &joint_limits().arms
 }
 
@@ -68,9 +72,9 @@ pub(crate) fn gripper_limits() -> [f64; 2] {
 }
 
 // Clamp each joint setpoint into its configured [min, max]. The single clamp
-// path for every operator-driven arm command; the arm clamps again on its side.
-pub(crate) fn clamp_to_limits(joints: &mut JointVec, side: Side) {
-    for (j, &[lo, hi]) in joints.iter_mut().zip(arm_limits(side).iter()) {
+// path for every operator-driven arm command; the arm node clamps again on its own.
+pub(crate) fn clamp_to_limits(joints: &mut JointVec, arm: ArmId) {
+    for (j, &[lo, hi]) in joints.iter_mut().zip(arm_limits(arm).iter()) {
         *j = j.clamp(lo, hi);
     }
 }
@@ -79,7 +83,9 @@ pub(crate) fn clamp_to_limits(joints: &mut JointVec, side: Side) {
 /// first use; concurrent tests settle benignly through get_or_init.
 #[cfg(test)]
 pub(crate) fn init_limits_for_tests() {
-    LIMITS.get_or_init(|| JointLimits::resolve(HardwareVersion::V2));
+    LIMITS.get_or_init(|| {
+        JointLimits::resolve(crate::test_support::driven("openarm_v2").joint_limits())
+    });
 }
 
 #[cfg(test)]
@@ -89,17 +95,17 @@ mod tests {
     #[test]
     fn clamp_pins_each_joint_into_its_range() {
         init_limits_for_tests();
-        for side in Side::BOTH {
-            let limits = arm_limits(side);
+        for arm in PerArm::<(), ARMS>::ids() {
+            let limits = arm_limits(arm);
 
             let mut high = [f64::INFINITY; ARM_DOF];
-            clamp_to_limits(&mut high, side);
+            clamp_to_limits(&mut high, arm);
             for (v, &[_, hi]) in high.iter().zip(limits.iter()) {
                 assert_eq!(*v, hi);
             }
 
             let mut low = [f64::NEG_INFINITY; ARM_DOF];
-            clamp_to_limits(&mut low, side);
+            clamp_to_limits(&mut low, arm);
             for (v, &[lo, _]) in low.iter().zip(limits.iter()) {
                 assert_eq!(*v, lo);
             }
@@ -109,14 +115,14 @@ mod tests {
     #[test]
     fn clamp_leaves_in_range_values_untouched() {
         init_limits_for_tests();
-        for side in Side::BOTH {
-            let limits = arm_limits(side);
+        for arm in PerArm::<(), ARMS>::ids() {
+            let limits = arm_limits(arm);
             let mut mid = [0.0; ARM_DOF];
             for (m, &[lo, hi]) in mid.iter_mut().zip(limits.iter()) {
                 *m = (lo + hi) / 2.0;
             }
             let before = mid;
-            clamp_to_limits(&mut mid, side);
+            clamp_to_limits(&mut mid, arm);
             assert_eq!(mid, before);
         }
     }
@@ -125,8 +131,8 @@ mod tests {
     fn config_joint_limits_are_well_formed() {
         init_limits_for_tests();
         // Each range must be non-empty so clamp and the slider bounds are valid.
-        for side in Side::BOTH {
-            for &[lo, hi] in arm_limits(side).iter() {
+        for arm in PerArm::<(), ARMS>::ids() {
+            for &[lo, hi] in arm_limits(arm).iter() {
                 assert!(lo < hi, "joint range [{lo}, {hi}] must be non-empty");
             }
         }

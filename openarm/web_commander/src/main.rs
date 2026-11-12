@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use control_core::fault::Fault;
+
 fn main() -> peppygen::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -8,12 +10,14 @@ fn main() -> peppygen::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    peppygen::NodeBuilder::new().run(openarm_web_commander::setup)?;
+    let fault = Fault::default();
+    let raised = fault.clone();
+    peppygen::NodeBuilder::new()
+        .run(move |params, runner| openarm_web_commander::setup(params, runner, raised))?;
 
-    // The runtime has returned cleanly as far as it knows; a panel that died
-    // is the reason the token was cancelled, so exit as failed with it.
-    if let Some(fault) = openarm_web_commander::ui_failed() {
-        return Err(openarm_web_commander::NodeError::Ui(fault).into());
-    }
-    Ok(())
+    // The runtime has returned cleanly as far as it knows; a fault is the
+    // reason the token was cancelled, so exit as failed with it.
+    fault
+        .take()
+        .map_or(Ok(()), |reason| Err(peppygen::Error::Node(reason)))
 }

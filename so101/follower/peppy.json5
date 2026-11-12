@@ -15,7 +15,9 @@
     ],
     implements: [
       // Ready once the bus is connected, calibration is verified, and the
-      // first full position read has landed.
+      // first full position read has landed. The initializer tells it the
+      // robot's model (set_model): a model other than so101 gets an error
+      // reply naming it and ends the node.
       { name: "component_ready", tag: "v1", link_id: "ready" },
       // Per-motor temperature, load, and torque-enable telemetry, six
       // motors in bus order (five joints then the gripper), matching the
@@ -50,6 +52,7 @@
     },
     services: {
       exposes: [
+        { link_id: "ready", name: "set_model" },
         { link_id: "ready", name: "is_ready" },
       ],
     },

@@ -9,6 +9,14 @@ clamped joint radians and gripper openings, and streams them exactly like
 `openarm_web_commander`: each limb on its own joint_link / gripper_link pairing
 slot (the backbone governs them all).
 
+The joint limits it clamps to are those of the follower's model, which the
+node asks the robot's initializer for on its `robot_identity` link. It asks
+once its setup has returned, since the initializer may start after it, and
+asks again each second until the initializer answers; it opens the KER only
+then. A model whose arms are not two of seven joints, each with its gripper,
+ends the node with an error that names the served model and the models the
+KER leads.
+
 An arm engages when its trigger is squeezed to `engage_trigger_opening` or
 deeper, having first read back above it for three frames in a row, so a
 device returning under a held trigger never resumes motion. From that frame
@@ -79,12 +87,12 @@ other generation, naming what it reported.
 To watch the channels a running node reads, set `log_raw`, which logs the raw
 table (`CH01=.. CH02=..`, degrees) at 1 Hz:
 
-    peppy stack join openarm:echo --with v2,ker_commander \
+    peppy stack join openarm:echo --with openarm_v2,ker_commander \
       --set-arguments 'commander_inst.log_raw=true'
 
 First engaged run: keep the backbone's `max_stream_ee_velocity_m_s` conservative. An
 arm engaged far from the follower's pose streams that distant target at once,
 and the backbone's rate-limited follow chase moves the follower toward it:
 
-    peppy stack join openarm:echo --with v2,ker_commander \
+    peppy stack join openarm:echo --with openarm_v2,ker_commander \
       --set-arguments 'backbone_inst.max_stream_ee_velocity_m_s=0.1'

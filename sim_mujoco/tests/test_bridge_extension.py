@@ -9,13 +9,16 @@ read and published.
 
 from __future__ import annotations
 
+import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import mujoco
 import numpy as np
 import pytest
-from sim_robot_core.models import EngineModel, parse_entry
+from entries import camera, entry, known as known_model
+from sim_robot_core.models import Arm, ModelEntry
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the bridge imports)
 
@@ -24,7 +27,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 import bridge_extension  # noqa: E402  pylint: disable=C0413
 import mujoco_models  # noqa: E402  pylint: disable=C0413
 from bridge_extension import MujocoBridgeExtension  # noqa: E402  pylint: disable=C0413
-from mujoco_models import parse  # noqa: E402  pylint: disable=C0413
 from exts.actuator_ctrl import home_inertia  # noqa: E402  pylint: disable=C0413
 from world import World  # noqa: E402  pylint: disable=C0413
 
@@ -62,14 +64,15 @@ _JAW_ARM = f"""<mujoco model="jaw_arm">
       ctrlrange="{_JAW_RANGE[0]} {_JAW_RANGE[1]}"/>
   </actuator>
 </mujoco>"""
-_JAW_ARM_ENTRY = {
-    "arms": [{"name": "arm", "joints": ["lift", "flex"]}],
-    "grippers": [{"name": "gripper", "fingers": ["jaw"], "closed_at": "lower_limit"}],
-    "start_posture": _POSTURE,
-}
+_JAW_ARM_ENTRY = entry(
+    "jaw_arm",
+    arms={"arm": ["lift", "flex"]},
+    grippers={"gripper": {"jaw": _JAW_RANGE}},
+    start_posture=_POSTURE,
+)
 
-# Two mirrored prismatic fingers that close at zero, with the symmetric slack
-# an importer adds around the nominal travel.
+# Two mirrored prismatic fingers that close at zero, each joint's range the
+# travel and the symmetric slack an importer adds around it.
 _FINGER_TRAVEL = 0.044
 _PINCHER = f"""<mujoco model="pincher">
   <option gravity="0 0 0"/>
@@ -91,9 +94,10 @@ _PINCHER = f"""<mujoco model="pincher">
     <position name="finger_down" joint="finger_down" kp="100" forcelimited="true" forcerange="-5 5"/>
   </actuator>
 </mujoco>"""
-_PINCHER_ENTRY = {
-    "grippers": [{"name": "hand", "fingers": ["finger_up", "finger_down"], "closed_at": "zero"}],
-}
+_PINCHER_ENTRY = entry(
+    "pincher",
+    grippers={"hand": {"finger_up": (0.0, _FINGER_TRAVEL), "finger_down": (0.0, -_FINGER_TRAVEL)}},
+)
 
 
 class FakeIO:
@@ -152,16 +156,20 @@ def assets_fixture(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _known(model: str, entry: dict, xml: str, **engine):
-    parsed = parse_entry(model, f"{model}.json5", entry)
-    (mujoco_models.ASSETS_DIR / f"{model}.xml").write_text(xml, encoding="utf-8")
-    return parse(EngineModel(entry=parsed, engine={"scene": f"{model}.xml", **engine}))
+# The body of each scene that carries its robot.
+_MOUNTS = {"jaw_arm": "base", "pincher": "palm"}
+
+
+def _known(model: str, robot: ModelEntry, xml: str, **release):
+    scene = mujoco_models.ASSETS_DIR / f"{model}.xml"
+    scene.write_text(xml, encoding="utf-8")
+    return known_model(model, robot, scene, _MOUNTS[model], **release)
 
 
 def _stand(xml: str, known, io=None, time_base_s: float = 0.0, names=(ROBOT,)):
     """A scene composed and started the way the launcher stands it, with one
     robot of `known` under each name."""
-    world = World(head_camera_pack=None, renders=False)
+    world = World(renders=False)
     for name in names:
         world.add(name, known, world.free_spot())
     model = world.compose().compile()
@@ -177,8 +185,8 @@ def _stand(xml: str, known, io=None, time_base_s: float = 0.0, names=(ROBOT,)):
     return model, data, io, bridge
 
 
-def _jaw_arm(io=None, entry=None, time_base_s: float = 0.0, names=(ROBOT,)):
-    known = _known("jaw_arm", entry or _JAW_ARM_ENTRY, _JAW_ARM)
+def _jaw_arm(io=None, robot=None, time_base_s: float = 0.0, names=(ROBOT,)):
+    known = _known("jaw_arm", robot or _JAW_ARM_ENTRY, _JAW_ARM)
     return _stand(_JAW_ARM, known, io, time_base_s, names)
 
 
@@ -231,13 +239,6 @@ class TestStartPosture:
             bridge.step()
         assert abs(_qpos(model, data, "lift")) < _POSTURE["lift"] / 2
 
-    def test_a_model_whose_entry_names_no_posture_starts_where_its_file_puts_it(self):
-        entry = {key: value for key, value in _JAW_ARM_ENTRY.items() if key != "start_posture"}
-        model, data, _, _ = _jaw_arm(entry=entry)
-
-        assert data.qpos.tolist() == [0.0, 0.0, 0.0]
-        assert data.ctrl.tolist() == [0.0, 0.0, 0.0]
-
 
 class TestAJawClosedAtItsLowerLimit:
     @pytest.mark.parametrize(
@@ -277,6 +278,55 @@ class TestAJawClosedAtItsLowerLimit:
         io.gripper_commands[(ROBOT, "gripper")] = (0.5, 0.0)
         bridge.step()
         assert model.actuator_forcerange[jaw].tolist() == [-3.0, 3.0]
+
+
+# The pincher with its lower finger coupled to the upper one by an equality,
+# the way an upstream gripper mirrors its second finger: one actuator drives
+# the gripper.
+_COUPLED_PINCHER = _PINCHER.replace(
+    '    <position name="finger_down" joint="finger_down" kp="100" forcelimited="true" forcerange="-5 5"/>\n',
+    "",
+).replace(
+    "  <actuator>",
+    '  <equality>\n    <joint joint1="finger_down" joint2="finger_up" polycoef="0 -1 0 0 0"/>\n  </equality>\n  <actuator>',
+)
+
+
+class TestAFingerAnEqualityCouples:
+    def test_the_opening_drives_the_actuated_finger_and_reads_back_from_both(self, clock):
+        io = FakeIO()
+        io.gripper_commands[(ROBOT, "hand")] = (1.0, 2.0)
+        model, data, _, bridge = _stand(
+            _COUPLED_PINCHER, _known("pincher", _PINCHER_ENTRY, _COUPLED_PINCHER), io
+        )
+
+        bridge.step()
+
+        assert _ctrl(model, data, "finger_up") == pytest.approx(_FINGER_TRAVEL)
+        assert model.actuator_forcerange[model.actuator(f"{ROBOT}/finger_up").id].tolist() == [-2.0, 2.0]
+        data.qpos[model.joint(f"{ROBOT}/finger_up").qposadr[0]] = _FINGER_TRAVEL
+        data.qpos[model.joint(f"{ROBOT}/finger_down").qposadr[0]] = -_FINGER_TRAVEL / 2
+        bridge._publish_state()  # pylint: disable=W0212
+        assert io.gripper_states[-1] == (ROBOT, "hand", pytest.approx(0.75))
+
+    def test_the_start_posture_places_the_coupled_finger_and_targets_the_driven_one_alone(self, caplog):
+        posture = {"finger_up": 0.02, "finger_down": -0.02}
+        coupled = replace(_PINCHER_ENTRY, start_posture=posture)
+        with caplog.at_level(logging.WARNING):
+            model, data, _, _ = _stand(_COUPLED_PINCHER, _known("pincher", coupled, _COUPLED_PINCHER))
+
+        assert _qpos(model, data, "finger_up") == 0.02
+        assert _qpos(model, data, "finger_down") == -0.02
+        assert _ctrl(model, data, "finger_up") == 0.02
+        assert caplog.messages == []
+
+    def test_a_gripper_no_actuator_drives_is_refused_by_name(self):
+        unactuated = _COUPLED_PINCHER.replace(
+            '    <position name="finger_up" joint="finger_up" kp="100" forcelimited="true" forcerange="-5 5"/>\n',
+            "",
+        )
+        with pytest.raises(RuntimeError, match="no actuator of the scene standing .* drives a finger of gripper 'hand'"):
+            _stand(unactuated, _known("pincher", _PINCHER_ENTRY, unactuated))
 
 
 class TestFingersClosedAtZero:
@@ -341,12 +391,12 @@ class TestLimbs:
 
 class TestStartup:
     def test_a_joint_of_the_entry_the_scene_lacks_is_refused_by_name(self):
-        entry = dict(_JAW_ARM_ENTRY, arms=[{"name": "arm", "joints": ["lift", "flex", "wrist"]}])
+        robot = replace(_JAW_ARM_ENTRY, arms=(Arm(name="arm", joints=("lift", "flex", "wrist")),))
         with pytest.raises(
             RuntimeError,
             match=rf"jaw_arm entry names joints not in the scene standing '{ROBOT}': \['wrist'\]",
         ):
-            _jaw_arm(entry=entry)
+            _jaw_arm(robot=robot)
 
     def test_a_finger_whose_actuator_cannot_be_force_capped_is_refused(self):
         uncapped = _JAW_ARM.replace('forcelimited="true" forcerange="-3 3"', "")
@@ -434,7 +484,7 @@ class TestTheGainsAServoRuns:
         damped against another joint's is a different servo."""
         kp = (30.0, 12.0)
         known = _known(
-            "jaw_arm", _JAW_ARM_ENTRY, _JAW_ARM, arm_gains={"kp": list(kp), "kd": [0.0, 0.0]}
+            "jaw_arm", _JAW_ARM_ENTRY, _JAW_ARM, arm_gains={"arm": [(gain, 0.0) for gain in kp]}
         )
         model, _, _, _ = _stand(_JAW_ARM, known, None, 0.0, (ROBOT,))
         inertia = home_inertia(model)
@@ -507,15 +557,7 @@ class TestAFleetOfOneModel:
         assert _ctrl(model, data, "jaw", ROBOT) == 0.0
 
 
-_CAMERA = {
-    "name": "wrist",
-    "parent_link": "fore",
-    "pos": [0.0, 0.0, 0.1],
-    "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
-    "fovy_deg": 60.0,
-    "color": {"width": 8, "height": 4},
-    "fps": 10,
-}
+_CAMERA = camera("wrist", "fore", (0.0, 0.0, 0.1), (1.0, 0.0, 0.0, 0.0), 60.0, 8, 4, 10)
 
 
 class TestARenderingScene:
@@ -524,9 +566,9 @@ class TestARenderingScene:
     the composed scene."""
 
     def test_each_rig_carries_the_prefix_of_the_robot_it_renders_for(self):
-        entry = dict(_JAW_ARM_ENTRY, cameras=[_CAMERA])
-        known = _known("jaw_arm", entry, _JAW_ARM)
-        world = World(head_camera_pack=None, renders=True)
+        robot = replace(_JAW_ARM_ENTRY, cameras=(_CAMERA,))
+        known = _known("jaw_arm", robot, _JAW_ARM)
+        world = World(renders=True)
         for name in (ROBOT, "delta"):
             world.add(name, known, world.free_spot())
         model = world.compose().compile()
@@ -549,21 +591,21 @@ class TestARenderingScene:
         # Every camera each rig names is a camera of the composed scene, so
         # the render thread finds what it renders.
         for rig in rigs:
-            for camera in rig.cameras:
-                assert model.camera(f"{rig.prefix}{camera.name}") is not None
+            for rendered in rig.cameras:
+                assert model.camera(f"{rig.prefix}{rendered.name}") is not None
 
     def test_a_scene_the_engine_renders_nothing_in_has_no_rig(self):
-        entry = dict(_JAW_ARM_ENTRY, cameras=[_CAMERA])
-        _, _, _, bridge = _stand(_JAW_ARM, _known("jaw_arm", entry, _JAW_ARM))
+        robot = replace(_JAW_ARM_ENTRY, cameras=(_CAMERA,))
+        _, _, _, bridge = _stand(_JAW_ARM, _known("jaw_arm", robot, _JAW_ARM))
 
         assert bridge._camera_sensor is None  # pylint: disable=W0212
 
     def test_a_camera_keeps_counting_its_frames_across_a_scene_composed_again(self):
         """A consumer pairs a colour frame with its depth by the frame id, so
         the count carries onto the scene the robot is carried into."""
-        entry = dict(_JAW_ARM_ENTRY, cameras=[_CAMERA])
-        known = _known("jaw_arm", entry, _JAW_ARM)
-        world = World(head_camera_pack=None, renders=True)
+        robot = replace(_JAW_ARM_ENTRY, cameras=(_CAMERA,))
+        known = _known("jaw_arm", robot, _JAW_ARM)
+        world = World(renders=True)
         world.add(ROBOT, known, world.free_spot())
         model = world.compose().compile()
         first = MujocoBridgeExtension(

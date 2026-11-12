@@ -485,7 +485,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -617,7 +617,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
 dependencies = [
  "thiserror 2.0.21",
  "tokio",
@@ -2414,24 +2414,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
-name = "openarm_description"
-version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
-dependencies = [
- "serde",
- "srs_model",
- "urdf-rs",
-]
-
-[[package]]
 name = "openarm_web_commander"
 version = "0.1.0"
 dependencies = [
  "axum",
  "control_core",
- "openarm_description",
  "peppygen",
  "peppylib",
+ "robot_description",
  "serde",
  "serde_json",
  "srs_model",
@@ -2440,7 +2430,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
- "urdf-rs",
 ]
 
 [[package]]
@@ -3186,6 +3175,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "robot_description"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
+dependencies = [
+ "chain_kinematics",
+ "roxmltree",
+ "sha2",
+ "thiserror 2.0.21",
+ "urdf-rs",
+]
+
+[[package]]
 name = "ron"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3196,6 +3197,15 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -3802,10 +3812,11 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#348b874e8ecfd3d6ded6764dc99e901f105bbb2d"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#67dd22f487e53c6f3f0121c10ad17e7773a5445c"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
+ "robot_description",
  "thiserror 2.0.21",
  "urdf-rs",
 ]

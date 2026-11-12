@@ -4,7 +4,6 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
     && apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
         ca-certificates \
         git \
-        rclone \
         libgl1 \
         libgl1-mesa-dri \
         libglib2.0-0 \
@@ -18,23 +17,25 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
         libegl-mesa0 \
     && rm -rf /var/lib/apt/lists/*
 
+# robot_description_py is a Rust extension that pip builds from its source:
+# gcc and libc6-dev link it, and rustup's minimal profile under /opt/rust
+# compiles it. The image keeps the built extension and no compiler.
 COPY requirements.mujoco.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt
+RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+        curl gcc libc6-dev \
+    && export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo CARGO_TARGET_DIR=/opt/rust/target \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+    && PATH="$CARGO_HOME/bin:$PATH" pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt \
+    && rm -rf /opt/rust \
+    && apt-get purge -y --auto-remove curl gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# One directory per robot under /opt/robot_assets, which is where the node's
-# model entries look their scenes up.
-COPY download_assets.sh /tmp/download_assets.sh
-RUN --mount=type=secret,id=rclone_key \
-    --mount=type=secret,id=rclone_secret \
-    PEPPY_R2_DATA01_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
-    PEPPY_R2_DATA01_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
-    bash /tmp/download_assets.sh --variant mujoco \
-    && mkdir -p /opt/robot_assets/openarm \
-    && cp -r /tmp/.peppy_openarm_assets_mujoco/. /opt/robot_assets/openarm/ \
-    && rm -rf /tmp/.peppy_openarm_assets_mujoco
-
-# The SO-101: MuJoCo Menagerie's robotstudio_so101 at the commit
-# so101_model.lock.json pins, each file checked against its digest.
-COPY so101_model.py so101_model.lock.json /tmp/so101_model/
-RUN python3 /tmp/so101_model/so101_model.py fetch /opt/robot_assets/so101 \
-    && rm -rf /tmp/so101_model
+# Each robot's MuJoCo model, under /opt/robot_assets beside the release's
+# robots.json, where the node's model entries look their files up: the
+# release of Waldo's catalogue that waldo_catalogue.py pins, from the public
+# store, each file checked against its digest.
+COPY waldo_catalogue.py /tmp/waldo_catalogue.py
+RUN python3 /tmp/waldo_catalogue.py fetch /opt/robot_assets \
+    && rm /tmp/waldo_catalogue.py

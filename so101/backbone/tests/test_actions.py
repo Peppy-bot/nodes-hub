@@ -25,14 +25,11 @@ from conftest import (
 )
 from path_timing_py import JOINT_PATH_CORNER_DEVIATION, MIN_JOINT_CHANGE_RAD, JointTrajectory
 from peppygen.exposed_actions.limb_motion import execute_joint_path
-from so101_description import limits as limits_mod
-from so101_description.kinematics import Kinematics
-from so101_description.model import KINEMATICS_URDF_PATH
-from so101_description.postures import HOME_POSITIONS_RAD, READY_POSITIONS_RAD
-from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
-from so101_description.transforms import relative_rotation_rad
+from so101.staleness import COMMAND_SILENCE_LIMIT_S
+from so101.transforms import relative_rotation_rad
 
 from so101_backbone import actions
+from so101_backbone import limits as limits_mod
 from so101_backbone.actions import (
     ARM_WORDS,
     GRIPPER_WORDS,
@@ -51,6 +48,9 @@ from so101_backbone.coordinator import (
     GRIPPER_STILL_WINDOW_S,
 )
 from so101_backbone.failures import FailureKind, Refusal
+from so101_backbone.kinematics import Kinematics
+from so101_backbone.model import DESCRIPTION, urdf_path
+from so101_backbone.postures import HOME_POSITIONS_RAD, READY_POSITIONS_RAD
 
 # The reason the generated goal context gives for each cause of a cancel
 # signal, in peppy's words.
@@ -1531,8 +1531,8 @@ async def test_an_arm_goal_below_the_base_plane_is_admitted(follower_never_stale
     # Its grasp point is 0.2 m below the plane that the base stands on, thus
     # through the surface below the robot. The backbone accepts the move and
     # runs it to its end.
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     below_the_base = (0.0, 1.5, 0.0, 0.0, 0.0)
     assert limits.contains(below_the_base)
     position, _orientation = kinematics.forward_kinematics(below_the_base)
@@ -1553,8 +1553,8 @@ async def test_a_joint_path_below_the_base_plane_is_admitted(follower_never_stal
     # Its grasp point is 0.2 m below the plane that the base stands on, thus
     # through the surface below the robot. The backbone accepts the move and
     # runs it to its end.
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     below_the_base = (0.0, 1.5, 0.0, 0.0, 0.0)
     assert limits.contains(below_the_base)
     position, _orientation = kinematics.forward_kinematics(below_the_base)
@@ -2398,8 +2398,8 @@ async def test_a_walked_line_of_the_real_arm_stays_within_the_joint_limits(seed)
     # The real solver and model: a pose move's trajectory runs through its line's walk at
     # the launcher's limits.
     rng = random.Random(seed)
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     velocity, acceleration = (10.0,) * 5, (0.72,) * 5
     coordinator, layer = make_layer(
         kinematics,
@@ -2427,8 +2427,8 @@ async def test_a_walked_line_of_the_real_arm_stays_within_the_joint_limits(seed)
 async def test_a_short_walked_line_rests_at_none_of_its_samples():
     # Each sample of a 1 cm line lies within a joint path's repeat of the one before it,
     # and the line runs through them: under a second at the launcher's limits.
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
+    kinematics = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
     _, layer = make_layer(
         kinematics,
         limits,

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+robot_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "robot_description", features = ["meshes"] }
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 futures  = "0.3"

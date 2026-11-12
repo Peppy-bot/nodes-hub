@@ -13,16 +13,17 @@
 //! their *order* no longer matters.
 
 use control_core::throttle::Throttle;
-use openarm_description::{ARM_DOF, ARMS};
-use self_collision_model::{CollisionError, DistanceGradient, OpenArmModel};
+use self_collision_model::{CollisionError, DistanceGradient, SelfCollisionModel};
+use srs_model::ARM_DOF;
 use tracing::warn;
 
+use crate::robot::ARMS;
 use crate::streams::THROTTLED_WARN_PERIOD;
 
 use super::{GOV_DOF, GovState, NearestPair, split};
 
 pub(super) struct ConfiguredModel {
-    inner: OpenArmModel,
+    inner: SelfCollisionModel<ARM_DOF, ARMS>,
     /// Throttles the failed-query log. A failed query stays fail-safe (`None`
     /// reads as a breach in the scan and as "no pair" in the readout), but a
     /// persistently failing model must be visible in the log, not
@@ -31,7 +32,7 @@ pub(super) struct ConfiguredModel {
 }
 
 impl ConfiguredModel {
-    pub fn new(inner: OpenArmModel) -> Self {
+    pub fn new(inner: SelfCollisionModel<ARM_DOF, ARMS>) -> Self {
         Self {
             inner,
             query_error_log: Throttle::new(THROTTLED_WARN_PERIOD),

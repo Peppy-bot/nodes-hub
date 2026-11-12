@@ -1,6 +1,7 @@
-//! What the unit tests share: the arms built from the bundled description,
-//! the planner config and the planners of the tests, the poses the tests hold
-//! the arms at, each arm measured where its planner holds it, how far a point
+//! What the unit tests share: the arms by their places, the bundled
+//! descriptions, the arms and the postures built from them, the planner
+//! config and the planners of the tests, the poses the tests hold the arms
+//! at, each arm measured where its planner holds it, how far a point
 //! stands from a segment, move slots claimed as at a goal's admission, the
 //! goals of joint paths and where their shares report, a path guard that
 //! lets every path through and one that holds every path short, the guard
@@ -8,21 +9,23 @@
 //! end, the paths of a step no joint path moves, and the node's parameter set
 //! the integration tests boot the harness with.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use control_core::path_timing::RoundedPath;
-use openarm_description::{ARM_DOF, ArmOrder, ArmPair, HardwareVersion, Side};
-use srs_model::{Arm, JointVec, Limit};
-
+use robot_description::{ArmId, Driven, PerArm, RobotDescription};
+use srs_model::{ARM_DOF, Arm, JointVec, Limit};
 use tokio::sync::mpsc;
+use workspace_core::surface_block::ArmBodies;
 
+use crate::arm_order::ArmOrder;
 use crate::governor::{GovState, GuardAt, PathArms};
 use crate::move_slot::MoveSlot;
 use crate::planner::{
     JointPath, Measurement, PathGoal, PathGuard, PlanConfig, Planner, ShareReply, ShareReport,
 };
+use crate::robot::{self, ARMS};
 use crate::settle::Settle;
 
 #[path = "../tests/helpers/params.rs"]
@@ -37,12 +40,56 @@ const A_MAX: JointVec = [5.0; ARM_DOF];
 /// The control period of the test planners.
 const TEST_PERIOD: Duration = Duration::from_millis(10);
 
-/// The `side` arm of `version`, built by `HardwareVersion::arm_model` from the bundled
-/// description.
-pub(crate) fn bundled_arm(version: HardwareVersion, side: Side) -> Arm {
-    version
-        .arm_model(side)
+/// The arms, in place order: the arm [`robot::LIMBS`] names first, then the second.
+pub(crate) const LEFT: ArmId = ArmId::new(0);
+pub(crate) const RIGHT: ArmId = ArmId::new(1);
+
+/// The models the tests drive, by their robot_identity model ids.
+pub(crate) const V1: &str = "openarm_v1";
+pub(crate) const V2: &str = "openarm_v2";
+
+/// [`V1`] and [`V2`], each held to this node's arms, read once per test binary.
+static DRIVEN: LazyLock<[Driven<ARM_DOF, ARMS>; 2]> = LazyLock::new(|| {
+    [V1, V2].map(|model| {
+        robot::LIMBS
+            .model(model)
+            .expect("this node drives the model")
+    })
+});
+
+/// `model`, one of [`V1`] and [`V2`], held to this node's arms.
+pub(crate) fn driven(model: &str) -> &'static Driven<ARM_DOF, ARMS> {
+    DRIVEN
+        .iter()
+        .find(|driven| driven.model().id() == model)
+        .expect("the tests drive V1 and V2")
+}
+
+/// The bundled description of `model`, one of [`V1`] and [`V2`].
+pub(crate) fn description(model: &str) -> &'static RobotDescription {
+    driven(model).description()
+}
+
+/// The arm `arm` of `model`, built from its bundled description.
+pub(crate) fn bundled_arm(model: &str, arm: ArmId) -> Arm {
+    let description = description(model);
+    Arm::from_description(description, &description.arms()[arm.place()])
         .expect("build the arm from the bundled URDF")
+}
+
+/// The arm bodies of `model`, from its bundled description and collision meshes.
+pub(crate) fn arm_bodies(model: &str) -> ArmBodies {
+    let meshes = driven(model).model().directory().join("meshes");
+    ArmBodies::new(
+        description(model),
+        meshes.to_str().expect("the meshes path is UTF-8"),
+    )
+    .expect("the arm bodies of the bundled description")
+}
+
+/// Each arm's posture in the state `state` of `model`'s description.
+pub(crate) fn postures(model: &str, state: &'static str) -> PerArm<JointVec, ARMS> {
+    robot::postures_of(driven(model), state).expect("each arm's posture")
 }
 
 /// The planner config of the tests: a 10 ms period, 10 rad/s on every
@@ -62,33 +109,30 @@ pub(crate) fn plan_config() -> PlanConfig {
     }
 }
 
-/// An in-limit pose of v1's left arm: elbow off its 0.05 floor, j2 inside
-/// [-3.32, 0.17].
+/// An in-limit pose of v1's left arm, its elbow bent.
 pub(crate) const POSE_TEST_Q: JointVec = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
 
 /// Where both arms stand in the path tests: [`POSE_TEST_Q`], the right arm's
 /// mirrored into its limits, whose second joint runs the other way.
-pub(crate) const BOTH_HELD: ArmPair<JointVec> = ArmPair {
-    left: POSE_TEST_Q,
-    right: [0.0, 0.8, 0.0, 1.2, 0.0, 0.0, 0.0],
-};
+pub(crate) const BOTH_HELD: PerArm<JointVec, ARMS> =
+    PerArm::new([POSE_TEST_Q, [0.0, 0.8, 0.0, 1.2, 0.0, 0.0, 0.0]]);
 
-/// A planner of the `side` arm of v1 hardware, within the arm's own joint
-/// limits, holding `held`.
-pub(crate) fn planner_holding(side: Side, held: JointVec) -> Planner {
-    let model = bundled_arm(HardwareVersion::V1, side);
+/// A planner of the arm `arm` of [`V1`], within the arm's own joint limits,
+/// holding `held`.
+pub(crate) fn planner_holding(arm: ArmId, held: JointVec) -> Planner {
+    let model = bundled_arm(V1, arm);
     let cfg = PlanConfig {
         limits: model.limits(),
         ..plan_config()
     };
-    let mut planner = Planner::new(side, model, cfg);
+    let mut planner = Planner::new(arm, model, cfg);
     planner.commit(held);
     planner
 }
 
 /// Each arm measured where its planner holds it.
-pub(crate) fn measured_at_setpoints(planners: &ArmPair<Planner>) -> ArmPair<Measurement> {
-    ArmPair::from_fn(|side| Ok(planners[side].setpoint()))
+pub(crate) fn measured_at_setpoints(planners: &PerArm<Planner, ARMS>) -> PerArm<Measurement, ARMS> {
+    PerArm::from_fn(|arm| Ok(planners[arm].setpoint()))
 }
 
 /// How far `q` stands from the segment from `a` to `b`.
@@ -123,10 +167,10 @@ pub(crate) fn claimed_move_slot() -> MoveSlot {
 
 /// The move slots of both arms, those of `arms` claimed as the action's
 /// admission claims them.
-pub(crate) fn claimed(arms: &ArmOrder) -> ArmPair<MoveSlot> {
-    let move_slots = ArmPair::from_fn(|_| MoveSlot::default());
-    for &side in arms.sides() {
-        assert!(move_slots[side].claim(), "a new slot is free");
+pub(crate) fn claimed(arms: &ArmOrder) -> PerArm<MoveSlot, ARMS> {
+    let move_slots = PerArm::from_fn(|_| MoveSlot::default());
+    for &arm in arms.ids() {
+        assert!(move_slots[arm].claim(), "a new slot is free");
     }
     move_slots
 }
@@ -136,7 +180,7 @@ pub(crate) fn claimed(arms: &ArmOrder) -> ArmPair<MoveSlot> {
 pub(crate) fn share_reply(
     cancelled: &Arc<AtomicBool>,
 ) -> (ShareReply, mpsc::Receiver<ShareReport>) {
-    let (done_tx, done_rx) = mpsc::channel(Side::BOTH.len());
+    let (done_tx, done_rx) = mpsc::channel(ARMS);
     let reply = ShareReply {
         done_tx,
         cancelled: cancelled.clone(),
@@ -149,15 +193,15 @@ pub(crate) fn share_reply(
 /// in a second.
 pub(crate) fn test_settle(arms: &ArmOrder) -> Settle<Vec<f64>> {
     Settle {
-        tolerance: vec![0.01; arms.sides().len() * ARM_DOF],
+        tolerance: vec![0.01; arms.ids().len() * ARM_DOF],
         timeout: Duration::from_secs(1),
     }
 }
 
 /// The array in the order of `arms` of each named arm's joints in
 /// `joints`.
-pub(crate) fn array_of(arms: &ArmOrder, joints: &ArmPair<JointVec>) -> Vec<f64> {
-    arms.sides().iter().flat_map(|&side| joints[side]).collect()
+pub(crate) fn array_of(arms: &ArmOrder, joints: &PerArm<JointVec, ARMS>) -> Vec<f64> {
+    arms.ids().iter().flat_map(|&arm| joints[arm]).collect()
 }
 
 /// A goal of a path of `arms` through `waypoints` over `duration` at least,
@@ -165,11 +209,11 @@ pub(crate) fn array_of(arms: &ArmOrder, joints: &ArmPair<JointVec>) -> Vec<f64> 
 /// holding the slot `slot_of` gives each of its arms.
 pub(crate) fn path_goal_through<'a>(
     arms: &ArmOrder,
-    waypoints: &[ArmPair<JointVec>],
+    waypoints: &[PerArm<JointVec, ARMS>],
     duration: Duration,
     settle: Settle<Vec<f64>>,
     reply: ShareReply,
-    slot_of: impl Fn(Side) -> &'a MoveSlot,
+    slot_of: impl Fn(ArmId) -> &'a MoveSlot,
 ) -> PathGoal {
     PathGoal {
         path: JointPath {
@@ -177,13 +221,13 @@ pub(crate) fn path_goal_through<'a>(
             waypoints: waypoints.iter().map(|w| array_of(arms, w)).collect(),
             duration,
         },
-        expected_starts: vec![None; arms.sides().len()],
+        expected_starts: vec![None; arms.ids().len()],
         settle,
         reply,
         move_slots: arms
-            .sides()
+            .ids()
             .iter()
-            .map(|&side| slot_of(side).release_on_drop())
+            .map(|&arm| slot_of(arm).release_on_drop())
             .collect(),
     }
 }
@@ -225,10 +269,10 @@ impl PathGuard for Refusing {
 /// The guard the paths of the tests are judged against: where the arms are
 /// held, the grippers open, and the guard disabled; the checkers of the tests
 /// judge the path alone.
-pub(crate) fn test_guard(planners: &ArmPair<Planner>) -> GuardAt {
+pub(crate) fn test_guard(planners: &PerArm<Planner, ARMS>) -> GuardAt {
     GuardAt::disabled(GovState::new(
-        ArmPair::from_fn(|side| planners[side].setpoint()),
-        ArmPair::new(1.0, 1.0),
+        PerArm::from_fn(|arm| planners[arm].setpoint()),
+        PerArm::new([1.0, 1.0]),
     ))
 }
 

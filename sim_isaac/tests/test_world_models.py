@@ -1,9 +1,11 @@
 """What a robot's model asks of the stage as it joins, on a stage that is
 stood in: the stage its entry names is referenced under the prim it stands
-at, the head camera seats there for a model that draws one and for no other,
-and a robot whose head camera cannot be seated leaves nothing on the stage.
-What the pack does to the stage is test_head_camera.py's, and what a posture
-and gravity compensation author is test_world_joining.py's."""
+at, the head camera seats there, its chest camera held to the pack's rig,
+for a model that draws one and for no other, and a robot whose head camera
+cannot be seated leaves nothing on the stage.
+What the pack does to the stage is test_head_camera.py's, and what a posture,
+a mimic finger's coupling and gravity compensation author is
+test_world_joining.py's."""
 
 import sys
 from types import ModuleType
@@ -29,12 +31,15 @@ def _world(monkeypatch, tmp_path):
     # `import omni.usd` binds the package, so the submodule rides on it.
     monkeypatch.setattr(sys.modules["omni"], "usd", usd, raising=False)
     monkeypatch.setattr(module.World, "place", staticmethod(lambda prim, position, yaw: None))
+    monkeypatch.setattr(module.World, "_hold_to_description", staticmethod(calls.hold_to_description))
     monkeypatch.setattr(module.World, "_start_in_posture", staticmethod(calls.start_in_posture))
+    monkeypatch.setattr(module.World, "_couple_followers", staticmethod(calls.couple_followers))
     calls.compensate_gravity.return_value = 0
     monkeypatch.setattr(module.World, "_compensate_gravity", staticmethod(calls.compensate_gravity))
     attach = calls.attach
     attach.side_effect = lambda stage, root, pack: f"{root}/openarm_body_link0/openarm_head_camera"
     monkeypatch.setattr(module.head_camera, "attach", attach)
+    monkeypatch.setattr(module.head_camera, "check_chest_camera", calls.check_chest_camera)
     pack = stand_in_pack(module.head_camera, tmp_path / "head_camera")
     # Every model's stage is on disk where its entry names it.
     monkeypatch.setattr(sys.modules["isaac_models"], "ASSETS_DIR", tmp_path)
@@ -56,10 +61,16 @@ def test_each_v2_draws_its_head_camera_under_its_own_prim_once_referenced(world)
         ((calls.stage, charlie.prim(), pack),),
     ]
     assert [bravo.prim(), charlie.prim()] == ["/World/bravo", "/World/charlie"]
-    # The head camera seats on the pedestal the reference brings in.
+    # Each robot's chest camera is held to the pack's left eye.
+    assert calls.check_chest_camera.call_args_list == [
+        ((pack.rig, bravo.known.entry),),
+        ((pack.rig, charlie.known.entry),),
+    ]
+    # The head camera seats on the pedestal the reference brings in, once
+    # the robot's chest camera is found to look out of its lens.
     names = [name for name, _, _ in calls.mock_calls]
     referenced = names.index("stage.DefinePrim().GetReferences().AddReference")
-    assert names.index("attach") > referenced
+    assert names.index("attach") > names.index("check_chest_camera") > referenced
 
 
 @pytest.mark.parametrize("model", ["openarm_v1", "so101"])
@@ -68,6 +79,7 @@ def test_a_model_whose_entry_asks_for_no_head_camera_draws_none(world, model):
 
     stood.add("charlie", known(model), module.Placement.of([1.5, 0.0, 0.0], 0.0))
 
+    calls.check_chest_camera.assert_not_called()
     calls.attach.assert_not_called()
 
 
@@ -79,6 +91,22 @@ def test_a_robot_whose_head_camera_cannot_be_seated_leaves_nothing_behind(world)
     with pytest.raises(RuntimeError, match="openarm_body_link0"):
         stood.add("bravo", known("openarm_v2"), spot)
 
+    calls.stage.RemovePrim.assert_called_once_with("/World/bravo")
+    assert stood.robots() == []
+    assert not stood.occupied(spot)
+
+
+def test_a_robot_whose_chest_camera_is_off_the_packs_left_eye_leaves_nothing_behind(world):
+    stood, calls, _, module = world
+    calls.check_chest_camera.side_effect = RuntimeError(
+        "the chest camera of the openarm_v2 entry sits off the head camera's left lens front"
+    )
+    spot = module.Placement.of([0.0, -1.5, 0.0], 0.0)
+
+    with pytest.raises(RuntimeError, match="left lens front"):
+        stood.add("bravo", known("openarm_v2"), spot)
+
+    calls.attach.assert_not_called()
     calls.stage.RemovePrim.assert_called_once_with("/World/bravo")
     assert stood.robots() == []
     assert not stood.occupied(spot)
@@ -157,3 +185,18 @@ def test_every_robot_is_put_in_the_posture_its_own_model_starts_in(world):
         (prim, known("openarm_v2")),
         (prim, known("so101")),
     ]
+    # Each robot's mimic fingers are bound to the fingers they follow, by its
+    # own model, once it stands in its posture.
+    assert [args for args, _ in calls.couple_followers.call_args_list] == [
+        (prim, known("openarm_v2")),
+        (prim, known("so101")),
+    ]
+    # Each robot's stage is held to its own model's description before its
+    # posture is written on it.
+    assert [args for args, _ in calls.hold_to_description.call_args_list] == [
+        (prim, known("openarm_v2")),
+        (prim, known("so101")),
+    ]
+    names = [name for name, _, _ in calls.mock_calls]
+    assert names.index("couple_followers") > names.index("start_in_posture")
+    assert names.index("start_in_posture") > names.index("hold_to_description")

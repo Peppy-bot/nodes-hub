@@ -1,29 +1,68 @@
 //! The gripper motor as this node commands it: the CAN driver in its
-//! generation's control mode, paired with that instance's opening geometry.
+//! mechanism's control mode, paired with that instance's opening geometry.
 //!
-//! The two generations differ only here. The v1.0 prismatic jaws run MIT
-//! position hold at fixed gains, a mode carrying no per-command force limit,
-//! so that gripper caps no grip effort and reports none on `gripper_states`
-//! (its motor torque still reaches the wire as motor_health). The v2.0
-//! revolute pinch runs POS_FORCE, a position command bounded by a speed limit
-//! and a torque-current ceiling, and reports the force it meets. Every other
-//! operation is the same bus behaviour, dispatched once through [`ModeBus`].
+//! The two mechanisms differ only here. The v1.0 prismatic parallel jaws run
+//! MIT position hold at fixed gains, a mode carrying no per-command force
+//! limit, so that gripper caps no grip effort and reports none on
+//! `gripper_states` (its motor torque still reaches the wire as
+//! motor_health). The v2.0 revolute pinch fingers run POS_FORCE, a position
+//! command bounded by a speed limit and a torque-current ceiling, and report
+//! the force they meet. Every other operation is the same bus behavior,
+//! dispatched once through [`ModeBus`].
 //!
 //! One type owns the driver, the geometry and the mode's bounds together,
-//! resolved from the same `hardware_version`, so no caller can pair a
-//! generation with another's mapping or with bounds its mode cannot apply.
+//! resolved from the same [`Mechanism`], so no caller can pair a mechanism
+//! with another's travel or with bounds its mode cannot apply.
 
 use std::num::NonZeroU32;
 use std::time::Duration;
 
 use control_core::motor_health::Ratings;
 use openarm_can::{
-    CanError, EnableFailure, GripperCan, GripperState, Mit, Mode, MotorParam, MotorType, PosForce,
-    ReceivePass, v10, v20,
+    CanError, CanInterface, EnableFailure, GripperCan, GripperState, Mit, Mode, MotorParam,
+    MotorType, PosForce, ReceivePass, v10, v20,
 };
-use openarm_description::{HardwareVersion, Side};
+use robot_description::{DrivenModels, Finger};
 
 use crate::geometry::Geometry;
+
+/// The gripper mechanism the driver runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mechanism {
+    /// The v1.0 prismatic parallel jaws: MIT position hold, no force control.
+    ParallelJaws,
+    /// The v2.0 revolute pinch fingers: POS_FORCE, with a speed limit, a
+    /// grip-force ceiling and force feedback.
+    PinchFingers,
+}
+
+/// Each model whose gripper this node drives, by its robot_identity model id,
+/// with the mechanism that gripper is.
+pub(crate) const DRIVEN_MODELS: DrivenModels<Mechanism, 2> = DrivenModels::new([
+    ("openarm_v1", Mechanism::ParallelJaws),
+    ("openarm_v2", Mechanism::PinchFingers),
+]);
+
+impl Mechanism {
+    /// The motor this mechanism's gripper drives.
+    pub fn motor_type(self) -> MotorType {
+        match self {
+            Self::ParallelJaws => v10::GRIPPER_MOTOR_TYPE,
+            Self::PinchFingers => v20::GRIPPER_MOTOR_TYPE,
+        }
+    }
+
+    /// The opening geometry of this mechanism's motor driving `finger`: the
+    /// parallel jaws' motor stands at [`v10::GRIPPER_OPEN_RAD`] at full open,
+    /// signed the way the finger opens, and the pinch fingers' motor turns its
+    /// finger one to one.
+    pub fn geometry(self, finger: &Finger) -> Geometry {
+        match self {
+            Self::ParallelJaws => Geometry::new(v10::GRIPPER_OPEN_RAD, finger),
+            Self::PinchFingers => Geometry::one_to_one(finger),
+        }
+    }
+}
 
 /// A motor the datasheet table carries no ratings for.
 #[derive(Debug, thiserror::Error)]
@@ -93,7 +132,8 @@ impl MaxEffortNm {
     }
 }
 
-/// The POS_FORCE bounds every v2 command carries, parsed once at startup.
+/// The POS_FORCE bounds every pinch-finger command carries, parsed once at
+/// startup.
 #[derive(Debug, Clone, Copy)]
 pub struct PosForceLimits {
     /// Absolute speed limit (rad/s at the motor).
@@ -110,28 +150,20 @@ pub struct PosForceLimits {
     ratings: Ratings,
 }
 
-/// The motor a gripper of this generation drives.
-pub fn gripper_motor_type(hardware_version: HardwareVersion) -> MotorType {
-    match hardware_version {
-        HardwareVersion::V1 => v10::GRIPPER_MOTOR_TYPE,
-        HardwareVersion::V2 => v20::GRIPPER_MOTOR_TYPE,
-    }
-}
-
 impl PosForceLimits {
     /// Rejects the values POS_FORCE cannot carry or the robot cannot mean.
-    /// Checked for both generations: the ranges are properties of the
+    /// Checked for both mechanisms: the ranges are properties of the
     /// parameters, not of the gripper that happens to read them.
     ///
     /// The floors are the wire's resolution, not zero. A ceiling the field
     /// truncates to nothing would command zero grip force on every tick while
     /// publishing the `max_effort` value the gripper_link contract reserves
-    /// for "no effort control", leaving a v2 gripper that cannot grip and
-    /// reads on the wire as a v1 that never could; a speed that truncates to
-    /// nothing would command a gripper that cannot move. The force ceiling is
-    /// bounded above by the motor's datasheet peak rather than by the field's
-    /// full scale, which carries quantization headroom the hardware cannot
-    /// deliver.
+    /// for "no effort control", leaving pinch fingers that cannot grip and
+    /// read on the wire as parallel jaws that never could; a speed that
+    /// truncates to nothing would command a gripper that cannot move. The
+    /// force ceiling is bounded above by the motor's datasheet peak rather
+    /// than by the field's full scale, which carries quantization headroom the
+    /// hardware cannot deliver.
     pub fn new(
         motor_type: MotorType,
         speed_rad_s: f64,
@@ -252,7 +284,7 @@ impl<M: Mode> ModeBus for GripperCan<M> {
     }
 }
 
-/// The driver in the control mode its generation is commanded through.
+/// The driver in the control mode its mechanism is commanded through.
 enum Drive {
     Mit(GripperCan<Mit>),
     PosForce {
@@ -274,28 +306,26 @@ pub struct Gripper {
 }
 
 impl Gripper {
-    /// Opens the motor in this generation's control mode and resolves this
-    /// side's opening geometry. `limits` reaches the wire only on v2, whose
-    /// POS_FORCE frames carry them; MIT takes no per-command bounds.
+    /// Opens the motor on `interface` in `mechanism`'s control mode and
+    /// resolves the opening geometry of the motor driving `finger`. `limits`
+    /// reaches the wire only on the pinch fingers, whose POS_FORCE frames carry
+    /// them; MIT takes no per-command bounds.
     pub fn open(
-        hardware_version: HardwareVersion,
-        side: Side,
-        can_interface: &str,
-        enable_fd: bool,
+        mechanism: Mechanism,
+        finger: &Finger,
+        interface: CanInterface,
         limits: PosForceLimits,
     ) -> Result<Self, CanError> {
-        let drive = match hardware_version {
-            HardwareVersion::V1 => Drive::Mit(GripperCan::open_mit(
-                can_interface,
-                enable_fd,
+        let drive = match mechanism {
+            Mechanism::ParallelJaws => Drive::Mit(GripperCan::open_mit(
+                interface,
                 v10::GRIPPER_MOTOR_TYPE,
                 v10::GRIPPER_SEND_ID,
                 v10::GRIPPER_RECV_ID,
             )?),
-            HardwareVersion::V2 => Drive::PosForce {
+            Mechanism::PinchFingers => Drive::PosForce {
                 can: GripperCan::open_pos_force(
-                    can_interface,
-                    enable_fd,
+                    interface,
                     v20::GRIPPER_MOTOR_TYPE,
                     v20::GRIPPER_SEND_ID,
                     v20::GRIPPER_RECV_ID,
@@ -305,14 +335,15 @@ impl Gripper {
         };
         Ok(Self {
             drive,
-            geometry: Geometry::new(hardware_version, side),
+            geometry: mechanism.geometry(finger),
         })
     }
 
     /// Drive toward `opening` (fraction, 0 = closed, 1 = fully open), capping
     /// the effort at `max_effort` where the mode can. The clamp saturates at
     /// the calibrated travel, which is the wanted behaviour rather than a
-    /// distrust of the caller. MIT carries no cap, so v1 ignores it.
+    /// distrust of the caller. MIT carries no cap, so the parallel jaws
+    /// ignore it.
     pub fn command(
         &mut self,
         opening: f64,
@@ -329,8 +360,8 @@ impl Gripper {
 
     /// The measured opening, grip effort, and effort ceiling for the cached
     /// sample, in the wire's terms. MIT carries no per-command force cap, so
-    /// v1 reports 0 effort and the 0 ceiling the gripper_link contract reads
-    /// as "no effort control".
+    /// the parallel jaws report 0 effort and the 0 ceiling the gripper_link
+    /// contract reads as "no effort control".
     pub fn wire_state(&self) -> WireState {
         let state = self.get_state();
         let opening = self.geometry.motor_rad_to_fraction(state.position);
@@ -343,7 +374,7 @@ impl Gripper {
             Drive::PosForce { limits, .. } => WireState {
                 opening,
                 // Motor current-derived torque estimate (N*m at the shaft) in
-                // the opening frame: positive toward open on either side.
+                // the opening frame: positive toward open on every gripper.
                 effort: self.geometry.motor_torque_to_effort(state.torque),
                 max_effort: limits.effort_ceiling_nm(),
             },
@@ -401,10 +432,10 @@ impl Gripper {
 mod tests {
     use super::*;
 
-    /// Both generations drive this motor.
+    /// Both mechanisms drive this motor.
     const MOTOR: MotorType = v20::GRIPPER_MOTOR_TYPE;
 
-    /// The DM4310 both generations drive, resolved the way `Gripper` does.
+    /// The DM4310 both mechanisms drive, resolved the way `Gripper` does.
     fn full_scale_nm() -> f64 {
         torque_full_scale_nm(MOTOR)
     }
@@ -430,8 +461,11 @@ mod tests {
     }
 
     #[test]
-    fn both_generations_drive_the_same_motor_and_full_scale() {
-        assert_eq!(v10::GRIPPER_MOTOR_TYPE, v20::GRIPPER_MOTOR_TYPE);
+    fn both_mechanisms_drive_the_same_motor_and_full_scale() {
+        assert_eq!(
+            Mechanism::ParallelJaws.motor_type(),
+            Mechanism::PinchFingers.motor_type()
+        );
         assert_eq!(full_scale_nm(), 10.0);
     }
 

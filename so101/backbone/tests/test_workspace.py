@@ -22,8 +22,6 @@ from conftest import (
     NOT_CHECKED,
     assert_rectangle_inside_reach,
 )
-from so101_description.kinematics import ApproachSolver, ReachSphere
-from so101_description.model import KINEMATICS_URDF_PATH
 from workspace_core_py import (
     GRASP_ANGLE_TOLERANCE,
     GRASP_DIRECTIONS,
@@ -38,6 +36,8 @@ from workspace_core_py import (
 
 from so101_backbone import workspace as workspace_module
 from so101_backbone.failures import FailureKind, Refusal
+from so101_backbone.kinematics import ApproachSolver, ReachSphere
+from so101_backbone.model import urdf_path
 from so101_backbone.workspace import (
     CHUNK_TARGETS,
     ReachWorker,
@@ -68,7 +68,8 @@ class FakeApproachSolver:
     records each call of least_distance and approach. Its approach keeps the
     rule of ApproachSolver.approach: None for a position that the reach
     sphere rules out at the position tolerance. It approaches every other
-    position in the directions named `fitting`."""
+    position in the directions named `fitting`, its grasp frame then at the
+    position, pointing the direction."""
 
     def __init__(
         self, reach_sphere: ReachSphere, least_distance: float, fitting: tuple[str, ...] = ()
@@ -77,6 +78,7 @@ class FakeApproachSolver:
         self._least_distance = least_distance
         self._fitting = [d.approach for d in GRASP_DIRECTIONS if d.name in fitting]
         self.calls: list[tuple] = []
+        self._approached: tuple = ()
 
     def least_distance(self, position):
         self.calls.append(("least_distance", position))
@@ -88,7 +90,15 @@ class FakeApproachSolver:
         )
         if self.reach_sphere.rules_out(position, position_tolerance_m):
             return None
-        return (0.0,) * 5 if direction in self._fitting else None
+        if direction not in self._fitting:
+            return None
+        self._approached = (position, direction)
+        return (0.0,) * 5
+
+    def grasp_frame(self, joints):
+        """The grasp point and approach of the pose the last approach found:
+        at its position, pointing its direction."""
+        return self._approached
 
 
 def approached(direction, target: Target = NEAR) -> tuple:
@@ -102,10 +112,9 @@ def test_a_target_the_reach_sphere_rules_out_is_short_by_its_least_distance():
         RULES_OUT_NEAR, least_distance=FAR_PAST_THE_TOLERANCE, fitting=("down", "forward")
     )
     assert reach_of(solver, NEAR) == Reach.short(FAR_PAST_THE_TOLERANCE)
-    # Both directions fit inside the sphere. reach_of tries both, and the
-    # solver approaches NEAR in neither: the sphere rules it out at the reach
-    # tolerance.
-    assert solver.calls == [approached(DOWN), approached(FORWARD), ("least_distance", NEAR)]
+    # Both directions fit, but the sphere rules NEAR out at the reach
+    # tolerance: the rule tries neither.
+    assert solver.calls == [("least_distance", NEAR)]
 
 
 def test_a_target_is_reached_by_the_arm_in_the_first_direction_that_fits():
@@ -139,7 +148,7 @@ def test_a_target_the_grasp_point_comes_close_to_in_no_direction_is_short_by_tha
 
 
 def test_a_target_the_arm_reaches_straight_down_is_reached():
-    solver = ApproachSolver(KINEMATICS_URDF_PATH)
+    solver = ApproachSolver(urdf_path())
     down = solver.approach(
         REACHED_STRAIGHT_DOWN,
         DOWN.approach,
@@ -152,15 +161,17 @@ def test_a_target_the_arm_reaches_straight_down_is_reached():
 
 class FakeReaches:
     """Measures the reach of targets by `rule`, or raises what `failures`
-    holds first, and records the targets of each call."""
+    holds first, and records the targets and the surface of each call."""
 
     def __init__(self, rule, failures: list[Exception] | None = None):
         self._rule = rule
         self._failures = failures or []
         self.calls: list[list] = []
+        self.surfaces: list = []
 
-    async def __call__(self, targets):
+    async def __call__(self, targets, surface):
         self.calls.append(list(targets))
+        self.surfaces.append(surface)
         if self._failures:
             raise self._failures.pop(0)
         return [self._rule(target) for target in targets]
@@ -303,7 +314,7 @@ async def test_values_that_are_not_points_of_a_request_are_refused_unmeasured(wi
 
 @pytest.fixture
 async def worker():
-    worker = ReachWorker(KINEMATICS_URDF_PATH)
+    worker = ReachWorker(urdf_path())
     yield worker
     worker.close()
 
@@ -340,24 +351,26 @@ def open_pidfd(pid: int) -> int:
 
 
 async def test_the_worker_measures_what_the_solver_answers_in_this_process(worker):
-    near, close, far = await worker.reaches([NEAR, CLOSE, FAR])
+    near, close, far = await worker.reaches([NEAR, CLOSE, FAR], None)
 
-    solver = ApproachSolver(KINEMATICS_URDF_PATH)
+    solver = ApproachSolver(urdf_path())
     assert [near, close, far] == [reach_of(solver, target) for target in (NEAR, CLOSE, FAR)]
     assert near == Reach.reached_by("arm")
     assert not close.reached
     assert 0.0 <= close.short_by <= REACH_TOLERANCE
     assert far.short_by > FAR_SHORT_BY_MORE_THAN
-    # The worker's solver was built in the worker: this process never built
-    # one, and _measure_reaches refuses to run without it.
+    # The worker's solver and arm bodies were built in the worker: this
+    # process never built them, and _measure_reaches refuses to run without
+    # them.
     assert workspace_module._worker_solver is None
+    assert workspace_module._worker_bodies is None
 
 
 async def test_one_spawned_worker_serves_every_request_and_ends_on_close(worker):
     before = children_pids()
     # Two requests at once: a second worker would take the second.
-    await asyncio.gather(worker.reaches([NEAR]), worker.reaches([FAR]))
-    await worker.reaches([CLOSE])
+    await asyncio.gather(worker.reaches([NEAR], None), worker.reaches([FAR], None))
+    await worker.reaches([CLOSE], None)
     (process,) = spawned_since(before)
     assert isinstance(process, multiprocessing.context.SpawnProcess)
     assert process.pid != os.getpid()
@@ -365,7 +378,7 @@ async def test_one_spawned_worker_serves_every_request_and_ends_on_close(worker)
     worker.close()
     assert_ends(process.sentinel)
     with pytest.raises(Refusal, match="^the node is shutting down$") as raised:
-        await worker.reaches([NEAR])
+        await worker.reaches([NEAR], None)
     assert raised.value.kind is FailureKind.RESOURCE_UNAVAILABLE
     assert spawned_since(before | {process.pid}) == []
 
@@ -375,11 +388,11 @@ async def test_a_target_the_solver_refuses_refuses_the_request_and_the_worker_se
     with pytest.raises(
         Refusal, match=r"^the reach could not be measured: ValueError\("
     ) as raised:
-        await worker.reaches([NEAR, (math.nan, 0.0, 0.0)])
+        await worker.reaches([NEAR, (math.nan, 0.0, 0.0)], None)
     assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     (process,) = spawned_since(before)
 
-    assert await worker.reaches([NEAR]) == [Reach.reached_by("arm")]
+    assert await worker.reaches([NEAR], None) == [Reach.reached_by("arm")]
     assert spawned_since(before) == [process]
 
 
@@ -396,7 +409,7 @@ async def test_a_worker_that_ended_while_it_held_no_chunk_is_replaced_once_the_p
     worker,
 ):
     before = children_pids()
-    await worker.reaches([NEAR])
+    await worker.reaches([NEAR], None)
     (ended,) = spawned_since(before)
     os.kill(ended.pid, signal.SIGKILL)
     assert_ends(ended.sentinel)
@@ -405,7 +418,7 @@ async def test_a_worker_that_ended_while_it_held_no_chunk_is_replaced_once_the_p
     wait_until_the_pool_is_broken(worker)
 
     # Another worker measures the next request.
-    assert await worker.reaches([NEAR]) == [Reach.reached_by("arm")]
+    assert await worker.reaches([NEAR], None) == [Reach.reached_by("arm")]
     (another,) = spawned_since(before)
     assert another.pid != ended.pid
 
@@ -440,13 +453,13 @@ def sent_chunks(monkeypatch) -> asyncio.Queue:
 
 async def test_a_worker_that_ends_while_it_holds_a_chunk_refuses_its_request(worker, sent_chunks):
     before = children_pids()
-    await worker.reaches([NEAR])
+    await worker.reaches([NEAR], None)
     await next_sent(sent_chunks)
     (ended,) = spawned_since(before)
     # A stopped worker holds the chunk it is sent and cannot measure it.
     os.kill(ended.pid, signal.SIGSTOP)
     os.waitid(os.P_PID, ended.pid, os.WSTOPPED | os.WNOWAIT)
-    request = asyncio.create_task(worker.reaches([NEAR]))
+    request = asyncio.create_task(worker.reaches([NEAR], None))
     await next_sent(sent_chunks)
     os.kill(ended.pid, signal.SIGKILL)
 
@@ -454,7 +467,7 @@ async def test_a_worker_that_ends_while_it_holds_a_chunk_refuses_its_request(wor
         await outcome_of(request)
     assert raised.value.kind is FailureKind.ATTEMPT_FAILED
     # The next request starts another worker.
-    assert await worker.reaches([NEAR]) == [Reach.reached_by("arm")]
+    assert await worker.reaches([NEAR], None) == [Reach.reached_by("arm")]
     (another,) = spawned_since(before)
     assert another.pid != ended.pid
 
@@ -463,12 +476,12 @@ async def test_a_worker_that_ends_while_it_holds_a_chunk_refuses_its_request(wor
 # process, and waits for the test to kill it.
 NODE_SCRIPT = """
 import asyncio, multiprocessing, sys
-from so101_description.model import KINEMATICS_URDF_PATH
+from so101_backbone.model import urdf_path
 from so101_backbone.workspace import ReachWorker
 
 async def main():
-    worker = ReachWorker(KINEMATICS_URDF_PATH)
-    await worker.reaches([(0.2, 0.0, 0.04)])
+    worker = ReachWorker(urdf_path())
+    await worker.reaches([(0.2, 0.0, 0.04)], None)
     (process,) = multiprocessing.active_children()
     print(process.pid, flush=True)
     sys.stdin.read()
@@ -532,7 +545,7 @@ class HeldPool:
         self.sent: asyncio.Queue[tuple[list, Future]] = asyncio.Queue()
         self.shutdowns: list[bool] = []
 
-    def submit(self, fn, chunk):
+    def submit(self, fn, surface_m, chunk):
         held = Future()
         # In the worker, a chunk can no longer be cancelled.
         held.set_running_or_notify_cancel()
@@ -565,9 +578,9 @@ async def test_a_long_request_goes_to_the_worker_in_chunks_of_one_surface_one_af
     held_pool,
 ):
     assert CHUNK_TARGETS == len(SurfaceHeight.from_wire(0.0).grid_targets()) == 663
-    worker = ReachWorker(KINEMATICS_URDF_PATH)
+    worker = ReachWorker(urdf_path())
     asked = targets(2 * CHUNK_TARGETS + 5)
-    request = asyncio.create_task(worker.reaches(asked))
+    request = asyncio.create_task(worker.reaches(asked, None))
 
     chunks = []
     for _ in range(3):
@@ -581,10 +594,10 @@ async def test_a_long_request_goes_to_the_worker_in_chunks_of_one_surface_one_af
 
 
 async def test_a_request_waits_for_one_chunk_of_a_long_request_ahead_of_it(held_pool):
-    worker = ReachWorker(KINEMATICS_URDF_PATH)
+    worker = ReachWorker(urdf_path())
     long = targets(2 * CHUNK_TARGETS)
-    long_request = asyncio.create_task(worker.reaches(long))
-    short_request = asyncio.create_task(worker.reaches([NEAR]))
+    long_request = asyncio.create_task(worker.reaches(long, None))
+    short_request = asyncio.create_task(worker.reaches([NEAR], None))
 
     # Both requests start before the worker has measured a chunk.
     order = []
@@ -602,9 +615,9 @@ async def test_a_request_waits_for_one_chunk_of_a_long_request_ahead_of_it(held_
 async def test_a_cancelled_request_sends_no_more_chunks_and_the_worker_ends_its_chunk_first(
     held_pool,
 ):
-    worker = ReachWorker(KINEMATICS_URDF_PATH)
-    cancelled = asyncio.create_task(worker.reaches(targets(2 * CHUNK_TARGETS)))
-    next_request = asyncio.create_task(worker.reaches([NEAR]))
+    worker = ReachWorker(urdf_path())
+    cancelled = asyncio.create_task(worker.reaches(targets(2 * CHUNK_TARGETS), None))
+    next_request = asyncio.create_task(worker.reaches([NEAR], None))
     first, held_first = await next_sent(held_pool.sent)
 
     cancelled.cancel()
@@ -626,8 +639,8 @@ async def test_a_cancelled_request_sends_no_more_chunks_and_the_worker_ends_its_
 async def test_close_lets_the_worker_end_after_the_chunk_it_holds_and_refuses_the_rest(
     held_pool,
 ):
-    worker = ReachWorker(KINEMATICS_URDF_PATH)
-    request = asyncio.create_task(worker.reaches(targets(2 * CHUNK_TARGETS)))
+    worker = ReachWorker(urdf_path())
+    request = asyncio.create_task(worker.reaches(targets(2 * CHUNK_TARGETS), None))
     first, held = await next_sent(held_pool.sent)
     assert held_pool.sent.empty()
 
@@ -638,3 +651,29 @@ async def test_close_lets_the_worker_end_after_the_chunk_it_holds_and_refuses_th
     with pytest.raises(Refusal, match="^the node is shutting down$"):
         await outcome_of(request)
     assert held_pool.sent.empty()
+
+
+
+async def test_on_a_surface_the_worker_reaches_a_target_only_in_a_pose_clear_of_it(worker):
+    # Measured on this model: of the grid targets of a surface 0.1 m above
+    # the base, 13 are reached with nothing in the way, each only by an arm
+    # that passes through the surface, and none on it. On the surface the
+    # base stands on, 157 of the 160 are reached clear of it.
+    raised = SurfaceHeight.from_wire(0.1)
+    free = await worker.reaches(raised.grid_targets(), None)
+    on = await worker.reaches(raised.grid_targets(), raised)
+    assert sum(r.reached for r in free) > 0
+    assert not any(r.reached for r in on)
+    base = SurfaceHeight.from_wire(0.0)
+    on_base = await worker.reaches(base.grid_targets(), base)
+    assert sum(r.reached for r in on_base) > 0.9 * sum(
+        r.reached for r in await worker.reaches(base.grid_targets(), None)
+    )
+
+
+async def test_describe_measures_on_its_surface_and_check_with_nothing_in_the_way():
+    reaches = FakeReaches(reached_near_the_middle)
+    workspace = Workspace(reaches)
+    await workspace.describe(0.1)
+    await workspace.check([0.2, 0.0, 0.04])
+    assert reaches.surfaces == [SurfaceHeight.from_wire(0.1), None]

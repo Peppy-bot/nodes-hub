@@ -27,46 +27,45 @@ limb_motion's `execute_joint_path`, passing every arm of the answer and each arm
 
 ## The robot
 
-The node plans for the model the robot's identity names: it asks
-`robot_identity.get_identity` of the instance its `identity` slot binds until it answers,
-each ask waiting up to 5 s and the next a second after, since the robot's initializer may
-start after it, and then starts and serves. `openarm_v2` and `so101` are the models it
-knows: another ends the node with an error that names the model and the ones it knows. The
-model `openarm_v2` gives:
+The node plans for the robot its identity describes: it asks `robot_identity` of the
+instance its `identity` slot binds for the model's name (`get_identity`, waiting up to 5 s)
+and its description (`get_description`: the URDF, the SRDF and the collision meshes, waiting
+up to 10 s) until both answer, the next ask a second after a failure, since the robot's
+initializer may start after it, and then starts and serves. The description gives:
 
-- each arm by its limb name (`left_arm`, `right_arm`), its gripper's (`left_gripper`,
-  `right_gripper`), and its joints in limb_state's order, with the limits
-  limb_motion enforces: the URDF's, the elbow's lower limit raised to its
-  singularity floor;
+- each arm: an SRDF group of one chain whose tip is an end effector's parent link, by the
+  group's name, its limb name; its gripper, the end effector's group, by its name; and its
+  joints in limb_state's order, with the URDF's limits, which limb_motion enforces;
 - the grasp point's pose, at the end of the arm's chain from its base link to the grasp
-  point, where limb_state reports it;
+  link, where limb_state reports it;
 - the links: every link the arm's first joint moves, its gripper's included; the
   gripper's links, which a held object may touch: every link the arm's last joint moves
-  that has collision geometry (`openarm_left_ee_base_link`, `openarm_left_ee_link1` and
-  `openarm_left_ee_link2`); the grasp link (`openarm_left_tcp`) and its frame's approach
-  (`+z`) and closing (`+y`) axes;
-- the body around the arms (the torso, the shoulder mounts, the head camera), and
-  OpenArm's self-collision model of `self_collision_model`, which leaves out the pairs
-  the joint limits keep apart: each upper arm (`link3`) against the torso and against its
-  own arm's base.
+  that has collision geometry; the grasp link and its frame's axes: the approach axis is
+  the grasp link's `+z`, and the closing axis the axis a sliding finger moves along, or
+  the approach axis crossed with the axis a turning finger turns on, as the positive axis
+  of the grasp frame it lies along;
+- the body around the arms, the links with collision geometry that fixed joints alone join
+  to the URDF's root, and the robot's self-collision model, which checks every pair of
+  bodies but those whose collisions the SRDF disables.
 
-At home (`openarm_description::home`) with the grippers closed, the robot's bodies stand
+The planner's libraries fix an arm's joint count and the robot's arm count when they
+compile: it plans for one or two arms of five, six or seven joints. A description it cannot
+read or plan for, or collision meshes it cannot write, ends the node with an error that
+names the cause: a URDF or SRDF that does not parse, no arm, arms of different joint
+counts, a shape outside those, an arm whose base a moving joint carries, a gripper finger
+that carries another moving link, a gripper that moves no finger, or a gripper that closes
+along no axis of its grasp frame.
+
+At home, as its SRDF gives it, with the grippers closed, an OpenArm v2's bodies stand
 0.077 m apart at the least, a hand from the torso. At 0.4 of a gripper's opening a finger
 stands 0.050 m from the torso there, and at 0.5 or more within the self clearance (0.039 m
 at 0.5), so a plan to home is `unreachable`, the message naming the finger and the torso,
 until the gripper closes.
 
-The model `so101` gives one arm, `arm`, its gripper `gripper`, and five joints from
-`shoulder_pan` to `wrist_roll`, with the URDF's limits; its grasp link `gripper_frame_link`,
-approach `+z` and closing `+x`; and its gripper's links, `gripper_link` and the jaw,
-`moving_jaw_so101_v1_link`, which swings with the gripper's opening. `base_link` is its body.
-Its self model is `self_collision_model`'s SO-101 model: a state keeps its clearance from
-the objects of the planning scene and between the pairs of its own links that the model
-checks, and an object the hand holds keeps it from the base and from the links it may not
-touch. Folded onto itself as it rests, its links touch in the model, so a plan from there is
-refused, `start_in_collision`, the message saying to move the arms to the home posture with
-`move_to_home`, which stands out of contact, and plan from there. With no depth camera its
-launchers leave the four camera slots vacant.
+An SO-101 has one arm, folded onto itself as it rests: its links touch in its self model, so
+a plan from there is refused, `start_in_collision`, the message saying to move the arms to
+the home posture with `move_to_home`, which stands out of contact, and plan from there.
+With no depth camera its launchers leave the four camera slots vacant.
 
 Five joints hold few orientations at a position, so a goal of the grasp point, or of a link
 every joint moves, on an arm of fewer than six joints is sampled by these options:
@@ -506,9 +505,9 @@ sampling, which departs too, is in "The robot".
 - The time: the check of the rounded path runs to its end after the deadline.
 - Self pairs: MoveIt's OpenArm v2 SRDF (enactic/openarm_ros2,
   `openarm_v2.0/openarm_bimanual.srdf`) disables adjacent links alone, and checks each
-  upper arm against the torso and against its own arm's base. Here those pairs are left
-  out: within the joint limits they stay 12.9 mm and 18.5 mm apart
-  (`openarm_description`'s `never_touching_pairs`).
+  upper arm against the torso and against its own arm's base. The SRDF of
+  robot_description disables those pairs too, as `Never`: within the joint limits they
+  stay 12.9 mm and 18.5 mm apart.
 - Attempts: as MoveIt's, but for the departures `ompl_bridge`'s README lists under
   Attempts.
 - Repeatability: a plan is seeded from the map's stamp, so a request repeats on the same

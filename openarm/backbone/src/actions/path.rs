@@ -17,11 +17,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use openarm_description::{ARM_DOF, ArmOrder, ArmPair, Side};
+use crate::arm_order::ArmOrder;
+use crate::robot::{ARMS, LIMBS};
 use peppygen::exposed_actions::limb_motion::execute_joint_path::{
     self, ExecuteJointPathResultArmsItem,
 };
 use peppygen::{NodeRunner, Result};
+use robot_description::{ArmId, PerArm};
+use srs_model::ARM_DOF;
 use srs_model::{JointVec, Limit, take_targets};
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
@@ -55,22 +58,22 @@ struct ExecuteJointPathGoal {
 /// positive; the duration, and the settle timeout.
 fn execute_joint_path_goal(
     d: &execute_joint_path::GoalRequestData,
-    limits: &ArmPair<[Limit; ARM_DOF]>,
+    limits: &PerArm<[Limit; ARM_DOF], ARMS>,
 ) -> std::result::Result<ExecuteJointPathGoal, String> {
     let names: Vec<&str> = d.arms.iter().map(|arm| arm.arm_name.as_str()).collect();
     let order = ArmOrder::parse(&names)?;
-    let arms: Vec<(Side, &execute_joint_path::GoalArmsItem)> =
-        order.sides().iter().copied().zip(&d.arms).collect();
+    let arms: Vec<(ArmId, &execute_joint_path::GoalArmsItem)> =
+        order.ids().iter().copied().zip(&d.arms).collect();
     let counts: Vec<usize> = d.arms.iter().map(|arm| arm.waypoints.len()).collect();
     let count = order.waypoint_count(&counts)?;
     let taken = arms
         .iter()
-        .map(|(side, arm)| {
-            arm.waypoints
+        .map(|(arm, item)| {
+            item.waypoints
                 .iter()
                 .enumerate()
                 .map(|(k, waypoint)| {
-                    waypoint_within_limits(*side, k, &waypoint.joint_positions, &limits[*side])
+                    waypoint_within_limits(*arm, k, &waypoint.joint_positions, &limits[*arm])
                 })
                 .collect::<std::result::Result<Vec<JointVec>, String>>()
         })
@@ -80,13 +83,13 @@ fn execute_joint_path_goal(
         .collect();
     let expected_starts = arms
         .iter()
-        .map(|(side, arm)| expected_start(*side, &arm.expected_start_joint_positions))
+        .map(|(arm, item)| expected_start(*arm, &item.expected_start_joint_positions))
         .collect::<std::result::Result<Vec<Option<JointVec>>, String>>()?;
     let tolerance = arms
         .iter()
-        .map(|(side, arm)| {
-            joint_tolerances_from_wire(arm.settle_tolerances_rad)
-                .map_err(|reason| format!("{}: {reason}", side.arm_name()))
+        .map(|(arm, item)| {
+            joint_tolerances_from_wire(item.settle_tolerances_rad)
+                .map_err(|reason| format!("{}: {reason}", LIMBS.arm_name(*arm)))
         })
         .collect::<std::result::Result<Vec<JointVec>, String>>()?
         .concat();
@@ -104,30 +107,30 @@ fn execute_joint_path_goal(
     })
 }
 
-/// `q`, waypoint `k` (from 0) of the arm on `side`, inside `limits`
+/// `q`, waypoint `k` (from 0) of the arm `arm`, inside `limits`
 /// ([`take_targets`]), or its refusal where it is not finite or puts a
 /// joint outside `limits`, naming the waypoint and the joint.
 fn waypoint_within_limits(
-    side: Side,
+    arm: ArmId,
     k: usize,
     q: &JointVec,
     limits: &[Limit; ARM_DOF],
 ) -> std::result::Result<JointVec, String> {
-    let waypoint = format!("waypoint {} of {}", k + 1, side.arm_name());
+    let waypoint = format!("waypoint {} of {}", k + 1, LIMBS.arm_name(arm));
     if !q.iter().all(|v| v.is_finite()) {
         return Err(format!("{waypoint} holds a non-finite value"));
     }
     take_targets(limits, q).map_err(|outside| format!("{waypoint} puts {outside}"))
 }
 
-/// The expected start of the arm on `side` off the wire: none when
+/// The expected start of the arm `arm` off the wire: none when
 /// `joints` is empty, else a finite position of each joint, or the refusal
 /// naming the arm.
-fn expected_start(side: Side, joints: &[f64]) -> std::result::Result<Option<JointVec>, String> {
+fn expected_start(arm: ArmId, joints: &[f64]) -> std::result::Result<Option<JointVec>, String> {
     if joints.is_empty() {
         return Ok(None);
     }
-    let field = format!("expected_start_joint_positions of {}", side.arm_name());
+    let field = format!("expected_start_joint_positions of {}", LIMBS.arm_name(arm));
     let start: JointVec = joints.try_into().map_err(|_| {
         format!(
             "{field} holds {} values, where the arm has {ARM_DOF} joints: give none, or one per \
@@ -147,19 +150,19 @@ fn expected_start(side: Side, joints: &[f64]) -> std::result::Result<Option<Join
 /// a refusal names the arm ([`PathOrder::failure_of`]).
 fn admit_arms(
     arms: &ArmOrder,
-    fresh: &ArmPair<Arc<AtomicBool>>,
-    activity: &ArmPair<LeaderActivity>,
-    move_slots: &ArmPair<MoveSlot>,
+    fresh: &PerArm<Arc<AtomicBool>, ARMS>,
+    activity: &PerArm<LeaderActivity, ARMS>,
+    move_slots: &PerArm<MoveSlot, ARMS>,
 ) -> std::result::Result<(), Failure> {
-    for &side in arms.sides() {
+    for &arm in arms.ids() {
         check_limb_free(
-            fresh[side].load(Ordering::Acquire),
-            activity[side].streaming(),
+            fresh[arm].load(Ordering::Acquire),
+            activity[arm].streaming(),
             &ARM_WORDS,
         )
-        .map_err(|refusal| arms.failure_of(side, refusal))?;
+        .map_err(|refusal| arms.failure_of(arm, refusal))?;
     }
-    claim_slots(arms.sides(), move_slots).map_err(|busy| {
+    claim_slots(arms.ids(), move_slots).map_err(|busy| {
         let refusal = Failure::new(FailureKind::PreconditionFailed, ARM_WORDS.busy);
         arms.failure_of(busy, refusal)
     })
@@ -186,7 +189,7 @@ enum PathEnd {
 /// planner that dropped the move. A goal that completes or ends cancelled
 /// gives the reports in the order of `arms`.
 fn summarize(arms: &ArmOrder, reports: Vec<ShareReport>, cancel: Option<String>) -> PathEnd {
-    if reports.len() < arms.sides().len() {
+    if reports.len() < arms.ids().len() {
         return PathEnd::Failed(Failure::new(
             FailureKind::AttemptFailed,
             "a planner dropped the move",
@@ -197,7 +200,7 @@ fn summarize(arms: &ArmOrder, reports: Vec<ShareReport>, cancel: Option<String>)
         _ => None,
     });
     let mut reports = reports;
-    reports.sort_by_key(|report| arms.sides().iter().position(|&side| side == report.side));
+    reports.sort_by_key(|report| arms.ids().iter().position(|&arm| arm == report.arm));
     let stop = reports.iter().find_map(|report| match &report.outcome {
         Outcome::Cancelled(reason) => Some(reason.clone()),
         _ => None,
@@ -217,7 +220,7 @@ fn path_result(reports: &[ShareReport]) -> (Vec<ExecuteJointPathResultArmsItem>,
     let arms = reports
         .iter()
         .map(|report| ExecuteJointPathResultArmsItem {
-            arm_name: report.side.arm_name().to_string(),
+            arm_name: LIMBS.arm_name(report.arm).to_string(),
             final_joint_positions: report.joints,
         })
         .collect();
@@ -248,7 +251,7 @@ fn path_cancel_reason(reason: String, reports: &[ShareReport]) -> String {
 async fn run_path(
     requests: &mpsc::Sender<CoordinatorRequest>,
     goal: ExecuteJointPathGoal,
-    move_slots: &ArmPair<MoveSlot>,
+    move_slots: &PerArm<MoveSlot, ARMS>,
     cancel_signal: impl Future<Output = ()>,
     cancel_reason: impl FnOnce() -> Option<String>,
 ) -> PathEnd {
@@ -258,14 +261,14 @@ async fn run_path(
         settle,
     } = goal;
     let arms = path.arms.clone();
-    let shares = arms.sides().len();
+    let shares = arms.ids().len();
     let cancelled = Arc::new(AtomicBool::new(false));
     let (done_tx, mut done_rx) = mpsc::channel(shares);
     let goal = PathGoal {
         move_slots: arms
-            .sides()
+            .ids()
             .iter()
-            .map(|&side| move_slots[side].release_on_drop())
+            .map(|&arm| move_slots[arm].release_on_drop())
             .collect(),
         path,
         expected_starts,
@@ -300,10 +303,10 @@ async fn run_path(
 /// different arms run side by side.
 pub async fn run_execute_joint_path(
     runner: Arc<NodeRunner>,
-    move_slots: ArmPair<MoveSlot>,
-    fresh: ArmPair<Arc<AtomicBool>>,
-    activity: ArmPair<LeaderActivity>,
-    limits: ArmPair<[Limit; ARM_DOF]>,
+    move_slots: PerArm<MoveSlot, ARMS>,
+    fresh: PerArm<Arc<AtomicBool>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
+    limits: PerArm<[Limit; ARM_DOF], ARMS>,
     requests: mpsc::Sender<CoordinatorRequest>,
 ) -> Result<()> {
     let mut handle = execute_joint_path::ActionHandle::expose(&runner).await?;
@@ -351,25 +354,27 @@ pub async fn run_execute_joint_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{LEFT, RIGHT};
 
     use execute_joint_path::{GoalArmsItem, GoalArmsItemWaypointsItem, GoalRequestData};
 
     use crate::failure::stale_failure;
     use crate::planner::OTHER_SHARE_FAILED;
-    use crate::test_support::bundled_arm;
+    use srs_model::TARGET_SLACK;
+
+    use crate::robot::arm_in;
+    use crate::test_support::{V1, bundled_arm};
 
     /// Both arms' joints, the left arm's `left` in every joint and the right
-    /// arm's `right`. From 0.05 to 0.17 rad, every joint of v1 lies within its
-    /// limits on both arms.
-    fn joints(left: f64, right: f64) -> ArmPair<JointVec> {
-        ArmPair::new([left; ARM_DOF], [right; ARM_DOF])
+    /// arm's `right`. From 0.05 to 0.17 rad, every joint of [`V1`] lies within
+    /// its limits on both arms.
+    fn joints(left: f64, right: f64) -> PerArm<JointVec, ARMS> {
+        PerArm::new([[left; ARM_DOF], [right; ARM_DOF]])
     }
 
     /// v1's joint limits of both arms.
-    fn limits() -> ArmPair<[Limit; ARM_DOF]> {
-        ArmPair::from_fn(|side| {
-            bundled_arm(openarm_description::HardwareVersion::V1, side).limits()
-        })
+    fn limits() -> PerArm<[Limit; ARM_DOF], ARMS> {
+        PerArm::from_fn(|arm| bundled_arm(V1, arm).limits())
     }
 
     /// The goal of the arm `arm_name` through `waypoints`, expecting its
@@ -377,20 +382,20 @@ mod tests {
     /// on every joint. An arm name of no arm takes the left arm's joints.
     fn arm(
         arm_name: &str,
-        waypoints: &[ArmPair<JointVec>],
-        expected_start: Option<ArmPair<JointVec>>,
+        waypoints: &[PerArm<JointVec, ARMS>],
+        expected_start: Option<PerArm<JointVec, ARMS>>,
     ) -> GoalArmsItem {
-        let side = Side::from_arm_name(arm_name).unwrap_or(Side::Left);
+        let arm = arm_in("arm_name", arm_name).unwrap_or(LEFT);
         GoalArmsItem {
             arm_name: arm_name.to_string(),
             waypoints: waypoints
                 .iter()
                 .map(|joints| GoalArmsItemWaypointsItem {
-                    joint_positions: joints[side],
+                    joint_positions: joints[arm],
                 })
                 .collect(),
             expected_start_joint_positions: expected_start
-                .map_or_else(Vec::new, |joints| joints[side].to_vec()),
+                .map_or_else(Vec::new, |joints| joints[arm].to_vec()),
             settle_tolerances_rad: [0.03; ARM_DOF],
         }
     }
@@ -399,8 +404,8 @@ mod tests {
     /// `waypoints` (see [`arm`]).
     fn goal(
         arm_names: &[&str],
-        waypoints: &[ArmPair<JointVec>],
-        expected_start: Option<ArmPair<JointVec>>,
+        waypoints: &[PerArm<JointVec, ARMS>],
+        expected_start: Option<PerArm<JointVec, ARMS>>,
     ) -> GoalRequestData {
         GoalRequestData {
             arms: arm_names
@@ -424,27 +429,29 @@ mod tests {
             let parsed =
                 execute_joint_path_goal(&request, &limits()).expect("a goal within the limits");
             let arms = &parsed.path.arms;
-            let sides = names.map(|name| Side::from_arm_name(name).expect("an arm"));
-            assert_eq!(arms.sides(), sides);
+            let named = names.map(|name| arm_in("arm_name", name).expect("an arm"));
+            assert_eq!(arms.ids(), named);
             for (parsed, sent) in parsed.path.waypoints.iter().zip(&waypoints) {
-                let in_order: Vec<f64> = sides.iter().flat_map(|&side| sent[side]).collect();
+                let in_order: Vec<f64> = named.iter().flat_map(|&arm| sent[arm]).collect();
                 assert_eq!(*parsed, in_order);
             }
-            assert_eq!(parsed.expected_starts, sides.map(|side| Some(start[side])));
+            assert_eq!(parsed.expected_starts, named.map(|arm| Some(start[arm])));
             assert_eq!(parsed.settle.tolerance, vec![0.03; 2 * ARM_DOF]);
         }
     }
 
-    /// A waypoint whose elbow lies a hair under its floor, as a measured
-    /// pose can, runs at the floor; its other joints run as sent.
+    /// A waypoint whose elbow lies a hair under its lower limit, as a
+    /// measured pose of the straight arm can, runs at the limit; its other
+    /// joints run as sent.
     #[test]
     fn a_waypoint_a_hair_outside_its_limits_runs_at_the_limit() {
+        let elbow = limits()[LEFT][3];
         let mut waypoints = [joints(0.10, 0.12)];
-        waypoints[0][Side::Left][3] = 0.0499925;
+        waypoints[0][LEFT][3] = elbow.lo - TARGET_SLACK / 2.0;
         let request = goal(&["left_arm"], &waypoints, None);
         let parsed = execute_joint_path_goal(&request, &limits()).expect("a goal at the limits");
         let mut expected = [0.10; ARM_DOF];
-        expected[3] = 0.05;
+        expected[3] = elbow.lo;
         assert_eq!(parsed.path.waypoints, [expected.to_vec()]);
     }
 
@@ -454,7 +461,7 @@ mod tests {
     fn a_goal_of_one_arm_moves_it_alone_and_an_empty_expected_start_checks_nothing() {
         let request = goal(&["right_arm"], &[joints(0.10, 0.12)], None);
         let parsed = execute_joint_path_goal(&request, &limits()).expect("a goal of the right arm");
-        assert_eq!(parsed.path.arms.sides(), [Side::Right]);
+        assert_eq!(parsed.path.arms.ids(), [RIGHT]);
         assert_eq!(parsed.path.waypoints, [vec![0.12; ARM_DOF]]);
         assert_eq!(parsed.expected_starts, [None]);
 
@@ -548,31 +555,31 @@ mod tests {
     fn a_goal_on_an_arm_that_is_not_free_is_refused_naming_the_arm() {
         let both = ArmOrder::parse(&["left_arm", "right_arm"]).expect("both arms");
         let right = ArmOrder::parse(&["right_arm"]).expect("the right arm");
-        let move_slots = ArmPair::from_fn(|_| MoveSlot::default());
-        let fresh = ArmPair::from_fn(|_| Arc::new(AtomicBool::new(true)));
-        let idle = ArmPair::from_fn(|_| LeaderActivity::default());
+        let move_slots = PerArm::from_fn(|_| MoveSlot::default());
+        let fresh = PerArm::from_fn(|_| Arc::new(AtomicBool::new(true)));
+        let idle = PerArm::from_fn(|_| LeaderActivity::default());
 
-        let right_stale = ArmPair::new(
+        let right_stale = PerArm::new([
             Arc::new(AtomicBool::new(true)),
             Arc::new(AtomicBool::new(false)),
-        );
+        ]);
         let stale = Failure::new(FailureKind::ResourceUnavailable, ARM_WORDS.no_fresh_state);
         assert_eq!(
             admit_arms(&both, &right_stale, &idle, &move_slots),
-            Err(stale.clone().labelled(Side::Right.arm_name()))
+            Err(stale.clone().labelled(LIMBS.arm_name(RIGHT)))
         );
         assert_eq!(
             admit_arms(&right, &right_stale, &idle, &move_slots),
             Err(stale)
         );
 
-        let left_streamed = ArmPair::from_fn(|_| LeaderActivity::default());
-        left_streamed.left.note();
+        let left_streamed = PerArm::from_fn(|_| LeaderActivity::default());
+        left_streamed[LEFT].note();
         assert_eq!(
             admit_arms(&both, &fresh, &left_streamed, &move_slots),
             Err(
                 Failure::new(FailureKind::LeaderStreaming, ARM_WORDS.leader_streaming)
-                    .labelled(Side::Left.arm_name())
+                    .labelled(LIMBS.arm_name(LEFT))
             )
         );
         assert!(
@@ -580,8 +587,11 @@ mod tests {
             "a refused goal claims no arm"
         );
 
-        let right_busy = ArmPair::from_fn(|_| MoveSlot::default());
-        assert!(right_busy.right.claim(), "another move holds the right arm");
+        let right_busy = PerArm::from_fn(|_| MoveSlot::default());
+        assert!(
+            right_busy[RIGHT].claim(),
+            "another move holds the right arm"
+        );
         assert_eq!(
             admit_arms(&both, &fresh, &idle, &right_busy),
             Err(Failure::new(
@@ -590,7 +600,7 @@ mod tests {
             ))
         );
         assert!(
-            !right_busy.left.is_claimed(),
+            !right_busy[LEFT].is_claimed(),
             "the refusal releases the left arm it claimed"
         );
         assert_eq!(
@@ -605,11 +615,11 @@ mod tests {
         assert!(move_slots.iter().all(MoveSlot::is_claimed));
     }
 
-    /// A report of the arm on `side` ending on `outcome`, `elapsed_s` after
+    /// A report of the arm `arm` ending on `outcome`, `elapsed_s` after
     /// its path started, measured at `joints` when `fresh`.
-    fn report(side: Side, outcome: Outcome, joints: JointVec, fresh: bool) -> ShareReport {
+    fn report(arm: ArmId, outcome: Outcome, joints: JointVec, fresh: bool) -> ShareReport {
         ShareReport {
-            side,
+            arm,
             outcome,
             joints,
             measured: if fresh {
@@ -627,17 +637,12 @@ mod tests {
     #[test]
     fn a_goal_fails_with_the_failure_that_ended_its_path() {
         let arms = ArmOrder::parse(&["left_arm", "right_arm"]).expect("both arms");
-        let stale = stale_failure().labelled(Side::Right.arm_name());
+        let stale = stale_failure().labelled(LIMBS.arm_name(RIGHT));
         let caused = Failure::new(FailureKind::AttemptFailed, OTHER_SHARE_FAILED)
-            .labelled(Side::Left.arm_name());
+            .labelled(LIMBS.arm_name(LEFT));
         let arrived = vec![
-            report(
-                Side::Right,
-                Outcome::Failed(stale.clone()),
-                [0.2; ARM_DOF],
-                false,
-            ),
-            report(Side::Left, Outcome::Failed(caused), [0.1; ARM_DOF], true),
+            report(RIGHT, Outcome::Failed(stale.clone()), [0.2; ARM_DOF], false),
+            report(LEFT, Outcome::Failed(caused), [0.1; ARM_DOF], true),
         ];
         assert_eq!(summarize(&arms, arrived, None), PathEnd::Failed(stale));
     }
@@ -653,8 +658,8 @@ mod tests {
         let right_first = ArmOrder::parse(&["right_arm", "left_arm"]).expect("both arms");
         let (left, right) = ([0.1; ARM_DOF], [0.2; ARM_DOF]);
         let completed = vec![
-            report(Side::Left, Outcome::Complete, left, true),
-            report(Side::Right, Outcome::Complete, right, true),
+            report(LEFT, Outcome::Complete, left, true),
+            report(RIGHT, Outcome::Complete, right, true),
         ];
         let PathEnd::Completed(reports) = summarize(&right_first, completed.clone(), None) else {
             panic!("both shares completed");
@@ -675,13 +680,8 @@ mod tests {
 
         let stopped = "stopped: operator".to_string();
         let stopped_reports = vec![
-            report(Side::Left, Outcome::Cancelled(stopped.clone()), left, true),
-            report(
-                Side::Right,
-                Outcome::Cancelled(stopped.clone()),
-                right,
-                false,
-            ),
+            report(LEFT, Outcome::Cancelled(stopped.clone()), left, true),
+            report(RIGHT, Outcome::Cancelled(stopped.clone()), right, false),
         ];
         let PathEnd::Cancelled(reason, reports) =
             summarize(&right_first, stopped_reports.clone(), None)
@@ -699,10 +699,10 @@ mod tests {
             PathEnd::Cancelled(reason, _) if reason == caller
         ));
 
-        let failure = Failure::new(FailureKind::Timeout, "left: still short");
+        let failure = Failure::new(FailureKind::Timeout, "left_arm: still short");
         let one_failed = vec![
-            report(Side::Left, Outcome::Failed(failure.clone()), left, true),
-            report(Side::Right, Outcome::Complete, right, true),
+            report(LEFT, Outcome::Failed(failure.clone()), left, true),
+            report(RIGHT, Outcome::Complete, right, true),
         ];
         assert_eq!(
             summarize(&right_first, one_failed, None),

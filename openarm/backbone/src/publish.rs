@@ -6,7 +6,7 @@
 //!
 //! Each pairing slot is its own generated module, so two slots carrying the
 //! same schema expose two distinct `build_message` items. Holding the builder
-//! as a function pointer lets one [`Publisher`] serve both sides of a pairing,
+//! as a function pointer lets one [`Publisher`] serve both arms of a pairing,
 //! and the send path is written once instead of once per slot.
 //!
 //! Publishing on an unpaired slot is a legal no-op, so the backbone declares
@@ -19,7 +19,6 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_core::throttle::Throttle;
-use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
@@ -28,12 +27,14 @@ use peppygen::paired_topics::{
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
 use peppylib::{Payload, TopicPublisher};
+use robot_description::PerArm;
 use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
 use crate::camera_mounts::MeasuredGrasps;
+use crate::robot::ARMS;
 use crate::streams::{GripperState, THROTTLED_WARN_PERIOD};
 use crate::types::{arm_pose_arrays, limb_names, world_pose_arrays};
 
@@ -77,11 +78,11 @@ type LimbStateBuild = fn(
 
 /// One whole-robot state snapshot, gathered by the coordinator at the readout
 /// cadence: every limb's measured joints, grasp-point pose, and gripper
-/// opening, in [`Side::BOTH`] order like every [`ArmPair`].
+/// opening, in place order like every [`PerArm`].
 pub struct LimbStateSnapshot {
-    pub joints: ArmPair<JointVec>,
-    pub poses: ArmPair<Isometry3<f64>>,
-    pub openings: ArmPair<f64>,
+    pub joints: PerArm<JointVec, ARMS>,
+    pub poses: PerArm<Isometry3<f64>, ARMS>,
+    pub openings: PerArm<f64, ARMS>,
 }
 
 /// One outbound slot: its declared publisher, that slot's generated
@@ -248,17 +249,17 @@ impl<Build> Publisher<Build> {
 /// Every publisher the coordination loop owns, declared once at bringup.
 pub struct Publishers {
     /// The governed joint setpoints, one per paired arm.
-    pub arm_setpoints: ArmPair<Publisher<JointBuild>>,
+    pub arm_setpoints: PerArm<Publisher<JointBuild>, ARMS>,
     /// The governed gripper opening fractions, one per paired gripper.
-    pub gripper_setpoints: ArmPair<Publisher<OpeningBuild>>,
+    pub gripper_setpoints: PerArm<Publisher<OpeningBuild>, ARMS>,
     /// Each arm's measured state, relayed up its leader slot so the leading
     /// node sees the same back-channel a follower gives the backbone.
-    pub arm_states: ArmPair<Publisher<JointBuild>>,
+    pub arm_states: PerArm<Publisher<JointBuild>, ARMS>,
     /// Each gripper's measured state, relayed up its leader slot.
-    pub gripper_states: ArmPair<Publisher<ApertureBuild>>,
+    pub gripper_states: PerArm<Publisher<ApertureBuild>, ARMS>,
     /// Each arm's measured end-effector pose, relayed up its Cartesian leader
     /// slot in pose mode (an unpaired slot is a no-op).
-    pub arm_pose_states: ArmPair<Publisher<PoseBuild>>,
+    pub arm_pose_states: PerArm<Publisher<PoseBuild>, ARMS>,
     /// The governor proximity readout, on its contract-backed topic.
     status: Publisher<StatusBuild>,
     /// The whole-robot state snapshot, on its contract-backed topic.
@@ -275,76 +276,76 @@ impl Publishers {
     ) -> peppygen::Result<Self> {
         Ok(Self {
             measured_grasps,
-            arm_setpoints: ArmPair::new(
+            arm_setpoints: PerArm::new([
                 Publisher::declare(
-                    format!("{} joint_setpoints", Side::Left),
+                    "left_arm joint_setpoints".to_owned(),
                     left_arm::joint_setpoints::declare_publisher(runner),
                     left_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    format!("{} joint_setpoints", Side::Right),
+                    "right_arm joint_setpoints".to_owned(),
                     right_arm::joint_setpoints::declare_publisher(runner),
                     right_arm::joint_setpoints::build_message as JointBuild,
                 )
                 .await?,
-            ),
-            gripper_setpoints: ArmPair::new(
+            ]),
+            gripper_setpoints: PerArm::new([
                 Publisher::declare(
-                    format!("{} gripper_setpoints", Side::Left),
+                    "left_gripper gripper_setpoints".to_owned(),
                     left_gripper::gripper_setpoints::declare_publisher(runner),
                     left_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    format!("{} gripper_setpoints", Side::Right),
+                    "right_gripper gripper_setpoints".to_owned(),
                     right_gripper::gripper_setpoints::declare_publisher(runner),
                     right_gripper::gripper_setpoints::build_message as OpeningBuild,
                 )
                 .await?,
-            ),
-            arm_states: ArmPair::new(
+            ]),
+            arm_states: PerArm::new([
                 Publisher::declare(
-                    format!("upstream {} joint_states", Side::Left),
+                    "upstream left_arm joint_states".to_owned(),
                     leader_left_arm::joint_states::declare_publisher(runner),
                     leader_left_arm::joint_states::build_message as JointBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    format!("upstream {} joint_states", Side::Right),
+                    "upstream right_arm joint_states".to_owned(),
                     leader_right_arm::joint_states::declare_publisher(runner),
                     leader_right_arm::joint_states::build_message as JointBuild,
                 )
                 .await?,
-            ),
-            gripper_states: ArmPair::new(
+            ]),
+            gripper_states: PerArm::new([
                 Publisher::declare(
-                    format!("upstream {} gripper_states", Side::Left),
+                    "upstream left_gripper gripper_states".to_owned(),
                     leader_left_gripper::gripper_states::declare_publisher(runner),
                     leader_left_gripper::gripper_states::build_message as ApertureBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    format!("upstream {} gripper_states", Side::Right),
+                    "upstream right_gripper gripper_states".to_owned(),
                     leader_right_gripper::gripper_states::declare_publisher(runner),
                     leader_right_gripper::gripper_states::build_message as ApertureBuild,
                 )
                 .await?,
-            ),
-            arm_pose_states: ArmPair::new(
+            ]),
+            arm_pose_states: PerArm::new([
                 Publisher::declare(
-                    format!("upstream {} pose_states", Side::Left),
+                    "upstream left_arm pose_states".to_owned(),
                     leader_left_arm_pose::pose_states::declare_publisher(runner),
                     leader_left_arm_pose::pose_states::build_message as PoseBuild,
                 )
                 .await?,
                 Publisher::declare(
-                    format!("upstream {} pose_states", Side::Right),
+                    "upstream right_arm pose_states".to_owned(),
                     leader_right_arm_pose::pose_states::declare_publisher(runner),
                     leader_right_arm_pose::pose_states::build_message as PoseBuild,
                 )
                 .await?,
-            ),
+            ]),
             status: Publisher::declare(
                 "collision_status".to_owned(),
                 collision_status::declare_publisher(runner),

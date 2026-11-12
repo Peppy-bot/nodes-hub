@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from control_core_py.params import require_non_empty, require_positive, require_rate
-from so101_description.device import BUS_MAX_RATE_HZ
+from so101.device import BUS_MAX_RATE_HZ
 
 
 @dataclass(frozen=True)

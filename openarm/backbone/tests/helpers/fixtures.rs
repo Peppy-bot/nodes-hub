@@ -4,10 +4,10 @@
 use std::time::{Duration, Instant};
 
 use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
-use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
+use robot_description::states;
 use srs_model::chain_kinematics::pose_miss;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
-use srs_model::{Arm, ArmAnglePolicy, JointVec};
+use srs_model::{ARM_DOF, Arm, ArmAnglePolicy, JointVec};
 
 /// How far (m, rad) a line's last solve may land from its goal: a descent's
 /// convergence, as KDL's `CartToJnt` judges it.
@@ -24,11 +24,35 @@ pub const V_MAX_V2: JointVec = [
     16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
 ];
 
-/// The right arm's Ready posture, where the backbone's move_to_ready puts it.
-pub const READY: JointVec = ready(Side::Right);
+/// The arm of the description of the model `model` named `arm_name`, as the
+/// backbone builds it.
+fn arm_of(model: &str, arm_name: &str) -> Arm {
+    let description = robot_description::model(model)
+        .expect("a bundled model")
+        .description();
+    let arm = description
+        .arms()
+        .iter()
+        .find(|arm| arm.name == arm_name)
+        .expect("an arm of the model");
+    Arm::from_description(&description, arm).expect("the bundled description builds")
+}
 
-/// The left arm's Ready posture.
-pub const READY_LEFT: JointVec = ready(Side::Left);
+/// The model the plan regressions run on.
+pub const V2: &str = "openarm_v2";
+
+/// The posture `state` of the arm `arm_name` of the model `model`, where the
+/// backbone's posture moves put it.
+pub fn posture(model: &str, arm_name: &str, state: &str) -> JointVec {
+    let description = robot_description::model(model)
+        .expect("a bundled model")
+        .description();
+    description
+        .state(arm_name, state)
+        .expect("each arm's posture")
+        .try_into()
+        .expect("a posture of each joint")
+}
 
 /// The posture of the right arm, as measured in the field, that the field reports
 /// start from: the reported pull and the cross-body repro.
@@ -48,21 +72,15 @@ const REPRO_QUAT: [f64; 4] = [
 ];
 
 pub fn v2_right_arm() -> Arm {
-    HardwareVersion::V2
-        .arm_model(Side::Right)
-        .expect("bundled v2 URDF builds")
+    arm_of(V2, "right_arm")
 }
 
 pub fn v2_left_arm() -> Arm {
-    HardwareVersion::V2
-        .arm_model(Side::Left)
-        .expect("bundled v2 URDF builds")
+    arm_of(V2, "left_arm")
 }
 
 pub fn v1_left_arm() -> Arm {
-    HardwareVersion::V1
-        .arm_model(Side::Left)
-        .expect("bundled v1 URDF builds")
+    arm_of("openarm_v1", "left_arm")
 }
 
 fn world_pose(position: [f64; 3], quat_xyzw: [f64; 4]) -> Isometry3<f64> {
@@ -103,8 +121,9 @@ pub fn played(walk: &[JointVec], now: Instant) -> JointTrajectory<ARM_DOF> {
     )
 }
 
+/// The grasp pose of `model`, a right arm of [`V2`], at its Ready posture.
 pub fn ready_pose(model: &Arm) -> Isometry3<f64> {
-    model.world_pose(&model.at(&READY).ee_pose())
+    model.world_pose(&model.at(&posture(V2, "right_arm", states::READY)).ee_pose())
 }
 
 /// Asserts the hand at `q` lies on `end`, to the solver's rounding, on both axes.

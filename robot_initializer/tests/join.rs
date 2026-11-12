@@ -21,7 +21,6 @@ mod common;
 use common::{
     ScriptedClock, await_setup_return, capture_logs, joining_a_simulation, logged, logged_times,
     on_its_own_hardware, scripted_clock, setup_on, shutdown_once_setup_returns, simulation_of,
-    stood,
 };
 
 /// How long the wire may take for any one exchange.
@@ -72,6 +71,10 @@ async fn the_robot_joins_the_scene_under_its_own_name() -> peppygen::Result<()> 
     assert_eq!(goal.request.model, "openarm_v2");
     assert_eq!(goal.request.robot, harness.instance_id());
     assert!(goal.request.placement.is_none());
+    // It brings the model's description, from which the engine maps its limbs.
+    let model = robot_description::model("openarm_v2").expect("a bundled model");
+    assert_eq!(goal.request.urdf, model.urdf());
+    assert_eq!(goal.request.srdf, model.srdf());
 
     // Readiness waits on the scene, so a robot the engine has not stood yet
     // answers nothing.
@@ -80,7 +83,7 @@ async fn the_robot_joins_the_scene_under_its_own_name() -> peppygen::Result<()> 
         "a robot the scene has not stood serves no readiness"
     );
 
-    let stay = goal.accept(stood()).await?;
+    let stay = goal.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
 
@@ -129,7 +132,7 @@ async fn a_robot_starts_once_the_simulation_stands_it_and_says_so_while_it_waits
 
     // Admitted, the robot says how long the simulation has to stand it, and
     // goes on saying that it does not stand yet.
-    let stay = goal.accept(stood()).await?;
+    let stay = goal.accept().await?;
     logged(&format!(
         "'{robot}' was admitted to the simulation as openarm_v2; it starts once the simulation stands it, within 164.5 s"
     ))
@@ -149,7 +152,7 @@ async fn a_robot_starts_once_the_simulation_stands_it_and_says_so_while_it_waits
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
     logged(&format!(
-        "'{robot}' stands in the simulation, with arms [right, left] and grippers [right, left]"
+        "'{robot}' stands in the simulation, with arms [left_arm, right_arm] and grippers [left_gripper, right_gripper]"
     ))
     .await;
     await_setup_return(&harness).await;
@@ -165,12 +168,7 @@ async fn a_robot_the_engine_ends_before_it_stands_fails_with_the_engines_reason(
     let (harness, mut mocks) =
         Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
     let mut simulation = simulation_of(&mut mocks);
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
 
     // The engine admitted the robot and then could not stand it: the goal
     // fails before the robot ever stood, and the node fails with the
@@ -199,12 +197,7 @@ async fn a_robot_whose_engine_is_gone_before_it_stands_fails() -> peppygen::Resu
     let (harness, mut mocks) =
         Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
     let mut simulation = simulation_of(&mut mocks);
-    let _stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let _stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
 
     // The engine dies before it stands the robot.
     simulation.stop();
@@ -227,12 +220,7 @@ async fn a_robot_that_does_not_stand_within_its_budget_leaves_and_fails() -> pep
         Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
     let mut simulation = simulation_of(&mut mocks);
     let robot = harness.instance_id().to_owned();
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
     logged(&format!("'{robot}' was admitted to the simulation")).await;
 
     // The budget runs out: the robot leaves the simulation, and fails.
@@ -270,7 +258,7 @@ async fn a_robot_out_of_budget_before_the_engine_answers_fails_and_cancels_the_g
 
     // The engine accepts the goal after all, and the node cancels it at
     // once, so no robot stays in the scene for a node that failed.
-    let stay = goal.accept(stood()).await?;
+    let stay = goal.accept().await?;
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a robot out of budget cancels the goal the engine accepts");
@@ -305,7 +293,7 @@ async fn a_robot_stopped_before_the_engine_answers_cancels_the_goal_it_accepts()
 
     // The engine accepts the goal, and the node cancels it at once, so no
     // robot stays in the scene for a node that stopped.
-    let stay = goal.accept(stood()).await?;
+    let stay = goal.accept().await?;
     tokio::time::timeout(WIRE, stay.cancel_signal())
         .await
         .expect("a stopped robot cancels the goal the engine accepts");
@@ -323,12 +311,7 @@ async fn a_robot_stopped_before_it_stands_leaves_the_scene() -> peppygen::Result
         Harness::start_with(joining_a_simulation("openarm_v2"), setup_on(scripted)).await?;
     let mut simulation = simulation_of(&mut mocks);
     let robot = harness.instance_id().to_owned();
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
     logged(&format!("'{robot}' was admitted to the simulation")).await;
 
     // Admitted and not standing yet, the robot is stopped: it takes itself
@@ -388,7 +371,7 @@ async fn a_robot_refused_with_busy_attaches_again_and_stands() -> peppygen::Resu
         .clone()
         .expect("the robot names its spot again");
     assert_eq!((spot.position, spot.yaw), ([1.0, -2.0, 0.0], 0.5));
-    let stay = again.accept(stood()).await?;
+    let stay = again.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
     await_setup_return(&harness).await;
@@ -542,12 +525,7 @@ async fn a_robot_stays_until_the_engine_ends_its_goal() -> peppygen::Result<()> 
     let (harness, mut mocks) =
         Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
 
     // The engine says the robot stands and keeps the goal open: the robot
     // is in the scene, and stays, serving readiness.
@@ -578,12 +556,7 @@ async fn a_robot_the_engine_takes_out_says_why_and_stops() -> peppygen::Result<(
         Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
     let robot = harness.instance_id().to_owned();
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
     await_setup_return(&harness).await;
@@ -610,12 +583,7 @@ async fn a_robot_another_goal_of_its_copy_holds_says_so_and_stops() -> peppygen:
         Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
     let robot = harness.instance_id().to_owned();
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
     await_setup_return(&harness).await;
@@ -638,12 +606,7 @@ async fn a_robot_whose_engine_is_gone_stops() -> peppygen::Result<()> {
     let (harness, mut mocks) =
         Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
     await_setup_return(&harness).await;
@@ -673,12 +636,7 @@ async fn a_stopping_robot_waits_for_the_engine_to_take_it_out() -> peppygen::Res
     let (harness, mut mocks) =
         Harness::start_with(joining_a_simulation("openarm_v2"), robot_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
-    let stay = simulation
-        .attach
-        .next_goal(WIRE)
-        .await?
-        .accept(stood())
-        .await?;
+    let stay = simulation.attach.next_goal(WIRE).await?.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
     await_setup_return(&harness).await;
@@ -718,8 +676,8 @@ async fn a_robot_attaches_as_the_model_it_was_launched_as() -> peppygen::Result<
         Harness::start_with(joining_a_simulation("so101"), robot_initializer::setup).await?;
     let mut simulation = simulation_of(&mut mocks);
 
-    // The model reaches the engine as the launcher wrote it: which models
-    // exist is the engine's to say, and this node adds nothing to the name.
+    // A model the node holds a description of reaches the engine as the
+    // launcher wrote it: this node adds nothing to the name.
     let goal = simulation.attach.next_goal(WIRE).await?;
     assert_eq!(goal.request.model, "so101");
     goal.refuse(
@@ -732,25 +690,25 @@ async fn a_robot_attaches_as_the_model_it_was_launched_as() -> peppygen::Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_robot_of_no_model_is_refused() -> peppygen::Result<()> {
-    for blank in ["", "  "] {
+async fn a_robot_of_no_bundled_model_never_attaches() -> peppygen::Result<()> {
+    for model in ["", "openarm_v3"] {
         let (harness, mut mocks) =
-            Harness::start_with(joining_a_simulation(blank), robot_initializer::setup).await?;
+            Harness::start_with(joining_a_simulation(model), robot_initializer::setup).await?;
         let mut simulation = simulation_of(&mut mocks);
 
         // Setup has returned, so a goal it never fired never arrives.
         await_setup_return(&harness).await;
         assert!(
             simulation.attach.next_goal(UNSERVED).await.is_err(),
-            "a robot of no model never attaches"
+            "a robot of no bundled model never attaches"
         );
         let failure = harness
             .shutdown()
             .await
-            .expect_err("a robot of no model fails to start")
+            .expect_err("a robot of no bundled model fails to start")
             .to_string();
         assert!(
-            failure.contains("model names the robot's model"),
+            failure.contains(&format!("model: no robot model is named {model:?}")),
             "{failure}"
         );
     }

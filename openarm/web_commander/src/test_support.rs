@@ -1,19 +1,31 @@
-//! Fixtures the unit tests share: the v2 arm models, the gesture roster baked
-//! from them once, the production jog caps, the tests' governor controls, a
-//! state built from both, a motor health reading at a given level, and the
-//! error of a result poll that timed out.
+//! Fixtures the unit tests share: the arms by place, a bundled description, the
+//! v2 arm models, the gesture roster baked from them once, the production jog
+//! caps, the tests' governor controls, a state built from both, a motor health
+//! reading at a given level, and the error of a result poll that timed out.
 
 use std::sync::OnceLock;
 
-use openarm_description::HardwareVersion;
+use robot_description::{ArmId, Driven};
+use srs_model::ARM_DOF;
 
 use crate::gestures::Registry;
 use crate::limits::{arm_ranges, init_limits_for_tests};
 use crate::pose::{ArmModels, JogCaps};
+use crate::robot::{ARMS, LIMBS};
 use crate::state::{GovernorSettings, HealthLevel, MotorHealthReading, UiState};
 
+/// The arm `robot::LIMBS` names first, left_arm.
+pub(crate) const LEFT: ArmId = ArmId::new(0);
+/// The arm `robot::LIMBS` names second, right_arm.
+pub(crate) const RIGHT: ArmId = ArmId::new(1);
+
+/// The bundled model `model`, held to this node's arms.
+pub fn driven(model: &str) -> Driven<ARM_DOF, ARMS> {
+    LIMBS.model(model).expect("this node drives the model")
+}
+
 pub fn models() -> ArmModels {
-    ArmModels::from_version(HardwareVersion::V2)
+    ArmModels::from_driven(&driven("openarm_v2"))
 }
 
 /// The roster baked from [`models`] against the panel's joint ranges, as

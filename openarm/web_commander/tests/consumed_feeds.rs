@@ -6,7 +6,7 @@
 //! motor_health uses the same producer identity as the observed left arm.
 //! An unrelated producer's reports are dropped at the parse boundary.
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 use peppygen::consumed_topics::alerts::alerts;
 use peppygen::consumed_topics::collision_status::collision_status;
 use peppygen::consumed_topics::motor_health::motor_health;
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 use peppygen::mock::observed::observed_left_arm;
 
 const PANEL_PORT: u16 = 18633;
@@ -34,7 +34,7 @@ fn proximity_msg() -> collision_status::Message {
 /// A set holding one alert, as a producer publishes it.
 fn alert_msg() -> alerts::Message {
     alert_set_msg(vec![alerts::MessageActiveItem {
-        source: "left arm j2".to_string(),
+        source: "left_arm j2".to_string(),
         kind: "motor_condition".to_string(),
         severity: 2,
         message: "holding 93% of rated torque".to_string(),
@@ -93,18 +93,15 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start_with(
-        Config {
-            parameters: Some(helpers::test_parameters(PANEL_PORT)),
-            motor_health_instance_ids: vec![
-                observed_left_arm::MOCK_INSTANCE_ID.to_string(),
-                "alpha_right_arm_inst".to_string(),
-            ],
-            alerts_instances: 2,
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (harness, mocks) = helpers::start(Config {
+        parameters: Some(helpers::test_parameters(PANEL_PORT)),
+        motor_health_instance_ids: vec![
+            observed_left_arm::MOCK_INSTANCE_ID.to_string(),
+            "alpha_right_arm_inst".to_string(),
+        ],
+        alerts_instances: 2,
+        ..Config::default()
+    })
     .await?;
 
     // Slot binding is resolved once at owner start, so the very first
@@ -152,7 +149,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
     )
     .await?;
     let alert = &snapshot["alerts"][0];
-    assert_eq!(alert["source"], "left arm j2");
+    assert_eq!(alert["source"], "left_arm j2");
     assert_eq!(alert["severity"], 2);
     assert_eq!(alert["message"], "holding 93% of rated torque");
 
@@ -164,7 +161,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
         || {
             let first = alert_msg();
             let second = alert_set_msg(vec![alerts::MessageActiveItem {
-                source: "right arm j1".to_string(),
+                source: "right_arm j1".to_string(),
                 kind: "motor_condition".to_string(),
                 severity: 3,
                 message: "overload: the motor cut out and the joint is limp".to_string(),
@@ -179,7 +176,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
     )
     .await?;
     let worst = &snapshot["alerts"][0];
-    assert_eq!(worst["source"], "right arm j1", "most severe first");
+    assert_eq!(worst["source"], "right_arm j1", "most severe first");
     assert_eq!(worst["severity"], 3);
 
     // An empty set from the first producer clears its entry and leaves the
@@ -190,7 +187,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
         || {
             let cleared = alert_set_msg(Vec::new());
             let second = alert_set_msg(vec![alerts::MessageActiveItem {
-                source: "right arm j1".to_string(),
+                source: "right_arm j1".to_string(),
                 kind: "motor_condition".to_string(),
                 severity: 3,
                 message: "overload: the motor cut out and the joint is limp".to_string(),
@@ -204,7 +201,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
         |s| {
             s["alerts"]
                 .as_array()
-                .is_some_and(|a| a.len() == 1 && a[0]["source"] == "right arm j1")
+                .is_some_and(|a| a.len() == 1 && a[0]["source"] == "right_arm j1")
         },
     )
     .await?;
@@ -219,13 +216,13 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
             let publisher = &mocks.deps.motor_health[0].motor_health;
             async move { publisher.publish(&msg).await }
         },
-        |s| s["health"]["left"]["status"] == "live",
+        |s| helpers::arm(s, "left_arm")["health"]["status"] == "live",
     )
     .await?;
-    // A live side renders its arm rows plus the (silent) gripper component's
+    // A live arm renders its joint rows plus the (silent) gripper component's
     // placeholder row: 7 + 1.
     assert_eq!(
-        live["health"]["left"]["motors"]
+        helpers::arm(&live, "left_arm")["health"]["motors"]
             .as_array()
             .expect("left motor rows")
             .len(),
@@ -233,7 +230,7 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
         "seven arm motor rows plus the gripper placeholder"
     );
 
-    // A producer outside the observed limbs must leave the right side empty.
+    // A producer outside the observed limbs must leave the right arm empty.
     for _ in 0..10 {
         mocks.deps.motor_health[1]
             .motor_health
@@ -242,18 +239,13 @@ async fn consumed_topics_surface_on_the_panel() -> peppygen::Result<()> {
         let snapshot = ws
             .next_snapshot(Duration::from_secs(5), "snapshot pass")
             .await;
-        let status = snapshot["health"]["right"]["status"]
-            .as_str()
-            .expect("right status");
+        let right = &helpers::arm(&snapshot, "right_arm")["health"];
+        let status = right["status"].as_str().expect("right status");
         assert!(
             status == "pending" || status == "not_reporting",
             "right health must stay empty for an unobserved producer, got {status}"
         );
-        assert!(
-            snapshot["health"]["right"]["motors"]
-                .as_array()
-                .is_some_and(Vec::is_empty)
-        );
+        assert!(right["motors"].as_array().is_some_and(Vec::is_empty));
     }
 
     harness.shutdown().await

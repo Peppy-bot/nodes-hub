@@ -12,20 +12,26 @@ from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
-from sim_robot_core.models import EngineModel, shipped_entry
+from robot_description_py import model as bundled
+from sim_robot_core.models import shipped_entry
+
+import _world
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 
-# Joint limits as each model's stage carries them: an OpenArm's fingers close
-# at zero, the left ones opening toward positive and the right toward
-# negative, and the SO-101's jaw closes at its lower limit.
-_OPENARM_FINGER_LIMITS = {
-    "openarm_left_finger_joint1": (0.0, 0.044),
-    "openarm_left_finger_joint2": (0.0, 0.044),
-    "openarm_right_finger_joint1": (-0.044, 0.0),
-    "openarm_right_finger_joint2": (-0.044, 0.0),
-}
-_SO101_JAW_LIMITS = (-0.174533, 1.74533)
+
+def _finger(model: str, joint: str):
+    """The finger of `model`'s description that `joint` moves."""
+    arms = bundled(model).description().arms
+    return next(finger for arm in arms for finger in arm.gripper.fingers if finger.joint == joint)
+
+
+# Where each finger closes and opens, as each model's description gives it:
+# the SO-101's jaw closes below its joint's zero, and an OpenArm v2's fingers
+# close at zero, the left ones opening toward positive by as much as the
+# right ones open toward negative.
+_SO101_JAW = (_finger("so101", "gripper").closed, _finger("so101", "gripper").open)
+_OPENARM_V2_FINGER_OPEN = _finger("openarm_v2", "openarm_left_finger_joint1").open
 
 
 class _Views:
@@ -39,7 +45,6 @@ class _Views:
         self.rigs = []
         # Per articulation prim: the dof names it reports, in its own order.
         self.dofs = {}
-        self.limits = {}
         self.positions = {}
 
     def articulation(self, prim, name):
@@ -54,10 +59,6 @@ class _Views:
 
             def get_joint_names(self):
                 return list(views.dofs[prim])
-
-            def get_joint_limits(self):
-                pairs = [views.limits.get(dof, (-3.0, 3.0)) for dof in views.dofs[prim]]
-                return [lo for lo, _ in pairs], [hi for _, hi in pairs]
 
             def get_joint_states(self):
                 positions = [views.positions.get((prim, dof), 0.0) for dof in views.dofs[prim]]
@@ -114,12 +115,6 @@ def _engine(monkeypatch):
     return module
 
 
-def _models():
-    import isaac_models  # pylint: disable=C0415
-
-    return isaac_models.IsaacModels.read()
-
-
 def _robot(engine, instance: str, known):
     """A robot on the stage, its articulation reporting every joint of its
     model, fingers first so no limb's rows are its entry's own order."""
@@ -128,13 +123,11 @@ def _robot(engine, instance: str, known):
     robot = world.Robot(instance=instance, known=known, placement=world.Placement.of([0, 0, 0], 0.0))
     entry = known.entry
     engine.views.dofs[robot.articulation()] = [*entry.finger_joints(), *entry.arm_joints()]
-    engine.views.limits.update(_OPENARM_FINGER_LIMITS)
-    engine.views.limits["gripper"] = _SO101_JAW_LIMITS
     return robot
 
 
 def _limbs(engine, instance: str, model: str):
-    limbs = engine.RobotLimbs(_robot(engine, instance, _models().of(model)))
+    limbs = engine.RobotLimbs(_robot(engine, instance, _world.known(model)))
     assert limbs.setup()
     return limbs
 
@@ -153,6 +146,10 @@ class TestLimbs:
             "right_arm_alpha",
             "right_gripper_alpha",
         ]
+        # A gripper drives its first finger: the second one mimics it.
+        for side in ("left", "right"):
+            joints = engine.views.actuators[f"{side}_gripper_alpha"][1]
+            assert joints == [f"openarm_{side}_finger_joint1"]
 
     def test_an_so101_is_driven_by_its_one_arm_and_its_one_jaw(self, engine):
         limbs = _limbs(engine, "charlo", "so101")
@@ -169,12 +166,13 @@ class TestLimbs:
         _limbs(engine, "charlo", "so101")
         params = {name: built[2] for name, built in engine.views.actuators.items()}
 
+        gains = _world.known("openarm_v2").arm_gains
         for arm in ("left_arm_alpha", "right_arm_alpha"):
-            assert params[arm]["kp"] == [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0]
-            assert params[arm]["kd"] == [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2]
+            assert params[arm]["kp"] == list(gains.kp)
+            assert params[arm]["kd"] == list(gains.kd)
             assert params[arm]["max_efforts"] == [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0]
-        assert params["left_gripper_alpha"]["kp"] == [80.0, 80.0]
-        assert params["left_gripper_alpha"]["max_efforts"] == [5.0, 5.0]
+        assert params["left_gripper_alpha"]["kp"] == [80.0]
+        assert params["left_gripper_alpha"]["max_efforts"] == [7.0]
         assert params["arm_charlo"] == {
             "joint_names": ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"],
             "kp": [998.22] * 5,
@@ -189,7 +187,7 @@ class TestLimbs:
         }
 
     def test_a_joint_its_models_entry_names_and_its_articulation_lacks_is_refused(self, engine):
-        robot = _robot(engine, "charlo", _models().of("so101"))
+        robot = _robot(engine, "charlo", _world.known("so101"))
         engine.views.dofs[robot.articulation()].remove("wrist_roll")
 
         with pytest.raises(
@@ -201,11 +199,12 @@ class TestLimbs:
     def test_the_views_read_the_articulation_where_the_models_stage_keeps_it(self, engine):
         import isaac_models  # pylint: disable=C0415
 
-        known = isaac_models.parse(
-            EngineModel(
-                entry=shipped_entry("so101"),
-                engine={"stage": "so101/so101.usd", "articulation_root": "base_link"},
-            )
+        known = isaac_models.stood(
+            "so101",
+            shipped_entry("so101", bundled("so101").description()),
+            isaac_models.parse("so101", {"stage": "so101/so101.usd", "articulation_root": "base_link"}),
+            {},
+            {},
         )
         robot = _robot(engine, "charlo", known)
 
@@ -219,22 +218,23 @@ class TestLimbs:
 
 
 class TestFingerSpans:
-    def test_the_so101_jaw_opens_from_its_lower_limit_to_its_upper_one(self, engine):
+    def test_the_so101_jaw_opens_from_its_closed_state_to_its_open_one(self, engine):
         (span,) = _limbs(engine, "charlo", "so101").spans["gripper"]
-        lower, upper = _SO101_JAW_LIMITS
+        closed, opened = _SO101_JAW
 
-        assert span.position(0.0) == pytest.approx(lower)
-        assert span.position(1.0) == pytest.approx(upper)
-        assert span.position(0.5) == pytest.approx((lower + upper) / 2.0)
-        assert span.opening(upper) == pytest.approx(1.0)
+        assert span.position(0.0) == pytest.approx(closed)
+        assert span.position(1.0) == pytest.approx(opened)
+        assert span.position(0.5) == pytest.approx((closed + opened) / 2.0)
+        assert span.opening(opened) == pytest.approx(1.0)
         # The jaw's zero is not its closed pose.
-        assert span.opening(0.0) == pytest.approx(-lower / (upper - lower))
+        assert span.opening(0.0) == pytest.approx(-closed / (opened - closed))
 
     def test_an_openarms_fingers_open_from_zero_each_toward_its_own_side(self, engine):
         spans = _limbs(engine, "alpha", "openarm_v2").spans
 
-        assert [span.position(1.0) for span in spans["left_gripper"]] == [0.044, 0.044]
-        assert [span.position(1.0) for span in spans["right_gripper"]] == [-0.044, -0.044]
+        assert _OPENARM_V2_FINGER_OPEN > 0.0
+        assert [span.position(1.0) for span in spans["left_gripper"]] == [_OPENARM_V2_FINGER_OPEN] * 2
+        assert [span.position(1.0) for span in spans["right_gripper"]] == [-_OPENARM_V2_FINGER_OPEN] * 2
         for gripper in ("left_gripper", "right_gripper"):
             assert [span.position(0.0) for span in spans[gripper]] == [0.0, 0.0]
 
@@ -242,10 +242,9 @@ class TestFingerSpans:
 @pytest.fixture(name="fleet")
 def _fleet(engine, monkeypatch):
     """An OpenArm v2 and an SO-101 standing on one stage."""
-    models = _models()
     robots = [
-        _robot(engine, "alpha", models.of("openarm_v2")),
-        _robot(engine, "charlo", models.of("so101")),
+        _robot(engine, "alpha", _world.known("openarm_v2")),
+        _robot(engine, "charlo", _world.known("so101")),
     ]
     world, io, registry = Mock(), Mock(), Mock()
     world.robots.return_value = robots
@@ -329,24 +328,22 @@ class TestDrivingAFleet:
 
         fleet.step()
 
-        lower, upper = _SO101_JAW_LIMITS
+        closed, opened = _SO101_JAW
         (jaw,) = _writes(engine, "gripper_charlo").call_args.args
-        assert jaw == {"gripper": pytest.approx((lower + upper) / 2.0)}
+        assert jaw == {"gripper": pytest.approx((closed + opened) / 2.0)}
+        # The first finger takes the target; the second one follows it.
         (fingers,) = _writes(engine, "right_gripper_alpha").call_args.args
-        assert fingers == {
-            "openarm_right_finger_joint1": pytest.approx(-0.044),
-            "openarm_right_finger_joint2": pytest.approx(-0.044),
-        }
+        assert fingers == {"openarm_right_finger_joint1": pytest.approx(-_OPENARM_V2_FINGER_OPEN)}
         _writes(engine, "left_gripper_alpha").assert_not_called()
 
     def test_each_robots_state_is_published_under_its_own_limbs(self, engine, fleet):
         positions = engine.views.positions
         positions[("/World/charlo", "shoulder_lift")] = -1.72
-        lower, upper = _SO101_JAW_LIMITS
-        positions[("/World/charlo", "gripper")] = upper
+        _, opened = _SO101_JAW
+        positions[("/World/charlo", "gripper")] = opened
         positions[("/World/alpha", "openarm_left_joint7")] = 0.3
-        positions[("/World/alpha", "openarm_right_finger_joint1")] = -0.022
-        positions[("/World/alpha", "openarm_right_finger_joint2")] = -0.022
+        positions[("/World/alpha", "openarm_right_finger_joint1")] = -_OPENARM_V2_FINGER_OPEN / 2.0
+        positions[("/World/alpha", "openarm_right_finger_joint2")] = -_OPENARM_V2_FINGER_OPEN / 2.0
 
         fleet.step()
 
@@ -395,7 +392,7 @@ class TestRigs:
         assert [robot for robot, _, _ in engine.views.rigs] == ["charlo"]
 
     def test_a_model_with_no_camera_renders_none(self, engine, fleet):
-        fleet._world.robots.return_value = [_robot(engine, "bravo", _models().of("openarm_v1"))]
+        fleet._world.robots.return_value = [_robot(engine, "bravo", _world.known("openarm_v1"))]
         fleet._io.camera_robots.return_value = {"bravo"}
 
         fleet._reconcile_rigs()

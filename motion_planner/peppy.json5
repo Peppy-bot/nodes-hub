@@ -68,6 +68,7 @@
       ],
       consumes: [
         { link_id: "identity", name: "get_identity" },
+        { link_id: "identity", name: "get_description" },
         { link_id: "camera_mounts", name: "get_camera_poses" },
         { link_id: "workspace", name: "describe_workspace" },
         { link_id: "geometry", name: "get_depth_intrinsics" },

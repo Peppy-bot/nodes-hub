@@ -21,9 +21,11 @@ from typing import Optional
 from unittest.mock import Mock
 
 import pytest
+import robot_description_py
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
+from _world import known
 import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
 
@@ -31,12 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from isaac_models import IsaacModels  # noqa: E402  pylint: disable=C0413
-from robots_io import Ending, RobotsIO  # noqa: E402  pylint: disable=C0413
+from robots_io import Ending, RobotsIO, _Promise  # noqa: E402  pylint: disable=C0413
 
 MODELS = IsaacModels.read()
-OPENARM_V1 = MODELS.of("openarm_v1")
-OPENARM_V2 = MODELS.of("openarm_v2")
-SO101 = MODELS.of("so101")
+OPENARM_V1 = known("openarm_v1")
+OPENARM_V2 = known("openarm_v2")
+SO101 = known("so101")
 
 
 def _robots_io(world):
@@ -171,12 +173,13 @@ class _Goal:
         self.answers.append(("cancelled", reason))
 
 
-def _joining_io():
-    """A RobotsIO with one robot admitted and waiting for the thread that
-    steps the scene, which takes nothing up until a test drains the edits."""
+def _joining_io(model: str = "openarm_v2"):
+    """A RobotsIO with one robot of `model` admitted and waiting for the
+    thread that steps the scene, which takes nothing up until a test drains
+    the edits."""
     io = RobotsIO.__new__(RobotsIO)
     io._edits = Edits()
-    io._placements = {"alpha": Mock()}
+    io._promises = {"alpha": _Promise(placement=Mock(), known=known(model))}
     io._handovers = {}
     io._robots = Mock(spec=["release", "stand"])
     io._models = MODELS
@@ -190,7 +193,7 @@ def test_a_stand_whose_spot_was_taken_back_gives_the_name_back():
     the one holding it: a name nothing gives back is a name no copy can
     ever join under again."""
     io = _joining_io()
-    io._placements = {}
+    io._promises = {}
     goal = _Goal()
 
     assert asyncio.run(io._stand(goal, "alpha", "openarm_v2")) is False
@@ -235,7 +238,7 @@ def test_a_robot_that_leaves_before_the_stage_takes_it_up_never_stands():
     assert goal.answers == [("cancelled", "cancelled by its caller")]
     io._robots.release.assert_called_once_with("alpha")
     io._robots.stand.assert_not_called()
-    assert "alpha" not in io._placements
+    assert "alpha" not in io._promises
     assert io._edits.drain() == 0
 
 
@@ -276,9 +279,12 @@ def test_a_robot_that_leaves_while_the_stage_stands_it_is_stood_first():
 
 @pytest.mark.parametrize("model", ["openarm_v1", "openarm_v2", "so101"])
 def test_a_stand_asks_the_stage_for_the_robots_own_model(model):
-    io = _joining_io()
+    """The model the robot was promised as it was admitted, as its
+    description describes it."""
+    io = _joining_io(model)
+    promised = io._promises["alpha"]
     asked = []
-    io.stand = lambda name, known, placement: asked.append((name, known, placement))
+    io.stand = lambda *stood: asked.append(stood)
 
     async def stand_once():
         goal = _Goal()
@@ -288,7 +294,7 @@ def test_a_stand_asks_the_stage_for_the_robots_own_model(model):
         return await asyncio.wait_for(standing, 5)
 
     assert asyncio.run(stand_once()) is True
-    assert asked == [("alpha", MODELS.of(model), io._placements["alpha"])]
+    assert asked == [("alpha", promised.known, promised.placement)]
 
 
 def _done():
@@ -332,7 +338,7 @@ def test_a_stay_ending_with_the_engine_asks_nothing_of_the_stopping_stage():
 
     io._edits.submit.assert_not_called()
     io._robots.release.assert_called_once_with("alpha")
-    assert "alpha" not in io._placements
+    assert "alpha" not in io._promises
     assert goal.answers == [("failed", FailureKind.RESOURCE_UNAVAILABLE, "the engine stopped")]
 
 
@@ -396,7 +402,7 @@ def _fleet_io_at(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) ->
     io._models = MODELS
     io._robots = Registry()
     for name, (model, _held) in fleet.items():
-        io._robots.admit(name, MODELS.of(model).entry, _caller(name))
+        io._robots.admit(name, known(model).entry, _caller(name))
         if reached_s is not None:
             io._robots.note_limbs_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
@@ -431,7 +437,7 @@ def test_a_robot_that_left_before_it_stood_gives_back_its_name_and_its_spot():
 
     assert stood is False
     io._robots.release.assert_called_once_with("alpha")
-    assert io._placements == {}
+    assert io._promises == {}
 
 
 def test_a_robot_the_stage_refused_gives_back_its_name_and_its_spot():
@@ -454,7 +460,7 @@ def test_a_robot_the_stage_refused_gives_back_its_name_and_its_spot():
 
     assert asyncio.run(stand_and_drain()) is False
     io._robots.release.assert_called_once_with("alpha")
-    assert io._placements == {}
+    assert io._promises == {}
     ((outcome, kind, message),) = goal.answers
     assert (outcome, kind) == ("failed", FailureKind.ATTEMPT_FAILED)
     assert "the stage will not take it" in message
@@ -790,16 +796,26 @@ def _admitting() -> RobotsIO:
     io._world = _Spots()
     io._loop = SimpleNamespace(time=lambda: 0.0)
     io._handovers = {}
-    io._placements = {}
+    io._promises = {}
     return io
 
 
-def _request(robot: str, model: str):
+def _request(robot: str, model: str, described_as: Optional[str] = None, srdf: Optional[str] = None):
+    """The attach goal of `robot`, a robot of `model`, which carries the
+    bundled description of `described_as` (`model` when None), its SRDF
+    written as `srdf` when one is given."""
     caller = _caller(robot)
+    files = robot_description_py.model(described_as or model)
     return SimpleNamespace(
         core_node=caller.core_node,
         instance_id=caller.instance_id,
-        data=SimpleNamespace(robot=robot, model=model, placement=None),
+        data=SimpleNamespace(
+            robot=robot,
+            model=model,
+            placement=None,
+            urdf=files.urdf,
+            srdf=files.srdf if srdf is None else srdf,
+        ),
     )
 
 
@@ -812,7 +828,7 @@ class TestAdmission:
             ("so101", ["arm"], [5], ["gripper"]),
         ],
     )
-    def test_a_robot_is_admitted_with_the_limbs_of_its_model_under_its_robots_names(
+    def test_a_robot_is_admitted_with_the_limbs_of_its_description_under_its_robots_names(
         self, model, arm_names, arm_joints, gripper_names
     ):
         io = _admitting()
@@ -820,25 +836,47 @@ class TestAdmission:
         decision = io._admit(_request("alpha", model))
 
         assert decision.refusal is None
-        answer = decision.response
-        assert (answer.arm_names, answer.arm_joints, answer.gripper_names) == (
-            arm_names,
-            arm_joints,
-            gripper_names,
-        )
-        assert io._robots.of_name("alpha").model == model
+        admitted = io._robots.of_name("alpha")
+        assert admitted.model == model
+        assert (
+            admitted.entry.arm_names(),
+            admitted.entry.arm_joint_counts(),
+            admitted.entry.gripper_names(),
+        ) == (arm_names, arm_joints, gripper_names)
+        # The robot stands as the model its description describes.
+        assert io._promises["alpha"].known.entry == admitted.entry
 
     def test_a_model_the_engine_has_no_entry_for_is_rejected_with_the_ones_it_stands(self):
         io = _admitting()
 
-        decision = io._admit(_request("alpha", "openarm_v9"))
+        decision = io._admit(_request("alpha", "openarm_v9", described_as="openarm_v2"))
 
         assert decision.refusal.kind is FailureKind.REJECTED
         assert decision.refusal.message == (
             "unknown model 'openarm_v9': this engine stands openarm_v1, openarm_v2, so101"
         )
         assert io._robots.robots() == []
-        assert io._placements == {}
+        assert io._promises == {}
+
+    def test_a_description_that_does_not_read_is_rejected(self):
+        io = _admitting()
+
+        decision = io._admit(_request("alpha", "openarm_v2", srdf="<robot"))
+
+        assert decision.refusal.kind is FailureKind.REJECTED
+        assert decision.refusal.message.startswith("the SRDF does not parse:")
+        assert io._robots.robots() == []
+        assert io._promises == {}
+
+    def test_a_description_the_models_entry_does_not_fit_is_rejected(self):
+        io = _admitting()
+
+        decision = io._admit(_request("alpha", "openarm_v2", described_as="so101"))
+
+        assert decision.refusal.kind is FailureKind.REJECTED
+        assert "the cameras of the description are ['wrist']" in decision.refusal.message
+        assert io._robots.robots() == []
+        assert io._promises == {}
 
     def test_an_so101_is_admitted_beside_an_openarm_each_on_a_spot_of_its_own(self):
         io = _admitting()
@@ -850,5 +888,5 @@ class TestAdmission:
             "alpha": "openarm_v2",
             "charlo": "so101",
         }
-        spots = [placement.position for placement in io._placements.values()]
+        spots = [promise.placement.position for promise in io._promises.values()]
         assert len(set(spots)) == 2

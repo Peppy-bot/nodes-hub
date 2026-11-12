@@ -7,9 +7,8 @@ use std::num::NonZeroUsize;
 use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 
 use motion_planning_core::{Arms, Moving, SelfModel};
+use robot_description::ArmId;
 use self_collision_model::{CollisionError, Joints, Proximity, SelfCollisionModel};
-
-use crate::arm_set::ArmId;
 
 /// Copies of one snapshot of the robot's self-collision model: as many threads as that ask
 /// at once, each on a copy no other holds.
@@ -159,12 +158,10 @@ impl<const N: usize, const K: usize, const D: usize> SelfModel<D> for EveryArm<N
 
 #[cfg(test)]
 mod tests {
-    use openarm_description::{ARM_DOF, DUAL_DOF, Side, home, ready};
-    use so101_description::ARM_DOF as SO101_DOF;
+    use crate::robot::tests::{ARM_DOF, ARMS, DUAL_DOF, LEFT, RIGHT, bundled, home, ready};
 
     use super::*;
-    use crate::arm_set::PerArm;
-    use crate::robot::{openarm_v2, so101};
+    use robot_description::PerArm;
 
     /// A bound under the distance of every pair of the robots at the postures of the tests.
     const UNDER_EVERY_PAIR_M: f64 = -1.0;
@@ -186,8 +183,8 @@ mod tests {
     // right at its home posture, where those stand nearest at different distances.
     #[test]
     fn a_turn_of_one_arm_of_both_reads_its_pairs_with_the_arms_before_it() {
-        let robot = openarm_v2().expect("OpenArm v2's model");
-        let at = [ready(Side::Left), home(Side::Right)];
+        let robot = bundled::<ARM_DOF, DUAL_DOF, ARMS>("openarm_v2");
+        let at = [ready(LEFT), home(RIGHT)];
         let q = Arms::<ARM_DOF, DUAL_DOF>::join(&at);
         let both = robot.own.of_every_arm::<DUAL_DOF>(NonZeroUsize::MIN);
         let mut model = robot.own.model.clone();
@@ -207,13 +204,11 @@ mod tests {
     // a plan of both reads for the arm last in the state.
     #[test]
     fn a_plan_of_one_arm_reads_its_pairs_with_the_other_arm_where_it_stands() {
-        let robot = openarm_v2().expect("OpenArm v2's model");
-        let at = [ready(Side::Left), home(Side::Right)];
-        let held = robot.own.of_one_arm(
-            NonZeroUsize::MIN,
-            Side::Right.into(),
-            &PerArm::new(at.to_vec()),
-        );
+        let robot = bundled::<ARM_DOF, DUAL_DOF, ARMS>("openarm_v2");
+        let at = [ready(LEFT), home(RIGHT)];
+        let held = robot
+            .own
+            .of_one_arm(NonZeroUsize::MIN, RIGHT, &PerArm::new(at));
         let mut model = robot.own.model.clone();
         let of_right = model
             .min_distance_of_chain(1, &at)
@@ -225,14 +220,14 @@ mod tests {
     // SO-101's one arm reads every checked pair, planned alone or as every arm.
     #[test]
     fn a_plan_of_so101s_arm_reads_every_pair() {
-        let robot = so101().expect("SO-101's model");
+        let robot = bundled::<5, 5, 1>("so101");
         let q = [0.3, -0.4, 0.9, 0.2, -0.1];
         let mut model = robot.own.model.clone();
         let of_all = model.min_distance(&[q]).expect("a measured state").distance;
         let alone = robot
             .own
-            .of_one_arm(NonZeroUsize::MIN, ArmId::new(0), &PerArm::new(vec![q]));
-        let every = robot.own.of_every_arm::<SO101_DOF>(NonZeroUsize::MIN);
+            .of_one_arm(NonZeroUsize::MIN, ArmId::new(0), &PerArm::new([q]));
+        let every = robot.own.of_every_arm::<5>(NonZeroUsize::MIN);
         reads(&alone, &q, Moving::All, of_all);
         reads(&every, &q, Moving::Arm(0), of_all);
         reads(&every, &q, Moving::All, of_all);

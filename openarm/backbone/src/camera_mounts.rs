@@ -1,33 +1,32 @@
 //! The camera_mounts contract: where the robot's design carries each camera,
-//! in the robot frame, now. The description lists each camera's pose in the
-//! frame of the URDF link it is fixed to, looking along its own -Z with +Y
-//! up; this module turns each one, once at bringup, into the pose of the
-//! camera's optical frame (+Z along the view, +Y down, as camera_geometry
-//! defines it) in the frame that carries it: the robot frame for a camera
-//! fixed to the base, the grasp point's frame for a camera an arm carries.
+//! in the robot frame, now. The description gives each camera's optical frame
+//! (+Z along the view, +Y down, as camera_geometry defines it) as a link of
+//! the URDF fixed to its parent link; this module places each one, once at
+//! bringup, in the frame that carries it: the robot frame for a camera fixed
+//! to the base, the grasp point's frame for a camera an arm carries.
 //! A request then composes the carried ones with the grasp poses the
 //! coordinator measured last, the ones limb_states publishes, and answers
 //! under that measurement's stamp. Served from bringup: until the coordinator
 //! has measured the arms the caller gets an error reply with
 //! `precondition_failed`. The workspace tools read the
-//! same placements, with the depths each camera measures, through
-//! [`CameraMounts::design_cameras`].
+//! same placements, with the depths the description gives each depth camera,
+//! through [`CameraMounts::design_cameras`].
 
-use std::f64::consts::PI;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use control_core::serving;
-use openarm_description::{ArmPair, CameraMount, HardwareVersion, Side};
 use peppygen::NodeRunner;
 use peppygen::exposed_services::camera_mounts::get_camera_poses;
 use peppylib::runtime::CancellationToken;
+use robot_description::{ArmId, CameraFrame, DepthRange, PerArm, RobotDescription};
 use srs_model::chain_kinematics::Tree;
-use srs_model::nalgebra::{Isometry3, UnitQuaternion, Vector3};
+use srs_model::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::types::{pose_from_wire, world_pose_arrays};
+use crate::robot::{ARMS, LIMBS};
+use crate::types::world_pose_arrays;
 
 /// The message of the error reply while the coordinator has measured
 /// nothing yet.
@@ -38,7 +37,7 @@ const NOT_MEASURED_YET: &str = "the robot has not measured its joints yet";
 #[derive(Clone, Debug)]
 pub struct MeasuredGrasps {
     pub timestamp: SystemTime,
-    pub poses: ArmPair<Isometry3<f64>>,
+    pub poses: PerArm<Isometry3<f64>, ARMS>,
 }
 
 /// What carries a camera.
@@ -47,7 +46,7 @@ enum Carrier {
     /// The robot's base: the camera has one pose for the life of the robot.
     Base,
     /// One arm's grasp point: the camera moves with that arm.
-    Arm(Side),
+    Arm(ArmId),
 }
 
 /// One camera, resolved: its optical frame in its carrier's frame, and the
@@ -57,7 +56,7 @@ struct ResolvedMount {
     name: &'static str,
     carrier: Carrier,
     pose: Isometry3<f64>,
-    depth_range: Option<[f64; 2]>,
+    depth_range: Option<DepthRange>,
 }
 
 /// One camera as the design fixes it, whatever the arms do: what the
@@ -65,9 +64,9 @@ struct ResolvedMount {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DesignCamera {
     pub name: &'static str,
-    /// The depths the camera measures, nearest and farthest, metres; none
-    /// for a camera that gives colour alone.
-    pub depth_range: Option<[f64; 2]>,
+    /// The depths the camera measures, as the description gives them; none
+    /// for a camera that gives color alone.
+    pub depth_range: Option<DepthRange>,
     /// The camera's optical frame in the robot frame when the base carries
     /// it; none when an arm carries it, so that it moves with that arm.
     pub fixed_pose: Option<Isometry3<f64>>,
@@ -86,9 +85,6 @@ struct CameraPose {
 /// A mount the robot's description carries that this backbone cannot place.
 #[derive(Debug, thiserror::Error)]
 pub enum CameraMountError {
-    #[error("camera {camera} is fixed to {link}, which the URDF does not carry")]
-    UnknownLink { camera: String, link: String },
-
     #[error(
         "camera {camera} is fixed to {link}, which joint {joint} moves: only the base and \
          the links the grasp points hang off carry a camera"
@@ -98,9 +94,6 @@ pub enum CameraMountError {
         link: String,
         joint: String,
     },
-
-    #[error("the URDF names no tool-centre-point joint for the {side} arm")]
-    NoToolJoint { side: Side },
 }
 
 /// The robot's cameras, each placed in the frame that carries it.
@@ -110,35 +103,30 @@ pub struct CameraMounts {
 }
 
 impl CameraMounts {
-    /// Resolves every mount of `version` against its URDF. A camera whose
-    /// link the grasp point of one arm hangs off is carried by that arm, in
-    /// the grasp point's frame; a camera whose link is fixed to the root is
-    /// carried by the base, in the robot frame; any other mount is refused.
-    pub fn resolve(version: HardwareVersion) -> Result<Self, CameraMountError> {
-        let robot = urdf_rs::read_from_string(version.urdf()).expect("bundled URDF must parse");
-        let tree = Tree::from_robot(&robot).expect("bundled URDF must be one tree");
-        for side in Side::BOTH {
-            if tree.link_index(version.tcp_link(side)).is_none() {
-                return Err(CameraMountError::NoToolJoint { side });
-            }
-        }
-        let mounts = version
-            .camera_mounts()
+    /// Resolves every mount of `description` against its URDF. A camera
+    /// whose link the grasp point of one arm hangs off is carried by that
+    /// arm, in the grasp point's frame; a camera whose link is fixed to the
+    /// root is carried by the base, in the robot frame; any other mount is
+    /// refused.
+    pub fn resolve(description: &'static RobotDescription) -> Result<Self, CameraMountError> {
+        let tree = Tree::from_robot(description.robot()).expect("a description is one tree");
+        let mounts = description
+            .cameras()
             .iter()
-            .map(|mount| resolve_mount(&tree, version, mount))
+            .map(|frame| resolve_mount(&tree, description, frame))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { mounts })
     }
 
     /// The pose of every camera in the robot frame at the grasp poses
     /// `grasps`, in the description's order.
-    fn poses(&self, grasps: &ArmPair<Isometry3<f64>>) -> Vec<CameraPose> {
+    fn poses(&self, grasps: &PerArm<Isometry3<f64>, ARMS>) -> Vec<CameraPose> {
         self.mounts
             .iter()
             .map(|mount| {
                 let (carried_by, pose) = match mount.carrier {
                     Carrier::Base => ("", mount.pose),
-                    Carrier::Arm(side) => (side.arm_name(), grasps[side] * mount.pose),
+                    Carrier::Arm(arm) => (LIMBS.arm_name(arm), grasps[arm] * mount.pose),
                 };
                 CameraPose {
                     name: mount.name,
@@ -165,55 +153,60 @@ impl CameraMounts {
     }
 }
 
-/// The description's pose of `mount` in the link that carries it.
-fn mount_pose(mount: &CameraMount) -> Isometry3<f64> {
-    let [w, x, y, z] = mount.quat_wxyz;
-    pose_from_wire(mount.position, [x, y, z, w]).expect("the description's mount pose is a pose")
+/// The optical frame `frame` in the link it is fixed to: its URDF origin, the
+/// roll, pitch and yaw about the link's fixed axes.
+fn frame_pose(frame: &CameraFrame) -> Isometry3<f64> {
+    let [x, y, z] = frame.xyz;
+    let [roll, pitch, yaw] = frame.rpy;
+    Isometry3::from_parts(
+        Translation3::new(x, y, z),
+        UnitQuaternion::from_euler_angles(roll, pitch, yaw),
+    )
 }
 
-/// One mount in its carrier's frame: the description's pose, turned half a
-/// turn about X into the optical frame, composed below the link it is fixed
-/// to as that link stands in its carrier's frame.
+/// One camera of `description` in its carrier's frame: its optical frame,
+/// composed below the link it is fixed to as that link stands in its
+/// carrier's frame.
 fn resolve_mount(
     tree: &Tree,
-    version: HardwareVersion,
-    mount: &CameraMount,
+    description: &RobotDescription,
+    frame: &'static CameraFrame,
 ) -> Result<ResolvedMount, CameraMountError> {
-    let in_link = mount_pose(mount) * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), PI);
-    let Some(link) = tree.link_index(mount.parent_link) else {
-        return Err(CameraMountError::UnknownLink {
-            camera: mount.name.to_string(),
-            link: mount.parent_link.to_string(),
-        });
-    };
-    for side in Side::BOTH {
+    let name = frame.name.as_str();
+    let depth_range = frame.depth_range;
+    let in_link = frame_pose(frame);
+    let link = tree
+        .link_index(&frame.parent_link)
+        .expect("a camera frame's parent link is a link of the URDF its tree holds");
+    for arm in PerArm::<(), ARMS>::ids() {
         // The grasp point hangs off the camera's link over fixed joints: the
         // camera in the grasp point's frame is the tool transform undone,
         // then the mount.
-        if let Some(tool) = tree.fixed_path_to(link, version.tcp_link(side)) {
+        let grasp_link = &description.arms()[arm.place()].grasp_link;
+        if let Some(tool) = tree.fixed_path_to(link, grasp_link) {
             return Ok(ResolvedMount {
-                name: mount.name,
-                carrier: Carrier::Arm(side),
+                name,
+                carrier: Carrier::Arm(arm),
                 pose: tool.inverse() * in_link,
-                depth_range: mount.depth_range,
+                depth_range,
             });
         }
     }
     let link_in_root = if link == tree.root() {
         Isometry3::identity()
     } else {
-        tree.fixed_path_to(tree.root(), mount.parent_link)
+        tree.fixed_path_to(tree.root(), &frame.parent_link)
             .ok_or_else(|| CameraMountError::MovingLink {
-                camera: mount.name.to_string(),
-                link: mount.parent_link.to_string(),
+                camera: name.to_string(),
+                link: frame.parent_link.clone(),
                 joint: moving_joint_above(tree, link),
             })?
     };
     Ok(ResolvedMount {
-        name: mount.name,
+        name,
         carrier: Carrier::Base,
         pose: link_in_root * in_link,
-        depth_range: mount.depth_range,
+        depth_range,
     })
 }
 
@@ -279,82 +272,131 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::test_support::bundled_arm;
+    use robot_description::states;
     use srs_model::JointVec;
+    use srs_model::nalgebra::Vector3;
+
+    use crate::test_support::{LEFT, RIGHT, V1, V2, bundled_arm, description, postures};
 
     fn v2_mounts() -> CameraMounts {
-        CameraMounts::resolve(HardwareVersion::V2).expect("the v2 mounts resolve")
+        CameraMounts::resolve(description(V2)).expect("the v2 mounts resolve")
     }
 
-    /// The grasp pose of `side` at `q`, in the robot frame.
-    fn grasp(side: Side, q: &JointVec) -> Isometry3<f64> {
-        let arm = bundled_arm(HardwareVersion::V2, side);
+    /// The camera `name` of [`V2`]'s description.
+    fn v2_camera(name: &str) -> &'static CameraFrame {
+        description(V2)
+            .cameras()
+            .iter()
+            .find(|camera| camera.name == name)
+            .expect("a camera of the description")
+    }
+
+    /// The names of the cameras of [`V2`]'s description, in its order.
+    fn v2_camera_names() -> Vec<&'static str> {
+        description(V2)
+            .cameras()
+            .iter()
+            .map(|camera| camera.name.as_str())
+            .collect()
+    }
+
+    /// The grasp pose of `arm` at `q`, in the robot frame.
+    fn grasp(arm: ArmId, q: &JointVec) -> Isometry3<f64> {
+        let arm = bundled_arm(V2, arm);
         arm.world_pose(&arm.at(q).ee_pose())
     }
 
-    fn by_name<'a>(poses: &'a [CameraPose], name: &str) -> &'a CameraPose {
+    /// The camera `carried_by` carries: the name of an arm, or "" for the base.
+    fn carried_by<'a>(poses: &'a [CameraPose], carrier: &str) -> &'a CameraPose {
         poses
             .iter()
-            .find(|camera| camera.name == name)
-            .unwrap_or_else(|| panic!("{name} is listed"))
+            .find(|camera| camera.carried_by == carrier)
+            .unwrap_or_else(|| panic!("a camera carried by {carrier:?}"))
+    }
+
+    /// The pose of `link` in the robot frame, composed by hand from the URDF's
+    /// joint origins over the fixed joints above it.
+    fn fixed_link_in_root(link: &str) -> Isometry3<f64> {
+        let robot = description(V2).robot();
+        let Some(joint) = robot.joints.iter().find(|joint| joint.child.link == link) else {
+            return Isometry3::identity();
+        };
+        assert_eq!(
+            joint.joint_type,
+            robot_description::urdf_rs::JointType::Fixed,
+            "{}",
+            joint.name
+        );
+        let [x, y, z] = *joint.origin.xyz;
+        let [roll, pitch, yaw] = *joint.origin.rpy;
+        fixed_link_in_root(&joint.parent.link)
+            * Isometry3::from_parts(
+                Translation3::new(x, y, z),
+                UnitQuaternion::from_euler_angles(roll, pitch, yaw),
+            )
     }
 
     #[test]
     fn v1_carries_no_camera() {
-        let mounts = CameraMounts::resolve(HardwareVersion::V1).expect("resolves");
-        let grasps = ArmPair::from_fn(|_| Isometry3::identity());
+        let mounts = CameraMounts::resolve(description(V1)).expect("resolves");
+        let grasps = PerArm::from_fn(|_| Isometry3::identity());
         assert!(mounts.poses(&grasps).is_empty());
     }
 
     #[test]
-    fn the_chest_camera_is_the_models_pose_turned_into_the_optical_frame() {
+    fn the_base_camera_is_its_optical_frame_in_the_robot_frame() {
         let mounts = v2_mounts();
-        let grasps = ArmPair::from_fn(|_| Isometry3::identity());
+        let grasps = PerArm::from_fn(|_| Isometry3::identity());
         let poses = mounts.poses(&grasps);
         assert_eq!(
             poses.iter().map(|c| c.name).collect::<Vec<_>>(),
-            ["wrist_left", "wrist_right", "chest"]
+            v2_camera_names()
         );
-        let chest = by_name(&poses, "chest");
-        assert_eq!(chest.carried_by, "");
-        let (position, _) = world_pose_arrays(&chest.pose);
-        assert_eq!(position, [0.0792, 0.0315, 0.7941]);
-        // The model's camera looks along its own -Z; the optical frame's +Z
-        // is that same direction, and its +Y points down the image where
-        // the model's +Y pointed up it.
-        let model_rotation = mount_pose(&HardwareVersion::V2.camera_mounts()[2]).rotation;
-        let view = model_rotation * -Vector3::z();
-        let image_up = model_rotation * Vector3::y();
-        let optical = chest.pose.rotation;
-        assert!((optical * Vector3::z() - view).norm() < 1e-9);
-        assert!((optical * Vector3::y() + image_up).norm() < 1e-9);
+        let base = carried_by(&poses, "");
+        let frame = v2_camera(base.name);
+        let expected = fixed_link_in_root(&frame.parent_link) * frame_pose(frame);
+        assert!(
+            (base.pose.translation.vector - expected.translation.vector).norm() < 1e-9,
+            "{:?} vs {:?}",
+            base.pose.translation,
+            expected.translation
+        );
+        assert!(base.pose.rotation.angle_to(&expected.rotation) < 1e-9);
         // It faces the robot's front and looks down.
+        let view = base.pose.rotation * Vector3::z();
         assert!(view.x > 0.4 && view.z < -0.8, "{view}");
     }
 
     #[test]
-    fn the_design_fixes_the_chest_camera_where_it_is_reported_and_no_wrist_camera() {
+    fn the_design_fixes_the_base_camera_where_it_is_reported_and_no_arm_camera() {
         let mounts = v2_mounts();
         let cameras = mounts.design_cameras();
         assert_eq!(
             cameras.iter().map(|c| c.name).collect::<Vec<_>>(),
-            ["wrist_left", "wrist_right", "chest"]
+            v2_camera_names()
         );
-        let reported = mounts.poses(&ArmPair::from_fn(|_| Isometry3::identity()));
-        let chest = &cameras[2];
-        assert_eq!(chest.fixed_pose, Some(by_name(&reported, "chest").pose));
-        assert_eq!(chest.depth_range, Some([0.1, 10.0]));
-        for wrist in &cameras[..2] {
+        let reported = mounts.poses(&PerArm::from_fn(|_| Isometry3::identity()));
+        for camera in &cameras {
+            let carrier = reported
+                .iter()
+                .find(|pose| pose.name == camera.name)
+                .expect("reported");
+            if carrier.carried_by.is_empty() {
+                assert_eq!(camera.fixed_pose, Some(carrier.pose), "{}", camera.name);
+                let described = v2_camera(camera.name).depth_range;
+                assert_eq!(camera.depth_range, described, "{}", camera.name);
+                assert!(camera.depth_range.is_some(), "{} gives depth", camera.name);
+                continue;
+            }
             assert_eq!(
-                (wrist.fixed_pose, wrist.depth_range),
+                (camera.fixed_pose, camera.depth_range),
                 (None, None),
                 "{}",
-                wrist.name
+                camera.name
             );
         }
         assert!(
-            CameraMounts::resolve(HardwareVersion::V1)
+            CameraMounts::resolve(description(V1))
                 .expect("resolves")
                 .design_cameras()
                 .is_empty()
@@ -362,38 +404,33 @@ mod tests {
     }
 
     #[test]
-    fn a_wrist_camera_moves_with_its_arm_and_matches_the_urdf_composed_by_hand() {
+    fn an_arm_camera_moves_with_its_arm_and_matches_the_urdf_composed_by_hand() {
         let mounts = v2_mounts();
-        let home: JointVec = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0];
+        let home = postures(V2, states::HOME);
         let bent: JointVec = [0.3, -0.8, 0.2, 1.2, -0.4, 0.5, 0.1];
-        let at_home = mounts.poses(&ArmPair::new(
-            grasp(Side::Left, &home),
-            grasp(Side::Right, &home),
-        ));
-        let at_bent = mounts.poses(&ArmPair::new(
-            grasp(Side::Left, &bent),
-            grasp(Side::Right, &home),
-        ));
-        let left_home = by_name(&at_home, "wrist_left");
-        let left_bent = by_name(&at_bent, "wrist_left");
-        assert_eq!(left_home.carried_by, "left_arm");
+        let at_home = mounts.poses(&PerArm::from_fn(|arm| grasp(arm, &home[arm])));
+        let at_bent = mounts.poses(&PerArm::new([
+            grasp(LEFT, &bent),
+            grasp(RIGHT, &home[RIGHT]),
+        ]));
+        let left_home = carried_by(&at_home, LIMBS.arm_name(LEFT));
+        let left_bent = carried_by(&at_bent, LIMBS.arm_name(LEFT));
         assert!(
             (left_home.pose.translation.vector - left_bent.pose.translation.vector).norm() > 0.1,
-            "the left wrist camera moved with its arm"
+            "the left arm's camera moved with its arm"
         );
         assert_eq!(
-            by_name(&at_home, "wrist_right").pose,
-            by_name(&at_bent, "wrist_right").pose,
+            carried_by(&at_home, LIMBS.arm_name(RIGHT)).pose,
+            carried_by(&at_bent, LIMBS.arm_name(RIGHT)).pose,
             "the right arm did not move, nor its camera"
         );
 
-        // By hand: the tip link's pose from the chain, then the model's
-        // mount in that link, then the half turn into the optical frame.
-        let arm = bundled_arm(HardwareVersion::V2, Side::Left);
+        // By hand: the tip link's pose from the chain, then the optical
+        // frame in that link.
+        let arm = bundled_arm(V2, LEFT);
         let tip_in_root = arm.world_pose(&arm.at(&bent).tip_pose());
-        let expected = tip_in_root
-            * mount_pose(&HardwareVersion::V2.camera_mounts()[0])
-            * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), PI);
+        let frame = v2_camera(left_bent.name);
+        let expected = tip_in_root * frame_pose(frame);
         assert!(
             (left_bent.pose.translation.vector - expected.translation.vector).norm() < 1e-9,
             "{:?} vs {:?}",
@@ -415,24 +452,46 @@ mod tests {
             )
         );
 
-        let home: JointVec = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0];
+        let home = postures(V2, states::HOME);
         let measured = MeasuredGrasps {
             timestamp: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7),
-            poses: ArmPair::from_fn(|side| grasp(side, &home)),
+            poses: PerArm::from_fn(|arm| grasp(arm, &home[arm])),
         };
         let reply = answer(&mounts, Some(&measured)).expect("the arms are measured");
         assert_eq!(reply.timestamp, measured.timestamp);
-        assert_eq!(reply.camera_names, ["wrist_left", "wrist_right", "chest"]);
-        assert_eq!(reply.carried_by, ["left_arm", "right_arm", ""]);
-        assert_eq!(reply.positions.len(), 9);
-        assert_eq!(reply.orientations.len(), 12);
+        assert_eq!(reply.camera_names, v2_camera_names());
+        let cameras = v2_camera_names().len();
+        assert_eq!(reply.carried_by.len(), cameras);
+        for arm in PerArm::<(), ARMS>::ids() {
+            assert_eq!(
+                reply
+                    .carried_by
+                    .iter()
+                    .filter(|c| *c == LIMBS.arm_name(arm))
+                    .count(),
+                1,
+                "{} carries one camera",
+                LIMBS.arm_name(arm)
+            );
+        }
+        assert_eq!(reply.positions.len(), 3 * cameras);
+        assert_eq!(reply.orientations.len(), 4 * cameras);
         for quat in reply.orientations.chunks(4) {
             let norm = quat.iter().map(|v| v * v).sum::<f64>().sqrt();
             assert!((norm - 1.0).abs() < 1e-9);
         }
-        // The wrists mirror across the robot's centre line at home.
-        assert!((reply.positions[0] - reply.positions[3]).abs() < 1e-6);
-        assert!((reply.positions[1] + reply.positions[4]).abs() < 1e-6);
-        assert!((reply.positions[2] - reply.positions[5]).abs() < 1e-6);
+        // The arms' cameras mirror across the robot's center line at home.
+        let position_of = |arm: ArmId| {
+            let k = reply
+                .carried_by
+                .iter()
+                .position(|c| c == LIMBS.arm_name(arm))
+                .expect("an arm's camera");
+            [0, 1, 2].map(|axis| reply.positions[3 * k + axis])
+        };
+        let (left, right) = (position_of(LEFT), position_of(RIGHT));
+        assert!((left[0] - right[0]).abs() < 1e-6);
+        assert!((left[1] + right[1]).abs() < 1e-6);
+        assert!((left[2] - right[2]).abs() < 1e-6);
     }
 }

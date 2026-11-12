@@ -15,6 +15,8 @@ from typing import Optional
 from unittest.mock import Mock
 
 import pytest
+import robot_description_py
+from entries import staged_release
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
@@ -23,12 +25,26 @@ from runtime_fakes import CANCEL_REASONS, FailureKind
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
+import mujoco_models  # noqa: E402  pylint: disable=C0413
 from mujoco_models import MujocoModels  # noqa: E402  pylint: disable=C0413
-from robots_io import Ending, RobotsIO  # noqa: E402  pylint: disable=C0413
+from robots_io import Ending, RobotsIO, _Promise  # noqa: E402  pylint: disable=C0413
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from world import Placement, World  # noqa: E402  pylint: disable=C0413
 
-MODELS = MujocoModels.read()
+# The shipped models, from the pinned release of Waldo's catalogue.
+MODELS = MujocoModels.read(assets_dir=staged_release(mujoco_models.ASSETS_DIR))
+
+
+def _known(model: str):
+    """The model a robot of `model` stands as, as its bundled description
+    describes it."""
+    return MODELS.of(model, robot_description_py.model(model).description())
+
+
+def _promised(model: str = "openarm_v2", placement=None) -> _Promise:
+    """What the admission of a robot of `model` promises it: `placement`,
+    the origin when None, and its model."""
+    return _Promise(placement=placement or Placement.of((0.0, 0.0, 0.0), 0.0), known=_known(model))
 CALLER = Caller(core_node="sim16", instance_id="alpha_init_inst")
 
 # What a robot holds once every limb of its model is paired.
@@ -57,19 +73,36 @@ def _robots_io() -> RobotsIO:
     io = RobotsIO.__new__(RobotsIO)
     io._models = MODELS
     io._robots = Registry()
-    io._world = World(head_camera_pack=None, renders=False)
+    io._world = World(renders=False)
     io._loop = SimpleNamespace(time=lambda: 0.0)
     io._handovers = {}
-    io._placements = {}
+    io._promises = {}
     io._admitted = None
     return io
 
 
-def _request(robot: str = "alpha", model: str = "openarm_v2", placement=None, instance: str = "alpha_init_inst"):
+def _request(
+    robot: str = "alpha",
+    model: str = "openarm_v2",
+    placement=None,
+    instance: str = "alpha_init_inst",
+    described_as: Optional[str] = None,
+    srdf: Optional[str] = None,
+):
+    """An attach goal of a robot of `model`, which carries the bundled
+    description of `described_as` (`model` when None), its SRDF written as
+    `srdf` when one is given."""
+    files = robot_description_py.model(described_as or model)
     return SimpleNamespace(
         core_node="sim16",
         instance_id=instance,
-        data=SimpleNamespace(robot=robot, model=model, placement=placement),
+        data=SimpleNamespace(
+            robot=robot,
+            model=model,
+            placement=placement,
+            urdf=files.urdf,
+            srdf=files.srdf if srdf is None else srdf,
+        ),
     )
 
 
@@ -91,31 +124,45 @@ CANCELLED_BY_ITS_CALLER = "cancelled by its caller"
 HANDED_OVER = "another goal of the same caller holds the robot now"
 
 
-@pytest.mark.parametrize(
-    ("model", "arm_names", "arm_joints", "gripper_names"),
-    [
-        ("openarm_v1", ["left_arm", "right_arm"], [7, 7], ["left_gripper", "right_gripper"]),
-        ("openarm_v2", ["left_arm", "right_arm"], [7, 7], ["left_gripper", "right_gripper"]),
-        ("so101", ["arm"], [5], ["gripper"]),
-    ],
-)
-def test_a_robot_of_a_model_the_engine_stands_is_admitted_with_its_limbs(
-    model, arm_names, arm_joints, gripper_names
-):
+@pytest.mark.parametrize("model", ["openarm_v1", "openarm_v2", "so101"])
+def test_a_robot_of_a_model_the_engine_stands_is_admitted_with_the_limbs_of_its_description(model):
     io = _robots_io()
     decision = io._admit(_request(model=model))
     assert _accepted(decision)
-    assert (decision.response.arm_names, decision.response.arm_joints, decision.response.gripper_names) == (
-        arm_names,
-        arm_joints,
-        gripper_names,
-    )
-    assert io._robots.of_name("alpha").model == model
+    admitted = io._robots.of_name("alpha")
+    assert admitted.model == model
+    arms = robot_description_py.model(model).description().arms
+    assert admitted.entry.arm_names() == [arm.name for arm in arms]
+    assert admitted.entry.gripper_names() == [arm.gripper.name for arm in arms]
+    assert io._promises["alpha"].known.entry == admitted.entry
+
+
+def test_a_description_that_does_not_read_is_rejected():
+    io = _robots_io()
+    decision = io._admit(_request(srdf="<robot"))
+    assert _refused(decision, FailureKind.REJECTED).startswith("the SRDF does not parse:")
+    assert io._robots.robots() == []
+
+
+def test_another_description_of_the_model_than_the_simulation_was_built_with_is_rejected():
+    io = _robots_io()
+    srdf = robot_description_py.model("so101").srdf.replace("<robot", "<robot ", 1)
+    decision = io._admit(_request(model="so101", srdf=srdf))
+    message = _refused(decision, FailureKind.REJECTED)
+    assert message.startswith("model so101: the robot attaches with another description"), message
+    assert io._robots.robots() == []
+
+
+def test_a_description_the_models_entry_does_not_fit_is_rejected():
+    io = _robots_io()
+    decision = io._admit(_request(model="openarm_v2", described_as="so101"))
+    assert "the cameras of the description are ['wrist']" in _refused(decision, FailureKind.REJECTED)
+    assert io._robots.robots() == []
 
 
 def test_a_model_the_engine_has_no_entry_for_is_rejected_with_the_ones_it_stands():
     io = _robots_io()
-    decision = io._admit(_request(model="openarm_v9"))
+    decision = io._admit(_request(model="openarm_v9", described_as="openarm_v2"))
     assert _refused(decision, FailureKind.REJECTED) == (
         "unknown model 'openarm_v9': this engine stands openarm_v1, openarm_v2, so101"
     )
@@ -127,7 +174,7 @@ def test_a_robot_that_asks_for_no_spot_is_promised_one_of_the_engines_own():
 
     assert _accepted(io._admit(_request()))
 
-    assert io._placements["alpha"] == Placement.of((0.0, 0.0, 0.0), 0.0)
+    assert io._promises["alpha"].placement == Placement.of((0.0, 0.0, 0.0), 0.0)
 
 
 def test_a_robot_stands_on_the_spot_it_asked_for():
@@ -136,7 +183,7 @@ def test_a_robot_stands_on_the_spot_it_asked_for():
 
     assert _accepted(io._admit(_request(placement=asked)))
 
-    assert io._placements["alpha"] == Placement.of((1.0, -2.0, 0.0), 0.5)
+    assert io._promises["alpha"].placement == Placement.of((1.0, -2.0, 0.0), 0.5)
 
 
 def test_a_spot_another_robot_was_promised_is_refused_with_what_to_ask_instead():
@@ -171,7 +218,7 @@ def test_a_second_robot_joins_beside_the_first_on_a_spot_of_its_own():
 
     assert _accepted(decision)
     assert {robot.name for robot in io._robots.robots()} == {"alpha", "charlo"}
-    assert io._placements["charlo"] != io._placements["alpha"]
+    assert io._promises["charlo"].placement != io._promises["alpha"].placement
 
 
 def test_the_name_is_free_again_once_the_robot_left():
@@ -216,7 +263,6 @@ def test_a_copy_re_registering_its_own_robot_is_admitted():
     decision = io._admit(_request())
 
     assert _accepted(decision)
-    assert decision.response.arm_names == ["left_arm", "right_arm"]
     assert list(io._robots.standing()) == ["alpha"], "one entity, not two"
     assert io._handover("alpha").is_set() is False, "the new goal's own signal is fresh"
 
@@ -258,7 +304,7 @@ def _built(pair_grace_s: float = PAIR_GRACE_S) -> RobotsIO:
         asyncio.new_event_loop(),
         MODELS,
         Registry(),
-        World(head_camera_pack=None, renders=False),
+        World(renders=False),
         Edits(),
         Mock(spec=["forget", "held_by"]),
         pair_grace_s,
@@ -315,7 +361,7 @@ def _fleet_io_at(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) ->
     at all when that is None."""
     io = _robots_io()
     for name, (model, _held) in fleet.items():
-        io._robots.admit(name, MODELS.of(model).entry, _caller(name))
+        io._robots.admit(name, _known(model).entry, _caller(name))
         if reached_s is not None:
             io._robots.note_limbs_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
@@ -360,7 +406,7 @@ def _ending_io() -> RobotsIO:
     io._edits = Mock(spec=["submit"])
     io._edits.submit.return_value = _done()
     io._io = Mock(spec=["forget"])
-    io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
+    io._promises["alpha"] = _promised()
     return io
 
 
@@ -385,8 +431,8 @@ def test_a_scene_that_cannot_stand_the_robot_answers_its_own_goal(model):
     back."""
     io = _robots_io()
     io._io = Mock(spec=["forget"])
-    io._robots.admit("alpha", MODELS.of(model).entry, CALLER)
-    io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
+    io._robots.admit("alpha", _known(model).entry, CALLER)
+    io._promises["alpha"] = _promised(model)
     refused: concurrent.futures.Future = concurrent.futures.Future()
     refused.set_exception(RuntimeError("the test scene stands nothing"))
     io._edits = Mock(spec=["submit"])
@@ -400,7 +446,7 @@ def test_a_scene_that_cannot_stand_the_robot_answers_its_own_goal(model):
         ("failed", FailureKind.ATTEMPT_FAILED, "the scene could not stand the robot: the test scene stands nothing")
     ]
     assert io._robots.of_name("alpha") is None, "the name goes back"
-    assert "alpha" not in io._placements, "and so does its spot"
+    assert "alpha" not in io._promises, "and so does its spot"
 
 
 def test_standing_a_robot_composes_the_scene_around_it_and_takes_it_back_out_on_a_refusal():
@@ -411,7 +457,7 @@ def test_standing_a_robot_composes_the_scene_around_it_and_takes_it_back_out_on_
     io._robots = Mock(spec=["renew", "release", "stand"])
     composed = []
     io.binds_with(lambda: composed.append("rebind"), lambda: composed.append("unbind"))
-    known = MODELS.of("openarm_v2")
+    known = _known("openarm_v2")
 
     io.stand("alpha", known, Placement.of((0.0, 0.0, 0.0), 0.0))
 
@@ -434,7 +480,7 @@ def test_taking_a_robot_out_composes_the_scene_around_the_ones_that_remain():
     io._robots = Mock(spec=["renew", "release", "stand"])
     composed = []
     io.binds_with(lambda: composed.append("rebind"), lambda: composed.append("unbind"))
-    io.stand("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
     composed.clear()
 
     io.unstand("alpha")
@@ -458,7 +504,7 @@ def test_a_robot_whose_holder_cannot_be_told_it_stands_is_taken_out():
     assert asyncio.run(io._standing(goal, "alpha")) is False
 
     io._edits.submit.assert_called_once()
-    assert "alpha" not in io._placements
+    assert "alpha" not in io._promises
     assert goal.answers == [
         (
             "failed",
@@ -477,7 +523,7 @@ def test_a_stay_ending_with_the_engine_asks_nothing_of_the_stopping_scene():
 
     io._edits.submit.assert_not_called()
     io._robots.release.assert_called_once_with("alpha")
-    assert "alpha" not in io._placements
+    assert "alpha" not in io._promises
     assert goal.answers == [("failed", FailureKind.RESOURCE_UNAVAILABLE, "the engine stopped")]
 
 
@@ -490,7 +536,7 @@ def test_a_stay_that_lapsed_takes_the_robot_out_of_the_scene_first():
     )
 
     io._edits.submit.assert_called_once()
-    assert "alpha" not in io._placements
+    assert "alpha" not in io._promises
     assert goal.answers == [
         ("failed", FailureKind.RESOURCE_UNAVAILABLE, "its pairs were gone for the pair grace time")
     ]
@@ -776,8 +822,8 @@ def _standing_io() -> RobotsIO:
     io = _robots_io()
     io._edits = Edits()
     io._io = Mock(spec=["forget"])
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER)
-    io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
+    io._robots.admit("alpha", _known("openarm_v2").entry, CALLER)
+    io._promises["alpha"] = _promised()
     io._admitted = None
     return io
 
@@ -793,7 +839,7 @@ def test_a_robot_that_left_before_it_stood_gives_back_its_name_and_its_spot():
 
     assert stood is False
     assert io._robots.of_name("alpha") is None
-    assert io._placements == {}
+    assert io._promises == {}
     assert goal.answers == [("cancelled", CANCELLED_BY_ITS_CALLER)]
 
 
@@ -802,7 +848,7 @@ def test_a_robot_the_scene_refused_gives_back_its_name_and_its_spot():
     what the admission held goes back with the answer."""
     io = _standing_io()
     io.binds_with(lambda: None, lambda: None)
-    io._world.add("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io._world.add("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
     goal = _Goal(_request())
 
     async def stand_and_drain():
@@ -813,7 +859,7 @@ def test_a_robot_the_scene_refused_gives_back_its_name_and_its_spot():
 
     assert asyncio.run(stand_and_drain()) is False
     assert io._robots.of_name("alpha") is None
-    assert io._placements == {}
+    assert io._promises == {}
     ((outcome, kind, message),) = goal.answers
     assert (outcome, kind) == ("failed", FailureKind.ATTEMPT_FAILED)
     assert "the scene could not stand the robot" in message
@@ -887,12 +933,12 @@ def test_forgetting_a_robot_drops_its_spot_and_its_signal():
     """What a robot's joining held is a spot promised and a signal its own
     goal waits on, and a name given back leaves neither behind."""
     io = _robots_io()
-    io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
+    io._promises["alpha"] = _promised()
     io._handover("alpha")
 
     io._forget("alpha")
 
-    assert io._placements == {}
+    assert io._promises == {}
     assert io._handovers == {}
 
 
@@ -1100,13 +1146,13 @@ def test_a_scene_that_will_not_let_go_is_taken_up_again(change):
         raise RuntimeError("this scene will not let go")
 
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
     composed.clear()
     io.binds_with(lambda: composed.append("rebind"), refuse_to_let_go)
 
     with pytest.raises(RuntimeError, match="this scene will not let go"):
         if change == "stand":
-            io.stand("bravo", MODELS.of("openarm_v2"), Placement.of((3.0, 0.0, 0.0), 0.0))
+            io.stand("bravo", _known("openarm_v2"), Placement.of((3.0, 0.0, 0.0), 0.0))
         else:
             io.unstand("alpha")
 
@@ -1129,12 +1175,12 @@ def test_a_stand_that_cannot_compose_the_scene_puts_the_previous_one_back():
             raise refusal
 
     io.binds_with(lambda: None, lambda: composed.append("unbind"))
-    io.stand("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
     composed.clear()
     io.binds_with(rebind, lambda: composed.append("unbind"))
 
     with pytest.raises(RuntimeError, match="this scene compiles nothing"):
-        io.stand("charlo", MODELS.of("openarm_v2"), Placement.of((3.0, 0.0, 0.0), 0.0))
+        io.stand("charlo", _known("openarm_v2"), Placement.of((3.0, 0.0, 0.0), 0.0))
 
     # The scene was composed again without the robot that could not join.
     assert composed == ["unbind", "refused", "rebind"]
@@ -1147,19 +1193,19 @@ def test_a_copy_that_comes_straight_back_keeps_the_spot_it_was_promised():
     promised must survive the goal that is leaving."""
     io = _ending_io()
     goal = _Answers()
-    promised = Placement.of((1.5, 0.0, 0.0), 0.0)
+    promised = _promised(placement=Placement.of((1.5, 0.0, 0.0), 0.0))
 
     def admit_the_copy_again(_change):
         # The copy is admitted while the take-out waits for the thread that
         # steps the scene, and is promised a spot of its own.
-        io._placements["alpha"] = promised
+        io._promises["alpha"] = promised
         return _done()
 
     io._edits.submit = admit_the_copy_again
 
     asyncio.run(io._take_out(goal, "alpha", Ending.LEFT, CANCELLED_BY_ITS_CALLER))
 
-    assert io._placements["alpha"] == promised
+    assert io._promises["alpha"] == promised
 
 
 def test_a_copy_that_comes_straight_back_is_stood_afresh():
@@ -1169,7 +1215,7 @@ def test_a_copy_that_comes_straight_back_is_stood_afresh():
     own robot to be handed over, and this robot is already on its way out, so
     everything its joining held goes back before the scene is asked."""
     io = _ending_io()
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER)
+    io._robots.admit("alpha", _known("openarm_v2").entry, CALLER)
     held_when_the_scene_was_asked = []
 
     def take_the_robot_out(_change):
@@ -1181,7 +1227,7 @@ def test_a_copy_that_comes_straight_back_is_stood_afresh():
     asyncio.run(io._take_out(_Answers(), "alpha", Ending.LEFT, CANCELLED_BY_ITS_CALLER))
 
     assert held_when_the_scene_was_asked == [None]
-    assert io._placements == {}
+    assert io._promises == {}
 
 
 def test_a_name_carrying_the_scene_separator_is_refused_without_touching_the_scene():
@@ -1205,7 +1251,7 @@ def test_a_spot_a_robot_stands_on_is_refused_naming_that_robot():
     promised it is named as about to."""
     io = _robots_io()
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
 
     decision = io._admit(
         _request(
@@ -1224,7 +1270,7 @@ def test_a_copy_that_comes_straight_back_takes_the_spot_it_had():
     copy is coming back to, and nothing else may be told to move for it."""
     io = _robots_io()
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
 
     # The take-out gave the name back; the robot has yet to leave the scene.
     asked_again = io._admit(_request(instance="alpha_init_2"))
@@ -1239,7 +1285,7 @@ def test_a_copy_that_comes_straight_back_takes_the_spot_it_had():
 
     assert _accepted(asked_again)
     assert _accepted(where_it_stands)
-    assert io._placements["alpha"] == Placement.of((0.0, 0.0, 0.0), 0.0)
+    assert io._promises["alpha"].placement == Placement.of((0.0, 0.0, 0.0), 0.0)
 
 
 def test_a_goal_that_never_reached_its_stay_gives_back_what_it_reserved():
@@ -1252,7 +1298,7 @@ def test_a_goal_that_never_reached_its_stay_gives_back_what_it_reserved():
     io._withdraw()
 
     assert io._robots.of_name("alpha") is None
-    assert io._placements == {}
+    assert io._promises == {}
     # A copy coming after it is admitted, under the name and on the spot.
     assert _accepted(io._admit(_request(instance="alpha_init_2")))
 
@@ -1266,7 +1312,7 @@ def test_withdrawing_again_leaves_the_copy_that_took_the_name_alone():
     io._withdraw()
 
     # The name the withdrawal freed is taken by a copy of its own.
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, _caller("alpha_2"))
+    io._robots.admit("alpha", _known("openarm_v2").entry, _caller("alpha_2"))
     io._robots.stand("alpha")
     io._withdraw()
 
@@ -1292,7 +1338,7 @@ def test_a_goal_lost_on_its_way_back_frees_the_name_it_reserved():
     asyncio.run(serve_once())
 
     assert io._robots.of_name("alpha") is None
-    assert io._placements == {}
+    assert io._promises == {}
 
 
 class _Hosting(_Answers):
@@ -1358,7 +1404,7 @@ def test_a_spot_the_robot_coming_back_stands_on_is_its_own():
     it go, so the lattice offers it the spot it is standing on."""
     io = _robots_io()
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", MODELS.of("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
     world = io._world
 
     assert world.occupied(Placement.of((0.0, 0.0, 0.0), 0.0))
@@ -1369,7 +1415,7 @@ def test_a_spot_the_robot_coming_back_stands_on_is_its_own():
 def test_a_goal_whose_spot_was_taken_back_gives_its_name_back():
     io = _robots_io()
     io._io = Mock(spec=["forget"])
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, CALLER)
+    io._robots.admit("alpha", _known("openarm_v2").entry, CALLER)
     goal = _Goal(_request())
 
     asyncio.run(io._stay(goal))

@@ -1,28 +1,23 @@
 //! Shared primitives for the bimanual backbone: the limb tables, the
-//! world-pose wire codec, and both arms' joints in one vector.
+//! world-pose wire codec, and every arm's joints in one vector.
 
-use openarm_description::{ARM_DOF, ArmPair, DUAL_DOF, Side};
-use srs_model::JointVec;
+use robot_description::{ArmId, PerArm};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
+use srs_model::{ARM_DOF, JointVec};
 
-/// Both arms' joints, the left arm's then the right's.
+use crate::robot::{ARMS, DUAL_DOF, LIMBS};
+
+/// Every arm's joints, in place order.
 pub type DualJointVec = [f64; DUAL_DOF];
 
-/// Both arms' joints in one vector, the left arm's then the right's.
-pub fn dual_joints(arms: &ArmPair<JointVec>) -> DualJointVec {
-    std::array::from_fn(|i| match i {
-        i if i < ARM_DOF => arms.left[i],
-        i => arms.right[i - ARM_DOF],
-    })
+/// Every arm's joints in one vector, in place order.
+pub fn dual_joints(arms: &PerArm<JointVec, ARMS>) -> DualJointVec {
+    std::array::from_fn(|i| arms[ArmId::new(i / ARM_DOF)][i % ARM_DOF])
 }
 
-/// The joints of `side`'s arm in `q`.
-pub fn arm_joints(q: &DualJointVec, side: Side) -> JointVec {
-    let offset = match side {
-        Side::Left => 0,
-        Side::Right => ARM_DOF,
-    };
-    std::array::from_fn(|i| q[offset + i])
+/// The joints of `arm` in `q`.
+pub fn arm_joints(q: &DualJointVec, arm: ArmId) -> JointVec {
+    std::array::from_fn(|i| q[arm.place() * ARM_DOF + i])
 }
 
 /// Norm floor for [`pose_from_wire`]: a quaternion at or below it is refused
@@ -38,14 +33,12 @@ pub fn world_pose_arrays(pose: &Isometry3<f64>) -> ([f64; 3], [f64; 4]) {
     ([t.x, t.y, t.z], [r.i, r.j, r.k, r.w])
 }
 
-/// Both arms' grasp poses as limb_state and the posture results carry them.
+/// Every arm's grasp pose as limb_state and the posture results carry them.
 /// The positions have 3 values per arm. The orientations have 4 values per
-/// arm, `[x, y, z, w]`. Both are in [`Side::BOTH`] order.
-pub fn arm_pose_arrays(poses: &ArmPair<Isometry3<f64>>) -> (Vec<f64>, Vec<f64>) {
-    let (positions, orientations): (Vec<[f64; 3]>, Vec<[f64; 4]>) = Side::BOTH
-        .into_iter()
-        .map(|side| world_pose_arrays(&poses[side]))
-        .unzip();
+/// arm, `[x, y, z, w]`. Both are in place order.
+pub fn arm_pose_arrays(poses: &PerArm<Isometry3<f64>, ARMS>) -> (Vec<f64>, Vec<f64>) {
+    let (positions, orientations): (Vec<[f64; 3]>, Vec<[f64; 4]>) =
+        poses.iter().map(world_pose_arrays).unzip();
     (positions.concat(), orientations.concat())
 }
 
@@ -89,7 +82,7 @@ pub fn orientation_from_wire(orientation: [f64; 4]) -> Result<UnitQuaternion<f64
 }
 
 /// This robot's limb tables as the limb_state contract carries them, wire
-/// shaped and in [`Side::BOTH`] order.
+/// shaped and in place order.
 pub struct LimbNames {
     pub arm_names: Vec<String>,
     pub joints_per_arm: Vec<u32>,
@@ -100,11 +93,9 @@ pub struct LimbNames {
 /// snapshot and the answer get_limb_names gives.
 pub fn limb_names() -> LimbNames {
     LimbNames {
-        arm_names: Side::BOTH.map(|side| side.arm_name().to_owned()).to_vec(),
-        joints_per_arm: vec![ARM_DOF as u32; Side::BOTH.len()],
-        gripper_names: Side::BOTH
-            .map(|side| side.gripper_name().to_owned())
-            .to_vec(),
+        arm_names: LIMBS.arm_names().map(str::to_owned).to_vec(),
+        joints_per_arm: vec![ARM_DOF as u32; ARMS],
+        gripper_names: LIMBS.gripper_names().map(str::to_owned).to_vec(),
     }
 }
 
@@ -112,35 +103,32 @@ pub fn limb_names() -> LimbNames {
 mod tests {
     use super::*;
 
+    use crate::robot::{arm_in, gripper_in};
+
     #[test]
-    fn the_limb_tables_name_each_side_in_side_order() {
+    fn the_limb_tables_name_each_arm_in_place_order() {
         let names = limb_names();
-        for (side, (arm, gripper)) in Side::BOTH
-            .into_iter()
-            .zip(names.arm_names.iter().zip(&names.gripper_names))
+        for (arm, (arm_name, gripper_name)) in
+            PerArm::<(), ARMS>::ids().zip(names.arm_names.iter().zip(&names.gripper_names))
         {
-            assert_eq!(Side::from_arm_name(arm), Ok(side));
-            assert_eq!(Side::from_gripper_name(gripper), Ok(side));
+            assert_eq!(arm_in("arm_name", arm_name), Ok(arm));
+            assert_eq!(gripper_in("gripper_name", gripper_name), Ok(arm));
         }
-        assert_eq!(names.joints_per_arm, [ARM_DOF as u32; 2]);
+        assert_eq!(names.joints_per_arm, [ARM_DOF as u32; ARMS]);
     }
 
     #[test]
-    fn both_arms_joints_split_into_each_arms() {
-        let arms = ArmPair::from_fn(|side| {
-            std::array::from_fn(|j| match side {
-                Side::Left => j as f64,
-                Side::Right => 10.0 + j as f64,
-            })
-        });
+    fn every_arms_joints_split_into_each_arms() {
+        let arms =
+            PerArm::from_fn(|arm| std::array::from_fn(|j| (10 * arm.place()) as f64 + j as f64));
         let dual = dual_joints(&arms);
         assert_eq!(dual[ARM_DOF - 1], (ARM_DOF - 1) as f64);
         assert_eq!(dual[ARM_DOF], 10.0);
-        assert_eq!(ArmPair::from_fn(|side| arm_joints(&dual, side)), arms);
+        assert_eq!(PerArm::from_fn(|arm| arm_joints(&dual, arm)), arms);
     }
 
     // Pins the outbound wire ordering to the inbound one: a scalar-first slip
-    // on either side breaks the round trip.
+    // on either arm breaks the round trip.
     #[test]
     fn wire_arrays_round_trip_through_pose_from_wire() {
         let pose = Isometry3::from_parts(

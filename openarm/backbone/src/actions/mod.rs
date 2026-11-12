@@ -19,12 +19,13 @@ use std::time::Duration;
 
 use control_core::positive_finite::PositiveFinite;
 use control_core::sync::wait_for;
-use openarm_description::{ArmPair, Side};
+use robot_description::{ArmId, PerArm};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
 use crate::move_slot::{ARM_BUSY, GRIPPER_BUSY, MoveSlot};
+use crate::robot::{ARMS, LIMBS};
 use crate::streams::LeaderActivity;
 
 /// How long a service waits for the coordinator's answer before it gives an
@@ -60,6 +61,8 @@ fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, String> {
 
 /// The words of the refusals of a move on one kind of limb.
 struct LimbWords {
+    /// The name of the limb of this kind on an arm.
+    limb: fn(ArmId) -> &'static str,
     /// The follower of the limb delivers no fresh state: before its first
     /// state, or after it stopped.
     no_fresh_state: &'static str,
@@ -71,6 +74,7 @@ struct LimbWords {
 
 /// The refusals of an arm goal, and of a plan check.
 const ARM_WORDS: LimbWords = LimbWords {
+    limb: |arm| LIMBS.arm_name(arm),
     no_fresh_state: "no fresh follower state to anchor the move from",
     leader_streaming: "a leader is streaming arm commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry",
     busy: ARM_BUSY,
@@ -78,6 +82,7 @@ const ARM_WORDS: LimbWords = LimbWords {
 
 /// The refusals of a gripper goal.
 const GRIPPER_WORDS: LimbWords = LimbWords {
+    limb: |arm| LIMBS.gripper_name(arm),
     no_fresh_state: "no fresh gripper state to anchor the move from",
     leader_streaming: "a leader is streaming gripper commands; release the headset's grip, switch off the browser panel's stream, or stop the leader node, then retry",
     busy: GRIPPER_BUSY,
@@ -103,19 +108,19 @@ fn check_limb_free(fresh: bool, streaming: bool, words: &LimbWords) -> Result<()
     Ok(())
 }
 
-/// Claim the move slot of the limb on each side of `sides`, in their order,
+/// Claim the move slot of the limb on each arm of `arms`, in their order,
 /// `move_slots` being the slots of the arms or of the grippers, or give the
-/// first side whose slot another move holds. A refusal releases the slots it
+/// first arm whose slot another move holds. A refusal releases the slots it
 /// claimed before it, so it never leaves a slot held.
-fn claim_slots(sides: &[Side], move_slots: &ArmPair<MoveSlot>) -> Result<(), Side> {
-    for (k, &side) in sides.iter().enumerate() {
-        if move_slots[side].claim() {
+fn claim_slots(arms: &[ArmId], move_slots: &PerArm<MoveSlot, ARMS>) -> Result<(), ArmId> {
+    for (k, &arm) in arms.iter().enumerate() {
+        if move_slots[arm].claim() {
             continue;
         }
-        for &claimed in &sides[..k] {
+        for &claimed in &arms[..k] {
             move_slots[claimed].release();
         }
-        return Err(side);
+        return Err(arm);
     }
     Ok(())
 }

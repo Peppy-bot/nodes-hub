@@ -6,7 +6,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from pathlib import Path
 
 from peppylib.runtime import NodeBuilder
 
@@ -15,7 +14,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-import head_camera
 from _launcher import SimLauncher
 from edits import Edits
 from mujoco_models import MujocoModels
@@ -24,25 +22,20 @@ from sim_robot_core.registry import Registry
 from sim_topics import SimTopicIO
 from world import World
 
-# The head camera pack apptainer.def stages at image build (head_camera.py
-# fetch), beside the node's code. Setup reads it, and a robot standing as a
-# model that carries the head camera draws it.
-_HEAD_CAMERA_DIR = Path(__file__).parent / "assets" / "head_camera"
-
 _stop = threading.Event()
 
 
 async def _run_sim(params, node_runner) -> list:
-    # Every model's entry is parsed here, so a bad one fails node setup, before
-    # a robot attaches as it.
+    # Every model's entry and the release the image bakes are read here, so a
+    # bad one fails node setup, before a robot attaches as it; a robot's
+    # description is held to its model's entry when it attaches.
     models = MujocoModels.read()
-    head_camera_pack = head_camera.load_for(models, _HEAD_CAMERA_DIR)
     # Typed peppygen pub/sub lives on this loop; declare publishers and start the
     # command-consume tasks before the sim thread starts reading from them.
     loop = asyncio.get_running_loop()
     robots = Registry()
     edits = Edits()
-    world = World(head_camera_pack, renders=params.cameras_enabled)
+    world = World(renders=params.cameras_enabled)
     io = SimTopicIO(node_runner, loop, robots)
     await io.start()
     robots_io = RobotsIO(

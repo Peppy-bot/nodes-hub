@@ -62,8 +62,6 @@ def _publish(tmp_path, requirements: str = _REQUIREMENTS):
         cwd=tmp_path,
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.defpath}",
-            "PEPPY_R2_DATA01_ACCESS_KEY_ID": "mujoco-key",
-            "PEPPY_R2_DATA01_SECRET_ACCESS_KEY": "mujoco-secret",
             "MOCK_DOCKER_LOG": str(docker_log),
         },
         capture_output=True,
@@ -131,7 +129,8 @@ def test_requirements_without_one_mujoco_version_stop_the_publisher(tmp_path, pi
 
 def test_suites_run_on_what_the_image_installs():
     # The scene these suites compile is compiled by the mujoco the node runs
-    # on, with the numpy, the parser and the sim_robot_core the image carries.
+    # on, with the numpy, the parser, the sim_robot_core and the
+    # robot_description_py the image carries.
     project = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
     installed = _REQUIREMENTS.splitlines()
     for package in ("mujoco", "numpy", "pyjson5"):
@@ -141,9 +140,18 @@ def test_suites_run_on_what_the_image_installs():
             if dependency.startswith(f"{package}==")
         ]
         assert pin in installed, package
-    rev = project["tool"]["uv"]["sources"]["sim_robot_core"]["rev"]
-    assert [line for line in installed if line.startswith("sim_")] == [
-        "sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
-        f"@{rev}"
-        "#subdirectory=sim_robot_core"
+    sources = project["tool"]["uv"]["sources"]
+    assert [line for line in installed if "public-peppy-libs" in line] == [
+        f"{package} @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
+        f"@{sources[package]['rev']}"
+        f"#subdirectory={package}"
+        for package in ("sim_robot_core", "robot_description_py")
     ]
+
+
+def test_the_image_bakes_the_pinned_release_of_waldos_catalogue_with_no_token():
+    # The models come from the public store, so the image reads no secret and
+    # the publisher above runs with no R2 token.
+    dockerfile = (_IMAGES_DIR / "Dockerfile.mujoco").read_text()
+    assert "RUN python3 /tmp/waldo_catalogue.py fetch /opt/robot_assets" in dockerfile
+    assert "secret" not in dockerfile

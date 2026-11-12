@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: peppybot/sim-mujoco:4.0.0-2
+From: peppybot/sim-mujoco:4.0.0-5
 
 %labels
     Name sim-mujoco
@@ -21,13 +21,6 @@ From: peppybot/sim-mujoco:4.0.0-2
     engine /opt/sim_mujoco/engine
     .peppy/libs/peppygen /opt/sim_mujoco/.peppy/libs/peppygen
     .peppy/libs/peppylib /opt/sim_mujoco/.peppy/libs/peppylib
-
-%post
-    set -e
-    # The OpenArm v2 head camera pack from the public waldo-assets store,
-    # pinned by its digest in head_camera.py and checked file by file.
-    python3 /opt/sim_mujoco/engine/head_camera.py fetch \
-        /opt/sim_mujoco/engine/assets/head_camera
 
 %runscript
     cd /opt/sim_mujoco

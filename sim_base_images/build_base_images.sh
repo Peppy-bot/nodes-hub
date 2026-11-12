@@ -20,11 +20,10 @@
 # The script provisions QEMU binfmt handlers and a docker-container buildx
 # builder so the amd64 host can cross-build the arm64 layers.
 #
-# Each image reads its assets from its own R2 bucket, with its own token. The
-# Isaac image needs WALDO_R2_ACCESS_KEY_ID and WALDO_R2_SECRET_ACCESS_KEY
-# (isaac-sim-assets), the MuJoCo image PEPPY_R2_DATA01_ACCESS_KEY_ID and
-# PEPPY_R2_DATA01_SECRET_ACCESS_KEY (peppy-data01). The script asks only for
-# the pair of each image it builds.
+# The Isaac image reads its bundles from the isaac-sim-assets bucket of R2
+# and needs WALDO_R2_ACCESS_KEY_ID and WALDO_R2_SECRET_ACCESS_KEY. The MuJoCo
+# image reads its models from the public waldo-assets store and needs no
+# token.
 #
 # Usage:
 #   bash sim_base_images/build_base_images.sh [--isaac-only|--mujoco-only]
@@ -35,8 +34,8 @@ NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
 
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
-ISAAC_IMAGE_REV="9"      # bump when Isaac image content changes without an upstream version bump
-MUJOCO_IMAGE_REV="2"     # bump when MuJoCo image content changes without an upstream version bump
+ISAAC_IMAGE_REV="12"     # bump when Isaac image content changes without an upstream version bump
+MUJOCO_IMAGE_REV="5"     # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
 # The mujoco PyPI version that the MuJoCo image installs: the pin of
 # requirements.mujoco.txt, read here so that the tag of the image cannot name
@@ -75,10 +74,6 @@ esac
 if (( BUILD_ISAAC )); then
     export WALDO_R2_ACCESS_KEY_ID="${WALDO_R2_ACCESS_KEY_ID:?WALDO_R2_ACCESS_KEY_ID must be set to build the Isaac image}"
     export WALDO_R2_SECRET_ACCESS_KEY="${WALDO_R2_SECRET_ACCESS_KEY:?WALDO_R2_SECRET_ACCESS_KEY must be set to build the Isaac image}"
-fi
-if (( BUILD_MUJOCO )); then
-    export PEPPY_R2_DATA01_ACCESS_KEY_ID="${PEPPY_R2_DATA01_ACCESS_KEY_ID:?PEPPY_R2_DATA01_ACCESS_KEY_ID must be set to build the MuJoCo image}"
-    export PEPPY_R2_DATA01_SECRET_ACCESS_KEY="${PEPPY_R2_DATA01_SECRET_ACCESS_KEY:?PEPPY_R2_DATA01_SECRET_ACCESS_KEY must be set to build the MuJoCo image}"
 fi
 
 ISAAC_IMAGE="${IMAGE_NAMESPACE}/sim-isaac:${ISAAC_VERSION}-${ISAAC_IMAGE_REV}"
@@ -163,8 +158,6 @@ if (( BUILD_MUJOCO )); then
         --platform "${MUJOCO_PLATFORMS}" \
         --allow network.host \
         --network=host \
-        --secret id=rclone_key,env=PEPPY_R2_DATA01_ACCESS_KEY_ID \
-        --secret id=rclone_secret,env=PEPPY_R2_DATA01_SECRET_ACCESS_KEY \
         -t "${MUJOCO_IMAGE}" \
         -f "${IMAGES_DIR}/Dockerfile.mujoco" \
         --push \

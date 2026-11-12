@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use control_core::fault::Fault;
+
 fn main() -> peppygen::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -8,13 +10,15 @@ fn main() -> peppygen::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
-    peppygen::NodeBuilder::new().run(openarm_ker::setup)?;
+    let fault = Fault::default();
+    let raised = fault.clone();
+    peppygen::NodeBuilder::new()
+        .run(move |params, runner| openarm_ker::setup(params, runner, raised))?;
 
     // The runtime has returned, so the shutdown hooks (instance lock release)
-    // have already run; exiting non-zero here makes the daemon record a task
-    // that stopped on its own as failed instead of finished.
-    if let Some(task) = openarm_ker::task_failed() {
-        return Err(openarm_ker::NodeError::TaskStopped(task).into());
-    }
-    Ok(())
+    // have already run; exiting non-zero here makes the daemon record a node
+    // that a fault ended as failed instead of finished.
+    fault
+        .take()
+        .map_or(Ok(()), |reason| Err(peppygen::Error::Node(reason)))
 }

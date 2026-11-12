@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 
-use openarm_description::{ARM_DOF, Side};
 use peppygen::NodeRunner;
 use peppygen::consumed_actions::limb_motion::move_arm_joints as limb_motion_move_arm_joints;
 use peppylib::runtime::CancellationToken;
-use srs_model::JointVec;
+use robot_description::ArmId;
+use srs_model::{ARM_DOF, JointVec};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -17,16 +17,17 @@ use crate::owner::Feedback;
 use crate::result_wait::{
     GOAL_TIMEOUT, Waited, limb_goal_handle, preempt_grace_elapsed, summarize, wait_for_end,
 };
+use crate::robot;
 
 limb_goal_handle!(move_arm_joints);
 
-/// One discrete joint move, as fired at the backbone: the side, the 7-joint target
+/// One discrete joint move, as fired at the backbone: the arm, the 7-joint target
 /// (rad), the requested duration (0 = fastest safe), and the settle tolerance
 /// (rad, the one bar every joint is held to) and timeout (s) the move
 /// completes under.
 #[derive(Clone, Copy)]
 pub struct Goal {
-    pub side: Side,
+    pub arm: ArmId,
     pub joint_positions: JointVec,
     pub duration_s: f64,
     pub settle_tolerance_rad: f64,
@@ -57,7 +58,7 @@ async fn run(
     grace: bool,
 ) {
     let Goal {
-        side,
+        arm,
         joint_positions,
         duration_s,
         settle_tolerance_rad,
@@ -65,17 +66,13 @@ async fn run(
     } = goal;
     // A queued preempt fires only after the backbone releases its single-flight gate.
     if grace && !preempt_grace_elapsed(&token).await {
-        return finalize(&feedback, side, false, "shutting down; move dropped").await;
+        return finalize(&feedback, arm, false, "shutting down; move dropped").await;
     }
-    let label = side.to_string();
-    info!(
-        side = label.as_str(),
-        ?joint_positions,
-        "fire move_arm_joints"
-    );
+    let label = robot::LIMBS.arm_name(arm);
+    info!(arm = label, ?joint_positions, "fire move_arm_joints");
 
     let goal = limb_motion_move_arm_joints::GoalRequest {
-        arm_name: side.arm_name().to_string(),
+        arm_name: label.to_string(),
         joint_positions,
         duration_s,
         settle_tolerances_rad: [settle_tolerance_rad; ARM_DOF],
@@ -98,7 +95,7 @@ async fn run(
             Some(refusal) => {
                 finalize(
                     &feedback,
-                    side,
+                    arm,
                     false,
                     format!("backbone refused the goal: {refusal}"),
                 )
@@ -107,7 +104,7 @@ async fn run(
             }
         },
         Err(e) => {
-            finalize(&feedback, side, false, format!("fire_goal failed: {e}")).await;
+            finalize(&feedback, arm, false, format!("fire_goal failed: {e}")).await;
             return;
         }
     };
@@ -121,12 +118,12 @@ async fn run(
         &downstream,
         &token,
         Some(&preempt),
-        |trigger, e| warn!(side = label.as_str(), error = %e, "{}", trigger.failure_message()),
+        |trigger, e| warn!(arm = label, error = %e, "{}", trigger.failure_message()),
     )
     .await
     {
         Waited::Shutdown => {
-            finalize(&feedback, side, false, "shutting down; move cancelled").await;
+            finalize(&feedback, arm, false, "shutting down; move cancelled").await;
             return;
         }
         Waited::Ended(ended) => ended,
@@ -134,26 +131,26 @@ async fn run(
     // The backbone judges arrival: a completed move means the measured joints
     // settled within the goal's tolerance, and a failure's kind and message
     // say why not, such as `timeout` and how far off they stood.
-    let (success, summary) = summarize("move_arm_joints", &label, ended, |data| {
+    let (success, summary) = summarize("move_arm_joints", label, ended, |data| {
         format!("success in {:.2}s", data.action_time)
     });
-    finalize(&feedback, side, success, summary).await;
+    finalize(&feedback, arm, success, summary).await;
 }
 
 // Report the move outcome to the owner, which clears the in-flight slot and writes the
 // status line; a dropped channel means the owner is gone (shutdown), so ignore it.
 async fn finalize(
     feedback: &mpsc::Sender<Feedback>,
-    side: Side,
+    arm: ArmId,
     success: bool,
     summary: impl Into<String>,
 ) {
     let summary = summary.into();
-    let label = side.to_string();
+    let label = robot::LIMBS.arm_name(arm);
     if success {
-        info!(side = label.as_str(), %summary, "move_arm_joints done");
+        info!(arm = label, %summary, "move_arm_joints done");
     } else {
-        warn!(side = label.as_str(), %summary, "move_arm_joints done");
+        warn!(arm = label, %summary, "move_arm_joints done");
     }
-    let _ = feedback.send(Feedback::ArmGoalDone { side, summary }).await;
+    let _ = feedback.send(Feedback::ArmGoalDone { arm, summary }).await;
 }

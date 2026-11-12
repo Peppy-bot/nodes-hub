@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pyjson5
 import pytest
+from robot_description_py import model as bundled
 from sim_robot_core.models import shipped_entry
 from sim_robot_core.pairs import ARMS, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held
 from sim_robot_core.registry import Caller, Registry
@@ -55,7 +56,8 @@ def scene_fixture():
 
 
 def _admit(scene, name: str, model: str) -> None:
-    scene.robots.admit(name, shipped_entry(model), Caller("sim16", f"{name}_init"))
+    entry = shipped_entry(model, bundled(model).description())
+    scene.robots.admit(name, entry, Caller("sim16", f"{name}_init"))
 
 
 def _arm_setpoint(sender, positions, velocities=()):
