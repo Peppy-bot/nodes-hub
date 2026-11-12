@@ -14,4 +14,8 @@ pyjson5==2.0.1
 viser==1.1.1
 # What the node knows about the robots it stands, whatever its physics, pinned
 # to one commit so the image is reproducible.
-sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@e4222a3bf8e48d6dac01b8b6a3f693a823ce6626#subdirectory=sim_robot_core
+sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@1c80539a6b88f0f1566d3d7614f71ada8be9fcb1#subdirectory=sim_robot_core
+# The robots' descriptions sim_robot_core reads, from the same commit: a Rust
+# extension that pip builds from its source with the toolchain the image
+# installs for the build alone.
+robot_description_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@1c80539a6b88f0f1566d3d7614f71ada8be9fcb1#subdirectory=robot_description_py

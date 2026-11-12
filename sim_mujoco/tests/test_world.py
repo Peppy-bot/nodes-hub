@@ -1,19 +1,20 @@
-"""The scene the robots standing compose: each one's MJCF with the joint
-ranges and site poses its entry corrects to the robot's description, its
-weight compensated where its entry asks, and the cameras of its rig when the
-engine renders, attached under its own prefix at its own placement. The
-scenes are real (tiny) MJCF compiled by MuJoCo.
+"""The scene the robots standing compose: the body of each one's MJCF that
+carries the robot, with its servos and its weight compensated as the release
+gives them, and the cameras of its rig when the engine renders, attached
+under its own prefix at its own placement. The scenes are real (tiny) MJCF
+compiled by MuJoCo.
 """
 
 from __future__ import annotations
 
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import mujoco
 import pytest
-from sim_robot_core.models import EngineModel, parse_entry
+from entries import camera, entry, known as known_model
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the world imports)
 
@@ -21,7 +22,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
 import mujoco_models  # noqa: E402  pylint: disable=C0413
 from exts import camera_sensor  # noqa: E402  pylint: disable=C0413
-from mujoco_models import parse  # noqa: E402  pylint: disable=C0413
 import world as world_module  # noqa: E402  pylint: disable=C0413
 from world import SPOT_PITCH_M, Placement, World, compile_spec  # noqa: E402  pylint: disable=C0413
 
@@ -30,8 +30,9 @@ _POSTURE = {"lift": 0.5, "flex": -0.8}
 
 # A two-joint arm on a fixed base with a jointless tool below its last joint,
 # beside a free prop: every kind of body gravity compensation has to tell
-# apart. `lift` is driven by a position servo clamped to the joint's range
-# and by a torque motor that carries no control range.
+# apart. The base carries the robot, and the floor, the prop and the home
+# keyframe stay behind when it is attached. `lift` is driven by a position
+# servo and `flex` by a torque motor.
 _ARM = """<mujoco model="arm">
   <compiler angle="radian"/>
   <option timestep="0.002" integrator="implicitfast"/>
@@ -59,20 +60,17 @@ _ARM = """<mujoco model="arm">
   </worldbody>
   <actuator>
     <position name="lift" joint="lift" kp="20" kv="1" ctrlrange="-1.5 1.5"/>
-    <position name="flex" joint="flex" kp="20" kv="1" ctrlrange="-1.5 1.5"/>
-    <motor name="lift_torque" joint="lift"/>
+    <motor name="flex" joint="flex" ctrlrange="-1.5 1.5"/>
   </actuator>
+  <keyframe>
+    <key name="home" qpos="0.2 0.3 0.4 0 0.3 1 0 0 0"/>
+  </keyframe>
 </mujoco>"""
-_ARM_ENTRY = {"arms": [{"name": "arm", "joints": ["lift", "flex"]}]}
-_FRONT_CAMERA = {
-    "name": "front",
-    "parent_link": "base_link",
-    "pos": [0.5, 0.0, 0.3],
-    "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
-    "fovy_deg": 60.0,
-    "color": {"width": 8, "height": 4},
-    "fps": 10,
-}
+_MOUNT = "base"
+# The servos the arm holds its posture with in the compensation tests.
+_SERVOS = {"arm": [(20.0, 1.0), (20.0, 1.0)]}
+_ARM_ENTRY = entry("arm", arms={"arm": ["lift", "flex"]})
+_FRONT_CAMERA = camera("front", "base_link", (0.5, 0.0, 0.3), (1.0, 0.0, 0.0, 0.0), 60.0, 8, 4, 10)
 
 
 @pytest.fixture(name="assets", autouse=True)
@@ -85,13 +83,14 @@ def assets_fixture(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _known(entry=None, **engine):
-    parsed = parse_entry("arm", "arm.json5", entry or _ARM_ENTRY)
-    return parse(EngineModel(entry=parsed, engine={"scene": _SCENE, **engine}))
+def _known(robot=None, engine=None, **release):
+    return known_model(
+        "arm", robot or _ARM_ENTRY, mujoco_models.ASSETS_DIR / _SCENE, _MOUNT, engine=engine, **release
+    )
 
 
-def _compile(**engine):
-    return compile_spec(_known(**engine)).compile()
+def _compile(**release):
+    return compile_spec(_known(**release)).compile()
 
 
 def _compensated(model) -> set:
@@ -116,51 +115,49 @@ def _sag(model, data) -> float:
     )
 
 
-class TestCorrections:
-    def test_an_entry_that_corrects_nothing_compiles_the_file_as_it_is(self, assets):
+class TestTheServosOfTheRelease:
+    def test_a_model_with_no_gains_compiles_its_actuators_as_its_file_writes_them(self, assets):
         baked = mujoco.MjModel.from_xml_path(str(assets / _SCENE))
         model = _compile()
 
-        assert model.jnt_range.tolist() == baked.jnt_range.tolist()
-        assert model.actuator_ctrlrange.tolist() == baked.actuator_ctrlrange.tolist()
-        assert model.site_pos.tolist() == baked.site_pos.tolist()
+        assert model.actuator_gainprm.tolist() == baked.actuator_gainprm.tolist()
+        assert model.actuator_biasprm.tolist() == baked.actuator_biasprm.tolist()
 
-    def test_a_joint_range_reaches_the_joint_and_the_servo_clamped_to_it(self):
-        model = _compile(joint_ranges={"lift": [-1.0, 1.2]})
+    def test_an_arm_joint_with_gains_is_driven_by_a_position_servo_at_them(self):
+        """`flex` is a torque motor in the file: the gains make it a position
+        servo, as Waldo makes it one."""
+        model = _compile(arm_gains={"arm": [(30.0, 2.0), (40.0, 3.0)]})
 
-        assert model.joint("lift").range.tolist() == [-1.0, 1.2]
-        assert model.actuator("lift").ctrlrange.tolist() == [-1.0, 1.2]
-        assert model.actuator("lift").ctrllimited
-        # The joint beside it keeps its file's range.
-        assert model.joint("flex").range.tolist() == [-1.5, 1.5]
-        assert model.actuator("flex").ctrlrange.tolist() == [-1.5, 1.5]
+        for name, (kp, kv) in (("lift", (30.0, 2.0)), ("flex", (40.0, 3.0))):
+            actuator = model.actuator(name)
+            assert actuator.biastype[0] == mujoco.mjtBias.mjBIAS_AFFINE
+            assert actuator.gainprm[0] == kp
+            assert actuator.biasprm[1:3].tolist() == [-kp, -kv]
 
-    def test_an_actuator_with_no_control_range_is_given_none(self):
-        """A torque motor's control is no joint position, so the joint's range
-        says nothing about it."""
-        model = _compile(joint_ranges={"lift": [-1.0, 1.2]})
+    def test_a_gripper_with_gains_drives_its_fingers_through_position_servos(self):
+        robot = entry("arm", arms={"arm": ["lift"]}, grippers={"gripper": {"flex": (0.0, 1.0)}})
+        model = compile_spec(_known(robot, gripper_gains={"arm": (100.0, 1.0)})).compile()
 
-        assert not model.actuator("lift_torque").ctrllimited
-        assert model.actuator("lift_torque").ctrlrange.tolist() == [0.0, 0.0]
+        assert model.actuator("flex").gainprm[0] == 100.0
+        assert model.actuator("flex").biasprm[1:3].tolist() == [-100.0, -1.0]
+        # The arm, given no gains, keeps its file's servo.
+        assert model.actuator("lift").gainprm[0] == 20.0
 
-    def test_a_site_pose_reaches_the_compiled_site(self):
-        pose = {"pos": [0.01, -0.02, 0.05], "quat_wxyz": [0.0, 0.0, 1.0, 0.0]}
-        model = _compile(site_poses={"tool_point": pose})
-
-        assert model.site("tool_point").pos.tolist() == pytest.approx(pose["pos"])
-        assert model.site("tool_point").quat.tolist() == pytest.approx(pose["quat_wxyz"])
-
-    def test_a_joint_range_naming_a_joint_the_file_lacks_is_refused(self):
-        entry = {"arms": [{"name": "arm", "joints": ["lift", "flex", "wrist"]}]}
-        known = _known(entry, joint_ranges={"wrist": [-1.0, 1.0]})
-        with pytest.raises(RuntimeError, match=f"arm: joint_ranges names 'wrist', not in {_SCENE}"):
+    def test_gains_for_a_joint_no_actuator_drives_are_refused(self, assets):
+        (assets / _SCENE).write_text(_ARM.replace('<motor name="flex" joint="flex" ctrlrange="-1.5 1.5"/>', ""))
+        known = _known(arm_gains={"arm": [(30.0, 2.0), (40.0, 3.0)]})
+        with pytest.raises(RuntimeError, match=r"gives gains for \['flex'\], which no actuator of arm.xml drives"):
             compile_spec(known)
 
-    def test_a_site_pose_naming_a_site_the_file_lacks_is_refused(self):
-        pose = {"pos": [0.0, 0.0, 0.0], "quat_wxyz": [1.0, 0.0, 0.0, 0.0]}
-        known = _known(site_poses={"gripperframe": pose})
-        with pytest.raises(RuntimeError, match=f"arm: site_poses names 'gripperframe', not in {_SCENE}"):
+    def test_gains_for_a_joint_several_actuators_drive_are_refused(self, assets):
+        (assets / _SCENE).write_text(_ARM.replace("</actuator>", '<motor name="lift_torque" joint="lift"/></actuator>'))
+        known = _known(arm_gains={"arm": [(30.0, 2.0), (40.0, 3.0)]})
+        with pytest.raises(RuntimeError, match=r"several actuators of arm.xml drive, \{'lift': \['lift', 'lift_torque'\]\}"):
             compile_spec(known)
+
+    def test_the_files_keyframes_stay_out_of_the_scene(self):
+        """A robot starts in the posture of its description."""
+        assert _compile().nkey == 0
 
     def test_a_scene_missing_from_the_image_is_reported(self, assets):
         (assets / _SCENE).unlink()
@@ -179,8 +176,7 @@ class TestGravityCompensation:
         assert not {"world", "base", "cube"} & _compensated(model)
 
     def test_compensation_starts_at_the_bodies_the_models_joints_move(self):
-        entry = {"arms": [{"name": "arm", "joints": ["flex"]}]}
-        model = compile_spec(_known(entry, gravity_compensation=True)).compile()
+        model = compile_spec(_known(entry("arm", arms={"arm": ["flex"]}), gravity_compensation=True)).compile()
 
         assert _compensated(model) == {"fore", "tool"}
 
@@ -191,15 +187,15 @@ class TestGravityCompensation:
         assert model.ngravcomp == 0
 
     def test_a_compensated_arm_holds_its_posture_against_its_own_weight(self):
-        compensated = _compile(gravity_compensation=True)
-        loaded = _compile()
+        compensated = _compile(gravity_compensation=True, arm_gains=_SERVOS)
+        loaded = _compile(arm_gains=_SERVOS)
 
         assert _sag(compensated, _hold(compensated)) < 1e-9
         # The same servos alone give way under the arm's weight.
         assert _sag(loaded, _hold(loaded)) > 1e-3
 
     def test_the_prop_still_falls_beside_a_compensated_arm(self):
-        model = _compile(gravity_compensation=True)
+        model = _compile(gravity_compensation=True, arm_gains=_SERVOS)
         dropped_from = float(mujoco.MjData(model).qpos[model.joint("cube").qposadr[0] + 2])
 
         data = _hold(model, steps=100)
@@ -207,16 +203,15 @@ class TestGravityCompensation:
         assert float(data.body("cube").xpos[2]) < dropped_from - 0.05
 
     def test_a_joint_the_file_lacks_is_refused(self):
-        entry = {"arms": [{"name": "arm", "joints": ["lift", "flex", "wrist"]}]}
-        known = _known(entry, gravity_compensation=True)
+        known = _known(entry("arm", arms={"arm": ["lift", "flex", "wrist"]}), gravity_compensation=True)
         with pytest.raises(
-            RuntimeError, match=f"arm: gravity compensation names joint 'wrist', not in {_SCENE}"
+            RuntimeError, match="arm: gravity compensation names joint 'wrist', not in arm.xml"
         ):
             compile_spec(known)
 
 
-def _world(renders: bool = False, pack=None) -> World:
-    return World(head_camera_pack=pack, renders=renders)
+def _world(renders: bool = False) -> World:
+    return World(renders=renders)
 
 
 def _standing(names, known=None, renders: bool = False, placements=None):
@@ -246,8 +241,8 @@ class TestComposingTheScene:
 
         joints = _named(model, mujoco.mjtObj.mjOBJ_JOINT, model.njnt)
         actuators = _named(model, mujoco.mjtObj.mjOBJ_ACTUATOR, model.nu)
-        assert joints == ["alpha/lift", "alpha/flex", "alpha/cube", "bravo/lift", "bravo/flex", "bravo/cube"]
-        assert [name.split("/")[0] for name in actuators] == ["alpha"] * 3 + ["bravo"] * 3
+        assert joints == ["alpha/lift", "alpha/flex", "bravo/lift", "bravo/flex"]
+        assert [name.split("/")[0] for name in actuators] == ["alpha"] * 2 + ["bravo"] * 2
 
     def test_a_robot_stands_where_its_placement_puts_it(self):
         spot = Placement.of((2.0, -1.0, 0.0), 0.0)
@@ -260,16 +255,22 @@ class TestComposingTheScene:
         assert data.body("alpha/base").xpos.tolist() == pytest.approx([2.0, -1.0, 0.05])
 
     def test_a_robot_turned_about_z_stands_turned(self):
-        """The prop this model carries sits out along +x in the robot's own
-        frame, so a quarter turn about +z puts it on +y."""
         world = _world()
         world.add("alpha", _known(), Placement.of((0.0, 0.0, 0.0), math.pi / 2))
         model = world.compose().compile()
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
 
-        prop = data.body("alpha/cube").xpos
-        assert prop.tolist() == pytest.approx([0.0, 0.4, 0.3], abs=1e-9)
+        half = math.sqrt(0.5)
+        assert data.body("alpha/base").xquat.tolist() == pytest.approx([half, 0.0, 0.0, half], abs=1e-9)
+
+    def test_what_the_file_holds_beside_the_robot_stays_behind(self):
+        """The body that carries the robot is what the scene attaches: the
+        prop and the floor beside it in the file do not come along."""
+        _, model = _standing(["alpha"])
+
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "alpha/cube") == -1
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "alpha/floor") == -1
 
     def test_taking_a_robot_out_composes_the_scene_without_it(self):
         world, _ = _standing(["alpha", "bravo"])
@@ -288,7 +289,7 @@ class TestComposingTheScene:
         one never reaches the other."""
         _, model = _standing(["alpha", "bravo"])
 
-        assert model.njnt == 2 * mujoco.MjModel.from_xml_string(_ARM).njnt
+        assert model.njnt == 2 * len(_ARM_ENTRY.joints())
 
 
 class TestTheSpotsRobotsTake:
@@ -380,11 +381,11 @@ class TestTheSettingsTheModelsShare:
     def test_two_models_asking_for_different_settings_are_refused_by_name(self):
         other = _ARM.replace('timestep="0.002"', 'timestep="0.004"')
         (mujoco_models.ASSETS_DIR / "arm" / "other.xml").write_text(other)
-        slower = parse(
-            EngineModel(
-                entry=parse_entry("slow_arm", "slow_arm.json5", _ARM_ENTRY),
-                engine={"scene": "arm/other.xml"},
-            )
+        slower = known_model(
+            "slow_arm",
+            replace(_ARM_ENTRY, model="slow_arm"),
+            mujoco_models.ASSETS_DIR / "arm" / "other.xml",
+            _MOUNT,
         )
         world = _world()
         world.add("alpha", _known(), world.free_spot())
@@ -405,45 +406,10 @@ class TestTheSettingsTheModelsShare:
 
         assert model.njnt > 0
 
-    def test_a_model_alone_keeps_its_own_tuning_whatever_its_entry_accepts(self):
-        """An entry's `solver` is what the model gives way to in company, so
-        a scene standing it alone steps the settings its own file asks for:
-        a model upstream tuned keeps that tuning until it shares a scene."""
-        tuned = _known(solver='<option timestep="0.004" integrator="implicitfast"/>')
-        world = _world()
-        world.add("alpha", tuned, world.free_spot())
-
-        model = world.compose().compile()
-
-        assert model.opt.timestep == pytest.approx(0.002)
-
-    def test_a_model_takes_the_settings_its_entry_accepts_to_share_a_scene(self):
-        """Two models that disagree agree on what the entry of one names, so
-        the join stands."""
-        other = _ARM.replace('timestep="0.002"', 'timestep="0.004"')
-        (mujoco_models.ASSETS_DIR / "arm" / "other.xml").write_text(other)
-        yielding = parse(
-            EngineModel(
-                entry=parse_entry("fast_arm", "fast_arm.json5", _ARM_ENTRY),
-                engine={
-                    "scene": "arm/other.xml",
-                    "solver": '<option timestep="0.002" integrator="implicitfast"/>',
-                },
-            )
-        )
-        world = _world()
-        world.add("alpha", _known(), world.free_spot())
-        world.add("bravo", yielding, world.free_spot())
-
-        model = world.compose().compile()
-
-        assert model.opt.timestep == pytest.approx(0.002)
-
 
 class TestFittingOutTheScene:
     def test_a_rendering_engine_hangs_each_robots_cameras_under_its_prefix(self):
-        entry = dict(_ARM_ENTRY, cameras=[_FRONT_CAMERA])
-        known = _known(entry, link_bodies={"base_link": "base"}, gravity_compensation=True)
+        known = _known(replace(_ARM_ENTRY, cameras=(_FRONT_CAMERA,)), link_bodies={"base_link": "base"}, gravity_compensation=True)
 
         _, model = _standing(["alpha", "bravo"], known=known, renders=True)
 
@@ -457,8 +423,7 @@ class TestFittingOutTheScene:
         }
 
     def test_an_engine_that_renders_none_composes_the_scene_without_them(self):
-        entry = dict(_ARM_ENTRY, cameras=[_FRONT_CAMERA])
-        known = _known(entry, link_bodies={"base_link": "base"})
+        known = _known(replace(_ARM_ENTRY, cameras=(_FRONT_CAMERA,)), link_bodies={"base_link": "base"})
 
         _, model = _standing(["alpha"], known=known, renders=False)
 
@@ -470,33 +435,25 @@ class TestFittingOutTheScene:
         assert model.ncam == 0
 
     def test_the_light_rig_lights_the_scene_once_however_many_robots_stand(self):
-        entry = dict(_ARM_ENTRY, cameras=[_FRONT_CAMERA])
-        known = _known(entry, link_bodies={"base_link": "base"}, camera_lights=True)
+        known = _known(replace(_ARM_ENTRY, cameras=(_FRONT_CAMERA,)), link_bodies={"base_link": "base"}, engine={"camera_lights": True})
 
         _, model = _standing(["alpha", "bravo"], known=known, renders=True)
 
         assert model.nlight == len(camera_sensor._LIGHT_DIRECTIONS)  # pylint: disable=W0212
 
-    def test_a_model_that_draws_the_head_camera_needs_its_pack_staged(self):
-        world = _world()
-        world.add("alpha", _known(head_camera=True), world.free_spot())
-
-        with pytest.raises(RuntimeError, match="arm draws the head camera, and no pack was staged"):
-            world.compose()
-
     def test_the_floor_is_laid_once_for_every_robot_that_works_against_one(self):
         """Two robots of a model that works against a floor work against the
         same one: the scene lays it, so nothing rests on two planes at once.
-        A robot's own name carries its prefix, so the scene's floor is the
-        one that carries none."""
-        _, model = _standing(["alpha", "bravo"], known=_known(floor=True))
+        Each robot's file brings a floor of its own beside the body that
+        carries the robot, and it stays behind."""
+        _, model = _standing(["alpha", "bravo"], known=_known(engine={"floor": True}))
 
         floors = [
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, index)
             for index in range(model.ngeom)
             if model.geom(index).type[0] == mujoco.mjtGeom.mjGEOM_PLANE
         ]
-        assert floors.count("floor") == 1
+        assert floors == ["floor"]
         assert model.light("floor_light").type[0] == mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
 
     def test_a_scene_no_model_works_against_a_floor_in_lays_none(self):

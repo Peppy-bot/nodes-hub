@@ -49,8 +49,20 @@ COPY --from=ngx /ngx/libnvidia-ngx.so.${NGX_DRIVER_VERSION} /usr/lib/x86_64-linu
 RUN ln -s "libnvidia-ngx.so.${NGX_DRIVER_VERSION}" /usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.1 \
     && ldconfig
 
+# robot_description_py is a Rust extension that pip builds from its source:
+# gcc and libc6-dev link it, and rustup's minimal profile under /opt/rust
+# compiles it. The toolchain goes after the build; the packages stay, since
+# the Isaac Sim image may carry them for its own use.
 COPY requirements.isaac.txt /tmp/requirements.txt
-RUN /isaac-sim/python.sh -m pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt
+RUN apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update \
+    && apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
+        curl gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo CARGO_TARGET_DIR=/opt/rust/target \
+    && curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable \
+    && PATH="$CARGO_HOME/bin:$PATH" /isaac-sim/python.sh -m pip install --no-cache-dir --retries 5 --timeout 180 -r /tmp/requirements.txt \
+    && rm -rf /opt/rust
 
 # One directory per robot under /opt/robot_assets, which is where the node's
 # model entries look their stages up.
@@ -59,7 +71,7 @@ RUN --mount=type=secret,id=rclone_key \
     --mount=type=secret,id=rclone_secret \
     WALDO_R2_ACCESS_KEY_ID="$(cat /run/secrets/rclone_key)" \
     WALDO_R2_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
-    bash /tmp/download_assets.sh --variant isaac \
+    bash /tmp/download_assets.sh \
     && mkdir -p /opt/robot_assets \
     && cp -r /tmp/.peppy_openarm_assets_isaac/. /opt/robot_assets/ \
     && rm -rf /tmp/.peppy_openarm_assets_isaac

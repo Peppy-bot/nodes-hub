@@ -25,26 +25,30 @@ An `attach` goal is refused with `rejected` for a model with no entry, a name th
 
 ## Models
 
-A model is two entries of the same name. `sim_robot_core` ships what a robot of the model is made of, whatever the engine: its limbs under the names the robot answers to, the joints each moves, its cameras and the links they hang from, the posture it starts in. `engine/models/<model>.json5` holds what MuJoCo alone knows about it:
+A model is two entries of the same name and its MuJoCo model. `sim_robot_core` builds what a robot of the model is made of, whatever the engine, from the description its attach goal carries, its URDF and SRDF: its limbs under the names the robot answers to, the joints each moves, where each finger closes and opens, its cameras at their optical frames, and the posture it starts in, every arm at its ready state with its gripper closed. An attach whose description the engine's entry for the model does not fit is refused with `rejected`.
+
+The MuJoCo model of every robot is the release of Waldo's catalogue that `sim_base_images/waldo_catalogue.py` pins, which the base image bakes under `PEPPY_ROBOT_ASSETS_DIR` (`/opt/robot_assets`): each robot's pinned tree with the files the release lays over it, and the release's `robots.json`. Waldo stands its robots from the same release, so both engines stand one model of each robot. From each robot's entry of `robots.json` the engine reads (`engine/catalogue_robots.py`):
 
 | Key | Meaning |
 |---|---|
-| `scene` | the robot's MJCF, relative to `PEPPY_ROBOT_ASSETS_DIR` (`/opt/robot_assets` in the image) |
-| `world_links` | URDF links the MJCF compiler folds into the world body, so a camera hanging from one hangs from the world |
-| `link_bodies` | URDF link name to MJCF body name, where they differ |
-| `arm_gains` | MIT servo gains per arm joint, applied to every arm. Absent for a model driven by its file's own actuators |
-| `gravity_compensation` | counter-gravity on every body the model's joints move |
+| `description` | the URDF and SRDF the release ships beside the MJCF, whose links `linkBodies` and whose arm groups `ik.arms` name: the files of the model of the same id in `robot_description`, byte for byte. A robot that names none, or whose files differ from the model's, is refused |
+| `wrapper` | the robot's MJCF, over its tree; the scene attaches the body of it that carries the robot, and the floor, the light and the keyframe the file holds beside that body stay behind. A robot with no wrapper is attached from its `source.scene` |
+| `mount.body` | the body that carries the whole robot |
+| `linkBodies` | URDF link name to MJCF body name, where they differ, which is where each camera hangs |
+| `ik.arms[].gains` | the MIT servo gains of each joint of the arm group `name`: its actuator becomes a position servo at `kp` with its damping raised to critical against the joint's inertia, as the real drivers run; an arm without gains runs its file's actuators |
+| `ik.arms[].gripper.gains` | the position servo of each finger of the arm's gripper |
+| `gravityCompensation` | counter-gravity on every body the model's joints move, as the real drivers feed gravity forward |
+
+The OpenArm arms run the real arm's gains, the defaults of `openarm/arm/peppy.json5`, and `tests/test_mujoco_models.py` holds them equal. The SO-101 runs MuJoCo Menagerie's STS3215 servo model. A joint the gains name must be driven by one actuator of the file, and a stand refuses one that none or several drive. `engine/models/<model>.json5` holds what this engine alone decides about the model:
+
+| Key | Meaning |
+|---|---|
 | `camera_lights` | add the engine's light rig when rendering, for a scene that ships no light |
-| `head_camera` | draw the OpenArm v2 head camera pack on the pedestal (`engine/head_camera.py`) |
-| `joint_ranges`, `site_poses` | where the file is corrected to the robot's description |
 | `floor` | the robot works against a floor, which the scene lays once for the robots standing that ask for one |
-| `solver` | the one MJCF `<option>` the robot stands under, for a file asking for settings the scene it joins does not step |
 
-The engine stands `openarm_v1`, `openarm_v2` and `so101`. A model with no entry is refused naming these, and none falls back to another's layout. Every entry is parsed at node setup, so a bad one stops the node before a robot attaches as it.
+The engine stands `openarm_v1`, `openarm_v2` and `so101`. A model with no entry is refused naming these, and none falls back to another's layout. The engine's entries, `sim_robot_core`'s camera renders and the release's entry of each model the engine stands are read once at node setup, strictly: an entry that does not read, an unknown key, a field of the wrong type, a release robot that names no description or ships another than `robot_description`'s model, or an entry of a model the release does not stand stops the node before a robot attaches as it, naming the file and the field. What depends on the robot's description is checked as it attaches, and a description that does not fit is refused with `rejected`: a camera the description has and no render names, or the reverse, and release gains that name an arm the description lacks or give an arm another number of joints than its group moves. `tests/test_release_models.py` holds each model of the release to its description.
 
-The SO-101 is MuJoCo Menagerie's `robotstudio_so101`, the arm alone, driven by upstream's STS3215 servo model. `sim_base_images/so101_model.lock.json` pins it to one commit, file by file, and Waldo's catalogue names the same commit. Where upstream and `so101_description` differ the description wins: the entry widens `wrist_roll` to the URDF's upper limit and moves the tool site onto the URDF's `gripper_frame_link`, and `tests/test_so101_model.py` holds the compiled model to the description.
-
-To add a model: ship its entry in `sim_robot_core`, bake its files into the base image (`sim_base_images/Dockerfile.mujoco`), bump the base image, and write `engine/models/<model>.json5`.
+To add a model: ship its description in `robot_description`, and its camera renders in `sim_robot_core` when it carries a camera; publish a release of Waldo's catalogue that stands it and pin it in Waldo's `web/public/assets/catalogue.lock.json` and in `sim_base_images/waldo_catalogue.py`; write `engine/models/<model>.json5`; then bump `MUJOCO_IMAGE_REV` and run `sim_base_images/build_base_images.sh`. [`sim_robot_core`'s README](https://github.com/Peppy-bot/public-peppy-libs/tree/main/sim_robot_core#adding-a-robot) lists the steps of both engines.
 
 ## Cameras
 
@@ -54,7 +58,7 @@ The cameras render through EGL, on the first device MuJoCo can open. Where the N
 
 ## Base image
 
-The node builds on `peppybot/sim-mujoco`, which `sim_base_images/build_base_images.sh` produces for `linux/amd64` and `linux/arm64` with MuJoCo, `sim_robot_core` and every model's files baked in. The script stamps the tag into `apptainer.def`.
+The node builds on `peppybot/sim-mujoco`, which `sim_base_images/build_base_images.sh` produces for `linux/amd64` and `linux/arm64` with MuJoCo, `sim_robot_core`, `robot_description_py` and the pinned release of Waldo's catalogue baked in, read from the public store with no token. The script stamps the tag into `apptainer.def`.
 
 `sim_base_images/requirements.mujoco.txt` pins the MuJoCo the image installs, and the script reads the version in the tag out of that file. To move the node to another MuJoCo, change the pin there and in `tests/pyproject.toml`, write the lock of the suites again and run the script. `tests/test_base_image.py` holds the tag, `apptainer.def` and the pins of the suites to that file.
 
@@ -65,4 +69,4 @@ cd tests
 uv run pytest
 ```
 
-The suites render nothing and need no OpenArm file. `test_so101_model.py` reads the SO-101 from `PEPPY_ROBOT_ASSETS_DIR/so101`, and stages the pinned model itself when that directory holds none.
+The suites render nothing. `test_mujoco_models.py`, `test_release_models.py` and `test_robots_io.py` read the release from `PEPPY_ROBOT_ASSETS_DIR`, and where that directory holds none they stage the pinned release once in the machine's temporary directory, which needs the network on the first run. Every file is checked against the pin either way.

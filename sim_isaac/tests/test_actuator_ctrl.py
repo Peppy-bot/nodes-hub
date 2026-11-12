@@ -10,12 +10,13 @@ from types import ModuleType
 import numpy as np
 import pytest
 
+from _world import known
+
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 
 import actuator_ctrl  # noqa: E402  pylint: disable=C0413
-import isaac_models  # noqa: E402  pylint: disable=C0413
 
 
 class _View:
@@ -65,7 +66,7 @@ def _views(monkeypatch):
 
 
 def _so101():
-    return isaac_models.IsaacModels.read().of("so101")
+    return known("so101")
 
 
 def test_an_so101s_arm_takes_its_own_gains_on_its_own_joints(views):
@@ -136,7 +137,7 @@ def test_an_unset_wire_effort_restores_the_models_own_ceiling(views):
 
 def test_an_openarms_arm_takes_the_servo_gains_and_torque_caps_of_its_model(views):
     view_type, built = views
-    openarm = isaac_models.IsaacModels.read().of("openarm_v2")
+    openarm = known("openarm_v2")
     left = openarm.entry.arms[0]
     view_type.dof_names = list(left.joints)
     view_type.inertia = [0.0] * 7
@@ -146,5 +147,5 @@ def test_an_openarms_arm_takes_the_servo_gains_and_torque_caps_of_its_model(view
     )
 
     assert ctrl.setup()
-    assert built[0].gains[0] == [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0]
+    assert built[0].gains[0] == list(openarm.arm_gains.kp)
     assert built[0].max_efforts == [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0]

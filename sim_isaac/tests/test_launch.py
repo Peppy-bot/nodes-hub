@@ -14,6 +14,8 @@ from unittest.mock import ANY, Mock
 
 import pytest
 
+from _world import known
+
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _LAUNCH_PATH = _ENGINE_DIR / "launch.py"
 _KIT_PATH = _ENGINE_DIR / "config" / "sim_isaac.kit"
@@ -301,10 +303,7 @@ def test_blank_public_ip_leaves_ice_address_selection_automatic(startup, monkeyp
 def test_every_openarm_entry_names_a_stage_of_the_bundle_the_image_bakes(model, filename):
     """An entry names its stage under its robot's directory of the baked
     assets, and the image is built to carry exactly those files there."""
-    sys.path.insert(0, str(_ENGINE_DIR))
-    from isaac_models import IsaacModels
-
-    assert IsaacModels.read().of(model).stage == f"openarm/{filename}"
+    assert known(model).stage == f"openarm/{filename}"
     manifest = json.loads((_ENGINE_DIR.parent / "scripts/visual_sources.json").read_text())
     assert filename in manifest["robot"]["files"]
 
