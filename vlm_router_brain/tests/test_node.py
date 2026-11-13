@@ -9,7 +9,9 @@ from functools import partial
 
 import pytest
 from conftest import FakeProvider, answer, records_of
-from peppygen.consumed_actions.limb_motion import move_gripper
+from peppygen.consumed_actions.limb_motion import execute_joint_path, move_gripper
+from peppygen.consumed_actions.motion_planning import plan_cartesian_path, plan_joint_path
+from peppygen.consumed_services.motion_planning import describe_arms, get_planning_scene
 from peppygen.exposed_actions.brain_model import switch_model as switch_action
 from peppygen.exposed_actions.item_manipulation import abort as abort_action
 from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
@@ -32,11 +34,13 @@ from wire import (
     failure_of,
     grab_by_pose,
     land_move,
+    limbs_of,
     once_the_brain_has_limbs,
     once_the_brain_sees,
     params,
     plan,
     publish_a_capture,
+    publish_limbs,
     publish_limbs_until,
     publish_wrist_until,
     refusal_of,
@@ -286,7 +290,8 @@ async def test_a_second_switch_is_refused_and_a_cancelled_one_keeps_the_model():
 
 async def test_identify_then_a_scripted_grab_holds_the_item():
     provider = FakeProvider(answer(("the cup", [250, 250, 750, 750])))
-    async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
+    # No motion planner: the grab moves by the backbone's lines.
+    async with harness.start(partial(setup, provider=provider), parameters=params(), motion_planning_vacant=True) as h:
         answer_the_camera(h)
         await publish_a_capture(h)
         seen = await once_the_brain_sees(identify_fx, h, identify())
@@ -326,7 +331,7 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
 
 
 async def test_a_gripper_that_closes_on_nothing_retreats_fails_the_grab_and_holds_nothing():
-    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params()) as h:
+    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params(), motion_planning_vacant=True) as h:
         answer_the_camera(h)
         await once_the_brain_has_limbs(h)
         plan(h, True, True, True)
@@ -349,13 +354,13 @@ async def test_a_gripper_that_closes_on_nothing_retreats_fails_the_grab_and_hold
 
 
 async def test_a_grab_during_a_grab_is_refused_and_abort_ends_the_first():
-    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params()) as h:
+    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params(), motion_planning_vacant=True) as h:
         answer_the_camera(h)
         await once_the_brain_has_limbs(h)
-        plan(h, True, True, True)
         first = await grab_fx.send_goal(h, grab_by_pose([0.5, 0.1, 0.75]), 5.0)
         assert first.accepted, first.refusal
-        # The first grab opens the gripper; the backbone holds that move.
+        # The first grab opens the gripper before its checks; the backbone
+        # holds that move.
         _, opening = await accepted_grip(h)
         assert (await get_state_fx.poll(h, 5.0)).current_action == "grab_item"
         second = await result_of(grab_fx, h, grab_by_pose([0.4, -0.1, 0.75]))
@@ -384,7 +389,7 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
         Reply('{"action": "ready"}', 2800, 40, 30, 9.4),
     )
     async with harness.start(
-        partial(setup, provider=provider), parameters=params(), wrist_cameras_instance_ids=["wrist_left"]
+        partial(setup, provider=provider), parameters=params(), wrist_cameras_instance_ids=["wrist_left"], motion_planning_vacant=True,
     ) as h:
         # The learner's answer and one per alignment step.
         answer_the_cameras(h, mounts_answers=3)
@@ -436,3 +441,113 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
         step = provider.calls[2]
         assert "Now: step 1 of 5." in step.prompt and "+x points toward 6 o'clock and +y toward 3 o'clock" in step.prompt
         assert step.schema["json_schema"]["strict"] is False
+
+
+def described_left_arm():
+    """describe_arms of the OpenArm's left arm, as the motion planner names it."""
+    return describe_arms.ResponseData(
+        arms=[
+            describe_arms.ResponseDataArmsItem(
+                name="left_arm", gripper_name="left_gripper", joint_names=[f"openarm_left_joint{i}" for i in range(1, 8)],
+                joint_lower_limits=[-3.0] * 7, joint_upper_limits=[3.0] * 7, link_names=[f"openarm_left_link{i}" for i in range(8)],
+                grasp_link="openarm_left_tcp", approach_axis="+z", closing_axis="+y", gripper_links=LEFT_GRIPPER_LINKS,
+            )
+        ],
+        body_link_names=["openarm_body_link0"],
+    )
+
+
+def a_scene(*objects):
+    return get_planning_scene.ResponseData(objects=list(objects), attached_objects=[], allowed_pairs=[], clearance_m=0.04, voxel_size_m=0.02)
+
+
+LEFT_GRIPPER_LINKS = ["openarm_left_ee_base_link", "openarm_left_ee_link1", "openarm_left_ee_link2"]
+START = [0.0] * 7
+AT_PRE = [0.1, -0.2, 0.3, 1.2, 0.4, -0.5, 0.6]
+
+
+async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_held_item_is_attached():
+    """The router's default manipulation model with the motion planner
+    bound: the item's object before the plan, the plan of the transit, the
+    reach test of the descent and the lift, the run of the plan through the
+    backbone, the checked descent of stage 1, the lines down and up, then the
+    object moved with the hand and attached."""
+    provider = FakeProvider(answer(("the cup", [250, 250, 750, 750])))
+    async with harness.start(partial(setup, provider=provider), parameters=params()) as h:
+        answer_the_camera(h)
+        await publish_a_capture(h)
+        found = (await once_the_brain_sees(identify_fx, h, identify())).data
+        await once_the_brain_has_limbs(h)
+        planner = h.mocks.deps.motion_planning
+        object_id = f"brain/{found.item_id}"
+        # The scene at the start of the grab, the arms of its transit, and
+        # the scene at the hold, the cup's object where the grab added it.
+        for _ in range(3):
+            planner.describe_arms.enqueue_response(described_left_arm())
+        planner.get_planning_scene.enqueue_response(a_scene())
+        planner.get_planning_scene.enqueue_response(a_scene(get_planning_scene.ResponseDataObjectsItem(
+            id=object_id, position=list(found.position), orientation=[0.0, 0.0, 0.0, 1.0], shapes=[],
+        )))
+        for _ in range(2):
+            planner.apply_collision_objects.enqueue_response()
+        planner.set_allowed_collision.enqueue_response()
+        planner.apply_attached_collision_object.enqueue_response()
+        grab = await grab_fx.send_goal(
+            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, position=[0.0] * 3, orientation=None, max_effort=15.0),
+            5.0,
+        )
+        assert grab.accepted, grab.refusal
+        assert (await stop_grip_at(h, 1.0)).opening == 1.0
+        down = [0.0, 1.0, 0.0, 0.0]
+        pending = await planner.plan_joint_path.next_goal(WAIT)
+        planned = pending.request
+        assert [round(v, 6) for v in planned.goal_position_constraints[0].position] == [0.0, 0.0, 1.05]
+        assert planned.goal_position_constraints[0].link_name == "openarm_left_tcp" and planned.goal_orientation_constraints[0].orientation == down
+        assert (planned.planner, planned.refiner, planned.allowed_planning_time_s) == ("rrt_connect", "none", 0.5)
+        await (await pending.accept()).complete(plan_joint_path.ResultResponseData(
+            arms=[plan_joint_path.ResultResponseDataArmsItem(
+                arm_name="left_arm", start_joint_positions=START,
+                waypoints=[plan_joint_path.ResultResponseDataArmsItemWaypointsItem(joint_positions=AT_PRE, position=[0.0, 0.0, 1.05], orientation=down)],
+            )],
+            map_stamp=None,
+        ))
+        pending = await planner.plan_cartesian_path.next_goal(WAIT)
+        reach = pending.request
+        assert (reach.avoid_collisions, reach.start_joint_positions) == (False, AT_PRE)
+        assert [[round(v, 6) for v in w.position] for w in reach.waypoints] == [[0.0, 0.0, 0.975], [0.0, 0.0, 1.05]]
+        await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(start_joint_positions=AT_PRE, waypoints=[], fraction=1.0, map_stamp=None))
+        pending = await h.mocks.deps.limb_motion.execute_joint_path.next_goal(WAIT)
+        [run] = pending.request.arms
+        assert (run.arm_name, run.expected_start_joint_positions, [w.joint_positions for w in run.waypoints]) == ("left_arm", START, [AT_PRE])
+        limbs = limbs_of(h)
+        limbs.left_position, limbs.left_orientation = [0.0, 0.0, 1.05], down
+        limbs.stamp += 1.0
+        await publish_limbs(h)
+        await (await pending.accept()).complete(execute_joint_path.ResultResponseData(
+            arms=[execute_joint_path.ResultResponseDataArmsItem(arm_name="left_arm", final_joint_positions=AT_PRE)], action_time=2.0,
+        ))
+        pending = await planner.plan_cartesian_path.next_goal(WAIT)
+        checked = pending.request
+        assert (checked.avoid_collisions, checked.start_joint_positions) == (True, [])
+        await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(start_joint_positions=AT_PRE, waypoints=[], fraction=0.38, map_stamp=None))
+        assert [round(v, 6) for v in (await land_move(h)).position] == [0.0, 0.0, 0.975]
+        await stop_grip_at(h, 0.3)
+        done = asyncio.Event()
+        stream = asyncio.create_task(publish_limbs_until(h, done, 0.3))
+        assert [round(v, 6) for v in (await land_move(h)).position] == [0.0, 0.0, 1.05]
+        result = (await grab.get_result(WAIT)).data
+        done.set()
+        await stream
+        assert (result.success, result.item_id) == (True, found.item_id), result.message
+        [added, moved] = [request.objects[0] for request in planner.apply_collision_objects.captured()]
+        assert (added.id, added.operation, added.shapes[0].kind, added.shapes[0].dimensions) == (object_id, "add", "sphere", [0.05])
+        assert [round(v, 6) for v in added.position] == [round(v, 6) for v in found.position]
+        [allowed] = planner.set_allowed_collision.captured()
+        assert (allowed.name, allowed.other_names, allowed.allowed) == (object_id, LEFT_GRIPPER_LINKS, True)
+        # The object moved by what the grasp point moved since the close.
+        assert (moved.id, moved.operation) == (object_id, "move")
+        assert [round(v, 6) for v in moved.position] == [round(found.position[0], 6), round(found.position[1], 6), round(found.position[2] + 0.075, 6)]
+        [attached] = planner.apply_attached_collision_object.captured()
+        assert (attached.object_id, attached.link_name, attached.touch_links, attached.operation) == (object_id, "openarm_left_tcp", LEFT_GRIPPER_LINKS, "attach")
+        state = await get_state_fx.poll(h, 5.0)
+        assert state.held_item_ids == [found.item_id, ""]
