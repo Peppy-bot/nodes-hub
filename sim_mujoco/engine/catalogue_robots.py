@@ -6,11 +6,8 @@ names otherwise, whether the robot's weight is compensated, and the servo
 gains of its arms and grippers. Waldo stands its robots from the same
 release, so both engines stand one model of each robot.
 
-The robots this engine stands are read strictly: each names the description
-its MJCF stands for, the URDF and SRDF the release ships beside it, which are
-the files of the model of the same id in robot_description; a field the
-engine reads that is missing or of another type, and a description file that
-differs from the model's, are refused naming the robot.
+The robots this engine stands are read strictly: a field the engine reads
+that is missing or of another type is refused naming the robot.
 """
 
 from __future__ import annotations
@@ -20,7 +17,6 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-import robot_description_py
 from sim_robot_core.errors import ModelEntryError
 
 ROBOTS_FILE = "robots.json"
@@ -126,43 +122,7 @@ def _scene(model: str, raw: dict) -> str:
     return source["scene"]
 
 
-def _description(directory: Path, model: str, raw: dict) -> None:
-    """Holds the description a robot's MJCF stands for, the URDF and SRDF the
-    release ships beside it, to the files of the model of the same id in
-    robot_description, which is what makes a URDF link's body (linkBodies)
-    and an arm group's gains (ik) the description's. A robot that names no
-    description, a model robot_description does not bundle, and a file that
-    differs from the model's are refused."""
-    description = raw.get("description")
-    if not isinstance(description, dict) or not all(
-        isinstance(description.get(file), str) and description[file] for file in ("urdf", "srdf")
-    ):
-        raise _fail(
-            model,
-            f"names no description, the URDF and SRDF its MJCF stands for, got {description!r}: "
-            "pin a release of Waldo's catalogue whose robots name theirs",
-        )
-    try:
-        bundled = robot_description_py.model(model)
-    except ValueError as unknown:
-        raise _fail(model, f"robot_description bundles no such model: {unknown}") from unknown
-    differing = [
-        description[file]
-        for file, text in (("urdf", bundled.urdf), ("srdf", bundled.srdf))
-        if (directory / model / description[file]).read_bytes() != text.encode()
-    ]
-    if differing:
-        raise _fail(
-            model,
-            f"the release ships another {' and '.join(differing)} than robot_description's "
-            f"{model}: pack the catalogue again with Waldo's catalogue.mjs pack at the "
-            "public-peppy-libs commit sim_base_images/requirements.mujoco.txt pins, and pin "
-            "that release in sim_base_images/waldo_catalogue.py",
-        )
-
-
 def _robot(directory: Path, model: str, raw: dict) -> CatalogueRobot:
-    _description(directory, model, raw)
     mount = _object(model, raw.get("mount"), "mount")
     if not isinstance(mount.get("body"), str) or not mount["body"]:
         raise _fail(model, "names no mount body, the body a scene attaches the robot by")
