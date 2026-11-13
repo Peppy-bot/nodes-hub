@@ -2415,7 +2415,6 @@ version = "0.1.0"
 dependencies = [
  "control_core",
  "instance_lock",
- "openarm_description",
  "peppygen",
  "peppylib",
  "robot_description",
