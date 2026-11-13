@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use crate::owner::Feedback;
 use crate::result_wait::{
-    GOAL_TIMEOUT, Waited, limb_goal_handle, preempt_grace_elapsed, summarize, wait_for_end,
+    GOAL_TIMEOUT, NO_CONTACT_CHECK_M, Waited, limb_goal_handle, preempt_grace_elapsed, summarize,
+    wait_for_end,
 };
 use crate::robot;
 
@@ -77,6 +78,7 @@ async fn run(
         duration_s,
         settle_tolerances_rad: [settle_tolerance_rad; ARM_DOF],
         settle_timeout_s,
+        contact_gap_m: NO_CONTACT_CHECK_M,
     };
 
     // The launcher-pinned, cardinality-one limb_motion slot provides the explicit

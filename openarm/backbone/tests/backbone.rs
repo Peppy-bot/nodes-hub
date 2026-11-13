@@ -256,10 +256,13 @@ fn leader_command(
 }
 
 /// An arm played by [`spawn_arm_follower`]: the latest position it adopted,
-/// every setpoint it received, in order, and its brake.
+/// the last setpoint it received, every setpoint it received, in order,
+/// with the velocities each came with, and its brake.
 struct ArmFollower {
     followed: watch::Receiver<[f64; 7]>,
+    commanded: watch::Receiver<[f64; 7]>,
     received: Arc<Mutex<Vec<[f64; 7]>>>,
+    velocities: Arc<Mutex<Vec<Vec<f64>>>>,
     brake: mpsc::Sender<oneshot::Sender<[f64; 7]>>,
 }
 
@@ -270,6 +273,35 @@ impl ArmFollower {
             .lock()
             .expect("no panic while recording")
             .clone()
+    }
+
+    /// The velocities that came with the setpoint the arm received at
+    /// `index`, among every setpoint it received.
+    fn velocities_received(&self, index: usize) -> Vec<f64> {
+        self.velocities.lock().expect("no panic while recording")[index].clone()
+    }
+
+    /// Wait until the node holds the arm at `stood` again after a move that
+    /// began once the arm had received `before` setpoints: the setpoints of
+    /// the move left `stood`, and the last two the arm received stand on it.
+    /// Gives the index, among every setpoint the arm received, of the one
+    /// that brought the command back onto `stood`.
+    async fn held_again_at(&self, stood: [f64; 7], before: usize) -> usize {
+        let mut commanded = self.commanded.clone();
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let moved = self.received().split_off(before);
+            let left = moved.iter().rposition(|q| *q != stood);
+            if let Some(left) = left
+                && matches!(moved[..], [.., last, next] if last == stood && next == stood)
+            {
+                return before + left + 1;
+            }
+            tokio::time::timeout_at(deadline, commanded.changed())
+                .await
+                .expect("the node never commanded the arm back to where it stands")
+                .expect("the follower runs");
+        }
     }
 
     /// Wait until the arm adopts its first setpoint: the backbone streams to
@@ -283,8 +315,8 @@ impl ArmFollower {
             .expect("the follower runs");
     }
 
-    /// Stop the arm where it stands: from now on it adopts no setpoint and
-    /// publishes the position this returns.
+    /// Stop the arm where it stands, as an object in its way does: from now
+    /// on it adopts no setpoint and publishes the position this returns.
     async fn brake(&self) -> [f64; 7] {
         let (reply, held) = oneshot::channel();
         self.brake
@@ -304,9 +336,10 @@ impl ArmFollower {
 ///   `$setpoints`, plus the standing error, as the new measurement, until
 ///   the test brakes it.
 ///
-/// Its `followed` watch carries the latest adopted position, and `received`
-/// every setpoint in order. Thus a test can assert what motion the arm mock
-/// observed.
+/// Its `followed` watch carries the latest adopted position, `commanded`
+/// the last setpoint it received, and `received` every setpoint in order,
+/// those that came after the brake too. Thus a test can assert what motion
+/// the arm mock observed.
 macro_rules! spawn_arm_follower {
     ($states:expr, $setpoints:expr, $message:path, $standing_error:expr, $home:expr $(,)?) => {{
         let states = $states;
@@ -314,9 +347,12 @@ macro_rules! spawn_arm_follower {
         let standing_error: [f64; 7] = $standing_error;
         let home: [f64; 7] = $home;
         let (tx, followed) = watch::channel(home);
+        let (commanded_tx, commanded) = watch::channel(home);
         let (brake, mut brakes) = mpsc::channel::<oneshot::Sender<[f64; 7]>>(1);
         let received = Arc::new(Mutex::new(Vec::new()));
         let record = received.clone();
+        let velocities = Arc::new(Mutex::new(Vec::new()));
+        let velocity_record = velocities.clone();
         tokio::spawn(async move {
             if !matches!(states.wait_for_subscriber(PUMP_TIMEOUT).await, Ok(true)) {
                 return;
@@ -339,12 +375,20 @@ macro_rules! spawn_arm_follower {
                         }
                     }
                     received = setpoints.next() => match received {
-                        Ok(Some(m)) if !braked && m.positions.len() == 7 => {
+                        Ok(Some(m)) if m.positions.len() == 7 => {
                             let setpoint: [f64; 7] =
                                 m.positions.try_into().expect("seven joint positions");
-                            positions = std::array::from_fn(|i| setpoint[i] + standing_error[i]);
+                            velocity_record
+                                .lock()
+                                .expect("no panic while recording")
+                                .push(m.velocities);
                             record.lock().expect("no panic while recording").push(setpoint);
-                            tx.send_replace(positions);
+                            commanded_tx.send_replace(setpoint);
+                            if !braked {
+                                positions =
+                                    std::array::from_fn(|i| setpoint[i] + standing_error[i]);
+                                tx.send_replace(positions);
+                            }
                         }
                         Ok(Some(_)) | Err(_) => {}
                         Ok(None) => return,
@@ -358,7 +402,9 @@ macro_rules! spawn_arm_follower {
         });
         ArmFollower {
             followed,
+            commanded,
             received,
+            velocities,
             brake,
         }
     }};
@@ -718,21 +764,34 @@ async fn snapshot_with_both_arms_at(
         .into_iter()
         .flat_map(|arm_name| launched_posture(arm_name, state))
         .collect();
+    snapshot_measuring(harness, &joints).await
+}
+
+/// The first limb_states snapshot the node emits that measures the robot's
+/// first joints at `joints`, within 1e-9 rad in each. The left arm's joints
+/// come first, then the right arm's.
+async fn snapshot_measuring(
+    harness: &mut Harness,
+    joints: &[f64],
+) -> peppygen::Result<peppygen::fixtures::emitted_topics::limb_state::limb_states::Message> {
     let deadline = tokio::time::Instant::now() + DEADLINE;
     loop {
         let snapshot = next_snapshot(harness).await?;
-        let at_posture = snapshot.joint_positions.len() == joints.len()
-            && snapshot
-                .joint_positions
-                .iter()
-                .zip(&joints)
-                .all(|(measured, posture)| (measured - posture).abs() <= 1e-9);
-        if at_posture {
+        let at_joints = snapshot
+            .joint_positions
+            .get(..joints.len())
+            .is_some_and(|measured| {
+                measured
+                    .iter()
+                    .zip(joints)
+                    .all(|(measured, joint)| (measured - joint).abs() <= 1e-9)
+            });
+        if at_joints {
             return Ok(snapshot);
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the robot never measured both arms at {joints:?}"
+            "the robot never measured its first joints at {joints:?}"
         );
     }
 }
@@ -892,12 +951,26 @@ async fn fold_both_arms_in(harness: &Harness) -> peppygen::Result<()> {
 }
 
 /// Send one `move_arm_joints` goal for `arm_name` to `target` over
-/// `duration_s`, assert that the node accepts it, and wait for how it ends.
+/// `duration_s` with no contact check, assert that the node accepts it, and
+/// wait for how it ends.
 async fn arm_joint_move(
     harness: &Harness,
     arm_name: &str,
     target: [f64; 7],
     duration_s: f64,
+) -> peppygen::Result<move_arm_joints::ResultOutcome> {
+    arm_joint_move_within(harness, arm_name, target, duration_s, NO_CONTACT_CHECK_M).await
+}
+
+/// Send one `move_arm_joints` goal for `arm_name` to `target` over
+/// `duration_s` with the contact gap `contact_gap_m`, assert that the node
+/// accepts it, and wait for how it ends.
+async fn arm_joint_move_within(
+    harness: &Harness,
+    arm_name: &str,
+    target: [f64; 7],
+    duration_s: f64,
+    contact_gap_m: f64,
 ) -> peppygen::Result<move_arm_joints::ResultOutcome> {
     let goal = move_arm_joints::send_goal(
         harness,
@@ -907,6 +980,7 @@ async fn arm_joint_move(
             duration_s,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -922,6 +996,9 @@ const SETTLE_TOLERANCE_RAD: f64 = 0.05;
 const SETTLE_POSITION_TOLERANCE_M: f64 = 0.005;
 const SETTLE_ORIENTATION_TOLERANCE_RAD: f64 = 0.05;
 const SETTLE_TIMEOUT_S: f64 = 0.5;
+/// The contact gap of a goal with no contact check: the move ends by its
+/// settle alone.
+const NO_CONTACT_CHECK_M: f64 = 0.0;
 
 /// The seconds a settle timeout's message names after the planned end. The
 /// node formats the time it measured, so a stalled test host reads higher
@@ -1040,11 +1117,16 @@ async fn a_leader_command_fans_through_to_the_governed_arm_wire() -> peppygen::R
         );
     }
 
-    // The leading node commands an elbow bend on the left arm only. The watch
-    // keeps the latest command, so one delivery suffices; the republish on an
-    // empty read window covers a best-effort drop.
+    // The leading node commands an elbow bend on the left arm only, once the
+    // node's subscription to it stands. The watch keeps the latest command, so
+    // one delivery suffices; the republish on an empty read window covers a
+    // best-effort drop.
     let mut target = left_home();
     target[3] = 0.4;
+    assert!(
+        leader.wait_for_subscriber(DEADLINE).await?,
+        "the node never subscribed to the left leader"
+    );
     let deadline = tokio::time::Instant::now() + DEADLINE;
     leader.publish(&leader_command(target)).await?;
     loop {
@@ -1124,6 +1206,7 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
             duration_s: 0.2,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m: NO_CONTACT_CHECK_M,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -1199,6 +1282,7 @@ async fn a_goal_on_a_limb_with_no_fresh_follower_state_is_refused_at_admission()
             duration_s: 1.0,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m: NO_CONTACT_CHECK_M,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -1399,6 +1483,7 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
         settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
         settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
         settle_timeout_s: SETTLE_TIMEOUT_S,
+        contact_gap_m: NO_CONTACT_CHECK_M,
     };
     let goal = move_arm::send_goal(
         &harness,
@@ -1793,6 +1878,7 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
             duration_s: 1.0,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m: NO_CONTACT_CHECK_M,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -1864,6 +1950,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
             duration_s: 30.0,
             settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m: NO_CONTACT_CHECK_M,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -2143,17 +2230,7 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
     // The arm stops where it stands; the stop comes once the robot measures
     // it there.
     let stopped_at = left.brake().await;
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    let snapshot = loop {
-        let snapshot = next_snapshot(&mut harness).await?;
-        if snapshot.joint_positions[..7] == stopped_at {
-            break snapshot;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the robot never measured the braked arm at {stopped_at:?}"
-        );
-    };
+    let snapshot = snapshot_measuring(&mut harness, &stopped_at).await?;
     let answer = stop::poll(
         &harness,
         &stop::RequestData {
@@ -2565,6 +2642,7 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
             settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
             settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m: NO_CONTACT_CHECK_M,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -2645,6 +2723,7 @@ async fn a_position_goal_completes_at_the_turn_the_hand_starts_with() -> peppyge
             settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
             settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
             settle_timeout_s: SETTLE_TIMEOUT_S,
+            contact_gap_m: NO_CONTACT_CHECK_M,
         },
         peppygen::DEFAULT_FEEDBACK_BOUND,
         DEADLINE,
@@ -3179,6 +3258,7 @@ fn joint_path(arms: Vec<GoalArmsItem>, duration_s: f64) -> execute_joint_path::G
         arms,
         duration_s,
         settle_timeout_s: SETTLE_TIMEOUT_S,
+        contact_gap_m: NO_CONTACT_CHECK_M,
     }
 }
 
@@ -3250,6 +3330,7 @@ async fn a_move_arm_joints_goal_on_a_busy_arm_is_refused_in_the_words_of_a_busy_
         duration_s: 30.0,
         settle_tolerances_rad: [SETTLE_TOLERANCE_RAD; 7],
         settle_timeout_s: SETTLE_TIMEOUT_S,
+        contact_gap_m: NO_CONTACT_CHECK_M,
     };
     let send =
         || move_arm_joints::send_goal(&harness, &goal, peppygen::DEFAULT_FEEDBACK_BOUND, DEADLINE);
@@ -3309,6 +3390,171 @@ async fn a_joint_path_whose_arm_stops_short_fails_its_settle_with_timeout() -> p
         "the failure came no sooner than the settle timeout: {}",
         failure.message
     );
+    harness.shutdown().await
+}
+
+// --- An arm that an object blocks -------------------------------------------
+
+/// The contact gap of the goals of these tests that ask for a contact check
+/// (m).
+const CONTACT_GAP_M: f64 = 0.01;
+
+/// How an arm move ended, in the words the three arm moves share.
+#[derive(Debug, PartialEq)]
+enum ArmMoveEnd {
+    /// Completed, with what its result says of the left arm's contact.
+    Completed { ended_on_contact: bool },
+    /// Failed with `timeout`.
+    TimedOut,
+}
+
+/// How the arm move `$action` ended from `$outcome`, `$ended_on_contact`
+/// reading the left arm's contact off its result.
+macro_rules! arm_move_end {
+    ($action:ident, $outcome:expr, $ended_on_contact:expr $(,)?) => {
+        match $outcome {
+            $action::ResultOutcome::Completed(data) => ArmMoveEnd::Completed {
+                ended_on_contact: $ended_on_contact(&data),
+            },
+            $action::ResultOutcome::Failed(failure)
+                if failure.kind == $action::FailureKind::Timeout =>
+            {
+                ArmMoveEnd::TimedOut
+            }
+            other => panic!(
+                "{} neither completed nor timed out: {other:?}",
+                stringify!($action)
+            ),
+        }
+    };
+}
+
+/// An arm move ends as its goal's contact gap says, and an arm that an
+/// object blocks holds where it stands after it.
+///
+/// The left arm first follows its commands. A move_arm 8 mm up with a contact
+/// gap of 1 cm completes with no contact: the whole line is shorter than the
+/// gap.
+///
+/// The test then brakes the arm, as an object in its way does. On each of
+/// move_arm_joints, execute_joint_path and move_arm:
+/// - a goal with no contact gap fails with `timeout`;
+/// - a goal with a contact gap completes, and its result says that the arm
+///   ended it on contact.
+///
+/// After each of these moves the node commands the arm the joints it stands
+/// at. The setpoint that brings the command back after a `timeout`, when the
+/// command had stood at rest on its target, comes with no velocity: the arm
+/// stands still where the command goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_arm_move_ends_by_its_contact_gap_and_a_blocked_arm_holds_where_it_stands()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
+
+    let (mut harness, mocks) = start_ready_vacant(params(), MODEL).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let arm = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    );
+    pump_right_arm_and_grippers!(mocks);
+    next_snapshot(&mut harness).await?;
+    let ready = launched_posture("left_arm", states::READY);
+    complete_left_arm_joint_move(&harness, ready, 0.0).await?;
+
+    let raise_by = async |harness: &mut Harness, from: [f64; 7], up_m: f64, contact_gap_m: f64| {
+        let snapshot = snapshot_measuring(harness, &from).await?;
+        let mut position = [0.0; 3];
+        position.copy_from_slice(&snapshot.positions[..3]);
+        position[2] += up_m;
+        let mut orientation = [0.0; 4];
+        orientation.copy_from_slice(&snapshot.orientations[..4]);
+        let goal = move_arm::send_goal(
+            harness,
+            &move_arm::GoalRequestData {
+                arm_name: "left_arm".to_string(),
+                position,
+                orientation: Some(orientation),
+                duration_s: 1.0,
+                settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
+                settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
+                settle_timeout_s: SETTLE_TIMEOUT_S,
+                contact_gap_m,
+            },
+            peppygen::DEFAULT_FEEDBACK_BOUND,
+            DEADLINE,
+        )
+        .await?;
+        assert!(goal.accepted, "goal refused: {:?}", goal.refusal);
+        let outcome = goal.get_result(DEADLINE).await?.outcome;
+        peppygen::Result::Ok(arm_move_end!(
+            move_arm,
+            outcome,
+            |data: &move_arm::ResultData| data.ended_on_contact
+        ))
+    };
+    assert_eq!(
+        raise_by(&mut harness, ready, 0.008, CONTACT_GAP_M).await?,
+        ArmMoveEnd::Completed {
+            ended_on_contact: false
+        },
+        "a free arm on a line shorter than the gap"
+    );
+
+    let stood = arm.brake().await;
+    let held_again = async |before: usize, expected: &ArmMoveEnd, action: &str| {
+        let back = arm.held_again_at(stood, before).await;
+        if *expected != ArmMoveEnd::TimedOut {
+            return;
+        }
+        let velocities = arm.velocities_received(back);
+        assert!(
+            velocities.iter().all(|v| v.abs() < 1e-3),
+            "{action}: the setpoint that brings the command back asks the arm to move: \
+             {velocities:?} rad/s"
+        );
+    };
+    for (contact_gap_m, expected) in [
+        (NO_CONTACT_CHECK_M, ArmMoveEnd::TimedOut),
+        (
+            CONTACT_GAP_M,
+            ArmMoveEnd::Completed {
+                ended_on_contact: true,
+            },
+        ),
+    ] {
+        let before = arm.received().len();
+        let outcome =
+            arm_joint_move_within(&harness, "left_arm", left_home(), 0.0, contact_gap_m).await?;
+        let ended = arm_move_end!(
+            move_arm_joints,
+            outcome,
+            |data: &move_arm_joints::ResultData| data.ended_on_contact
+        );
+        assert_eq!(ended, expected, "move_arm_joints, gap {contact_gap_m} m");
+        held_again(before, &expected, "move_arm_joints").await;
+
+        let before = arm.received().len();
+        let path = execute_joint_path::GoalRequestData {
+            contact_gap_m,
+            ..left_joint_path(&[left_home()], 0.0)
+        };
+        let ended = arm_move_end!(
+            execute_joint_path,
+            run_joint_path(&harness, &path).await?,
+            |data: &execute_joint_path::ResultData| data.arms[0].ended_on_contact
+        );
+        assert_eq!(ended, expected, "execute_joint_path, gap {contact_gap_m} m");
+        held_again(before, &expected, "execute_joint_path").await;
+
+        let before = arm.received().len();
+        let ended = raise_by(&mut harness, stood, 0.05, contact_gap_m).await?;
+        assert_eq!(ended, expected, "move_arm, gap {contact_gap_m} m");
+        held_again(before, &expected, "move_arm").await;
+    }
     harness.shutdown().await
 }
 

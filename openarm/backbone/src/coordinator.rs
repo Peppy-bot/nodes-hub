@@ -305,6 +305,7 @@ pub async fn run(
         }
         let arm_ticks = advance_arms(&mut channels, &mut planners, arm_admission, now).await;
         let paths = paths_of(PerArm::from_fn(|arm| arm_ticks[arm].on_path));
+        let holding: PerArm<_, ARMS> = PerArm::from_fn(|arm| arm_ticks[arm].holds);
         let (arm_candidate, hands) = arm_ticks
             .map(|_, tick| (tick.candidate, tick.streamed_hand))
             .unzip();
@@ -365,7 +366,13 @@ pub async fn run(
             // Desired velocity is the per-tick position delta; low-pass it per joint so a
             // noisy stream does not drive the arm's Kd term into buzz. The published
             // position (`governed_q`) is untouched, so tracking is unaffected.
-            let dq = filtered_velocity(&mut dq_filters[arm], &governed_q, &prev.arms[arm], dt);
+            let dq = published_velocity(
+                &mut dq_filters[arm],
+                &governed_q,
+                &prev.arms[arm],
+                holding[arm],
+                dt,
+            );
             if arm_admission[arm] == Admission::Stale {
                 continue;
             }
@@ -556,8 +563,10 @@ async fn serve_queued(
 ///   ([`MoveSlot::stop_unstarted`](crate::move_slot::MoveSlot::stop_unstarted)),
 ///   and ends when the loop takes it.
 /// - Each goal the stop ends is cancelled, for a reason that names the
-///   stop. The answer names the limbs whose move was in flight. The
-///   setpoints hold where they were last governed.
+///   stop. The answer names the limbs whose move was in flight. Each arm
+///   whose move had played holds where it stands: its command moves to the
+///   joints it measures. Every other setpoint holds where it was last
+///   governed.
 /// - A check asks the named arm's planner and moves nothing.
 /// - A grasp request answers the grasp pose of each arm.
 /// - The path of an execute_joint_path goal starts on every arm it moves, or
@@ -1176,6 +1185,7 @@ async fn tick_arm(
         }
         return planner::Tick {
             candidate: planner.setpoint(),
+            holds: false,
             streamed_hand: None,
             on_path: None,
         };
@@ -1265,6 +1275,22 @@ fn filtered_velocity(
     std::array::from_fn(|j| filters[j].filter((governed_q[j] - prev_q[j]) / dt))
 }
 
+/// The velocity published with one arm's setpoint `governed_q`, which the
+/// last tick governed to `prev_q`: the filtered rate of that step
+/// ([`filtered_velocity`]). A step of a hold (`holds`) moves the command onto
+/// an arm that stands still, so it asks the arm for the filtered rate of no
+/// step.
+fn published_velocity(
+    filters: &mut [LowPassFilter; ARM_DOF],
+    governed_q: &JointVec,
+    prev_q: &JointVec,
+    holds: bool,
+    dt: f64,
+) -> JointVec {
+    let step_from = if holds { governed_q } else { prev_q };
+    filtered_velocity(filters, governed_q, step_from, dt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,6 +1331,21 @@ mod tests {
 
     fn dq_filters() -> [LowPassFilter; ARM_DOF] {
         std::array::from_fn(|_| LowPassFilter::from_cutoff(CUTOFF_HZ, DT).unwrap())
+    }
+
+    /// A step of a hold, however long, asks the arm for no velocity, and an
+    /// ordinary step for its rate.
+    #[test]
+    fn a_step_of_a_hold_is_published_with_no_velocity() {
+        let prev = [0.0; ARM_DOF];
+        let q = [0.07; ARM_DOF];
+        let held = published_velocity(&mut dq_filters(), &q, &prev, true, DT);
+        assert_eq!(held, [0.0; ARM_DOF]);
+        let moved = published_velocity(&mut dq_filters(), &q, &prev, false, DT);
+        assert!(
+            moved.iter().all(|v| (v - 7.0).abs() < 1e-9),
+            "0.07 rad a tick at 100 Hz is 7 rad/s: {moved:?}"
+        );
     }
 
     #[test]

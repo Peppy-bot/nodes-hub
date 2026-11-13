@@ -2498,7 +2498,6 @@ dependencies = [
  "control_core",
  "instance_lock",
  "openarm_can",
- "openarm_description",
  "peppygen",
  "peppylib",
  "robot_description",

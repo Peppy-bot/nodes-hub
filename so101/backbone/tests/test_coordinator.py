@@ -11,6 +11,7 @@ from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
     GRIPPER_STILL_BAND,
     GRIPPER_STILL_WINDOW_S,
+    NO_CONTACT_CHECK_M,
     PUBLISH_FAILED,
     STALE_FOLLOWER_TIMEOUT_S,
     PlanFailure,
@@ -84,7 +85,7 @@ def test_plan_owns_the_arm_and_drops_mid_plan_stream_input(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.05, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.05, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
 
     c.leader_joints.set((9.0,) * 5)  # streamed input during the plan
     start = time.monotonic()
@@ -109,7 +110,7 @@ def test_abort_freezes_where_the_trajectory_stands(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     # Run the trajectory well past its start before cutting it, so freezing
     # where it stands is distinguishable from reporting where it began.
     start = time.monotonic()
@@ -464,7 +465,7 @@ def test_release_resets_anchors_to_measured(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.01, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.01, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     start = time.monotonic()
     while not adopted.done.is_set():
         c.measured_joints.set(MEASURED)  # the live follower keeps streaming
@@ -501,17 +502,21 @@ def test_a_held_arm_is_commanded_at_its_hold_until_its_plan_or_release(
     c.measured_joints.set(MEASURED)
     assert c.arm_tick(0.03) == held
     # The plan installed after it owns the arm.
-    adopted = c.adopt_arm_plan(plan(held, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(held, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     assert c.arm_tick(0.04) == adopted.profile.start
     c.abort_arm_plan(adopted)
-    assert c.arm_tick(0.05) is None
+    # The cut plan had started: one tick commands the arm where it stands,
+    # and the wire is silent after it.
+    assert c.arm_tick(0.05) == MEASURED
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(0.06) is None
     c.release_arm()
     # A release ends the hold too.
     assert c.try_claim_arm()
     c.hold_arm(held)
     c.release_arm()
     assert c.try_claim_arm()
-    assert c.arm_tick(0.06) is None
+    assert c.arm_tick(0.07) is None
 
 
 def test_follower_staleness_silences_the_stream_until_it_returns(fake_kinematics):
@@ -536,7 +541,7 @@ def test_follower_staleness_fails_an_active_arm_plan(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     assert c.arm_tick(time.monotonic()) is not None
     time.sleep(STALE_FOLLOWER_TIMEOUT_S * 1.5)
     assert c.arm_tick(time.monotonic()) is None
@@ -563,7 +568,7 @@ def test_publish_failure_fails_the_plan_the_setpoint_came_from(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     assert c.arm_tick(time.monotonic()) is not None
     c.arm_published(False, None)
     assert adopted.done.is_set()
@@ -579,7 +584,7 @@ def test_publish_failure_with_no_plan_touches_nothing(fake_kinematics):
     # A failed streamed publish has no goal to fail; the plan installed
     # between the tick and the outcome must be untouched.
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     c.arm_published(False, None)
     assert not adopted.done.is_set()
     assert adopted.failed is None
@@ -590,7 +595,7 @@ def test_final_sample_publish_failure_fails_the_goal(fake_kinematics):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.001, (1000.0,) * 5), ANYWHERE)
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 0.001, (1000.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     start = time.monotonic()
     target = None
     while target is None:
@@ -611,7 +616,7 @@ def test_gripper_streams_while_an_arm_plan_runs(fake_kinematics):
     c.measured_joints.set(MEASURED)
     c.measured_gripper.set(0.0)
     assert c.try_claim_arm()
-    c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE)
+    c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 10.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     c.arm_tick(time.monotonic())
     # The operator can still work the gripper during a long arm move.
     c.leader_gripper.set(1.0)
@@ -660,7 +665,9 @@ def test_admission_during_a_doomed_publish_anchors_on_delivered_state(fake_kinem
     c.arm_published(False, None)
 
 
-def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(fake_kinematics):
+def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(
+    fake_kinematics, follower_never_stale
+):
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     c.measured_gripper.set(0.0)
@@ -668,7 +675,7 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(f
     assert (c.stop_count, c.last_stop) == (1, "stopped: nothing yet")
 
     assert c.try_claim_arm() and c.try_claim_gripper()
-    arm_plan = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE)
+    arm_plan = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
     gripper_plan = adopt_gripper(c, 1.0)
     now = time.monotonic()
     sample = c.arm_tick(now)
@@ -678,16 +685,19 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(f
 
     assert c.stop_all("stopped: the operator asked") == ["arm", "gripper"]
 
-    # Each plan is cut where its stream stood, as a cancel cuts it, and
-    # carries the stop's message; the wire goes silent. The arm's cut is
-    # sampled at the stop's instant, a hair past the tick's.
+    # Each plan is cut as a cancel cuts it, and carries the stop's message.
+    # The arm's cut is sampled at the stop's instant, a hair past the tick's.
+    # The arm, whose plan had started, is commanded where it stands once; the
+    # gripper's wire goes silent.
     assert arm_plan.stopped == "stopped: the operator asked"
     assert arm_plan.aborted and arm_plan.done.is_set()
     assert arm_plan.frozen == pytest.approx(sample, abs=1e-6)
     assert gripper_plan.stopped == "stopped: the operator asked"
     assert gripper_plan.aborted and gripper_plan.done.is_set()
     assert gripper_plan.frozen == opening
-    assert c.arm_tick(now + 0.01) is None
+    assert c.arm_tick(now + 0.01) == MEASURED
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(now + 0.02) is None
     assert c.gripper_tick(now + 0.01) is None
     assert c.stop_count == 2
     # The goals release the slots, as after a cancel; the stop does not.
@@ -702,7 +712,7 @@ def test_an_arm_plan_keeps_commanding_its_end_sample_until_the_joints_settle(fak
     c = make_coordinator(fake_kinematics)
     c.measured_joints.set(MEASURED)
     assert c.try_claim_arm()
-    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle())
+    adopted = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M)
     c.arm_published(True, c.arm_tick(0.0))
     # At the planned end the follower still measures the start: the end
     # sample goes out and the plan stays installed.
@@ -731,7 +741,7 @@ def test_an_arm_plan_outside_its_tolerances_at_the_timeout_fails_naming_the_wors
     # out, within its 0.2 rad.
     target = (0.15, 0.15, 0.9, 0.35, 0.45)
     settle = arm_settle(tolerances_rad=(0.2, 0.1, 0.1, 0.1, 0.1), timeout_s=2.0)
-    adopted = c.adopt_arm_plan(plan(MEASURED, target, 1.0, (100.0,) * 5), settle)
+    adopted = c.adopt_arm_plan(plan(MEASURED, target, 1.0, (100.0,) * 5), settle, NO_CONTACT_CHECK_M)
     c.arm_published(True, c.arm_tick(0.0))
     for now in (1.0, 2.0, 2.9):
         c.measured_joints.set(MEASURED)
@@ -739,12 +749,322 @@ def test_an_arm_plan_outside_its_tolerances_at_the_timeout_fails_naming_the_wors
         c.arm_published(True, target)
         assert not adopted.done.is_set()
     c.measured_joints.set(MEASURED)
-    assert c.arm_tick(3.0) is None
+    # The tick of the timeout fails the plan and commands the arm where it
+    # stands; the wire is silent after it.
+    assert c.arm_tick(3.0) == MEASURED
     assert adopted.done.is_set()
     assert adopted.failed == PlanFailure(
         FailureKind.TIMEOUT, "still 0.700 rad from the target at joint 3, 2.0 s after the planned end"
     )
+    assert not adopted.ended_on_contact
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(3.01) is None
     c.release_arm()
+
+
+def grasp_points_apart(kinematics, joints, other) -> float:
+    """How far apart (m) the grasp points of two joint vectors stand."""
+    return math.dist(
+        kinematics.forward_kinematics(joints)[0], kinematics.forward_kinematics(other)[0]
+    )
+
+
+def test_a_cut_plan_that_had_started_commands_the_arm_where_it_stands_once(
+    fake_kinematics, follower_never_stale
+):
+    # The second joint's lower limit lies above where the follower measures
+    # it, so the stand is the measured joints clamped into the limits.
+    limits = limits_mod.JointLimits(lower=(-3.1, 0.15, -3.1, -3.1, -3.1), upper=(3.1,) * 5)
+    c = make_coordinator(fake_kinematics, limits=limits)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    adopted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    ahead = c.arm_tick(0.5)
+    c.arm_published(True, ahead)
+    assert ahead != MEASURED, "the command ran ahead of the arm"
+
+    c.abort_arm_plan(adopted)
+    stood = (MEASURED[0], 0.15, *MEASURED[2:])
+    assert c.arm_tick(0.51) == stood
+    c.arm_published(True, stood)
+    assert c.arm_tick(0.52) is None
+    # The hold the arm is owed outlives the release of the goal that the cut
+    # ended.
+    adopted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(1.0))
+    c.abort_arm_plan(adopted)
+    c.release_arm()
+    assert c.arm_tick(1.01) == stood
+
+
+def test_a_plan_cut_before_it_starts_owes_the_arm_no_hold(fake_kinematics, follower_never_stale):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    # Cut before its first tick: the arm never moved, and the wire is silent.
+    unstarted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.abort_arm_plan(unstarted)
+    assert c.arm_tick(0.0) is None
+
+
+def test_a_hold_owed_to_an_arm_that_goes_silent_waits_for_the_follower(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    cut = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    c.abort_arm_plan(cut)
+    # The follower goes silent before the next tick: nothing says where the
+    # arm stands, so the tick stays silent and the hold stays owed.
+    c.measured_joints.clear()
+    assert c.arm_tick(0.01) is None
+    # The follower reports again: the arm gets its hold, where it measures
+    # then.
+    returned = tuple(m + 0.02 for m in MEASURED)
+    c.measured_joints.set(returned)
+    assert c.arm_tick(0.02) == returned
+    c.arm_published(True, returned)
+    assert c.arm_tick(0.03) is None
+
+
+def test_a_plan_cut_in_the_dark_owes_no_hold(fake_kinematics, follower_never_stale):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    unseen = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    # The follower goes silent and the plan is cut: nothing says where the
+    # arm stands, so the arm keeps its last command.
+    c.measured_joints.clear()
+    c.abort_arm_plan(unseen)
+    assert c.arm_tick(0.01) is None
+    # The follower reports again, and the wire stays silent: the cut left
+    # no hold owed.
+    c.measured_joints.set(tuple(m + 0.02 for m in MEASURED))
+    assert c.arm_tick(0.02) is None
+    assert c.arm_tick(0.03) is None
+
+
+def test_a_plan_adopted_after_a_cut_takes_the_place_of_the_hold_the_arm_is_owed(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    cut = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    c.abort_arm_plan(cut)
+    # The next plan is installed before a tick commands the hold. It owns the
+    # arm to its end, and no hold follows it.
+    adopted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M
+    )
+    assert c.arm_tick(1.0) == MEASURED
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(2.0) == FAR_TARGET
+    c.arm_published(True, FAR_TARGET)
+    assert adopted.done.is_set()
+    assert c.arm_tick(2.01) is None
+
+
+def test_a_cut_during_the_publish_of_a_plan_sample_still_owes_the_hold(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    adopted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    # The cut lands between the tick that sampled the plan and the delivery
+    # of that sample: the delivered sample is no hold, and the next tick
+    # commands the arm where it stands.
+    sample = c.arm_tick(0.5)
+    c.abort_arm_plan(adopted)
+    c.arm_published(True, sample)
+    assert c.arm_tick(0.51) == MEASURED
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(0.52) is None
+
+
+def test_an_undelivered_hold_after_a_cut_goes_out_again_from_where_the_arm_then_stands(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    adopted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    c.arm_published(True, c.arm_tick(0.5))
+    c.abort_arm_plan(adopted)
+    assert c.arm_tick(0.51) == MEASURED
+    c.arm_published(False, None)
+    # The follower never got the hold, and the arm has sunk a little since:
+    # the next tick commands the joints measured then, and its delivery ends
+    # the hold.
+    sunk = tuple(m - 0.01 for m in MEASURED)
+    c.measured_joints.set(sunk)
+    assert c.arm_tick(0.52) == sunk
+    c.arm_published(True, sunk)
+    assert c.arm_tick(0.53) is None
+
+
+def test_an_undelivered_hold_at_the_settle_timeout_goes_out_again(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    adopted = c.adopt_arm_plan(
+        plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(), NO_CONTACT_CHECK_M
+    )
+    c.arm_published(True, c.arm_tick(0.0))
+    assert c.arm_tick(1.0) == FAR_TARGET
+    c.arm_published(True, FAR_TARGET)
+    # The tick of the timeout fails the plan with `timeout` and commands the
+    # hold; the follower does not get it.
+    assert c.arm_tick(3.0) == MEASURED
+    c.arm_published(False, None)
+    assert adopted.failed is not None and adopted.failed.kind is FailureKind.TIMEOUT
+    assert c.arm_tick(3.01) == MEASURED
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(3.02) is None
+
+
+def test_an_undelivered_hold_on_contact_fails_the_plan_and_goes_out_again(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    profile = plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5)
+    apart_m = grasp_points_apart(fake_kinematics, profile.sample(0.5), MEASURED)
+    adopted = c.adopt_arm_plan(profile, arm_settle(), contact_gap_m=0.5 * apart_m)
+    c.arm_published(True, c.arm_tick(0.0))
+    c.arm_published(True, c.arm_tick(0.5))
+    # The tick of the contact commands the hold; the follower does not get
+    # it, so the plan fails as a plan whose sample was not delivered.
+    assert c.arm_tick(0.51) == MEASURED
+    c.arm_published(False, None)
+    assert adopted.done.is_set()
+    assert adopted.failed == PUBLISH_FAILED
+    assert c.arm_tick(0.52) == MEASURED
+    c.arm_published(True, MEASURED)
+    assert c.arm_tick(0.53) is None
+
+
+def test_an_arm_that_an_object_holds_completes_its_plan_on_contact_where_it_stands(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    profile = plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5)
+    apart_m = grasp_points_apart(fake_kinematics, profile.sample(0.5), MEASURED)
+    assert apart_m > 0.0
+    adopted = c.adopt_arm_plan(profile, arm_settle(), contact_gap_m=0.5 * apart_m)
+    # The follower never leaves MEASURED. The first tick has no command to
+    # compare; the tick at 0.5 s finds the arm on the command of the first.
+    c.arm_published(True, c.arm_tick(0.0))
+    assert c.arm_tick(0.5) == profile.sample(0.5)
+    c.arm_published(True, profile.sample(0.5))
+    assert not adopted.done.is_set()
+    # The next tick finds the grasp point farther than the gap from that of
+    # the joints commanded last: the plan completes on the delivery of the
+    # command that holds the arm where it stands.
+    assert c.arm_tick(0.51) == MEASURED
+    assert adopted.ended_on_contact
+    assert not adopted.done.is_set(), "completion waits for delivery"
+    c.arm_published(True, MEASURED)
+    assert adopted.done.is_set()
+    assert adopted.failed is None
+    assert c.arm_tick(0.52) is None
+    c.release_arm()
+
+
+def test_a_gap_the_arm_stays_within_never_ends_its_plan_on_contact(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    profile = plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5)
+    apart_m = grasp_points_apart(fake_kinematics, profile.sample(0.5), MEASURED)
+    adopted = c.adopt_arm_plan(profile, arm_settle(), contact_gap_m=2.0 * apart_m)
+    c.arm_published(True, c.arm_tick(0.0))
+    c.arm_published(True, c.arm_tick(0.5))
+    # The arm stands the whole of `apart_m` behind its last command, inside
+    # the gap: the plan plays on.
+    assert c.arm_tick(0.51) == profile.sample(0.51)
+    c.arm_published(True, profile.sample(0.51))
+    # The arm follows to its target, and the plan completes by its settle.
+    c.measured_joints.set(FAR_TARGET)
+    assert c.arm_tick(1.0) == FAR_TARGET
+    c.arm_published(True, FAR_TARGET)
+    assert adopted.done.is_set()
+    assert not adopted.ended_on_contact
+    c.release_arm()
+
+
+def test_past_the_planned_end_a_settle_comes_before_a_contact_and_a_contact_before_the_timeout(
+    fake_kinematics, follower_never_stale
+):
+    tight_gap_m = 1e-6
+
+    def at_the_settle_timeout(measured_then):
+        """A plan whose first tick after its start is its planned end, the
+        follower at MEASURED until then, and the plan's next tick, on the
+        instant its settle timeout runs out, with the follower at
+        `measured_then`: the plan, and what that tick commands."""
+        c = make_coordinator(fake_kinematics)
+        c.measured_joints.set(MEASURED)
+        assert c.try_claim_arm()
+        adopted = c.adopt_arm_plan(
+            plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), arm_settle(timeout_s=2.0), tight_gap_m
+        )
+        c.arm_published(True, c.arm_tick(0.0))
+        # The arm stands on the command of the first tick: no contact.
+        assert c.arm_tick(1.0) == FAR_TARGET
+        c.arm_published(True, FAR_TARGET)
+        assert not adopted.done.is_set()
+        c.measured_joints.set(measured_then)
+        return c, adopted, c.arm_tick(3.0)
+
+    # Within the settle tolerances of the target, and past the gap from the
+    # command: the plan settles.
+    near = tuple(t - 0.05 for t in FAR_TARGET)
+    assert grasp_points_apart(fake_kinematics, FAR_TARGET, near) > tight_gap_m
+    c, settled, commanded = at_the_settle_timeout(near)
+    assert commanded == FAR_TARGET
+    c.arm_published(True, FAR_TARGET)
+    assert settled.done.is_set() and not settled.ended_on_contact
+    assert settled.failed is None
+
+    # Outside the settle tolerances, with the settle timeout run out: the
+    # plan completes on contact.
+    c, blocked, commanded = at_the_settle_timeout(MEASURED)
+    assert commanded == MEASURED
+    c.arm_published(True, MEASURED)
+    assert blocked.done.is_set() and blocked.ended_on_contact
+    assert blocked.failed is None
 
 
 def test_a_joint_settle_names_the_joint_farthest_outside_its_own_tolerance():

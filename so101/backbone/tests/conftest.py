@@ -170,13 +170,15 @@ def joint_path_goal(
     *waypoints,
     duration_s=0.0,
     settle_timeout_s=2.0,
+    contact_gap_m=0.0,
     tolerances=(0.1,) * 5,
     expected_start=(),
     arm_names=("arm",),
 ) -> execute_joint_path.GoalRequestData:
     """An execute_joint_path goal with an entry per name in `arm_names`, each
     through `waypoints`, settling within `tolerances` of the last and
-    expecting the arm at `expected_start`."""
+    expecting the arm at `expected_start`, with no contact check unless
+    `contact_gap_m` names a gap."""
     return execute_joint_path.GoalRequestData(
         arms=[
             execute_joint_path.GoalRequestDataArmsItem(
@@ -194,6 +196,7 @@ def joint_path_goal(
         ],
         duration_s=duration_s,
         settle_timeout_s=settle_timeout_s,
+        contact_gap_m=contact_gap_m,
     )
 
 

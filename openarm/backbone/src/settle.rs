@@ -1,10 +1,12 @@
-//! How an arm move settles: the slack and the time its goal names, the
-//! verdict the move gets from the planned end of its motion on, and how far a
-//! joint target or a grasp point still stands from its target. The joint and
-//! Cartesian moves are judged by this one rule.
+//! How an arm move ends: the slack and the time its goal names for its
+//! settle, the gap its goal names for a contact, the verdict the move gets on
+//! each tick, and how far a joint target or a grasp point still stands from
+//! its target. The joint move, the joint path and the Cartesian move are
+//! judged by this one rule.
 
 use std::time::{Duration, Instant};
 
+use control_core::positive_finite::PositiveFinite;
 use srs_model::ARM_DOF;
 use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
@@ -25,33 +27,62 @@ pub struct PoseTolerance {
     pub orientation_rad: f64,
 }
 
-/// How a move at or past its planned end ends.
+/// How far the measured grasp point of an arm may stand from the grasp point
+/// the arm is commanded to before its move ends on contact, as a goal's
+/// `contact_gap_m` names it: a gap in meters, or no contact check.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContactGap(Option<PositiveFinite>);
+
+impl ContactGap {
+    /// No contact check: the move ends by its settle alone.
+    pub const NONE: Self = Self(None);
+
+    /// The gap `gap_m` meters.
+    pub fn of(gap_m: PositiveFinite) -> Self {
+        Self(Some(gap_m))
+    }
+
+    /// Whether a measured grasp point `distance_m` from the commanded one
+    /// stands farther than the gap allows.
+    pub fn is_exceeded_by(self, distance_m: f64) -> bool {
+        self.0.is_some_and(|gap_m| distance_m > gap_m.get())
+    }
+}
+
+/// How a move ends on a tick.
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
     /// The measured limb stands within the tolerance of the target.
     Settled,
+    /// The measured grasp point stands farther from the commanded one than
+    /// the goal's contact gap allows, and the move completes on contact.
+    Contact,
     /// The timeout passed with the limb still short of the target, and the
     /// move fails with `timeout`; the message says how far and how long
     /// after the planned end.
     TimedOut(String),
 }
 
-/// Judge a move at `now` whose motion ends at `planned_end`: nothing before
-/// the planned end; from it on, settled once nothing stands short of the
-/// target, timed out once `timeout` has passed since the planned end with
-/// `shortfall` still standing, and in flight in between.
+/// Judge a move at `now` whose motion ends at `planned_end`, in the order
+/// limb_motion gives its ends. Before the planned end only a contact ends
+/// the move: `contact` says its grasp point stands past its contact gap.
+/// From the planned end on the move is settled once `shortfall` finds
+/// nothing short of the target; else it ends on contact; else it has timed
+/// out once `timeout` has passed since the planned end; and it is in flight
+/// otherwise. `shortfall` is asked from the planned end on.
 pub fn verdict(
-    shortfall: Option<String>,
+    shortfall: impl FnOnce() -> Option<String>,
+    contact: bool,
     planned_end: Instant,
     now: Instant,
     timeout: Duration,
 ) -> Option<Verdict> {
-    if now < planned_end {
-        return None;
-    }
-    let since_end = now.duration_since(planned_end);
-    match shortfall {
+    let Some(since_end) = now.checked_duration_since(planned_end) else {
+        return contact.then_some(Verdict::Contact);
+    };
+    match shortfall() {
         None => Some(Verdict::Settled),
+        Some(_) if contact => Some(Verdict::Contact),
         Some(shortfall) if since_end >= timeout => Some(Verdict::TimedOut(format!(
             "still {shortfall}, {:.1} s after the planned end",
             since_end.as_secs_f64()
@@ -113,6 +144,8 @@ pub fn pose_shortfall(
 mod tests {
     use super::*;
 
+    use std::cell::Cell;
+
     use hegel::TestCase;
     use hegel::generators as gs;
     use srs_model::nalgebra::{Translation3, UnitQuaternion, Vector3};
@@ -121,12 +154,15 @@ mod tests {
         Duration::from_secs_f64(s)
     }
 
-    // Nothing is judged before the planned end; from it on, the verdict
-    // settles on nothing short of the target, times out once the timeout has
-    // passed with a shortfall still standing, and waits in between.
+    // The verdict follows limb_motion's order. Before the planned end only a
+    // contact ends the move, and the settle is not judged. From it on the
+    // move settles on nothing short of the target, else ends on contact, else
+    // times out once the timeout has passed with a shortfall still standing,
+    // and waits otherwise.
     #[hegel::test]
-    fn the_verdict_settles_times_out_or_waits_by_shortfall_and_time(tc: TestCase) {
+    fn the_verdict_settles_ends_on_contact_times_out_or_waits(tc: TestCase) {
         let short: bool = tc.draw(gs::booleans());
+        let contact: bool = tc.draw(gs::booleans());
         let [since_end_s, timeout_s]: [f64; 2] =
             tc.draw(gs::arrays(gs::floats().min_value(-1.0).max_value(10.0)));
         let planned_end = Instant::now();
@@ -136,31 +172,56 @@ mod tests {
             planned_end + seconds(since_end_s)
         };
         let shortfall = short.then(|| "8 mm / 0.02 rad from the target".to_string());
+        let settle_judged = Cell::new(false);
         let judged = verdict(
-            shortfall.clone(),
+            || {
+                settle_judged.set(true);
+                shortfall.clone()
+            },
+            contact,
             planned_end,
             now,
             seconds(timeout_s.max(0.0)),
         );
+        assert_eq!(settle_judged.get(), now >= planned_end);
         if now < planned_end {
-            assert_eq!(judged, None, "judged before the planned end");
+            assert_eq!(
+                judged,
+                contact.then_some(Verdict::Contact),
+                "before the planned end only a contact ends the move"
+            );
             return;
         }
         let timed_out = now.duration_since(planned_end) >= seconds(timeout_s.max(0.0));
-        match (shortfall, timed_out, judged) {
-            (None, _, Some(Verdict::Settled)) => {}
-            (Some(shortfall), true, Some(Verdict::TimedOut(message))) => {
+        match (shortfall, contact, timed_out, judged) {
+            (None, _, _, Some(Verdict::Settled)) => {}
+            (Some(_), true, _, Some(Verdict::Contact)) => {}
+            (Some(shortfall), false, true, Some(Verdict::TimedOut(message))) => {
                 assert!(
                     message.starts_with(&format!("still {shortfall}, ")),
                     "{message}"
                 );
                 assert!(message.ends_with(" s after the planned end"), "{message}");
             }
-            (Some(_), false, None) => {}
-            (shortfall, timed_out, judged) => {
-                panic!("shortfall {shortfall:?}, timed out {timed_out}: {judged:?}")
+            (Some(_), false, false, None) => {}
+            (shortfall, contact, timed_out, judged) => {
+                panic!(
+                    "shortfall {shortfall:?}, contact {contact}, timed out {timed_out}: {judged:?}"
+                )
             }
         }
+    }
+
+    #[test]
+    fn a_contact_gap_is_exceeded_by_a_distance_past_it_alone() {
+        let gap = ContactGap::of(PositiveFinite::parse(0.005).expect("a positive gap"));
+        assert!(!gap.is_exceeded_by(0.0));
+        assert!(!gap.is_exceeded_by(0.005), "the gap itself is allowed");
+        assert!(gap.is_exceeded_by(0.0051));
+        assert!(
+            !ContactGap::NONE.is_exceeded_by(f64::MAX),
+            "no contact check is exceeded by no distance"
+        );
     }
 
     #[test]
@@ -168,7 +229,8 @@ mod tests {
         let planned_end = Instant::now();
         assert_eq!(
             verdict(
-                Some("8 mm / 0.02 rad from the target".to_string()),
+                || Some("8 mm / 0.02 rad from the target".to_string()),
+                false,
                 planned_end,
                 planned_end + seconds(2.04),
                 seconds(2.0)
