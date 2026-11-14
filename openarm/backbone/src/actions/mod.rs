@@ -4,8 +4,9 @@
 //! shares of the limbs it moves and ends with their one result, and an
 //! execute_joint_path goal for the share of each of its arms
 //! ([`collect_ends`]); the stop and the plan check ask the coordinator and
-//! answer what it says. The times and the tolerances every move goal names
-//! are parsed here, and each action's own fields in its module.
+//! answer what it says. The times and the tolerances every move goal names,
+//! and the contact gap every arm goal names, are parsed here, and each
+//! action's own fields in its module.
 
 pub mod arm;
 pub mod gripper;
@@ -26,6 +27,7 @@ use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind};
 use crate::move_slot::{ARM_BUSY, GRIPPER_BUSY, MoveSlot};
 use crate::robot::{ARMS, LIMBS};
+use crate::settle::ContactGap;
 use crate::streams::LeaderActivity;
 
 /// How long a service waits for the coordinator's answer before it gives an
@@ -57,6 +59,17 @@ fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, String> {
     Err(format!(
         "{field} must be a number of seconds from 0 to {MAX_MOVE_DURATION_S:.0}"
     ))
+}
+
+/// Parse the `contact_gap_m` of an arm goal off the wire: 0 for no contact
+/// check, a positive finite number of meters for a gap, or the refusal.
+fn contact_gap_from_wire(value: f64) -> Result<ContactGap, String> {
+    if value == 0.0 {
+        return Ok(ContactGap::NONE);
+    }
+    PositiveFinite::parse(value)
+        .map(ContactGap::of)
+        .map_err(|_| "contact_gap_m must be 0 or a positive number of meters".to_string())
 }
 
 /// The words of the refusals of a move on one kind of limb.
@@ -302,6 +315,43 @@ mod tests {
                     "settle_timeout_s must be a number of seconds from 0 to 60"
                 );
             }
+        }
+    }
+
+    // A contact gap off the wire is exactly 0, for no contact check, or a
+    // positive finite number of meters, carried as that gap.
+    #[hegel::test]
+    fn a_contact_gap_is_accepted_exactly_at_0_or_positive_and_finite(tc: TestCase) {
+        let value: f64 = tc.draw(gs::floats());
+        match contact_gap_from_wire(value) {
+            Ok(gap) => {
+                let expected =
+                    PositiveFinite::parse(value).map_or(ContactGap::NONE, ContactGap::of);
+                assert!(value.is_finite() && value >= 0.0, "{value} m was accepted");
+                assert_eq!(gap, expected);
+            }
+            Err(refusal) => {
+                assert!(
+                    !(value.is_finite() && value >= 0.0),
+                    "{value} m was refused"
+                );
+                assert_eq!(
+                    refusal,
+                    "contact_gap_m must be 0 or a positive number of meters"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_contact_gap_of_0_asks_for_no_contact_check_and_a_negative_one_is_refused() {
+        assert_eq!(contact_gap_from_wire(0.0), Ok(ContactGap::NONE));
+        assert_eq!(contact_gap_from_wire(-0.0), Ok(ContactGap::NONE));
+        for bad in [-1e-9, -0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                contact_gap_from_wire(bad).is_err(),
+                "gap {bad} must be refused"
+            );
         }
     }
 }

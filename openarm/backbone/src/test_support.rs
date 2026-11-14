@@ -26,7 +26,7 @@ use crate::planner::{
     JointPath, Measurement, PathGoal, PathGuard, PlanConfig, Planner, ShareReply, ShareReport,
 };
 use crate::robot::{self, ARMS};
-use crate::settle::Settle;
+use crate::settle::{ContactGap, Settle};
 
 #[path = "../tests/helpers/params.rs"]
 mod params;
@@ -205,8 +205,8 @@ pub(crate) fn array_of(arms: &ArmOrder, joints: &PerArm<JointVec, ARMS>) -> Vec<
 }
 
 /// A goal of a path of `arms` through `waypoints` over `duration` at least,
-/// with no expected start, settling under `settle`, reporting on `reply`,
-/// holding the slot `slot_of` gives each of its arms.
+/// with no expected start and no contact check, settling under `settle`,
+/// reporting on `reply`, holding the slot `slot_of` gives each of its arms.
 pub(crate) fn path_goal_through<'a>(
     arms: &ArmOrder,
     waypoints: &[PerArm<JointVec, ARMS>],
@@ -223,6 +223,7 @@ pub(crate) fn path_goal_through<'a>(
         },
         expected_starts: vec![None; arms.ids().len()],
         settle,
+        contact: ContactGap::NONE,
         reply,
         move_slots: arms
             .ids()

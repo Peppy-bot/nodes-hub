@@ -3,7 +3,8 @@
 //! limbs whose move was ended. The moves of both contracts run on the
 //! coordinator's tick, so the request is handed to it and its reply awaited
 //! ([`CoordinatorRequest::Stop`]); each goal a stop ends is cancelled with a
-//! reason that names the stop, and the arm holds where it was last governed.
+//! reason that names the stop, and each arm whose move it ends holds where it
+//! stands.
 //! A coordinator that does not answer cannot carry the stop out: the caller
 //! gets an error reply with `attempt_failed`.
 

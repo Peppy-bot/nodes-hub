@@ -23,7 +23,8 @@ interaction modes:
   The group the next Execute does not fire dims. The backbone completes an arm
   move once the measured arm stands within the tolerance of the target at or
   after the planned end, and fails it with `timeout` and the remaining error
-  once the timeout runs out. The inputs are prefilled with 2 s, 2 s, 0.1 rad,
+  once the timeout runs out. A panel move asks for no contact check
+  (`contact_gap_m` 0), so its settle alone ends it. The inputs are prefilled with 2 s, 2 s, 0.1 rad,
   20 mm and 0.15 rad, and send what the operator types; the backbone refuses a
   value out of its range with `rejected`. The status line shows each refusal
   and failure as its failure kind and message, such as `backbone refused the

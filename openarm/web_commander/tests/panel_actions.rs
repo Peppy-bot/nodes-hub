@@ -88,6 +88,10 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
         pending.request.settle_timeout_s, SETTLE_TIMEOUT_S,
         "the goal must carry the operator's settle timeout as typed"
     );
+    assert_eq!(
+        pending.request.contact_gap_m, 0.0,
+        "a panel move asks for no contact check"
+    );
     let goal_joints = pending.request.joint_positions;
     // The node's goal-accept timeout is 2 s, so admit before observing state.
     let active = pending.accept().await?;
@@ -101,6 +105,7 @@ async fn panel_commands_drive_backbone_and_recorder() -> peppygen::Result<()> {
     active
         .complete(&move_arm_joints::ResultResponseData {
             final_joint_positions: goal_joints,
+            ended_on_contact: false,
             action_time: 0.42,
         })
         .await?;

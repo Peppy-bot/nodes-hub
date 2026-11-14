@@ -7,18 +7,15 @@ import json
 
 import entries  # noqa: F401  pylint: disable=W0611  (puts the engine on the path)
 import pytest
-import robot_description_py
 from sim_robot_core.errors import ModelEntryError
 
 import catalogue_robots
 from catalogue_robots import ServoGains
 
-SO101 = robot_description_py.model("so101")
 ARM = {
     "id": "so101",
     "source": {"base": "https://example.invalid/so101/", "scene": "scene.xml"},
     "tree": "robots/so101/" + "1" * 64 + "/index.json",
-    "description": {"urdf": "so101.urdf", "srdf": "so101.srdf"},
     "wrapper": "mounted.xml",
     "mount": {"body": "arm_mount", "stance": "mounted"},
     "linkBodies": {"gripper_link": "gripper"},
@@ -35,13 +32,8 @@ ARM = {
 }
 
 
-def _read(tmp_path, *robots, stood=("so101",), urdf=SO101.urdf, srdf=SO101.srdf):
-    """The robots `stood` of a release of `robots`, which ships `urdf` and
-    `srdf` as the SO-101's description."""
-    directory = tmp_path / "so101"
-    directory.mkdir()
-    (directory / "so101.urdf").write_bytes(urdf.encode())
-    (directory / "so101.srdf").write_bytes(srdf.encode())
+def _read(tmp_path, *robots, stood=("so101",)):
+    """The robots `stood` of a release of `robots`."""
     (tmp_path / "robots.json").write_text(json.dumps(list(robots)))
     return catalogue_robots.read(tmp_path, list(stood))
 
@@ -70,8 +62,6 @@ def test_a_robot_without_gains_runs_its_files_actuators(tmp_path):
 @pytest.mark.parametrize(
     "change, refusal",
     [
-        ({"description": None}, "names no description, the URDF and SRDF its MJCF stands for, got None"),
-        ({"description": {"urdf": "so101.urdf"}}, "names no description"),
         ({"mount": None}, "mount must be an object"),
         ({"mount": {"stance": "mounted"}}, "names no mount body"),
         ({"wrapper": None, "source": {}}, "names neither a wrapper nor a source scene"),
@@ -94,37 +84,6 @@ def test_a_robot_without_gains_runs_its_files_actuators(tmp_path):
 def test_a_bad_robot_is_refused_naming_it(tmp_path, change, refusal):
     with pytest.raises(ModelEntryError, match=f"robots.json: robot 'so101': {refusal}"):
         _read(tmp_path, {**ARM, **change})
-
-
-def test_a_robot_that_names_no_description_is_refused_naming_it(tmp_path):
-    undescribed = {key: value for key, value in ARM.items() if key != "description"}
-    with pytest.raises(ModelEntryError, match="robots.json: robot 'so101': names no description"):
-        _read(tmp_path, undescribed)
-
-
-@pytest.mark.parametrize(
-    "files, named",
-    [
-        ({"srdf": SO101.srdf + "\n"}, "so101.srdf"),
-        ({"urdf": SO101.urdf + "\n", "srdf": SO101.srdf + "\n"}, "so101.urdf and so101.srdf"),
-    ],
-)
-def test_a_description_that_is_not_robot_descriptions_is_refused_naming_what_to_pack(tmp_path, files, named):
-    with pytest.raises(
-        ModelEntryError,
-        match=f"robots.json: robot 'so101': the release ships another {named} than "
-        "robot_description's so101: pack the catalogue again with Waldo's catalogue.mjs pack",
-    ):
-        _read(tmp_path, ARM, **files)
-
-
-def test_a_model_robot_description_does_not_bundle_is_refused_naming_it(tmp_path):
-    with pytest.raises(
-        ModelEntryError,
-        match="robots.json: robot 'aloha': robot_description bundles no such model: "
-        'no robot model is named "aloha"',
-    ):
-        _read(tmp_path, {**ARM, "id": "aloha"}, stood=("aloha",))
 
 
 def test_only_the_robots_the_engine_stands_are_read(tmp_path):

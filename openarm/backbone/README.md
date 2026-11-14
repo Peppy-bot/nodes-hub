@@ -158,9 +158,9 @@ field pose.
 
 | Action | Goal | Refused when (`rejected`, `leader_streaming`, `precondition_failed` for a busy arm) |
 |---|---|---|
-| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a leader streaming the arm, the arm busy |
-| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a leader streaming a named arm, a named arm busy |
-| `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a leader streaming the arm, the arm busy |
+| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a negative contact gap, a leader streaming the arm, the arm busy |
+| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a negative contact gap, a leader streaming a named arm, a named arm busy |
+| `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a negative contact gap, a leader streaming the arm, the arm busy |
 | `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, the gripper busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture, and no command to the grippers) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
 | `move_to_home` | `duration_s`, the time of the arm move alone (the postures contract; both grippers closed, then both arms to the Home rest) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm or either gripper, either arm or either gripper busy |
@@ -206,10 +206,46 @@ the measured grasp point stands within `settle_position_tolerance_m` and
 still stands outside its tolerance `settle_timeout_s` after the planned end
 fails with `timeout` and the remaining error, `still 0.031 rad from the target
 at joint 4, 2.0 s after the planned end` or `still 8.0 mm / 0.02 rad from the
-target, 2.0 s after the planned end`, and the arm holds where it stands: on
-the target, or where the governor held it short. A failed goal gives no result. A goal that completes or ends cancelled reports the
-measured state at that moment; a cancel of its caller ends it for the reason
-`cancelled by its caller`. A posture move completes once each arm stands
+target, 2.0 s after the planned end`. A failed goal gives no result. A goal
+that completes or ends cancelled reports the measured state at that moment; a
+cancel of its caller ends it for the reason `cancelled by its caller`.
+
+A `move_arm_joints`, `execute_joint_path` or `move_arm` goal with
+`contact_gap_m` above 0 also ends on contact. On each tick of the move the
+arm's planner compares two grasp points: the one of the joints the arm
+measures, and the one of the joints the arm was commanded to last
+(`Planner::stands_on_contact`, one check for the three moves). An arm that an
+object holds on its way falls behind its command. Once the two grasp points
+stand farther apart than the gap, the move completes with `ended_on_contact`
+true, and its result gives where the arm stands. The ends of a move come in
+the order of the limb_motion contract (`settle::verdict`): a cancel or the
+stop, a settle, which completes the move with `ended_on_contact` false, a
+contact, and the settle timeout. A gap of 0 is no contact check.
+
+What the arm is commanded to after a move depends on how the move ended
+(`Planner::end_move`):
+
+| End of the move | The arm's command from then on |
+|---|---|
+| Settled | the target of the move |
+| Ended on contact, failed with `timeout`, cancelled, or ended by `stop`, once the planner had started the move | it moves to the joints the arm measures on that tick, clamped into its joint limits, and holds them: an arm that an object holds short of its command stops pushing on it |
+| Ended with no fresh measurement of the arm (its follower stopped reporting) | the command it was last governed to |
+| Refused, failed before the planner started the move, or ended while a joint path waited for its judgment | the command as it was |
+
+The command moves to the measured joints as every command moves
+(`Planner::hold_where_it_stands`): a step of the joint velocity limits each
+tick, each step judged by the governor. The first step goes out on the tick
+the move ends, and for a share of a joint path, whose end is judged once its
+step is governed, on the tick after. The arm stands still where the command
+goes, so these steps are published with no velocity (`published_velocity`).
+Where the collision guard slows or holds those steps, the command stops
+where the guard leaves it once the steps the way takes at the velocity
+limits have run out, so a command the guard holds at the stop distance stays
+there, and no step toward that pose comes later. A move or a leader's stream
+that takes the command ends the hold; a joint path that waits for its
+judgment leaves it standing, and the hold goes on if the path never runs.
+
+A posture move completes once each arm stands
 within 0.1 rad of the posture in every joint, fails with `timeout` 2 s after
 the planned end otherwise, and reports where each arm stands. When the arm's follower stops reporting, the
 move fails with `resource_unavailable` and `the follower stopped reporting`,
@@ -364,7 +400,15 @@ its failure leads with its arm's name (`right_arm: the follower stopped
 reporting`), and the goal fails with the failure of the share that failed
 first. The goal completes once every named arm settles, and gives each
 arm's joints as its share measured them when it ended, in the order of
-`arms`, and the time since the path started.
+`arms`, and the time since the path started. A goal with `contact_gap_m`
+above 0 ends on contact for every named arm once one arm stands past the
+gap: both shares are judged on one reading of the contact of both arms
+(`planner::commit_both`), so on that tick that arm's share completes with
+`ended_on_contact` true, the other share with `ended_on_contact` false, and
+the goal completes. A contact of one arm comes before the settle timeout of
+the other. Each arm of a path that played and then ended on contact, failed,
+was cancelled or was stopped holds where it stands, as above; a goal that
+ends cancelled says `ended_on_contact` false for every arm.
 
 `move_to_ready` and `move_to_home` give each arm's planner a joint move to
 the posture. The goal completes once both arms settled at the posture: each
@@ -425,8 +469,8 @@ A goal that completes or ends cancelled gives the pose of each arm:
 Each pose is the grasp point of the arm in the robot frame. The
 coordinator measures both arms when the posture goal completes, after the
 moves of both arms ended. limb_state gives the same pose for the same
-joints. After a cancel or a stop, the pose is where the arm stopped. A
-moving arm can then settle a little further, to the setpoint it holds.
+joints. After a cancel or a stop, the pose is where the arm stood on that
+tick, and the arm's command moves there and holds it.
 
 When an arm has no fresh measurement when the goal ends, the three arrays
 are empty, and the log says why: the follower of the arm stopped reporting,
@@ -444,9 +488,12 @@ takes it: the stop marks the move slot of the limb. This ends a goal on its
 way from its action to the coordinator, and a `move_to_home` goal between
 the end of its close and the moves of its arms. Each goal ends cancelled for
 the reason `stopped: <reason>` (`stopped` for an empty reason), a posture
-goal too. Each limb holds the setpoint it was last governed to, as after a
-cancel, and the answer's `stopped` names the limbs whose move was in flight,
-empty when none was. The stop does not latch: a goal admitted after it runs.
+goal too. Each arm whose move the stop ends holds where it stands, as after
+a cancel: its command moves to the joints it measures on the stop's tick. An
+arm with no fresh measurement, and an arm whose joint path had not started
+to play, keeps the command it was last governed to, and so does each gripper.
+The answer's `stopped` names the limbs whose move was in flight, empty when
+none was. The stop does not latch: a goal admitted after it runs.
 A leader's streamed setpoints are not stopped.
 A coordinator that does not answer cannot carry the stop out: the stop then
 gives an error reply with `attempt_failed`.
@@ -562,7 +609,7 @@ The robot's own body is not checked for hiding a point from the camera.
 | `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
 | `planner/stream_smoothing.rs` | the smoothing of a streamed pose's steps: one Butterworth per joint at MoveIt Servo's default cutoff for the control period | a smoother can overshoot its input, so the planner holds its output to the velocity limit |
 | `path_checks.rs` | the judgments of `execute_joint_path` paths on a blocking thread, and the resumption of their shares on the tick each judgment comes | the loop never waits on a judgment |
-| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move settles within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
+| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move settles within), `ContactGap` (the gap a goal names for a contact), the verdict an arm move gets on each tick, and how far a joint target or a grasp point still stands from its target | one rule for the joint move, the joint path and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
 | `governor/sense.rs` | the pre-projection model read (`Sensed`) | limiters and the projection decide on one snapshot |
 | `governor/model.rs` | `ConfiguredModel`, the only door to the collision model | every query takes the whole configuration; stale-placement reads are unrepresentable |

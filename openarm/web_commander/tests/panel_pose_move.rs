@@ -84,6 +84,7 @@ async fn firing_a_pose_carries_the_settle_fields_and_reports_the_backbone_verdic
         .await?
         .complete(&move_arm_joints::ResultResponseData {
             final_joint_positions: SETTLED_JOINTS,
+            ended_on_contact: false,
             action_time: 0.1,
         })
         .await?;
@@ -127,6 +128,10 @@ async fn firing_a_pose_carries_the_settle_fields_and_reports_the_backbone_verdic
         ),
         "the goal must carry the operator's settle fields as typed"
     );
+    assert_eq!(
+        pending.request.contact_gap_m, 0.0,
+        "a panel move asks for no contact check"
+    );
     let goal_position = pending.request.position;
     let goal_orientation = pending
         .request
@@ -144,6 +149,7 @@ async fn firing_a_pose_carries_the_settle_fields_and_reports_the_backbone_verdic
         .complete(&move_arm::ResultResponseData {
             final_position: goal_position,
             final_orientation: goal_orientation,
+            ended_on_contact: false,
             action_time: 0.42,
         })
         .await?;
