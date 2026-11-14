@@ -15,7 +15,6 @@ mod common;
 use chain_kinematics::nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
 use motion_planner::node::NO_DEPTH_FRAME;
 use motion_planner::request::{MAX_PLANNING_TIME_S, Named, Planner, Refiner};
-use openarm_description::{ARM_DOF, HardwareVersion, Side, ready};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalGoalPositionConstraintsItem,
     GoalPathOrientationConstraintsItem,
@@ -27,13 +26,16 @@ use peppygen::fixtures::exposed_services::motion_planning::{
     check_joint_path, clear_occupancy_map, describe_arms,
 };
 use peppygen::fixtures::harness::{Config, Harness};
+use robot_description::{ArmId, states};
 
 use common::{
-    CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, TIMEOUT,
-    UNDER_THE_TABLE, along, arms, at_ms, check, describe_camera, facing_the_robot, left_elbow,
-    left_path, parameters, plan, plan_from, plan_to, planned_waypoints, publish_arms, render,
-    start, start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
-    start_without_the_rig, take_frame, take_frame_aligned, under_a_seen_table,
+    ARM_DOF, BOTH, CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT, OPENARM_V2, RIGHT, TIMEOUT, along, arms,
+    at_ms, check, describe_camera, facing_the_robot, left_elbow, left_path, left_ready,
+    over_the_table, parameters, plan, plan_from, plan_to, planned_waypoints, posture, posture_of,
+    publish_arms, publish_arms_with_grippers_at, render, right_ready, start, start_described,
+    start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
+    start_without_the_rig, take_frame, take_frame_aligned, under_a_seen_table, under_the_table,
+    vacant_camera, wait_for_the_arms,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -54,7 +56,7 @@ const GRASP_AXIS_RAD: f64 = 0.01;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plan_or_a_check_waits_for_a_depth_frame() -> peppygen::Result<()> {
     let (harness, mocks) = start_with_camera(&facing_the_robot()).await?;
-    let start = arms(LEFT_READY, RIGHT_READY);
+    let start = arms(left_ready(), right_ready());
     let goal = left_elbow(1.3);
     let refused = |ended: Result<ResultData, Ended>| {
         let Err(Ended::Refused(failure)) = ended else {
@@ -77,21 +79,21 @@ async fn a_plan_or_a_check_waits_for_a_depth_frame() -> peppygen::Result<()> {
 
     publish_arms(&mocks, at_ms(0), &start).await?;
     refused(plan(&harness, &plan_to(&goal)).await);
-    waiting(check(&harness, &left_path(&LEFT_READY, &[goal])).await);
+    waiting(check(&harness, &left_path(&left_ready(), &[goal])).await);
 
     let nothing = vec![None; (common::WIDTH * common::HEIGHT) as usize];
-    take_frame(&harness, &mocks, at_ms(0), &nothing, LEFT_READY).await?;
+    take_frame(&harness, &mocks, at_ms(0), &nothing, left_ready()).await?;
     let planned = plan(&harness, &plan_to(&goal)).await.expect("a path");
     assert_eq!(planned.map_stamp, Some(at_ms(0)));
     let arm = &planned.arms[0];
     assert_eq!(arm.arm_name, "left_arm");
-    assert_eq!(arm.start_joint_positions, LEFT_READY.to_vec());
+    assert_eq!(arm.start_joint_positions, left_ready().to_vec());
     let last = planned_waypoints(&planned).pop().expect("a waypoint");
     assert!(
         (0..ARM_DOF).all(|j| (last[j] - goal[j]).abs() <= 0.01 + 1e-9),
         "the path ends at {last:?}, not within 0.01 of {goal:?}"
     );
-    let chain = OPENARM_V2.arms[Side::Left].geometry.chain();
+    let chain = OPENARM_V2.arms[LEFT].geometry.chain();
     for waypoint in &arm.waypoints {
         let q: [f64; ARM_DOF] = waypoint.joint_positions.as_slice().try_into().expect("7");
         let pose = chain.world_ee_pose(&q);
@@ -105,10 +107,10 @@ async fn a_plan_or_a_check_waits_for_a_depth_frame() -> peppygen::Result<()> {
 
     clear_occupancy_map::poll(&harness, TIMEOUT).await?;
     refused(plan(&harness, &plan_to(&goal)).await);
-    waiting(check(&harness, &left_path(&LEFT_READY, &[goal])).await);
+    waiting(check(&harness, &left_path(&left_ready(), &[goal])).await);
 
     publish_arms(&mocks, at_ms(1_000), &start).await?;
-    take_frame(&harness, &mocks, at_ms(1_000), &nothing, LEFT_READY).await?;
+    take_frame(&harness, &mocks, at_ms(1_000), &nothing, left_ready()).await?;
     assert_eq!(
         plan(&harness, &plan_to(&goal))
             .await
@@ -127,9 +129,9 @@ async fn a_frame_of_another_alignment_asks_the_camera_again() -> peppygen::Resul
     let camera = facing_the_robot();
     let (harness, mocks) = start_with_camera(&camera).await?;
     describe_camera(&mocks, &camera, "none")?;
-    publish_arms(&mocks, at_ms(0), &arms(LEFT_READY, RIGHT_READY)).await?;
+    publish_arms(&mocks, at_ms(0), &arms(left_ready(), right_ready())).await?;
     let nothing = vec![None; (common::WIDTH * common::HEIGHT) as usize];
-    take_frame_aligned(&harness, &mocks, at_ms(0), &nothing, LEFT_READY, "none").await?;
+    take_frame_aligned(&harness, &mocks, at_ms(0), &nothing, left_ready(), "none").await?;
     let lens = mocks
         .deps
         .geometry
@@ -152,9 +154,9 @@ async fn the_arms_own_points_mark_nothing_while_they_move() -> peppygen::Result<
     let camera = facing_the_robot();
     let (harness, mocks) = start_with_camera(&camera).await?;
     let (before, after, halfway) = (left_elbow(0.6), left_elbow(1.6), left_elbow(1.1));
-    publish_arms(&mocks, at_ms(0), &arms(before, RIGHT_READY)).await?;
-    publish_arms(&mocks, at_ms(100), &arms(after, RIGHT_READY)).await?;
-    let frame = render(&camera, Some(&arms(halfway, RIGHT_READY)), &[]);
+    publish_arms(&mocks, at_ms(0), &arms(before, right_ready())).await?;
+    publish_arms(&mocks, at_ms(100), &arms(after, right_ready())).await?;
+    let frame = render(&camera, Some(&arms(halfway, right_ready())), &[]);
     assert!(
         frame.iter().flatten().count() > 100,
         "the camera sees the arms"
@@ -171,8 +173,8 @@ async fn the_arms_own_points_mark_nothing_while_they_move() -> peppygen::Result<
     assert_eq!(back.map_stamp, Some(at_ms(50)));
 
     clear_occupancy_map::poll(&harness, TIMEOUT).await?;
-    publish_arms(&mocks, at_ms(1_000), &arms(before, RIGHT_READY)).await?;
-    publish_arms(&mocks, at_ms(1_100), &arms(after, RIGHT_READY)).await?;
+    publish_arms(&mocks, at_ms(1_000), &arms(before, right_ready())).await?;
+    publish_arms(&mocks, at_ms(1_100), &arms(after, right_ready())).await?;
     take_frame(&harness, &mocks, at_ms(1_000), &frame, after).await?;
     let marked = check(&harness, &left_path(&[], &[before]))
         .await
@@ -192,7 +194,7 @@ async fn the_arms_own_points_mark_nothing_while_they_move() -> peppygen::Result<
 // planned path around the table passes whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen::Result<()> {
-    let (under_q, over_q) = (UNDER_THE_TABLE, OVER_THE_TABLE);
+    let (under_q, over_q) = (under_the_table(), over_the_table());
     let (harness, _mocks, crossing_t) = under_a_seen_table().await?;
 
     let through = check(&harness, &left_path(&[], &[over_q]))
@@ -226,7 +228,7 @@ async fn a_check_passes_a_planned_path_and_stops_before_the_table() -> peppygen:
 
     // The elbow opened past its lower limit, the hand moving down from under the table.
     let mut beyond = below;
-    beyond[3] = HardwareVersion::V2.joint_limits(Side::Left)[3][0] - 0.1;
+    beyond[3] = OPENARM_V2.arms[LEFT].geometry.chain().limits()[3].lo - 0.1;
     let outside = check(&harness, &left_path(&[], &[below, beyond]))
         .await
         .expect("an answer");
@@ -295,14 +297,14 @@ fn named_axis(name: &str) -> Vector3<f64> {
 /// the middle of the gripper's finger joints to the grasp point, along which the
 /// gripper approaches, and the direction from one finger joint to the other, along
 /// which its jaws close.
-fn grasp_axes(side: Side) -> (Vector3<f64>, Vector3<f64>) {
+fn grasp_axes(side: ArmId) -> (Vector3<f64>, Vector3<f64>) {
     let chain = OPENARM_V2.arms[side].geometry.chain();
-    let q = ready(side);
+    let q = posture(side, states::READY);
     let grasp = chain.world_ee_pose(&q);
     let posed = chain.at(&q);
     let joints: Vec<Vector3<f64>> = OPENARM_V2
         .own
-        .fingers(side.into(), &OPENARM_V2.arms[side].geometry)
+        .fingers(side, &OPENARM_V2.arms[side].geometry)
         .expect("the arm's fingers")
         .into_iter()
         .map(|finger| {
@@ -316,28 +318,154 @@ fn grasp_axes(side: Side) -> (Vector3<f64>, Vector3<f64>) {
     (-((a + b) / 2.0).normalize(), (b - a).normalize())
 }
 
-// A robot whose identity names a model the planner holds no model of ends the node with
-// a fault that names the model and the ones it plans for.
+// An OpenArm v1 plans with no planner change: its description alone gives the planner its
+// arms, which bear the names of OpenArm v2's, and a joint goal of its left arm plans.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unknown_model_ends_the_node_with_a_fault() -> peppygen::Result<()> {
+async fn openarm_v1_plans_from_its_description_alone() -> peppygen::Result<()> {
+    let config = Config {
+        camera_mounts_vacant: true,
+        workspace_vacant: true,
+        ..vacant_camera()
+    };
+    let (harness, mocks, _fault) = start_identified_as(config, "openarm_v1").await?;
+    let v1 = robot_description::model("openarm_v1")
+        .expect("robot_description bundles OpenArm v1")
+        .description();
+    let names: Vec<&str> = v1.arms().iter().map(|arm| arm.name.as_str()).collect();
+    let v2_names: Vec<&str> = BOTH
+        .iter()
+        .map(|arm| OPENARM_V2.arms[*arm].name.as_str())
+        .collect();
+    assert_eq!(names, v2_names);
+    let ready = |arm| posture_of("openarm_v1", arm, states::READY);
+    publish_arms(&mocks, at_ms(0), &arms(ready(LEFT), ready(common::RIGHT))).await?;
+    wait_for_the_arms(&harness, ready(LEFT)).await;
+    let mut goal = ready(LEFT);
+    goal[3] += 0.3;
+    let planned = plan(&harness, &plan_to(&goal)).await.expect("a path");
+    let last = planned_waypoints(&planned)
+        .last()
+        .copied()
+        .expect("a path ends");
+    assert!(
+        (0..ARM_DOF).all(|j| (last[j] - goal[j]).abs() <= 0.01 + 1e-9),
+        "{last:?} against {goal:?}"
+    );
+    harness.shutdown().await
+}
+
+// Each OpenArm plans its left arm from Home to Ready and from Ready to Home, its grippers shut and
+// open: its Home stands clear of the planner's own clearance at every opening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_openarm_plans_to_and_from_home_with_its_grippers_shut_and_open()
+-> peppygen::Result<()> {
+    for model in ["openarm_v1", "openarm_v2"] {
+        for opening in [0.0, 1.0] {
+            for (start, end) in [(states::HOME, states::READY), (states::READY, states::HOME)] {
+                let config = Config {
+                    camera_mounts_vacant: true,
+                    workspace_vacant: true,
+                    ..vacant_camera()
+                };
+                let (harness, mocks, _fault) = start_identified_as(config, model).await?;
+                let at = |arm, name| posture_of(model, arm, name);
+                let stand = arms(at(LEFT, start), at(RIGHT, start));
+                publish_arms_with_grippers_at(&mocks, at_ms(0), &stand, opening).await?;
+                wait_for_the_arms(&harness, at(LEFT, start)).await;
+                let goal = at(LEFT, end);
+                let planned = plan(&harness, &plan_to(&goal))
+                    .await
+                    .unwrap_or_else(|ended| {
+                        panic!("{model}, grippers at {opening}: {start} to {end}: {ended:?}")
+                    });
+                let last = planned_waypoints(&planned)
+                    .last()
+                    .copied()
+                    .expect("a path ends");
+                assert!(
+                    (0..ARM_DOF).all(|j| (last[j] - goal[j]).abs() <= 0.01 + 1e-9),
+                    "{model}, grippers at {opening}: {start} to {end} ends at {last:?}"
+                );
+                harness.shutdown().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// A robot whose description names no arm ends the node with a fault that names the cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_description_of_no_arm_ends_the_node_with_a_fault() -> peppygen::Result<()> {
     let config = Config {
         parameters: Some(parameters()),
         ..Config::default()
     };
-    let (harness, _mocks, fault) = start_identified_as(config, "openarm_v1").await?;
+    let bundled = robot_description::model("so101").expect("robot_description bundles SO-101");
+    let srdf = bundled.srdf();
+    let start = srdf.find("<end_effector").expect("an end effector");
+    let end = srdf[start..].find("/>").expect("a closed element") + start + 2;
+    let armless = format!("{}{}", &srdf[..start], &srdf[end..]);
+    let (harness, _mocks, fault) = start_described(
+        config,
+        "so101",
+        peppygen::mock::deps::identity::get_description::ResponseData::new(
+            bundled.urdf().to_string(),
+            armless,
+            Vec::new(),
+            "edited".to_string(),
+        ),
+    )
+    .await?;
     tokio::time::timeout(
         TIMEOUT,
         harness.node_runner().cancellation_token().cancelled(),
     )
     .await
     .expect("the fault shuts the node down");
-    let fault = fault.end().expect_err("the node ends with a fault");
+    let fault = fault.take().expect("the node ends with a fault");
     assert!(
-        fault
-            .to_string()
-            .contains("no robot is named \"openarm_v1\"; the robots are \"openarm_v2\""),
+        fault.to_string().contains(
+            "the motion planner for so101: the description names no arm: an arm is an SRDF \
+             group of one chain whose tip is an end effector's parent link"
+        ),
         "{fault}"
     );
+    harness.shutdown().await
+}
+
+// A description the planner cannot read ends the node with a fault that names the model
+// and the cause, after one ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_description_the_planner_cannot_read_ends_the_node_with_a_fault() -> peppygen::Result<()>
+{
+    let config = Config {
+        parameters: Some(parameters()),
+        ..Config::default()
+    };
+    let bundled = robot_description::model("so101").expect("robot_description bundles SO-101");
+    let (harness, mocks, fault) = start_described(
+        config,
+        "so101",
+        peppygen::mock::deps::identity::get_description::ResponseData::new(
+            "not a URDF".to_string(),
+            bundled.srdf().to_string(),
+            Vec::new(),
+            "edited".to_string(),
+        ),
+    )
+    .await?;
+    tokio::time::timeout(
+        TIMEOUT,
+        harness.node_runner().cancellation_token().cancelled(),
+    )
+    .await
+    .expect("the fault shuts the node down");
+    let fault = fault.take().expect("the node ends with a fault");
+    assert!(
+        fault.to_string().starts_with("the description of so101: "),
+        "{fault}"
+    );
+    assert_eq!(mocks.deps.identity.get_description.captured_count(), 1);
     harness.shutdown().await
 }
 
@@ -349,30 +477,38 @@ async fn an_unknown_model_ends_the_node_with_a_fault() -> peppygen::Result<()> {
 // no map stamp.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn describe_arms_names_the_joints_limits_and_links() -> peppygen::Result<()> {
-    let (harness, mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     assert_eq!(mocks.deps.identity.get_identity.captured_count(), 1);
     let described = describe_arms::poll(&harness, TIMEOUT).await?;
+    let description = robot_description::model("openarm_v2")
+        .expect("robot_description bundles OpenArm v2")
+        .description();
+    let urdf_limit = |joint: &str| {
+        let limit = &description
+            .robot()
+            .joints
+            .iter()
+            .find(|candidate| candidate.name == joint)
+            .expect("an arm joint of the URDF")
+            .limit;
+        [limit.lower, limit.upper]
+    };
     assert_eq!(
         described
             .arms
             .iter()
             .map(|a| a.name.as_str())
             .collect::<Vec<_>>(),
-        ["left_arm", "right_arm"]
+        description
+            .arms()
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
     );
-    for (arm, side) in described.arms.iter().zip(Side::BOTH) {
-        let prefix = match side {
-            Side::Left => "openarm_left",
-            Side::Right => "openarm_right",
-        };
-        assert_eq!(arm.gripper_name, side.gripper_name());
-        assert_eq!(
-            arm.joint_names,
-            (1..=ARM_DOF)
-                .map(|j| format!("{prefix}_joint{j}"))
-                .collect::<Vec<_>>()
-        );
-        let limits = HardwareVersion::V2.joint_limits(side);
+    for ((arm, from), id) in described.arms.iter().zip(description.arms()).zip(BOTH) {
+        assert_eq!(arm.gripper_name, from.gripper.name);
+        assert_eq!(arm.joint_names, from.joints);
+        let limits: Vec<[f64; 2]> = from.joints.iter().map(|joint| urdf_limit(joint)).collect();
         assert_eq!(
             arm.joint_lower_limits,
             limits.iter().map(|l| l[0]).collect::<Vec<_>>()
@@ -381,8 +517,8 @@ async fn describe_arms_names_the_joints_limits_and_links() -> peppygen::Result<(
             arm.joint_upper_limits,
             limits.iter().map(|l| l[1]).collect::<Vec<_>>()
         );
-        assert_eq!(arm.grasp_link, format!("{prefix}_tcp"));
-        let (approach, closing) = grasp_axes(side);
+        assert_eq!(arm.grasp_link, from.grasp_link);
+        let (approach, closing) = grasp_axes(id);
         assert!(
             named_axis(&arm.approach_axis).angle(&approach) <= GRASP_AXIS_RAD,
             "the approach axis {} against {approach:?}",
@@ -394,30 +530,21 @@ async fn describe_arms_names_the_joints_limits_and_links() -> peppygen::Result<(
             "the closing axis {} against {closing:?}",
             arm.closing_axis
         );
-        let mut gripper = arm.gripper_links.clone();
-        gripper.sort_unstable();
-        assert_eq!(
-            gripper,
-            ["ee_base_link", "ee_link1", "ee_link2"].map(|l| format!("{prefix}_{l}"))
-        );
+        assert_eq!(arm.gripper_links, OPENARM_V2.arms[id].gripper_links);
+        for finger in &from.gripper.fingers {
+            assert!(arm.gripper_links.contains(&finger.link), "{}", finger.link);
+        }
         assert!(
-            gripper.iter().all(|l| arm.link_names.contains(l))
-                && arm.link_names.contains(&format!("{prefix}_link1")),
+            arm.gripper_links.iter().all(|l| arm.link_names.contains(l)),
             "{:?}",
             arm.link_names
         );
     }
     let mut body = described.body_link_names.clone();
     body.sort_unstable();
-    assert_eq!(
-        body,
-        [
-            "openarm_body_link0",
-            "openarm_head_camera",
-            "openarm_left_base_link",
-            "openarm_right_base_link"
-        ]
-    );
+    let mut modeled: Vec<&str> = OPENARM_V2.body.link_names().collect();
+    modeled.sort_unstable();
+    assert_eq!(body, modeled);
 
     let goal = left_elbow(1.3);
     let answered = check(&harness, &left_path(&[], &[goal]))
@@ -436,9 +563,9 @@ async fn describe_arms_names_the_joints_limits_and_links() -> peppygen::Result<(
 // the forearm, give a path whose last waypoint puts the forearm there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plan_holds_a_link_of_the_arm() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     let forearm = |q: &[f64; ARM_DOF]| {
-        OPENARM_V2.arms[Side::Left]
+        OPENARM_V2.arms[LEFT]
             .geometry
             .chain()
             .at(q)
@@ -459,7 +586,7 @@ async fn a_plan_holds_a_link_of_the_arm() -> peppygen::Result<()> {
             tolerance_rad: FOREARM_ORIENTATION_RAD,
             free_axis: "none".to_string(),
         }],
-        ..plan_to(&LEFT_READY)
+        ..plan_to(&left_ready())
     };
     let planned = plan(&harness, &goal).await.expect("a path");
     let last = planned_waypoints(&planned).pop().expect("a waypoint");
@@ -477,8 +604,8 @@ async fn a_plan_holds_a_link_of_the_arm() -> peppygen::Result<()> {
 // approach axis along the target's, turned about it as the plan finds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
-    let reached = OPENARM_V2.arms[Side::Left]
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
+    let reached = OPENARM_V2.arms[LEFT]
         .geometry
         .chain()
         .world_ee_pose(&left_elbow(1.3));
@@ -496,7 +623,7 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
             tolerance_rad: APPROACH_AXIS_RAD,
             free_axis: "z".to_string(),
         }],
-        ..plan_to(&LEFT_READY)
+        ..plan_to(&left_ready())
     };
     let planned = plan(&harness, &goal).await.expect("a path");
     let last = planned.arms[0].waypoints.last().expect("a waypoint");
@@ -521,7 +648,7 @@ fn holding_the_left_hand(
     q: &[f64; ARM_DOF],
     free_axis: &str,
 ) -> GoalPathOrientationConstraintsItem {
-    let rotation = OPENARM_V2.arms[Side::Left]
+    let rotation = OPENARM_V2.arms[LEFT]
         .geometry
         .chain()
         .world_ee_pose(q)
@@ -538,9 +665,9 @@ fn holding_the_left_hand(
 // a plan whose goal names a position alone, which takes the orientation of the constraint.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_plan_holds_a_path_orientation_at_each_waypoint() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
-    let chain = OPENARM_V2.arms[Side::Left].geometry.chain();
-    let from = chain.world_ee_pose(&LEFT_READY);
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
+    let chain = OPENARM_V2.arms[LEFT].geometry.chain();
+    let from = chain.world_ee_pose(&left_ready());
     let position = from.translation.vector + Vector3::new(0.0, -0.05, 0.05);
     for free_axis in ["none", "z"] {
         let goal = GoalRequestData {
@@ -550,8 +677,8 @@ async fn a_plan_holds_a_path_orientation_at_each_waypoint() -> peppygen::Result<
                 position: position.into(),
                 tolerance_m: GRASP_POSITION_M,
             }],
-            path_orientation_constraints: vec![holding_the_left_hand(&LEFT_READY, free_axis)],
-            ..plan_to(&LEFT_READY)
+            path_orientation_constraints: vec![holding_the_left_hand(&left_ready(), free_axis)],
+            ..plan_to(&left_ready())
         };
         let planned = plan(&harness, &goal).await.expect("a path");
         let axis = Vector3::z();
@@ -577,20 +704,20 @@ async fn a_plan_holds_a_path_orientation_at_each_waypoint() -> peppygen::Result<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_or_a_goal_that_breaks_a_path_orientation_fails_with_no_path()
 -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     let elsewhere = left_elbow(1.3);
     let of_the_elbow = holding_the_left_hand(&elsewhere, "none");
-    let of_ready = holding_the_left_hand(&LEFT_READY, "none");
+    let of_ready = holding_the_left_hand(&left_ready(), "none");
     let starting_past_it = GoalRequestData {
         path_orientation_constraints: vec![of_the_elbow.clone()],
-        ..plan_to(&LEFT_READY)
+        ..plan_to(&left_ready())
     };
     let ending_past_it = GoalRequestData {
         path_orientation_constraints: vec![of_ready],
         ..plan_to(&elsewhere)
     };
     let staying_past_it = {
-        let mut goal = plan_to(&LEFT_READY);
+        let mut goal = plan_to(&left_ready());
         goal.arms.push(GoalArmsItem {
             arm_name: "right_arm".to_string(),
             start_joint_positions: Vec::new(),
@@ -598,10 +725,10 @@ async fn a_start_or_a_goal_that_breaks_a_path_orientation_fails_with_no_path()
         goal.goal_joint_constraints.clear();
         goal.path_orientation_constraints = vec![of_the_elbow];
         goal.goal_joint_constraints.extend(
-            OPENARM_V2.arms[Side::Right]
+            OPENARM_V2.arms[RIGHT]
                 .joint_names
                 .iter()
-                .zip(&RIGHT_READY)
+                .zip(&right_ready())
                 .map(|(name, &position)| {
                     peppygen::exposed_actions::motion_planning::plan_joint_path::GoalGoalJointConstraintsItem {
                         joint_name: name.clone(),
@@ -645,7 +772,7 @@ const OUT_OF_REACH: [f64; 3] = [5.0, 0.0, 1.0];
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
     let (harness, _mocks) =
-        start_without_camera_with(parameters(), &arms(LEFT_READY, RIGHT_READY)).await?;
+        start_without_camera_with(parameters(), &arms(left_ready(), right_ready())).await?;
     let long = GoalRequestData {
         allowed_planning_time_s: MAX_PLANNING_TIME_S,
         goal_joint_constraints: Vec::new(),
@@ -654,7 +781,7 @@ async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
             position: OUT_OF_REACH,
             tolerance_m: GRASP_POSITION_M,
         }],
-        ..plan_to(&LEFT_READY)
+        ..plan_to(&left_ready())
     };
     let handle = send_goal(&harness, &long, peppygen::DEFAULT_FEEDBACK_BOUND, TIMEOUT).await?;
     assert!(handle.accepted, "{:?}", handle.refusal);
@@ -671,7 +798,7 @@ async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
 // and a plan answers its path with no map stamp at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_robot_without_a_camera_plans_without_a_map() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     assert_plans_without_a_map(&harness).await;
     harness.shutdown().await
 }
@@ -680,7 +807,7 @@ async fn a_robot_without_a_camera_plans_without_a_map() -> peppygen::Result<()> 
 // OpenArm without its camera rig, the map stays empty too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_robot_without_its_camera_rig_plans_without_a_map() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_the_rig(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_the_rig(&arms(left_ready(), right_ready())).await?;
     assert_plans_without_a_map(&harness).await;
     harness.shutdown().await
 }
@@ -702,7 +829,7 @@ const EACH_PLANNER_TIME_S: f64 = 1.0;
 // rrt_connect and by rrt_star, each refined by none and by chomp.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_planner_and_refiner_answers_a_path_to_the_goal() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     for planner in Planner::ALL {
         for refiner in Refiner::ALL {
             let request = GoalRequestData {
@@ -741,13 +868,13 @@ async fn a_camera_without_its_mounts_refuses_every_plan_and_check() -> peppygen:
         ..Config::default()
     };
     let (harness, mocks) = start(config).await?;
-    publish_arms(&mocks, at_ms(0), &arms(LEFT_READY, RIGHT_READY)).await?;
+    publish_arms(&mocks, at_ms(0), &arms(left_ready(), right_ready())).await?;
     let reason = format!(
         "{NO_DEPTH_FRAME}: the launcher binds the planner's camera, geometry and workspace \
          and leaves its camera_mounts vacant; bind camera, geometry, camera_mounts and \
          workspace, or leave camera and geometry vacant"
     );
-    let failure = check(&harness, &left_path(&LEFT_READY, &[left_elbow(1.3)]))
+    let failure = check(&harness, &left_path(&left_ready(), &[left_elbow(1.3)]))
         .await
         .expect_err("a check is refused");
     assert_eq!(
@@ -773,7 +900,7 @@ async fn a_camera_without_its_mounts_refuses_every_plan_and_check() -> peppygen:
 // outside a joint limit by more than the start tolerance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     let goal = left_elbow(1.3);
     let refused = |ended: Result<ResultData, Ended>| match ended {
         Err(Ended::Refused(failure)) => failure.kind,
@@ -810,8 +937,8 @@ async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
         );
     }
 
-    let mut below = LEFT_READY;
-    below[3] = HardwareVersion::V2.joint_limits(Side::Left)[3][0] - 0.1;
+    let mut below = left_ready();
+    below[3] = OPENARM_V2.arms[LEFT].geometry.chain().limits()[3].lo - 0.1;
     assert_eq!(
         refused(plan(&harness, &plan_from(&below, &goal)).await),
         FailureKind::PreconditionFailed

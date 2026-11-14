@@ -114,19 +114,18 @@ CANCEL_REASONS = {"caller": "cancelled by its caller", "sender_gone": "its sende
 
 class _GoalDecision:
     """What admitting a goal answers, as the generated GoalDecision holds it:
-    the response of an accepted goal, or the failure of a refused one."""
+    nothing for an accepted goal, the failure of a refused one."""
 
-    def __init__(self, response, refusal: Optional[Failure]) -> None:
-        self.response = response
+    def __init__(self, refusal: Optional[Failure]) -> None:
         self.refusal = refusal
 
     @staticmethod
-    def accept(response) -> "_GoalDecision":
-        return _GoalDecision(response, None)
+    def accept() -> "_GoalDecision":
+        return _GoalDecision(None)
 
     @staticmethod
     def refuse(kind, message: str) -> "_GoalDecision":
-        return _GoalDecision(None, Failure(FailureKind(kind), message))
+        return _GoalDecision(Failure(FailureKind(kind), message))
 
 
 # Every attach action an engine exposed, in the order it exposed them.
@@ -160,13 +159,6 @@ async def _no_readiness_request(_runner, _handler) -> None:
     """The readiness service of an engine nobody asks: it waits for a request
     that never comes."""
     await asyncio.Event().wait()
-
-
-@dataclass(frozen=True)
-class _GoalResponse:
-    arm_names: list
-    arm_joints: list
-    gripper_names: list
 
 
 @dataclass(frozen=True)
@@ -242,7 +234,6 @@ def _install() -> None:
     attach.ActionHandle = _AttachHandle
     attach.FailureKind = FailureKind
     attach.GoalDecision = _GoalDecision
-    attach.GoalResponse = _GoalResponse
     is_ready = types.ModuleType("peppygen.exposed_services.robots.is_ready")
     is_ready.Response = _ReadyResponse
     is_ready.handle_requests = _no_readiness_request

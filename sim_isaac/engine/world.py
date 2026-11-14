@@ -56,6 +56,19 @@ JOINT_STATE_API = "PhysxJointStateAPI"
 ANGULAR = "angular"
 LINEAR = "linear"
 
+# How far a stage's joint limit may stand from the description's, in the
+# description's unit, rad or m: a stage keeps a limit in single precision, a
+# revolute joint's in degrees, 3.2e-7 rad off at most on the OpenArm bundles.
+LIMIT_TOLERANCE = 1e-6
+
+# The PhysX schema that binds one joint's position to another's, applied
+# once per degree of freedom under an instance name that names its axis,
+# "rot" and the joint's axis for a revolute and a prismatic joint alike, and
+# the prefix of its attributes. It holds position + gearing * reference
+# position + offset = 0, its offset in the joint's own unit.
+MIMIC_JOINT_API = "PhysxMimicJointAPI"
+MIMIC_JOINT = "physxMimicJoint"
+
 # The PhysX rigid body schema and its attribute that takes a link out of
 # gravity's reach.
 PHYSX_RIGID_BODY_API = "PhysxRigidBodyAPI"
@@ -98,6 +111,58 @@ def yaw_orientation(yaw: float) -> tuple[float, float, float, float]:
     spawned object's alike."""
     half = yaw / 2.0
     return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
+def _joints_named(root, names: set[str]) -> dict:
+    """The joint prims under `root` whose names are among `names`, by name."""
+    from pxr import Usd, UsdPhysics  # pylint: disable=C0415
+
+    return {
+        prim.GetName(): prim
+        for prim in Usd.PrimRange(root)
+        if prim.IsA(UsdPhysics.Joint) and prim.GetName() in names
+    }
+
+
+def _degree_of_freedom(joint, known: IsaacModel, name: str):
+    """The kind of the one degree of freedom of `joint`, the joint `name` of
+    the model `known`, and the conversion of a position from the
+    description's unit to the stage's: degrees on a revolute joint, the metre
+    on a prismatic one. Any other joint is refused."""
+    from pxr import UsdPhysics  # pylint: disable=C0415
+
+    if joint.IsA(UsdPhysics.RevoluteJoint):
+        return ANGULAR, math.degrees
+    if joint.IsA(UsdPhysics.PrismaticJoint):
+        return LINEAR, float
+    raise RuntimeError(
+        f"the {known.model} entry moves '{name}', which {known.stage} makes a "
+        f"{joint.GetTypeName()}: a robot's limbs move revolute and prismatic joints"
+    )
+
+
+def _moving_joints(root) -> dict:
+    """The revolute and prismatic joint prims under `root`, by name."""
+    from pxr import Usd, UsdPhysics  # pylint: disable=C0415
+
+    return {
+        prim.GetName(): prim
+        for prim in Usd.PrimRange(root)
+        if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint)
+    }
+
+
+def _stage_limits(prim) -> tuple[float, float]:
+    """The lower and upper limit of the revolute or prismatic joint `prim`,
+    in rad or m."""
+    from pxr import UsdPhysics  # pylint: disable=C0415
+
+    if prim.IsA(UsdPhysics.RevoluteJoint):
+        joint = UsdPhysics.RevoluteJoint(prim)
+        lower, upper = joint.GetLowerLimitAttr().Get(), joint.GetUpperLimitAttr().Get()
+        return math.radians(lower), math.radians(upper)
+    joint = UsdPhysics.PrismaticJoint(prim)
+    return float(joint.GetLowerLimitAttr().Get()), float(joint.GetUpperLimitAttr().Get())
 
 
 def name_in_the_stage(instance: str) -> str:
@@ -341,9 +406,9 @@ class World:
     @staticmethod
     def _reference(robot: Robot, head_camera_pack: Optional[head_camera.Pack]) -> None:
         """Puts a model's stage under this robot's prim, at its placement,
-        and authors on it what its model's entry asks for: the posture the
-        robot starts in, its links out of gravity's reach, and the head
-        camera on its pedestal.
+        holds the stage to the robot's description, and authors on it what
+        its model's entry asks for: the posture the robot starts in, each finger that mimics another bound to it, its
+        links out of gravity's reach, and the head camera on its pedestal.
 
         The reference brings the model's own transform ops along, and these
         models orient by quaternion, which XformCommonAPI does not carry: it
@@ -358,7 +423,9 @@ class World:
         prim.GetReferences().AddReference(str(known.stage_path()))
 
         World.place(prim, robot.placement.position, robot.placement.orientation())
+        World._hold_to_description(prim, known)
         World._start_in_posture(prim, known)
+        World._couple_followers(prim, known)
         if known.gravity_compensation:
             compensated = World._compensate_gravity(prim)
             logger.info(
@@ -372,6 +439,7 @@ class World:
                 raise RuntimeError(
                     f"{known.model} draws the head camera, and no pack was staged"
                 )
+            head_camera.check_chest_camera(head_camera_pack.rig, known.entry)
             body = head_camera.attach(stage, robot.prim(), head_camera_pack)
             logger.info(
                 "robot '%s' draws its head camera at %s from %s",
@@ -381,24 +449,69 @@ class World:
             )
 
     @staticmethod
+    def _hold_to_description(root, known: IsaacModel) -> None:
+        """Refuses a stage whose joints are not the description's: each joint
+        a limb of the robot moves is a revolute or prismatic joint of the
+        stage with the description's limits, within LIMIT_TOLERANCE; a finger
+        that follows another holds the description's limits within its own,
+        the joint it follows placing it; and every other revolute or
+        prismatic joint of the stage is locked, its two limits one, as a
+        joint the description fixes."""
+        moving = _moving_joints(root)
+        followers = {
+            joint for gripper in known.entry.grippers for joint, _ in gripper.followers()
+        }
+        differences = []
+        for name, (lower, upper) in known.position_limits.items():
+            prim = moving.get(name)
+            if prim is None:
+                differences.append(f"'{name}' is no revolute or prismatic joint of it")
+                continue
+            low, high = _stage_limits(prim)
+            if name in followers:
+                held = low <= lower + LIMIT_TOLERANCE and high >= upper - LIMIT_TOLERANCE
+            else:
+                held = abs(low - lower) <= LIMIT_TOLERANCE and abs(high - upper) <= LIMIT_TOLERANCE
+            if not held:
+                differences.append(
+                    f"'{name}' moves over [{low:.6g}, {high:.6g}] where the description "
+                    f"gives [{lower:.6g}, {upper:.6g}]"
+                )
+        for name, prim in moving.items():
+            if name in known.position_limits:
+                continue
+            low, high = _stage_limits(prim)
+            if high - low > LIMIT_TOLERANCE:
+                differences.append(
+                    f"'{name}' moves over [{low:.6g}, {high:.6g}], and the description moves no joint "
+                    "of that name"
+                )
+        if differences:
+            raise RuntimeError(
+                f"{known.stage} is not the {known.model} its description describes: "
+                + "; ".join(differences)
+                + ". Pin the asset bundle built for this description in "
+                "sim_base_images/isaac_assets.env and rebuild the base image: "
+                "bash sim_base_images/build_base_images.sh --isaac-only"
+            )
+
+    @staticmethod
     def _start_in_posture(root, known: IsaacModel) -> None:
         """Puts the robot in the posture its model starts in, and holds it
         there: each joint's PhysX state, which is where the simulation starts
-        it once the timeline plays with the robot on the stage, and its
-        drive's target, so the arm stands still until its first setpoint. A
-        model whose entry names no posture starts where its stage puts it.
-        A posture naming a joint the stage lacks is refused, so a stage
-        that names its joints otherwise is caught at the first stand."""
+        it once the timeline plays with the robot on the stage, and the
+        target of the drive of each joint a motor drives, so the arm stands
+        still until its first setpoint. A finger that follows another has no
+        drive: its coupling holds it. A posture naming a joint the stage lacks
+        is refused, so a stage that names its joints otherwise is caught at
+        the first stand."""
         posture = known.entry.start_posture
-        if not posture:
-            return
-        from pxr import Sdf, Usd, UsdPhysics  # pylint: disable=C0415
-
-        joints = {
-            prim.GetName(): prim
-            for prim in Usd.PrimRange(root)
-            if prim.IsA(UsdPhysics.Joint) and prim.GetName() in posture
+        followers = {
+            joint for gripper in known.entry.grippers for joint, _ in gripper.followers()
         }
+        from pxr import Sdf, UsdPhysics  # pylint: disable=C0415
+
+        joints = _joints_named(root, set(posture))
         missing = sorted(set(posture) - set(joints))
         if missing:
             raise RuntimeError(
@@ -406,20 +519,65 @@ class World:
             )
         for name, position in posture.items():
             joint = joints[name]
-            if joint.IsA(UsdPhysics.RevoluteJoint):
-                kind, value = ANGULAR, math.degrees(position)
-            elif joint.IsA(UsdPhysics.PrismaticJoint):
-                kind, value = LINEAR, position
-            else:
-                raise RuntimeError(
-                    f"the {known.model} entry starts '{name}', which {known.stage} makes a "
-                    f"{joint.GetTypeName()}: a posture places revolute and prismatic joints"
-                )
+            kind, in_stage_unit = _degree_of_freedom(joint, known, name)
+            value = in_stage_unit(position)
             joint.AddAppliedSchema(f"{JOINT_STATE_API}:{kind}")
             joint.CreateAttribute(
                 f"state:{kind}:physics:position", Sdf.ValueTypeNames.Float, False
             ).Set(value)
-            UsdPhysics.DriveAPI.Apply(joint, kind).CreateTargetPositionAttr().Set(value)
+            if name not in followers:
+                UsdPhysics.DriveAPI.Apply(joint, kind).CreateTargetPositionAttr().Set(value)
+
+    @staticmethod
+    def _couple_followers(root, known: IsaacModel) -> None:
+        """Binds each finger joint that follows another, as the robot's
+        description gives it, to the joint it follows with PhysX's mimic
+        joint, so one drive moves both: the description's position =
+        multiplier * followed position + offset is PhysX's relationship with
+        gearing -multiplier and offset -offset, in the stage's unit. A
+        follower and a joint it follows that the stage lacks, or that are of
+        two kinds, are refused."""
+        followers = {
+            joint: mimic
+            for gripper in known.entry.grippers
+            for joint, mimic in gripper.followers()
+        }
+        from pxr import Sdf, UsdPhysics  # pylint: disable=C0415
+
+        named = set(followers) | {mimic.joint for mimic in followers.values()}
+        joints = _joints_named(root, named)
+        missing = sorted(named - set(joints))
+        if missing:
+            raise RuntimeError(
+                f"the {known.model} entry couples finger joints not in {known.stage}: {missing}"
+            )
+        for name, mimic in followers.items():
+            joint = joints[name]
+            kind, in_stage_unit = _degree_of_freedom(joint, known, name)
+            followed_kind, _ = _degree_of_freedom(joints[mimic.joint], known, mimic.joint)
+            if kind != followed_kind:
+                raise RuntimeError(
+                    f"the {known.model} entry has '{name}' follow '{mimic.joint}', and "
+                    f"{known.stage} makes one {kind} and the other {followed_kind}: a finger "
+                    "follows a joint of its own kind"
+                )
+            axis = (
+                UsdPhysics.RevoluteJoint(joint).GetAxisAttr().Get()
+                if kind == ANGULAR
+                else UsdPhysics.PrismaticJoint(joint).GetAxisAttr().Get()
+            )
+            instance = f"rot{axis}"
+            joint.AddAppliedSchema(f"{MIMIC_JOINT_API}:{instance}")
+            prefix = f"{MIMIC_JOINT}:{instance}"
+            joint.CreateAttribute(f"{prefix}:gearing", Sdf.ValueTypeNames.Float, False).Set(
+                -mimic.multiplier
+            )
+            joint.CreateAttribute(f"{prefix}:offset", Sdf.ValueTypeNames.Float, False).Set(
+                -in_stage_unit(mimic.offset)
+            )
+            joint.CreateRelationship(f"{prefix}:referenceJoint", False).SetTargets(
+                [joints[mimic.joint].GetPath()]
+            )
 
     @staticmethod
     def _compensate_gravity(root) -> int:

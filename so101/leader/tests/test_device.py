@@ -1,6 +1,6 @@
 import pytest
 from conftest import wait_for
-from so101_description.units import MOTOR_NAMES
+from so101.units import MOTOR_NAMES
 
 from so101_leader.device import DeviceLoop
 

@@ -1,58 +1,59 @@
 //! Always-on command publisher. Reads the owner's per-tick `CommandFrame` and streams
-//! each enabled side's arm setpoint and gripper opening on that limb's pairing
-//! slot toward the backbone (the slot is the side, so no id demux), plus the
+//! each enabled arm's setpoint and its gripper's opening on that limb's pairing
+//! slot toward the backbone (the slot is the limb, so no id demux), plus the
 //! operator's governor controls on `governor_control`. The backbone governs each
-//! stream and re-streams the governed value the followers track. A side with
+//! stream and re-streams the governed value the followers track. An arm with
 //! `None` in the frame has its deadman off, so nothing is published and the
-//! backbone holds that side at its last governed setpoint. Re-publishing every
+//! backbone holds that arm at its last governed setpoint. Re-publishing every
 //! tick (even an unchanged frame) keeps the stream trivially fresh for a
 //! backbone that starts or re-pairs mid-session.
 //!
 //! The owner is the sole writer of state and the sole jog integrator; these tasks only
-//! forward the latest frame. Each side+stream runs its own publish task on its own
+//! forward the latest frame. Each limb's stream runs its own publish task on its own
 //! interval, owning its pairing slot's publisher and a clone of the frame receiver.
 //! Zenoh publish resolves synchronously, and each task publishes on its own tick, so
-//! neither side's setpoint waits behind the other's.
+//! no limb's setpoint waits behind another's.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use control_core::report_once::ReportOnce;
 use control_core::setpoint_stream::{SetpointSink, stream_setpoints};
-use openarm_description::{ArmPair, Side};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::governor::governor_control;
 use peppygen::paired_topics::{left_arm, left_gripper, right_arm, right_gripper};
 use peppylib::runtime::CancellationToken;
 use peppylib::{Payload, TopicPublisher};
+use robot_description::{ArmId, PerArm};
 use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::error;
 
 use crate::consumer::clock_now;
+use crate::robot::ARMS;
 use crate::state::{GovernorSettings, Limb, UiState};
 
 type BuildJointSetpoint = fn(SystemTime, Vec<f64>, Vec<f64>, Vec<f64>) -> peppygen::Result<Payload>;
 type BuildGripperSetpoint = fn(SystemTime, f64, f64) -> peppygen::Result<Payload>;
 
-/// Each arm's pairing slot message builder.
-const BUILD_ARM_SETPOINT: ArmPair<BuildJointSetpoint> = ArmPair::new(
+/// Each arm's pairing slot message builder, in place order.
+const BUILD_ARM_SETPOINT: PerArm<BuildJointSetpoint, ARMS> = PerArm::new([
     left_arm::joint_setpoints::build_message,
     right_arm::joint_setpoints::build_message,
-);
-/// Each gripper's pairing slot message builder.
-const BUILD_GRIPPER_SETPOINT: ArmPair<BuildGripperSetpoint> = ArmPair::new(
+]);
+/// Each gripper's pairing slot message builder, in its arm's place order.
+const BUILD_GRIPPER_SETPOINT: PerArm<BuildGripperSetpoint, ARMS> = PerArm::new([
     left_gripper::gripper_setpoints::build_message,
     right_gripper::gripper_setpoints::build_message,
-);
+]);
 
-/// The setpoints to stream this tick. `None` for a side means its deadman is off, so
+/// The setpoints to stream this tick. `None` for an arm means its deadman is off, so
 /// the publisher emits nothing and the backbone holds the last setpoint. Recomputed
 /// every command tick and read by the publisher tasks on their own cadence.
 #[derive(Clone, Copy, Debug)]
 pub struct CommandFrame {
-    pub arms: ArmPair<Option<JointVec>>,
-    pub grippers: ArmPair<Option<GripperFrame>>,
+    pub arms: PerArm<Option<JointVec>, ARMS>,
+    pub grippers: PerArm<Option<GripperFrame>, ARMS>,
     pub governor: GovernorSettings,
 }
 
@@ -66,16 +67,16 @@ pub struct GripperFrame {
 
 impl CommandFrame {
     pub(crate) fn from_state(s: &UiState) -> Self {
-        let arm = |side: Side| s.side_active(side).then_some(s.arms[side].joints);
-        let grip = |side: Side| {
-            s.side_active(side).then_some(GripperFrame {
-                opening: s.grippers[side].opening,
-                max_effort: s.grippers[side].max_effort.unwrap_or(0.0),
+        let joints = |arm: ArmId| s.arm_active(arm).then_some(s.arms[arm].joints);
+        let grip = |arm: ArmId| {
+            s.arm_active(arm).then_some(GripperFrame {
+                opening: s.grippers[arm].opening,
+                max_effort: s.grippers[arm].max_effort.unwrap_or(0.0),
             })
         };
         Self {
-            arms: ArmPair::from_fn(arm),
-            grippers: ArmPair::from_fn(grip),
+            arms: PerArm::from_fn(joints),
+            grippers: PerArm::from_fn(grip),
             governor: s.governor,
         }
     }
@@ -103,8 +104,10 @@ pub async fn run(
             return token.cancel();
         }
     };
-    let publishers = ArmPair::new(left_arm_pub, right_arm_pub)
-        .zip(ArmPair::new(left_gripper_pub, right_gripper_pub));
+    let publishers = PerArm::new([
+        (left_arm_pub, left_gripper_pub),
+        (right_arm_pub, right_gripper_pub),
+    ]);
     let governor_pub = match governor_control::declare_publisher(&runner).await {
         Ok(p) => p,
         Err(e) => {
@@ -123,19 +126,19 @@ pub async fn run(
         frame_rx.clone(),
         token.clone(),
     ));
-    for (side, (arm_pub, gripper_pub)) in publishers {
+    for (arm, (arm_pub, gripper_pub)) in PerArm::<(), ARMS>::ids().zip(publishers) {
         // Arm: stream the 7-joint setpoint while enabled (None in the frame =
         // disabled). Velocities and efforts stay empty: the backbone shapes its
         // own velocity feedforward over the governed stream.
-        let build_arm = BUILD_ARM_SETPOINT[side];
+        let build_arm = BUILD_ARM_SETPOINT[arm];
         let arm_rx = frame_rx.clone();
         tasks.spawn(stream_setpoints(
             SetpointPublisher(arm_pub),
             command_period,
             cancelled(token.clone()),
-            format!("{side} {}", Limb::Arm),
+            Limb::Arm.name_of(arm).to_owned(),
             move || {
-                let joints = arm_rx.borrow().arms[side]?;
+                let joints = arm_rx.borrow().arms[arm]?;
                 Some(clock_now().and_then(|timestamp| {
                     build_arm(timestamp, joints.to_vec(), Vec::new(), Vec::new())
                         .map_err(|e| e.to_string())
@@ -144,15 +147,15 @@ pub async fn run(
         ));
         // Gripper: stream the opening fraction and the operator's effort cap
         // while enabled (mirror of the arm stream above).
-        let build_gripper = BUILD_GRIPPER_SETPOINT[side];
+        let build_gripper = BUILD_GRIPPER_SETPOINT[arm];
         let gripper_rx = frame_rx.clone();
         tasks.spawn(stream_setpoints(
             SetpointPublisher(gripper_pub),
             command_period,
             cancelled(token.clone()),
-            format!("{side} {}", Limb::Gripper),
+            Limb::Gripper.name_of(arm).to_owned(),
             move || {
-                let frame = gripper_rx.borrow().grippers[side]?;
+                let frame = gripper_rx.borrow().grippers[arm]?;
                 Some(clock_now().and_then(|timestamp| {
                     build_gripper(timestamp, frame.opening, frame.max_effort)
                         .map_err(|e| e.to_string())
@@ -161,7 +164,7 @@ pub async fn run(
         ));
     }
     // join_next surfaces tasks in completion order, so a panicked stream is seen
-    // immediately. A dead channel would silently hold its side while the node reports
+    // immediately. A dead channel would silently hold its limb while the node reports
     // healthy, which is worse than a restart: cancel the node.
     while let Some(result) = tasks.join_next().await {
         if let Err(e) = result {

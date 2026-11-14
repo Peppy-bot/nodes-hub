@@ -13,17 +13,18 @@
 use std::sync::{Arc, Mutex};
 
 use control_core::sync::lock_ignoring_poison;
-use openarm_description::{ARM_DOF, ArmPair, HardwareVersion, Side};
-use srs_model::JointVec;
+use robot_description::{ArmId, Driven, PerArm, RobotDescription, states};
 use srs_model::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
-use srs_model::{Arm, ArmAnglePolicy};
+use srs_model::{ARM_DOF, Arm, ArmAnglePolicy, JointVec};
+
+use crate::robot::ARMS;
 
 /// A world-frame end-effector pose as `[x, y, z, roll, pitch, yaw]` (metres,
 /// radians): the form the panel edits and displays.
 pub type Pose = [f64; 6];
 
-/// The two per-side arm models (FK/IK/limits) behind mutexes, plus each
-/// side's URDF joint velocity limits.
+/// Each arm's model (FK/IK/limits) behind a mutex, plus each arm's URDF joint
+/// velocity limits and its ready and home postures.
 ///
 /// Each lock is held only for a single synchronous kinematics call and never
 /// across an `.await`. The owner task is the sole caller, so the locks are
@@ -31,40 +32,46 @@ pub type Pose = [f64; 6];
 /// (`at` takes `&mut self`) behind `ArmModels`'s shared `&self` methods.
 #[derive(Clone)]
 pub struct ArmModels {
-    arms: ArmPair<Arc<Mutex<Arm>>>,
-    velocity_limits: ArmPair<JointVec>,
-    // World-frame x/y/z reachable bounds per side, from the FK envelope (computed once
+    arms: PerArm<Arc<Mutex<Arm>>, ARMS>,
+    velocity_limits: PerArm<JointVec, ARMS>,
+    // World-frame x/y/z reachable bounds per arm, from the FK envelope (computed once
     // at construction); the panel sizes its position sliders to these.
-    bounds: ArmPair<[[f64; 2]; 3]>,
+    bounds: PerArm<[[f64; 2]; 3], ARMS>,
+    ready: PerArm<JointVec, ARMS>,
+    home: PerArm<JointVec, ARMS>,
 }
 
 impl ArmModels {
-    /// Build both arm models from the generation's embedded description, as the
-    /// backbone builds its own (`HardwareVersion::arm_model`: same URDF, same elbow
-    /// singularity floor), so the panel solves against the identical chain the backbone
-    /// governs. Joint velocity limits come from the same URDF: the budget the gesture
-    /// bake asserts its trajectories against.
-    pub fn from_version(version: HardwareVersion) -> Self {
-        let mut arms = ArmPair::from_fn(|side| build_arm(version, side));
-        let bounds = ArmPair::from_fn(|side| workspace_aabb(&mut arms[side]));
+    /// Build every arm's model from the description of the robot's model, `driven`, as
+    /// the backbone builds its own (`srs_model::Arm::from_description`: the same URDF
+    /// chain, its limits and its grasp point), so the panel solves against the identical
+    /// chain the backbone governs. Joint velocity limits come from the same URDF: the
+    /// budget the gesture bake asserts its trajectories against. The ready and home
+    /// postures are the SRDF's.
+    pub fn from_driven(driven: &Driven<ARM_DOF, ARMS>) -> Self {
+        let description = driven.description();
+        let mut arms = PerArm::from_fn(|arm| build_arm(description, arm));
+        let bounds = PerArm::from_fn(|arm| workspace_aabb(&mut arms[arm]));
         Self {
-            velocity_limits: ArmPair::from_fn(|side| velocity_limits(version.urdf(), side)),
+            velocity_limits: PerArm::from_fn(|arm| velocity_limits(description, arm)),
             arms: arms.map(|_, arm| Arc::new(Mutex::new(arm))),
             bounds,
+            ready: postures(driven, states::READY),
+            home: postures(driven, states::HOME),
         }
     }
 
-    /// World-frame end-effector pose of `joints` for `side`.
-    pub fn ee_pose_world(&self, side: Side, joints: &JointVec) -> Pose {
-        let model = lock_ignoring_poison(self.get(side));
+    /// World-frame end-effector pose of `joints` for `arm`.
+    pub fn ee_pose_world(&self, arm: ArmId, joints: &JointVec) -> Pose {
+        let model = lock_ignoring_poison(self.get(arm));
         let base = model.at(joints).ee_pose();
         decompose(&model.world_pose(&base))
     }
 
     /// World-frame end-effector orientation of `joints` as a quaternion `[x, y, z, w]`,
     /// for the panel's arcball (which composes orientation on quaternions, never euler).
-    pub fn ee_quat_world(&self, side: Side, joints: &JointVec) -> [f64; 4] {
-        let model = lock_ignoring_poison(self.get(side));
+    pub fn ee_quat_world(&self, arm: ArmId, joints: &JointVec) -> [f64; 4] {
+        let model = lock_ignoring_poison(self.get(arm));
         let base = model.at(joints).ee_pose();
         let q = model.world_pose(&base).rotation;
         [q.i, q.j, q.k, q.w]
@@ -78,12 +85,12 @@ impl ArmModels {
     /// backbone re-solves and plans a pose move itself.
     pub fn solve_ik(
         &self,
-        side: Side,
+        arm: ArmId,
         position: [f64; 3],
         rotation: UnitQuaternion<f64>,
         seed: &JointVec,
     ) -> Option<JointVec> {
-        let model = lock_ignoring_poison(self.get(side));
+        let model = lock_ignoring_poison(self.get(arm));
         let world = Isometry3::from_parts(
             Translation3::new(position[0], position[1], position[2]),
             rotation,
@@ -94,20 +101,32 @@ impl ArmModels {
             .map(|s| s.q)
     }
 
-    fn get(&self, side: Side) -> &Arc<Mutex<Arm>> {
-        &self.arms[side]
+    fn get(&self, arm: ArmId) -> &Arc<Mutex<Arm>> {
+        &self.arms[arm]
     }
 
-    /// Per-joint URDF velocity limits (rad/s) for `side`: the budget the backbone's
+    /// Per-joint URDF velocity limits (rad/s) for `arm`: the budget the backbone's
     /// chase enforces, which the gesture bake asserts its trajectories against.
-    pub(crate) fn velocity_limits(&self, side: Side) -> &JointVec {
-        &self.velocity_limits[side]
+    pub(crate) fn velocity_limits(&self, arm: ArmId) -> &JointVec {
+        &self.velocity_limits[arm]
     }
 
-    /// World-frame x/y/z reachable bounds `[[min, max]; 3]` for `side`, so the panel
-    /// sizes its position sliders to the arm's actual reach (correct per generation).
-    pub fn pos_bounds(&self, side: Side) -> [[f64; 2]; 3] {
-        self.bounds[side]
+    /// World-frame x/y/z reachable bounds `[[min, max]; 3]` for `arm`, so the panel
+    /// sizes its position sliders to the arm's actual reach (correct per model).
+    pub fn pos_bounds(&self, arm: ArmId) -> [[f64; 2]; 3] {
+        self.bounds[arm]
+    }
+
+    /// `arm`'s ready posture, the SRDF's: the backbone's move_to_ready lands on it, the
+    /// gestures anchor on it, and the panel's Ready Pose button fires it.
+    pub fn ready(&self, arm: ArmId) -> JointVec {
+        self.ready[arm]
+    }
+
+    /// `arm`'s home posture, the SRDF's: the backbone's move_to_home and the panel's
+    /// Home Pose button land on it.
+    pub fn home(&self, arm: ArmId) -> JointVec {
+        self.home[arm]
     }
 }
 
@@ -202,35 +221,47 @@ pub fn joint_jog_tick(
     }
 }
 
-/// Build one arm model from the generation's embedded description
-/// (`HardwareVersion::arm_model`, as the backbone builds its own, so the panel's poses
-/// and the backbone's are the same frame): the elbow singularity floor applied and the
-/// URDF's tcp frame mounted. A bad base link or tcp link aborts bringup, matching how
-/// the backbone fails.
-fn build_arm(version: HardwareVersion, side: Side) -> Arm {
-    version
-        .arm_model(side)
-        .unwrap_or_else(|e| panic!("build the {side} arm model: {e}"))
+/// Build `arm`'s model from the description (`srs_model::Arm::from_description`, as
+/// the backbone builds its own, so the panel's poses and the backbone's are the same
+/// frame): the chain from the arm's base link with the URDF's limits and its grasp link
+/// mounted. A chain srs_model cannot model aborts bringup, matching how the backbone
+/// fails.
+fn build_arm(description: &RobotDescription, arm: ArmId) -> Arm {
+    let described = &description.arms()[arm.place()];
+    Arm::from_description(description, described)
+        .unwrap_or_else(|e| panic!("build the {} model: {e}", described.name))
 }
 
-/// Per-joint velocity limits (rad/s) for `side`, j1..j7, from the bundled URDF:
-/// the same numbers the backbone's chase enforces, so the gesture bake and the
+/// Per-joint velocity limits (rad/s) of `arm`'s joints, in the arm's order, from the
+/// URDF: the same numbers the backbone's chase enforces, so the gesture bake and the
 /// backbone's follow capability agree by construction.
-fn velocity_limits(urdf: &str, side: Side) -> JointVec {
-    let robot = urdf_rs::read_from_string(urdf).expect("bundled URDF must parse");
+fn velocity_limits(description: &RobotDescription, arm: ArmId) -> JointVec {
+    let joints = &description.arms()[arm.place()].joints;
     std::array::from_fn(|i| {
-        let name = format!("openarm_{side}_joint{}", i + 1);
-        let joint = robot
+        let name = &joints[i];
+        let joint = description
+            .robot()
             .joints
             .iter()
-            .find(|j| j.name == name)
-            .unwrap_or_else(|| panic!("URDF missing joint {name}"));
+            .find(|j| &j.name == name)
+            .expect("the description holds every joint of its arms to the URDF");
         let v = joint.limit.velocity;
         assert!(
             v.is_finite() && v > 0.0,
             "URDF velocity limit for {name} must be positive"
         );
         v
+    })
+}
+
+/// Each arm's posture in the SRDF's state `state`. Aborts bringup when the SRDF gives an
+/// arm none.
+fn postures(driven: &Driven<ARM_DOF, ARMS>, state: &str) -> PerArm<JointVec, ARMS> {
+    driven.state(state).unwrap_or_else(|arm| {
+        panic!(
+            "the description of {} gives its arm {arm} no {state} state",
+            driven.model().id()
+        )
     })
 }
 
@@ -247,8 +278,8 @@ pub fn dist3(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// How far each world axis can be driven: `[[min, max]; 3]` (x, y, z) over every
 /// in-limit configuration, so each bound is the best case for that axis with the
-/// other two free. Runs once per side at construction to size the panel's position
-/// sliders per generation rather than hardcoding them.
+/// other two free. Runs once per arm at construction to size the panel's position
+/// sliders to the model's arms.
 ///
 /// A grid coarse enough to afford (`N^7` poses) lands near the extremes but not on
 /// them, so each of the six is refined by projected gradient ascent: the Jacobian's
@@ -342,7 +373,8 @@ fn ascend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{caps, models};
+    use crate::limits::{arm_limits, init_limits_for_tests};
+    use crate::test_support::{LEFT, caps, driven, models};
 
     /// A 100 Hz command tick.
     const DT_S: f64 = 0.01;
@@ -365,20 +397,21 @@ mod tests {
             0.055_728_090_0,
             0.034_441_853_75,
         ];
+        init_limits_for_tests();
         let m = models();
-        for side in Side::BOTH {
-            let bounds = m.pos_bounds(side);
-            let limits = HardwareVersion::V2.joint_limits(side);
+        for arm in PerArm::<(), ARMS>::ids() {
+            let bounds = m.pos_bounds(arm);
+            let limits = arm_limits(arm);
             for step in 0..5000 {
                 let q: JointVec = std::array::from_fn(|i| {
                     let t = (GOLDEN[i] * (step + 1) as f64).fract();
                     limits[i][0] + t * (limits[i][1] - limits[i][0])
                 });
-                let p = m.ee_pose_world(side, &q);
+                let p = m.ee_pose_world(arm, &q);
                 for k in 0..3 {
                     assert!(
                         p[k] >= bounds[k][0] && p[k] <= bounds[k][1],
-                        "{side:?} axis {k}: reachable {} outside {:?}",
+                        "{arm:?} axis {k}: reachable {} outside {:?}",
                         p[k],
                         bounds[k]
                     );
@@ -390,13 +423,13 @@ mod tests {
     #[test]
     fn workspace_bounds_are_sane_and_contain_home() {
         let m = models();
-        for side in Side::BOTH {
-            let b = m.pos_bounds(side);
+        for arm in PerArm::<(), ARMS>::ids() {
+            let b = m.pos_bounds(arm);
             for [lo, hi] in b {
                 assert!(lo < hi, "bound [{lo}, {hi}] must be non-empty");
             }
-            // A known-reachable pose (home: zeros, elbow off its floor) sits inside.
-            let home = m.ee_pose_world(side, &[0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0]);
+            // A known-reachable pose, the arm's home posture, sits inside.
+            let home = m.ee_pose_world(arm, &m.home(arm));
             for k in 0..3 {
                 assert!(
                     b[k][0] <= home[k] && home[k] <= b[k][1],
@@ -415,10 +448,10 @@ mod tests {
         // back to it.
         let m = models();
         let q = [0.3, 0.1, 0.2, 0.8, 0.3, 0.2, 0.15];
-        let p = m.ee_pose_world(Side::Left, &q);
+        let p = m.ee_pose_world(LEFT, &q);
         let rotation = UnitQuaternion::from_euler_angles(p[3], p[4], p[5]);
         let solved = m
-            .solve_ik(Side::Left, [p[0], p[1], p[2]], rotation, &q)
+            .solve_ik(LEFT, [p[0], p[1], p[2]], rotation, &q)
             .expect("a pose the arm stands at has a solution");
         for i in 0..ARM_DOF {
             assert!(
@@ -429,7 +462,7 @@ mod tests {
             );
         }
         assert!(
-            m.solve_ik(Side::Left, [p[0] + 2.0, p[1], p[2]], rotation, &q)
+            m.solve_ik(LEFT, [p[0] + 2.0, p[1], p[2]], rotation, &q)
                 .is_none(),
             "two metres out of reach has no solution"
         );
@@ -586,19 +619,21 @@ mod tests {
     }
 
     #[test]
-    fn velocity_limits_load_from_the_urdf() {
+    fn velocity_limits_are_each_arm_joints_own_in_the_arms_order() {
         let m = models();
-        for side in Side::BOTH {
-            let v = m.velocity_limits(side);
-            assert!(v.iter().all(|x| x.is_finite() && *x > 0.0));
-            // j3/j4 are the slow pair in both generations' datasheets; sanity-pin
-            // that we read per-joint values, not one shared number.
-            assert!(
-                v[2] < v[0],
-                "j3 ({}) should be slower than j1 ({})",
-                v[2],
-                v[0]
-            );
+        let driven = driven("openarm_v2");
+        let description = driven.description();
+        for arm in PerArm::<(), ARMS>::ids() {
+            let joints = &description.arms()[arm.place()].joints;
+            for (v, name) in m.velocity_limits(arm).iter().zip(joints) {
+                let urdf = description
+                    .robot()
+                    .joints
+                    .iter()
+                    .find(|joint| &joint.name == name)
+                    .expect("an arm's joint is the URDF's");
+                assert_eq!(*v, urdf.limit.velocity, "{name}");
+            }
         }
     }
 }

@@ -18,13 +18,12 @@ use chain_kinematics::nalgebra::{
     Isometry3, Matrix3, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
 };
 use collision_geometry::chain::{BodyMask, Padding, PlacedMask, RiderBody};
-use motion_planner::arm_set::PerArm;
+use control_core::fault::Fault;
 use motion_planner::history::ArmJoints;
-use motion_planner::node::Fault;
 use motion_planner::request::{Named, Planner, Refiner};
-use motion_planner::robot::{Robot, RobotModel, openarm_v2};
-use openarm_description::{ARM_DOF, DUAL_DOF, Side, ready};
+use motion_planner::robot::{RobotModel, model};
 use peppygen::Parameters;
+use peppygen::consumed_services::identity::get_description::ResponseDataMeshesItem;
 use peppygen::consumed_topics::camera::depth_stream::{Message as DepthFrame, MessageHeader};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalArmsItem, GoalGoalJointConstraintsItem,
@@ -34,7 +33,9 @@ use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
 };
 use peppygen::fixtures::exposed_services::motion_planning::check_joint_path;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
+use peppygen::mock::deps::identity::get_description;
 use peppygen::mock::deps::{camera, camera_mounts, geometry, identity, limb_state, workspace};
+use robot_description::{ArmId, PerArm};
 
 /// Bounds every wait on the node, past the longest a plan takes. Generous: the
 /// assertions are about the answers, never about how fast they come.
@@ -68,8 +69,53 @@ pub const CLEAR_OR_ALLOW_WAY_OUT: &str =
     "; move the arms clear first, or allow the pair with set_allowed_collision";
 
 /// OpenArm v2's model, its grippers open, as the node fits it.
-pub static OPENARM_V2: LazyLock<RobotModel<ARM_DOF, DUAL_DOF, 2>> =
-    LazyLock::new(|| openarm_v2().expect("OpenArm v2's model"));
+pub static OPENARM_V2: LazyLock<RobotModel<ARM_DOF, DUAL_DOF, ARMS>> =
+    LazyLock::new(|| bundled_model("openarm_v2"));
+
+/// The joints of each arm of OpenArm v2, the robot most suites run, and of both.
+pub const ARM_DOF: usize = 7;
+pub const ARMS: usize = 2;
+pub const DUAL_DOF: usize = ARMS * ARM_DOF;
+/// OpenArm v2's arms, in the order of its description: the left, then the right.
+pub const LEFT: ArmId = ArmId::new(0);
+pub const RIGHT: ArmId = ArmId::new(1);
+pub const BOTH: [ArmId; ARMS] = [LEFT, RIGHT];
+
+/// The planner's model of the description robot_description bundles as `id`, its meshes
+/// written to a directory for the build.
+pub fn bundled_model<const N: usize, const D: usize, const K: usize>(
+    id: &str,
+) -> RobotModel<N, D, K> {
+    let bundled = robot_description::model(id).expect("robot_description bundles it");
+    let meshes = tempfile::tempdir().expect("a temporary directory");
+    bundled
+        .write_meshes_to(meshes.path())
+        .expect("the meshes write");
+    model(
+        &bundled.description(),
+        meshes.path().to_str().expect("the directory is UTF-8"),
+    )
+    .unwrap_or_else(|error| panic!("{id}: {error}"))
+}
+
+/// The posture `name` of OpenArm v2's arm `arm`, as its description gives it.
+pub fn posture(arm: ArmId, name: &str) -> [f64; ARM_DOF] {
+    posture_of("openarm_v2", arm, name)
+}
+
+/// The posture `name` of the arm `arm` of the seven-joint model `id`, as its description
+/// gives it.
+pub fn posture_of(id: &str, arm: ArmId, name: &str) -> [f64; ARM_DOF] {
+    let description = robot_description::model(id)
+        .expect("robot_description bundles the model")
+        .description();
+    let group = &description.arms()[arm.place()].name;
+    description
+        .state(group, name)
+        .unwrap_or_else(|| panic!("{group} has the posture {name}"))
+        .try_into()
+        .expect("a posture of a seven-joint arm")
+}
 
 /// A camera at `eye` whose optical axis looks at `target`, image right across the
 /// optical axis and the robot's +z, so image down points down where it can.
@@ -100,24 +146,24 @@ pub type Solid = ([f64; 3], [f64; 3]);
 /// renderer places the robot from its pieces itself.
 pub fn render(
     camera: &Isometry3<f64>,
-    arms: Option<&ArmJoints<ARM_DOF>>,
+    arms: Option<&ArmJoints<ARM_DOF, ARMS>>,
     boxes: &[Solid],
 ) -> Vec<Option<[f64; 3]>> {
     let none = Padding::new(1.0, 0.0).expect("the padding that grows nothing");
     let chains: Vec<_> = OPENARM_V2
         .arms
         .iter()
-        .map(|arm| (arm.id.side(), arm.geometry.mask(none)))
+        .map(|arm| (arm.id, arm.geometry.mask(none)))
         .collect();
     let body = OPENARM_V2.body.mask(none);
     let fingers = arms.map(|arms| {
         BodyMask::of(
-            Side::BOTH.into_iter().flat_map(|side| {
+            BOTH.into_iter().flat_map(|side| {
                 let arm = &OPENARM_V2.arms[side].geometry;
                 let posed = arm.chain().at(&arms[side]);
                 OPENARM_V2
                     .own
-                    .fingers(side.into(), arm)
+                    .fingers(side, arm)
                     .expect("the arm's fingers")
                     .into_iter()
                     .map(move |finger| {
@@ -176,25 +222,33 @@ pub fn at_ms(ms: u64) -> SystemTime {
 }
 
 /// Both arms where `left` and `right` put them.
-pub fn arms(left: [f64; ARM_DOF], right: [f64; ARM_DOF]) -> ArmJoints<ARM_DOF> {
-    PerArm::both(left, right)
+pub fn arms(left: [f64; ARM_DOF], right: [f64; ARM_DOF]) -> ArmJoints<ARM_DOF, ARMS> {
+    PerArm::new([left, right])
 }
 
 /// Each arm's Ready posture: elbows bent, hands forward.
-pub const LEFT_READY: [f64; ARM_DOF] = ready(Side::Left);
-pub const RIGHT_READY: [f64; ARM_DOF] = ready(Side::Right);
+pub fn left_ready() -> [f64; ARM_DOF] {
+    posture(LEFT, robot_description::states::READY)
+}
+pub fn right_ready() -> [f64; ARM_DOF] {
+    posture(RIGHT, robot_description::states::READY)
+}
 
 /// The left arm at Ready with its elbow at `angle`.
-pub const fn left_elbow(angle: f64) -> [f64; ARM_DOF] {
-    let mut q = LEFT_READY;
+pub fn left_elbow(angle: f64) -> [f64; ARM_DOF] {
+    let mut q = left_ready();
     q[3] = angle;
     q
 }
 
 /// The left arm with its hand under the table of `table_across`, the elbow open, and
 /// over it, the elbow bent.
-pub const UNDER_THE_TABLE: [f64; ARM_DOF] = left_elbow(0.6);
-pub const OVER_THE_TABLE: [f64; ARM_DOF] = left_elbow(2.0);
+pub fn under_the_table() -> [f64; ARM_DOF] {
+    left_elbow(0.6)
+}
+pub fn over_the_table() -> [f64; ARM_DOF] {
+    left_elbow(2.0)
+}
 
 /// The configuration `t` of the way along the straight joint motion from `from` to
 /// `to`.
@@ -207,7 +261,7 @@ pub fn along(from: &[f64; ARM_DOF], to: &[f64; ARM_DOF], t: f64) -> [f64; ARM_DO
 /// lies where the grasp point crosses two fifths of the way up, found by bisection. The
 /// table, and the share of the motion at which the grasp point crosses its top.
 pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f64) {
-    let left = OPENARM_V2.arms[Side::Left].geometry.chain();
+    let left = OPENARM_V2.arms[LEFT].geometry.chain();
     let hand = |q: &[f64; ARM_DOF]| left.world_ee_pose(q).translation.vector;
     let (low, high) = (hand(under).z, hand(over).z);
     assert!(high - low > 0.15, "the hand rises from {low} to {high}");
@@ -232,18 +286,18 @@ pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f6
 /// The node with the left arm under `table_across`'s table, which the camera has seen, and
 /// the share of the motion from under the table to over it where the hand crosses its top.
 pub async fn under_a_seen_table() -> peppygen::Result<(Harness, Mocks, f64)> {
-    let (table, crossing_t) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
+    let (table, crossing_t) = table_across(&under_the_table(), &over_the_table());
     let ([x0, y0, _], [x1, y1, top]) = table;
     let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let camera = looking_at(Vector3::new(x + 0.5, y, top + 0.7), Vector3::new(x, y, top));
     let (harness, mocks) = start_with_camera(&camera).await?;
-    publish_arms(&mocks, at_ms(0), &arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
+    publish_arms(&mocks, at_ms(0), &arms(under_the_table(), right_ready())).await?;
     take_frame(
         &harness,
         &mocks,
         at_ms(0),
         &render(&camera, None, &[table]),
-        UNDER_THE_TABLE,
+        under_the_table(),
     )
     .await?;
     Ok((harness, mocks, crossing_t))
@@ -252,14 +306,16 @@ pub async fn under_a_seen_table() -> peppygen::Result<(Harness, Mocks, f64)> {
 /// The node over the harness with the four camera slots vacant, once the arms' joint
 /// positions at `arms` have arrived: a check of the left arm standing still stops being
 /// refused, and answers with no map stamp.
-pub async fn start_without_camera(arms: &ArmJoints<ARM_DOF>) -> peppygen::Result<(Harness, Mocks)> {
+pub async fn start_without_camera(
+    arms: &ArmJoints<ARM_DOF, ARMS>,
+) -> peppygen::Result<(Harness, Mocks)> {
     start_without_camera_with(parameters(), arms).await
 }
 
 /// `start_without_camera` with the node's parameters `params`.
 pub async fn start_without_camera_with(
     params: Parameters,
-    arms: &ArmJoints<ARM_DOF>,
+    arms: &ArmJoints<ARM_DOF, ARMS>,
 ) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(
         Config {
@@ -276,7 +332,7 @@ pub async fn start_without_camera_with(
 /// `start_without_camera` with only the camera and geometry slots vacant, as on a robot
 /// without a camera rig whose backbone answers camera_mounts and workspace.
 pub async fn start_without_the_rig(
-    arms: &ArmJoints<ARM_DOF>,
+    arms: &ArmJoints<ARM_DOF, ARMS>,
 ) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(vacant_camera(), arms).await
 }
@@ -294,15 +350,45 @@ pub fn vacant_camera() -> Config {
 /// The node over the harness as `config` binds it, its robot's identity answering that
 /// it is an OpenArm v2.
 pub async fn start(config: Config) -> peppygen::Result<(Harness, Mocks)> {
-    let (harness, mocks, _) = start_identified_as(config, &Robot::OpenArmV2.to_string()).await?;
+    let (harness, mocks, _) = start_identified_as(config, "openarm_v2").await?;
     Ok((harness, mocks))
 }
 
 /// The node over the harness as `config` binds it, its robot's identity answering the
-/// node's first ask that it is `model`, and the fault that ends the node.
+/// node's first asks that it is `model`, described as robot_description bundles it, and
+/// the fault that ends the node.
 pub async fn start_identified_as(
     config: Config,
     model: &str,
+) -> peppygen::Result<(Harness, Mocks, Fault)> {
+    let bundled = robot_description::model(model).expect("robot_description bundles it");
+    start_described(
+        config,
+        model,
+        get_description::ResponseData::new(
+            bundled.urdf().to_string(),
+            bundled.srdf().to_string(),
+            bundled
+                .meshes()
+                .iter()
+                .map(|(name, data)| ResponseDataMeshesItem {
+                    name: name.to_string(),
+                    data: data.to_vec(),
+                })
+                .collect(),
+            bundled.digest().to_string(),
+        ),
+    )
+    .await
+}
+
+/// The node over the harness as `config` binds it, its robot's identity answering the
+/// node's first asks that it is `model`, described by `description`, and the fault that
+/// ends the node.
+pub async fn start_described(
+    config: Config,
+    model: &str,
+    description: get_description::ResponseData,
 ) -> peppygen::Result<(Harness, Mocks, Fault)> {
     let fault = Fault::default();
     let raised = fault.clone();
@@ -323,6 +409,14 @@ pub async fn start_identified_as(
             "harness".to_string(),
         ))
         .await?;
+    mocks
+        .deps
+        .identity
+        .get_description
+        .next_request(TIMEOUT)
+        .await?
+        .respond(description)
+        .await?;
     Ok((harness, mocks, fault))
 }
 
@@ -331,11 +425,11 @@ pub async fn start_identified_as(
 /// being refused, and answers with no map stamp.
 async fn start_vacant(
     config: Config,
-    arms: &ArmJoints<ARM_DOF>,
+    arms: &ArmJoints<ARM_DOF, ARMS>,
 ) -> peppygen::Result<(Harness, Mocks)> {
     let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), arms).await?;
-    let answer = wait_for_the_arms(&harness, arms[Side::Left]).await;
+    let answer = wait_for_the_arms(&harness, arms[LEFT]).await;
     assert_eq!(answer.map_stamp, None, "{answer:?}");
     Ok((harness, mocks))
 }
@@ -478,22 +572,34 @@ pub fn describe_camera(
 pub async fn publish_arms(
     mocks: &Mocks,
     at: SystemTime,
-    arms: &ArmJoints<ARM_DOF>,
+    arms: &ArmJoints<ARM_DOF, ARMS>,
 ) -> peppygen::Result<()> {
-    let rest = |side: Side| arms[side].to_vec();
+    publish_arms_with_grippers_at(mocks, at, arms, 1.0).await
+}
+
+/// Publishes the arms at `arms` measured at `at`, both grippers at `opening`.
+pub async fn publish_arms_with_grippers_at(
+    mocks: &Mocks,
+    at: SystemTime,
+    arms: &ArmJoints<ARM_DOF, ARMS>,
+    opening: f64,
+) -> peppygen::Result<()> {
+    let rest = |arm: ArmId| arms[arm].to_vec();
     mocks
         .deps
         .limb_state
         .limb_states
         .publish(&limb_state::limb_states::Message {
             timestamp: at,
-            arm_names: vec!["left_arm".to_string(), "right_arm".to_string()],
-            joints_per_arm: vec![ARM_DOF as u32; 2],
-            joint_positions: [rest(Side::Left), rest(Side::Right)].concat(),
-            positions: vec![0.0; 6],
-            orientations: [[0.0, 0.0, 0.0, 1.0]; 2].concat(),
-            gripper_names: vec!["left_gripper".to_string(), "right_gripper".to_string()],
-            gripper_openings: vec![1.0; 2],
+            arm_names: BOTH.map(|arm| OPENARM_V2.arms[arm].name.clone()).to_vec(),
+            joints_per_arm: vec![ARM_DOF as u32; ARMS],
+            joint_positions: [rest(LEFT), rest(RIGHT)].concat(),
+            positions: vec![0.0; 3 * ARMS],
+            orientations: [[0.0, 0.0, 0.0, 1.0]; ARMS].concat(),
+            gripper_names: BOTH
+                .map(|arm| OPENARM_V2.arms[arm].gripper_name.clone())
+                .to_vec(),
+            gripper_openings: vec![opening; ARMS],
         })
         .await
 }
@@ -539,7 +645,7 @@ pub fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
             arm_name: "left_arm".to_string(),
             start_joint_positions: start.to_vec(),
         }],
-        goal_joint_constraints: OPENARM_V2.arms[Side::Left]
+        goal_joint_constraints: OPENARM_V2.arms[LEFT]
             .joint_names
             .iter()
             .zip(q)

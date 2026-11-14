@@ -7,6 +7,7 @@ from pathlib import Path
 from types import ModuleType
 
 import numpy as np
+import robot_description_py
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 
@@ -26,20 +27,23 @@ def world_module():
 
 
 def known(model: str):
-    """This engine's own entry of one of the models it stands."""
+    """This engine's own entry of one of the models it stands, as a robot of
+    the model's bundled description stands."""
     if str(_ENGINE_DIR) not in sys.path:
         sys.path.insert(0, str(_ENGINE_DIR))
     import isaac_models  # pylint: disable=C0415
 
-    return isaac_models.IsaacModels.read().of(model)
+    description = robot_description_py.model(model).description()
+    return isaac_models.IsaacModels.read().of(model, description)
 
 
 def stand_in_pack(head_camera, directory: Path):
     """A head camera pack for a stage that is stood in, where nothing reads
-    its meshes."""
+    its meshes or its rig."""
     return head_camera.Pack(
         directory=directory,
         body_position=(0.0315, 0.0, 0.743),
         visuals=(),
         collision=(np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)),
+        rig={},
     )

@@ -6,17 +6,17 @@
 //! that names it. A panic would unwind past the runtime's shutdown hooks and
 //! reach the daemon as a backtrace, where the parameter's name belongs.
 
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 
 mod helpers;
-use helpers::{params::params, shutdown_once_setup_returns};
+use helpers::{params::params, shutdown_once_setup_returns, start};
 
 /// Boot the node with one parameter spoiled and return the refusal as an
 /// operator reads it: the whole Display chain, since a wrapping variant names
 /// the step and its source carries the detail. Fails the test if the node
 /// accepts the value instead.
 ///
-/// `start_with` spawns `setup` rather than awaiting it, so a refusal can
+/// The harness spawns `setup` rather than awaiting it, so a refusal can
 /// surface at either end: from the start itself when the node dies before the
 /// fixture finishes converging, or from `shutdown`, which awaits `setup` and
 /// propagates its error. Reading only one end makes the test race the node.
@@ -36,19 +36,16 @@ async fn refusal(spoil: impl FnOnce(&mut peppygen::Parameters)) -> String {
 async fn refusal_error(spoil: impl FnOnce(&mut peppygen::Parameters)) -> peppygen::Error {
     let mut parameters = params();
     spoil(&mut parameters);
-    let started = Harness::start_with(
-        Config {
-            parameters: Some(parameters),
-            collision_ctrl_vacant: true,
-            perception_geometry_vacant: true,
-            ..Default::default()
-        },
-        openarm_backbone::setup,
-    )
+    let started = start(Config {
+        parameters: Some(parameters),
+        collision_ctrl_vacant: true,
+        perception_geometry_vacant: true,
+        ..Default::default()
+    })
     .await;
     match started {
         Err(e) => e,
-        Ok((harness, _mocks)) => shutdown_once_setup_returns(harness)
+        Ok((harness, _mocks, _fault)) => shutdown_once_setup_returns(harness)
             .await
             .expect_err("the backbone accepted a parameter it must refuse"),
     }
@@ -139,15 +136,6 @@ async fn a_filter_cutoff_at_or_above_nyquist_is_refused_by_name() {
         p.velocity_filter_cutoff_hz = p.control_rate_hz as f64 / 2.0
     })
     .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unknown_hardware_version_is_refused_by_name() {
-    let text = refusal(|p| p.hardware_version = "v3".to_string()).await;
-    assert!(
-        text.contains("v3"),
-        "the refusal must quote the offending value, got: {text}"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

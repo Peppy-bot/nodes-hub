@@ -1,21 +1,25 @@
-//! Node composition: parses every parameter up front, takes the single-instance
-//! lock, then wires the reader thread to the publish tasks. All device and
-//! stream logic lives in the sibling modules; this is only the assembly.
+//! Node composition: parses every parameter up front and takes the
+//! single-instance lock, then, once the robot's initializer names the follower's
+//! model, wires the reader thread to the publish tasks. All device and stream
+//! logic lives in the sibling modules; this is only the assembly.
 
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::fault::Fault;
 use control_core::time::{DurationError, RateOutOfRange, duration_from_secs, period_from_hz};
-use openarm_description::HardwareVersion;
 use peppygen::{NodeRunner, Parameters, Result};
+use robot_description::PerArm;
 use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::engage::{EngageTriggerOpening, EngageTriggerOpeningOutOfRange};
+use crate::identity;
 use crate::mapping::{GripperOpenFraction, GripperOpenFractionOutOfRange};
 use crate::publish;
 use crate::reader::{self, ReaderConfig};
+use crate::robot::{self, ARM_DOF, ARMS};
 use crate::transport::{TransportConfig, TransportError};
 
 /// One node instance per KER device: a second reader would fight for the USB
@@ -29,9 +33,6 @@ const MAX_RATE_HZ: u32 = 1_000;
 /// publisher) age against frame arrival, so this is the quantity that binds,
 /// and a window this tight already disengages on a five-frame hiccup.
 const MIN_STALE_TIMEOUT: Duration = Duration::from_millis(5);
-
-/// Latched when a task stopped on its own rather than in reaction to shutdown.
-static TASK_FAILED: std::sync::OnceLock<Task> = std::sync::OnceLock::new();
 
 /// A task whose stop ends the node.
 #[derive(Clone, Copy)]
@@ -62,11 +63,14 @@ impl fmt::Debug for Task {
     }
 }
 
-/// Everything this node refuses to run on, or stops for.
+/// Everything this node refuses to run on, or stops for: a parameter or the
+/// device lock, which `setup` refuses, and the follower's model, the reader
+/// thread's spawn or a task that stops, which end the node with a [`Fault`]
+/// after `setup` has returned.
 ///
 /// Named rather than stringly typed so each refusal keeps its source, and so
-/// this list names every refusal `setup` itself raises (a device the channel
-/// map does not describe is refused by the reader and arrives as
+/// this list names every refusal the node raises (a device the channel map does
+/// not describe is refused by the reader and arrives as
 /// [`NodeError::TaskStopped`], with the reason in the log).
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -83,8 +87,8 @@ pub enum NodeError {
     )]
     StaleTimeoutUnderFloor { given: f64, floor: f64 },
 
-    #[error(transparent)]
-    HardwareVersion(#[from] openarm_description::UnknownHardwareVersion),
+    #[error("the model the robot's initializer serves")]
+    Model(#[source] robot_description::UndrivenModel),
 
     #[error(transparent)]
     Transport(#[from] TransportError),
@@ -133,12 +137,12 @@ impl From<NodeError> for peppygen::Error {
 /// stack contact.
 #[derive(Debug)]
 struct Config {
-    version: HardwareVersion,
     command_period: Duration,
     stale_timeout: Duration,
     transport: TransportConfig,
     engage_trigger_opening: EngageTriggerOpening,
     gripper_open_fraction: GripperOpenFraction,
+    log_raw: bool,
 }
 
 /// Parse every launch parameter, refusing the first that cannot drive a KER.
@@ -154,7 +158,6 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         });
     }
     Ok(Config {
-        version: params.hardware_version.parse()?,
         command_period,
         stale_timeout,
         transport: TransportConfig::parse(
@@ -164,36 +167,41 @@ fn parse_config(params: &Parameters) -> NodeResult<Config> {
         )?,
         engage_trigger_opening: EngageTriggerOpening::try_from(params.engage_trigger_opening)?,
         gripper_open_fraction: GripperOpenFraction::try_from(params.gripper_open_fraction)?,
+        log_raw: params.log_raw,
     })
 }
 
-/// Which task stopped on its own, if one did; read by `main` after the
-/// runtime returns, so a reader or publisher death is recorded as a failure
-/// that names the task.
-pub fn task_failed() -> Option<Task> {
-    TASK_FAILED.get().copied()
+/// Each follower arm's joint limits in the description of `model`, which clamp
+/// the streamed joints: refused when the KER does not lead the model.
+fn follower_limits(model: &str) -> NodeResult<PerArm<[[f64; 2]; ARM_DOF], ARMS>> {
+    let driven = robot::LIMBS.model(model).map_err(NodeError::Model)?;
+    Ok(driven.joint_limits())
 }
 
-/// The runtime's entry point: the whole bring-up runs as [`NodeError`] and is
-/// converted once, here, so every step inside can use `?` on its own failures.
-pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
-    assemble(params, node_runner).await.map_err(Into::into)
+/// The runtime's entry point, in the shape `NodeBuilder::run` (and a test
+/// harness) take once `fault` is bound: the bring-up runs as [`NodeError`] and
+/// is converted once, here, so every step inside can use `?` on its own
+/// failures. The initializer that names the follower's model may start after
+/// this node, so `setup` returns without its answer, and a refusal after it
+/// raises `fault`.
+pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>, fault: Fault) -> Result<()> {
+    assemble(params, node_runner, fault)
+        .await
+        .map_err(Into::into)
 }
 
-async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResult {
+async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>, fault: Fault) -> NodeResult {
     // Pairing timestamps read this instance's bound clock, so the backbone
     // ages setpoints on one timeline.
     peppygen::clock::init(&node_runner).await?;
-    let token = node_runner.cancellation_token().clone();
 
     // Parse every parameter up front (parse, don't validate): a bad launch
     // fails here with the reason, before touching the device or the stack.
     let config = parse_config(&params)?;
 
     info!(
-        "config: {} follower, transport {}, {} Hz, engage at trigger opening <= {}, \
-         released gripper opening {}",
-        config.version,
+        "config: transport {}, {} Hz, engage at trigger opening <= {}, released gripper \
+         opening {}",
         config.transport,
         params.command_rate_hz,
         config.engage_trigger_opening.fraction(),
@@ -210,28 +218,55 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     node_runner.on_shutdown(async move {
         drop(ker_claim);
     });
+    let token = node_runner.cancellation_token().clone();
+    let run = run_once_identified(node_runner, config, fault.clone());
+    tokio::spawn(
+        fault.raise_on_panic("the start for the follower's model", run, move || {
+            token.cancel()
+        }),
+    );
+    Ok(())
+}
+
+/// Asks the robot's initializer for the follower's model until it answers,
+/// then reads the KER for it. A model the KER does not lead, or a task that
+/// stops on its own, raises `fault`.
+async fn run_once_identified(node_runner: Arc<NodeRunner>, config: Config, fault: Fault) {
+    let Some(model) = identity::model(&node_runner).await else {
+        return;
+    };
+    let token = node_runner.cancellation_token().clone();
+    if let Err(refusal) = run(&node_runner, config, &model, fault.clone()) {
+        fault.raise(refusal, || token.cancel());
+    }
+}
+
+/// Spawns the reader thread on the follower limits of `model` and the publish
+/// tasks, under the supervisor that raises `fault` when one stops on its own.
+fn run(node_runner: &Arc<NodeRunner>, config: Config, model: &str, fault: Fault) -> NodeResult {
+    let limits = follower_limits(model)?;
+    info!("leading a {model} follower");
+    let token = node_runner.cancellation_token().clone();
 
     // The reader thread owns the device and keeps the newest mapped sample
-    // on the watch channel; the publish tasks stream it. Returning
-    // promptly matters: peppylib registers node_health only after this
-    // closure returns, so the device connect must not be awaited here.
+    // on the watch channel; the publish tasks stream it.
     let (sample_tx, sample_rx) = watch::channel(None);
     let Config {
-        version,
         command_period,
         stale_timeout,
         transport,
         engage_trigger_opening,
         gripper_open_fraction,
+        log_raw,
     } = config;
     let reader_exited = reader::spawn(
         ReaderConfig {
             transport,
-            version,
+            limits,
             engage_trigger_opening,
             gripper_open_fraction,
             stale_timeout,
-            log_raw: params.log_raw,
+            log_raw,
         },
         sample_tx,
         token.clone(),
@@ -253,7 +288,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     {
         let token = node_runner.cancellation_token().clone();
         tokio::spawn(async move {
-            let fault: Option<Task> = tokio::select! {
+            let stopped: Option<Task> = tokio::select! {
                 exit = reader_exited => match exit {
                     Ok(reader::ReaderExit::Cancelled) => None,
                     // Fatal reports and a reader panic (closed channel) alike.
@@ -261,8 +296,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
                 },
                 joined = publisher => match joined {
                     Ok(Ok(())) => None,
-                    Ok(Err(fault)) => {
-                        error!("publisher stopped: {fault}");
+                    Ok(Err(stop)) => {
+                        error!("publisher stopped: {stop}");
                         Some(Task::Publisher)
                     }
                     Err(join) => {
@@ -271,11 +306,10 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
                     }
                 },
             };
-            if let Some(task) = fault {
-                error!("KER {task} stopped; cancelling the node");
-                let _ = TASK_FAILED.set(task);
+            match stopped {
+                Some(task) => fault.raise(NodeError::TaskStopped(task), || token.cancel()),
+                None => token.cancel(),
             }
-            token.cancel();
         });
     }
     Ok(())
@@ -292,7 +326,6 @@ mod tests {
             device_path: "/dev/openarm/ker".to_string(),
             engage_trigger_opening: 0.2,
             gripper_open_fraction: 0.5,
-            hardware_version: "v2".to_string(),
             log_raw: false,
             serial_baud: 2_000_000,
             stale_timeout_s: 0.25,
@@ -307,6 +340,38 @@ mod tests {
             Some(source) => format!("{error}: {source}"),
             None => error.to_string(),
         }
+    }
+
+    // Both OpenArm models give the follower limits of their description, and a
+    // model of other arms is refused naming the served model and the models the
+    // KER leads.
+    #[test]
+    fn the_follower_limits_are_those_of_a_model_the_ker_leads() {
+        for model in ["openarm_v1", "openarm_v2"] {
+            let limits = follower_limits(model).unwrap_or_else(|error| panic!("{model}: {error}"));
+            assert_eq!(
+                limits,
+                robot::LIMBS
+                    .model(model)
+                    .expect("an OpenArm")
+                    .joint_limits(),
+                "{model}"
+            );
+        }
+        let refused = follower_limits("so101").expect_err("the SO-101 is not two arms");
+        assert_eq!(
+            refused.to_string(),
+            "the model the robot's initializer serves"
+        );
+        let reason = std::error::Error::source(&refused)
+            .expect("the reason")
+            .to_string();
+        assert!(
+            reason.starts_with("model so101 describes")
+                && reason
+                    .ends_with("the models of that shape are \"openarm_v1\" and \"openarm_v2\""),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -370,13 +435,6 @@ mod tests {
                 "stale_timeout_s",
                 Parameters {
                     stale_timeout_s: f64::NAN,
-                    ..params()
-                },
-            ),
-            (
-                "hardware_version",
-                Parameters {
-                    hardware_version: "v3".into(),
                     ..params()
                 },
             ),

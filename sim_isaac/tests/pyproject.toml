@@ -10,8 +10,9 @@
 name = "sim-isaac-tests"
 version = "0.1.0"
 description = "GPU-free tests for the sim_isaac node: its model entries, pair routing, robot stays, stage, visuals, startup, loop pacing, cameras and clock"
-# One minor, so every run resolves the same interpreter.
-requires-python = ">=3.11,<3.12"
+# One minor, so every run resolves the same interpreter: the 3.12 that Isaac
+# Sim 6.1's python.sh runs.
+requires-python = ">=3.12,<3.13"
 dependencies = [
     # What the engine's modules reach for: pyjson5 to read the model entries,
     # numpy to pack depth. The pyjson5 pin is the one the node's base image
@@ -23,6 +24,9 @@ dependencies = [
     # What the engine shares with every other one: the registry, the four
     # slots, the model entries and the camera configuration.
     "sim_robot_core",
+    # The robots' descriptions, which a robot's entry is built from and the
+    # SO-101 stage is held to (test_so101_stage.py).
+    "robot_description_py",
 ]
 
 [dependency-groups]
@@ -45,4 +49,5 @@ dev = [
 package = false
 
 [tool.uv.sources]
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "e4222a3bf8e48d6dac01b8b6a3f693a823ce6626" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "67dd22f487e53c6f3f0121c10ad17e7773a5445c" }
+robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "67dd22f487e53c6f3f0121c10ad17e7773a5445c" }

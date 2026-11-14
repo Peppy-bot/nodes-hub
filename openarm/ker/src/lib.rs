@@ -11,11 +11,13 @@
 #![forbid(unsafe_code)]
 
 mod engage;
+mod identity;
 mod mapping;
 mod node;
 mod protocol;
 mod publish;
 mod reader;
+mod robot;
 mod transport;
 
-pub use node::{NodeError, setup, task_failed};
+pub use node::{NodeError, setup};

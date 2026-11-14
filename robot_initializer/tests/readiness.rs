@@ -9,27 +9,30 @@ use std::time::Duration;
 
 use peppygen::fixtures::exposed_services::robot_ready::is_ready as robot_is_ready;
 use peppygen::fixtures::harness::{Config, Harness};
-use peppygen::mock::deps::limbs::is_ready::ResponseData as LimbReady;
+use peppygen::mock::deps::limbs::is_ready::{FailureKind, ResponseData as LimbReady};
 use peppygen::mock::deps::simulation::attach;
 use peppygen::mock::deps::simulation::is_ready::ResponseData as SimulationReady;
 
 mod common;
 use common::{
-    LIMBS, joining_a_simulation, on_its_own_hardware, shutdown_once_setup_returns, simulation_of,
-    stood,
+    LIMBS, an_so101_on_its_own_hardware, capture_logs, joining_a_simulation, lines_holding,
+    on_its_own_hardware, shutdown_once_setup_returns, simulation_of,
 };
 
 /// How long each mock waits parked for the node's next poll. The node polls
 /// every 500ms, so this only expires once the harness is gone.
 const PUMP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Answers every `is_ready` poll from the node with the current value of
-/// `flag`, until the mock's session closes.
-fn pump_is_ready(
-    service: peppygen::mock::deps::limbs::is_ready::Service,
-    flag: &Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+/// How long the test waits for the node's next poll of a limb: the node polls
+/// every 500ms.
+const NEXT_POLL: Duration = Duration::from_secs(10);
+
+/// Takes every `set_model` call from the node, and answers every `is_ready`
+/// poll with the current value of `flag`, until the mock's session closes.
+fn pump_limb(mock: peppygen::mock::deps::limbs::Mock, flag: &Arc<AtomicBool>) {
+    pump_set_model(mock.set_model);
     let flag = Arc::clone(flag);
+    let service = mock.is_ready;
     tokio::spawn(async move {
         while let Ok(responder) = service.next_request(PUMP_TIMEOUT).await {
             let ready = flag.load(Ordering::SeqCst);
@@ -37,7 +40,18 @@ fn pump_is_ready(
                 break;
             }
         }
-    })
+    });
+}
+
+/// Takes every `set_model` call from the node.
+fn pump_set_model(service: peppygen::mock::deps::limbs::set_model::Service) {
+    tokio::spawn(async move {
+        while let Ok((_request, responder)) = service.next_request(PUMP_TIMEOUT).await {
+            if responder.respond().await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// The same, for the simulation's answer.
@@ -85,7 +99,7 @@ async fn reports_ready_only_when_every_limb_is() -> peppygen::Result<()> {
         .collect();
     assert_eq!(mocks.deps.limbs.len(), LIMBS);
     for (mock, flag) in mocks.deps.limbs.into_iter().zip(&flags) {
-        pump_is_ready(mock.is_ready, flag);
+        pump_limb(mock, flag);
     }
 
     // Three of four limbs ready: the robot must keep reporting not-ready
@@ -116,19 +130,79 @@ async fn losing_a_limb_flips_back_to_not_ready() -> peppygen::Result<()> {
     // for `stop()` below.
     let dying = limbs.next().expect("four limb mocks");
     for _ in 0..60 {
+        dying.set_model.enqueue_response()?;
         dying.is_ready.enqueue_response(LimbReady { ready: true })?;
     }
     for mock in limbs {
-        pump_is_ready(mock.is_ready, &always);
+        pump_limb(mock, &always);
     }
 
     poll_until(&harness, true, Duration::from_secs(10)).await?;
+
+    // Each poll tells the driver the robot's model before it asks.
+    let told = dying.set_model.captured()?;
+    assert!(
+        !told.is_empty() && dying.is_ready.captured_count() > 0,
+        "the node told and polled the limb"
+    );
+    assert!(
+        told.iter().all(|call| call.model == "openarm_v2"),
+        "every call names the robot's model: {told:?}"
+    );
 
     // The limb dies: its queryable disappears with its session, the node's
     // next poll of it fails, and the aggregate must drop.
     dying.stop();
     poll_until(&harness, false, Duration::from_secs(15)).await?;
 
+    harness.shutdown().await
+}
+
+/// A driver whose polls fail is logged once for each run of one reply, naming the
+/// driver and the reply: again when its reply changes, and again when it fails after
+/// an answer. The node handles each reply before it polls again, so the poll after a
+/// reply finds its line logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_limb_is_logged_once_per_reply_naming_it() -> peppygen::Result<()> {
+    const DRIVER: &str = "so101_follower_of_the_failing_limb_test";
+    const REJECTED: &str = "this component drives no model openarm_v2 in the failing limb test";
+    const GONE: &str = "the bus of the failing limb test is down";
+    capture_logs();
+    let config = Config {
+        limbs_instance_ids: vec![DRIVER.to_owned()],
+        ..an_so101_on_its_own_hardware()
+    };
+    let (harness, mut mocks) = Harness::start_with(config, robot_initializer::setup).await?;
+    let limb = mocks.deps.limbs.pop().expect("the SO-101's one driver");
+    pump_set_model(limb.set_model);
+
+    let replies = [
+        Some((FailureKind::Rejected, REJECTED)),
+        Some((FailureKind::Rejected, REJECTED)),
+        Some((FailureKind::Rejected, REJECTED)),
+        Some((FailureKind::ResourceUnavailable, GONE)),
+        Some((FailureKind::ResourceUnavailable, GONE)),
+        None,
+        Some((FailureKind::Rejected, REJECTED)),
+        Some((FailureKind::Rejected, REJECTED)),
+    ];
+    for reply in replies {
+        let responder = limb.is_ready.next_request(NEXT_POLL).await?;
+        match reply {
+            Some((kind, message)) => responder.respond_failure(kind, message).await?,
+            None => responder.respond(LimbReady { ready: false }).await?,
+        }
+    }
+    let _poll_after_the_last_reply = limb.is_ready.next_request(NEXT_POLL).await?;
+
+    assert_eq!(
+        (
+            lines_holding(&[DRIVER, REJECTED]),
+            lines_holding(&[DRIVER, GONE])
+        ),
+        (2, 1),
+        "one line for each run of one failed reply, naming the driver"
+    );
     harness.shutdown().await
 }
 
@@ -141,7 +215,7 @@ async fn a_simulated_robot_is_as_ready_as_its_simulation_says() -> peppygen::Res
         .attach
         .next_goal(Duration::from_secs(10))
         .await?
-        .accept(stood())
+        .accept()
         .await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;

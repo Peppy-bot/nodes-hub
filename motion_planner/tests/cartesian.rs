@@ -9,7 +9,6 @@ mod common;
 
 use chain_kinematics::nalgebra::{Isometry3, Translation3, Vector3};
 use motion_planner::node::NO_DEPTH_FRAME;
-use openarm_description::{ARM_DOF, Side};
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path::GoalWaypointsItem;
 use peppygen::fixtures::exposed_actions::motion_planning::plan_cartesian_path::{
     CancelState, Failure, FailureKind, GoalRequestData, ResultData, ResultOutcome, send_goal,
@@ -17,9 +16,9 @@ use peppygen::fixtures::exposed_actions::motion_planning::plan_cartesian_path::{
 use peppygen::fixtures::harness::Harness;
 
 use common::{
-    CLEAR_OR_ALLOW_WAY_OUT, LEFT_READY, OPENARM_V2, OVER_THE_TABLE, RIGHT_READY, Solid, TIMEOUT,
-    UNDER_THE_TABLE, along, arms, at_ms, facing_the_robot, looking_at, publish_arms, render,
-    start_with_camera, start_without_camera, take_frame, under_a_seen_table,
+    ARM_DOF, CLEAR_OR_ALLOW_WAY_OUT, LEFT, OPENARM_V2, Solid, TIMEOUT, along, arms, at_ms,
+    facing_the_robot, left_ready, looking_at, over_the_table, publish_arms, render, right_ready,
+    start_with_camera, start_without_camera, take_frame, under_a_seen_table, under_the_table,
 };
 
 /// A path of the left arm's grasp point from where it stands through `poses`.
@@ -46,10 +45,7 @@ fn path_through(poses: &[Isometry3<f64>], avoid_collisions: bool) -> GoalRequest
 
 /// The grasp point's pose with the left arm at `q`.
 fn hand(q: &[f64; ARM_DOF]) -> Isometry3<f64> {
-    OPENARM_V2.arms[Side::Left]
-        .geometry
-        .chain()
-        .world_ee_pose(q)
+    OPENARM_V2.arms[LEFT].geometry.chain().world_ee_pose(q)
 }
 
 /// `pose` moved `m` along z, its orientation kept.
@@ -104,8 +100,8 @@ async fn refusal(harness: &Harness, goal: &GoalRequestData) -> Failure {
 async fn a_path_that_checks_collisions_waits_for_a_depth_frame_and_one_that_does_not_answers()
 -> peppygen::Result<()> {
     let (harness, mocks) = start_with_camera(&facing_the_robot()).await?;
-    publish_arms(&mocks, at_ms(0), &arms(LEFT_READY, RIGHT_READY)).await?;
-    let poses = [raised(&hand(&LEFT_READY), 0.05)];
+    publish_arms(&mocks, at_ms(0), &arms(left_ready(), right_ready())).await?;
+    let poses = [raised(&hand(&left_ready()), 0.05)];
 
     let refused = refusal(&harness, &path_through(&poses, true)).await;
     assert!(
@@ -119,7 +115,7 @@ async fn a_path_that_checks_collisions_waits_for_a_depth_frame_and_one_that_does
         .expect("a path");
     assert_eq!(unchecked.fraction, 1.0);
     assert_eq!(unchecked.map_stamp, None);
-    assert_eq!(unchecked.start_joint_positions, LEFT_READY.to_vec());
+    assert_eq!(unchecked.start_joint_positions, left_ready().to_vec());
     for waypoint in &unchecked.waypoints {
         let q: [f64; ARM_DOF] = waypoint.joint_positions.as_slice().try_into().expect("7");
         let pose = hand(&q);
@@ -132,7 +128,7 @@ async fn a_path_that_checks_collisions_waits_for_a_depth_frame_and_one_that_does
     }
 
     let nothing = vec![None; (common::WIDTH * common::HEIGHT) as usize];
-    take_frame(&harness, &mocks, at_ms(0), &nothing, LEFT_READY).await?;
+    take_frame(&harness, &mocks, at_ms(0), &nothing, left_ready()).await?;
     let checked = path(&harness, &path_through(&poses, true))
         .await
         .expect("a path");
@@ -146,7 +142,7 @@ async fn a_path_that_checks_collisions_waits_for_a_depth_frame_and_one_that_does
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_line_toward_a_table_ends_before_it_unless_collisions_go_unchecked()
 -> peppygen::Result<()> {
-    let start = hand(&OVER_THE_TABLE);
+    let start = hand(&over_the_table());
     let here = start.translation.vector;
     let top = here.z - 0.2;
     let table: Solid = (
@@ -158,13 +154,13 @@ async fn a_line_toward_a_table_ends_before_it_unless_collisions_go_unchecked()
         Vector3::new(here.x, here.y, top),
     );
     let (harness, mocks) = start_with_camera(&camera).await?;
-    publish_arms(&mocks, at_ms(0), &arms(OVER_THE_TABLE, RIGHT_READY)).await?;
+    publish_arms(&mocks, at_ms(0), &arms(over_the_table(), right_ready())).await?;
     take_frame(
         &harness,
         &mocks,
         at_ms(0),
         &render(&camera, None, &[table]),
-        OVER_THE_TABLE,
+        over_the_table(),
     )
     .await?;
     let poses = [raised(&start, -0.15)];
@@ -198,7 +194,7 @@ fn up_from(start: &[f64; ARM_DOF], avoid_collisions: bool) -> GoalRequestData {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_in_contact_fails_unless_collisions_go_unchecked() -> peppygen::Result<()> {
     let (harness, _mocks, crossing_t) = under_a_seen_table().await?;
-    let crossing = along(&UNDER_THE_TABLE, &OVER_THE_TABLE, crossing_t);
+    let crossing = along(&under_the_table(), &over_the_table(), crossing_t);
     let Err(Ended::Failed(failed)) = path(&harness, &up_from(&crossing, true)).await else {
         panic!("a path from a start in contact fails once taken");
     };
@@ -230,7 +226,7 @@ async fn a_start_inside_the_clearance_fails_unless_collisions_go_unchecked() -> 
     let mut out_of_contact = None;
     for step in 1..=LIFT_STEPS {
         let t = crossing_t + (1.0 - crossing_t) * f64::from(step) / f64::from(LIFT_STEPS);
-        let start = along(&UNDER_THE_TABLE, &OVER_THE_TABLE, t);
+        let start = along(&under_the_table(), &over_the_table(), t);
         let ended = path(&harness, &up_from(&start, true)).await;
         let in_contact =
             matches!(&ended, Err(Ended::Failed(failure)) if failure.message.contains(" touches "));
@@ -265,8 +261,8 @@ const MANY_LINES: usize = 20_000;
 // A cancel of a path of many lines ends the goal cancelled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
-    let here = hand(&LEFT_READY);
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
+    let here = hand(&left_ready());
     let there = raised(&here, 0.01);
     let poses: Vec<Isometry3<f64>> = (0..MANY_LINES)
         .map(|k| if k % 2 == 0 { there } else { here })
@@ -293,20 +289,20 @@ async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
 // limit by more than the start tolerance.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(LEFT_READY, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     let inner = GoalRequestData {
         link_name: "openarm_left_link3".to_string(),
-        ..path_through(&[hand(&LEFT_READY)], true)
+        ..path_through(&[hand(&left_ready())], true)
     };
     let refused = refusal(&harness, &inner).await;
     assert_eq!(refused.kind, FailureKind::Rejected, "{refused}");
     let refused = refusal(&harness, &path_through(&[], true)).await;
     assert_eq!(refused.kind, FailureKind::Rejected, "{refused}");
-    let mut outside = LEFT_READY;
+    let mut outside = left_ready();
     outside[3] = -1.0;
     let from_outside = GoalRequestData {
         start_joint_positions: outside.to_vec(),
-        ..path_through(&[hand(&LEFT_READY)], true)
+        ..path_through(&[hand(&left_ready())], true)
     };
     let refused = refusal(&harness, &from_outside).await;
     assert_eq!(refused.kind, FailureKind::PreconditionFailed, "{refused}");

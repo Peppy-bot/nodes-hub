@@ -3,23 +3,27 @@
 The node that brings one robot into being, says who it is and says when it is
 ready. It serves a robot of any model: the launcher names the model in the
 `model` parameter, `openarm_v2` for an OpenArm or `so101` for an SO-101, and
-nothing else in the node is about one robot rather than another.
+the rest of the node is the same for every robot. The model is
+one of the models of `robot_description` in public-peppy-libs, whose URDF and
+SRDF hold every fact of the robot the node serves; the node refuses to start on
+a model it holds no description of, naming the models it holds.
 
 ## Joining a simulation
 
 A robot whose launcher binds a simulation to this node's `simulation` slot
 joins it before it does anything else. It attaches as the copy it runs as,
 naming its `model` verbatim, the id the simulation's catalogue knows the robot
-by, and the placement it was given, or none for a free spot of the engine's
-choosing, and the engine answers with the limbs it gave the robot. The node
-keeps no list of models: a simulation refuses a model it does not stand,
-naming the ones it does. The goal stays open for as long as the robot is in
-the scene, and shutting the node down takes the robot out, within peppy's
-shutdown grace. When the process of the node dies without shutting down,
-the engine keeps the robot for its pair grace time, which is the sender grace
-of the attach goal, and then takes the robot out. A node of the same copy
-that comes back within that time attaches the robot that still stands, and
-the goal of the node that died ends cancelled. A `placement` names where the robot's base stands; the
+by, the placement it was given, or none for a free spot of the engine's
+choosing, and the model's URDF and SRDF, from which the engine maps the
+robot's arms, grippers and cameras. A simulation refuses a model it does not
+stand, naming the ones it does, and a description its entry for the model does
+not fit. The goal stays open for as long as the robot is in the scene, and
+shutting the node down takes the robot out, within peppy's shutdown grace.
+When the process of the node dies without shutting down, the engine keeps the
+robot for its pair grace time, which is the sender grace of the attach goal,
+and then takes the robot out. A node of the same copy that comes back within
+that time attaches the robot that still stands, and the goal of the node that
+died ends cancelled. A `placement` names where the robot's base stands; the
 default lets the engine choose a free spot on the lattice it parks robots on.
 
 The node starts only once the robot stands. Its setup waits for the engine to
@@ -69,19 +73,26 @@ attached under. Every simulation stands as many robots as its machine
 can run.
 
 A robot that drives its own hardware leaves the `simulation` slot vacant: it
-joins no simulation and starts at once, and its `model` is identity only, the
-one `get_identity` answers.
+joins no simulation and starts at once, and its `model` names the
+description that `get_identity` and `get_description` answer.
 
 ## The readiness gate
 
 The node exposes the robot-level `is_ready` service the backbone gates on,
 true only once everything that answers for the robot reports ready. On a
 real robot the launcher binds on `limbs` whatever drivers answer for it: one
-per limb on an OpenArm, the single `so101_follower` on an SO-101. On a
-simulated one the simulation bound on `simulation` answers for the whole
-robot: standing, and holding a pair for every limb its model has. One initializer serves the real robot and every simulation. An
-answer that dies or becomes unreachable flips the robot back to not-ready on
-the next poll, and a launcher that binds neither slot is refused at start.
+per limb on an OpenArm, the single `so101_follower` on an SO-101. Each poll
+first tells a driver the robot's model (`set_model`), then asks whether it is
+ready (`is_ready`): a driver configures itself for the model it is told first,
+answers ready only once it is configured, and refuses a model it does not
+drive with an error reply that names the models it drives. A driver whose poll
+fails, with an error reply or no reply, is
+logged naming the driver and the reply, once for each run of one reply. On a
+simulated one the simulation bound on `simulation` answers for
+the whole robot: standing, and holding a pair for every limb its description
+names. One initializer serves the real robot and every simulation. An answer
+that dies or becomes unreachable flips the robot back to not-ready on the
+next poll, and a launcher that binds neither slot is refused at start.
 
 Readiness comes after the robot stands: a robot that the simulation refused
 or did not stand never serves `is_ready` at all, so the backbone never gates
@@ -98,26 +109,22 @@ entry a simulation lists for this robot carries the same `robot`. The answer
 is fixed when the node starts and is served from then on, before the robot
 joins a scene and whether or not it is ready.
 
+The node exposes `get_description` too, which answers the description of the
+robot's model: its URDF, its SRDF, each collision mesh the URDF names by its
+file name, and the digest of them all, as `robot_description` holds them.
+The robot's backbone compares the digest with the one of the description it
+was built with, and does not start on another. The answer is fixed when the
+node starts.
+
 ## The robot's guide
 
-The node exposes `get_guide` of the `robot_guide` contract: the park pose of
-each arm that the robot's launcher wrote one for. The park poses belong to the
-robot's model, so the launcher writes them beside `model`, and a caller that
-drives robots of many models, such as a chat agent, asks each robot. The node
-keeps no fact about any model.
-
-A node parameter is a primitive or a group, so the launcher writes the park
-poses in one string, `park_poses`: an entry `<arm>:<joint>,<joint>,...` for
-each arm that has a park pose, its joints in radians in the arm's joint order,
-and `;` between entries, for example
-`"left_arm:0.0584,-0.4923,-1.0367,1.7119,-0.4582,-0.1219,-1.1645"`.
-
-`park_poses` defaults to empty, and the guide of a robot whose launcher wrote
-none answers empty arrays. The node reads it when it starts and refuses to
-start on a value it cannot read: an entry with no arm or no joint, a joint
-that is not a finite number, an arm named twice. The refusal names the entry.
-The answer is fixed from then on and served whether or not the robot is
-ready.
+The node exposes `get_guide` of the `robot_guide` contract: the `park` state
+of each arm group of the SRDF of the robot's description, in the
+description's arm order. The park poses belong to the robot's model, so a
+caller that drives robots of many models, such as a chat agent, asks each
+robot. A description that gives no arm a park state answers empty arrays.
+The answer is fixed when the node starts and served whether or not the robot
+is ready.
 
 ## Build
 
@@ -154,8 +161,9 @@ Something answering for the robot is not reporting ready, and an unreachable
 answer counts as not ready. On a real robot that is one of the limb drivers;
 in a simulation it is the simulation, which reports the robot ready only
 once it stands and every one of its limb pairs is held. This node reports
-only the aggregate; find the holdout in the drivers' own logs (`peppy node
-info <node>:v1` per limb node) or the simulation's.
+the aggregate, and logs a limb driver whose poll fails with the reply it
+gave; find a holdout that answers not ready in the drivers' own logs
+(`peppy node info <node>:v1` per limb node) or the simulation's.
 
 **the node fails at start, saying the simulation refused it or did not stand it**
 The message gives the engine's failure kind and its reason. The engine

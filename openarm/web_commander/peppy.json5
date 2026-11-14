@@ -15,6 +15,13 @@
     ],
     depends_on: {
       contracts: [
+        // The robot's model, whose description the panel's arm models, joint
+        // ranges (the URDF's limits) and ready and home postures come from. The
+        // panel asks for it once its setup has returned, until the robot's
+        // initializer answers. A model whose arms are not the panel's ends the
+        // node naming the models that are. The gripper axis is the unitless
+        // opening fraction on every model.
+        { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
         // The dataset recorder behind the panel's record button. zero_or_more:
         // a deployment without a recorder leaves the slot unbound and the
         // panel hides the recording controls.
@@ -61,6 +68,7 @@
   interfaces: {
     services: {
       consumes: [
+        { link_id: "robot_identity", name: "get_identity" },
         // The panel's Finish-session button: the recorder finalizes and
         // mirrors the current dataset and opens a fresh session in place.
         { link_id: "recorder", name: "finish_session" }
@@ -68,7 +76,7 @@
     },
     actions: {
       // Goals fired by the operator land on the limb_motion producer, which runs
-      // the move itself for the side whose id matches.
+      // the move itself for the arm or gripper the goal names.
       consumes: [
         // The panel drives OpenArm's seven-joint arms, so the joint move's
         // generic joint vectors are pinned to that length, as on the backbone.
@@ -148,10 +156,6 @@
       // Rate (Hz) at which enabled targets are re-published on the arm and
       // gripper pairing slots, which the backbone consumes.
       command_rate_hz: "u32",
-      // Robot generation ("v1" or "v2"): picks the panel's arm joint ranges
-      // (URDF limits), so the launcher must be explicit. The gripper axis is
-      // the unitless opening fraction on every generation.
-      hardware_version: "string",
       // Operator's launch end-effector speed cap (m/s), streamed live to the backbone on
       // governor_control and retunable from the UI. Require > 0. The sim launchers
       // set a permissive value; the real arm a conservative one.

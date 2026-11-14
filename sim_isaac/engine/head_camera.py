@@ -240,15 +240,14 @@ def body_position(rig: dict) -> tuple[float, float, float]:
 
 
 def check_chest_camera(rig: dict, entry) -> None:
-    """The chest camera the sensor renders for a model that draws the pack
+    """The chest camera the sensor renders for a robot that draws the pack
     must be the pack's left eye: the same parent link, its position to a
-    tenth of a millimetre, its orientation the same rotation. The model's
-    entry is kept by hand from the rig the derivation prints, and this
-    refuses a pack bump or an entry edit that leaves the stream looking out
-    of the drawn lens."""
+    tenth of a millimetre, its orientation the same rotation. The robot's
+    description places the camera, and this refuses a pack bump or a
+    description that leaves the stream looking out of the drawn lens."""
     chest = next((c for c in entry.cameras if c.name == CHEST_CAMERA), None)
     if chest is None:
-        raise RuntimeError(f"the {entry.model} entry declares no {CHEST_CAMERA!r} camera")
+        raise RuntimeError(f"the {entry.model} description has no {CHEST_CAMERA!r} camera")
     left = rig["cameras"]["left"]
     position = np.array(left["position_m"], dtype=np.float64)
     quat = np.array(left["quat_wxyz"], dtype=np.float64)
@@ -275,40 +274,36 @@ def check_chest_camera(rig: dict, entry) -> None:
 class Pack:
     """A staged pack, read and checked: its directory, its mount origin in
     the pedestal link's frame, each visual mesh by name as (positions,
-    normals, triangles), and the collision hull as (points, triangles)."""
+    normals, triangles), the collision hull as (points, triangles), and its
+    rig, which a robot that draws it holds its chest camera to."""
 
     directory: Path
     body_position: tuple[float, float, float]
     visuals: tuple[tuple[str, tuple[np.ndarray, np.ndarray, np.ndarray]], ...]
     collision: tuple[np.ndarray, np.ndarray]
+    rig: dict
 
 
-def load(directory: Path, entries) -> Pack:
+def load(directory: Path) -> Pack:
     """The pack staged at `directory`, verified against the pinned digest,
-    with the chest camera of every entry in `entries` checked against its
-    rig and its meshes read. The node reads it once at setup, so a pack that
-    is not staged or not the pinned one, a mesh it cannot read, or a chest
-    camera that has drifted off the pack's left eye stops the node before
-    any robot stands."""
+    with its meshes read. The node reads it once at setup, so a pack that is
+    not staged or not the pinned one, or a mesh it cannot read, stops the
+    node before any robot stands."""
     verify(directory)
     rig = json.loads((directory / RIG_FILE).read_text())
-    for entry in entries:
-        check_chest_camera(rig, entry)
     return Pack(
         directory=directory,
         body_position=body_position(rig),
         visuals=tuple((name, read_obj(directory / f"{name}.obj")) for name in VISUAL_MESHES),
         collision=read_stl(directory / COLLISION_FILE),
+        rig=rig,
     )
 
 
 def load_for(models, directory: Path) -> Optional[Pack]:
     """The pack the models of this engine that draw the head camera share, or
     None when none of them draws it."""
-    drawing = [
-        models.of(name).entry for name in models.names() if models.of(name).head_camera
-    ]
-    return load(directory, drawing) if drawing else None
+    return load(directory) if models.draws_head_camera() else None
 
 
 def attach(stage, root: str, pack: Pack) -> str:

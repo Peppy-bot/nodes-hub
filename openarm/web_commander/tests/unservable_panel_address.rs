@@ -2,11 +2,11 @@
 //! launch naming what to fix. No other port can rescue this one, so it must
 //! not be retried.
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 
 // An address of TEST-NET-1 (RFC 5737), which no host holds.
 const UNSERVABLE_HOST: &str = "192.0.2.1";
@@ -28,13 +28,10 @@ async fn a_panel_address_this_host_cannot_serve_fails_the_launch() {
 
     // The harness runs `setup` in the background and hands its error back at
     // teardown, so the refusal surfaces there.
-    let (harness, _mocks) = Harness::start_with(
-        Config {
-            parameters: Some(parameters),
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (harness, _mocks, _fault) = helpers::boot(Config {
+        parameters: Some(parameters),
+        ..Config::default()
+    })
     .await
     .expect("the harness starts the node");
 

@@ -1,4 +1,4 @@
-from so101_description.units import MOTOR_NAMES
+from so101.units import MOTOR_NAMES
 
 from so101_follower.health import (
     LEVEL_CRITICAL,

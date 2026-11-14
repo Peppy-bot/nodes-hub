@@ -12,7 +12,7 @@ from peppygen import NodeBuilder, NodeRunner
 from peppygen.paired_topics.arm import joint_setpoints
 from peppygen.paired_topics.gripper import gripper_setpoints
 from peppygen.parameters import Parameters
-from so101_description import units
+from so101 import units
 
 from so101_leader import params as params_mod
 from so101_leader.device import DeviceLoop, LerobotLeader

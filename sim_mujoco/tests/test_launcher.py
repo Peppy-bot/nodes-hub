@@ -10,12 +10,13 @@ import logging
 import sys
 import threading
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import mujoco
 import mujoco.viewer
 import pytest
-from sim_robot_core.models import EngineModel, parse_entry
+from entries import camera, entry, known as known_model
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the launcher imports)
 
@@ -26,15 +27,15 @@ import _launcher as launcher_module  # noqa: E402  pylint: disable=C0413
 from _launcher import SimLauncher, _NoView  # noqa: E402  pylint: disable=C0413
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from exts import camera_sensor  # noqa: E402  pylint: disable=C0413
-from mujoco_models import parse  # noqa: E402  pylint: disable=C0413
 from world import World  # noqa: E402  pylint: disable=C0413
 
 _SCENE = "arm/arm.xml"
 _STATE_RATE_HZ = 50
 _POSTURE = {"lift": 0.25, "flex": -0.5}
 
-# A two-joint arm with a prop beside it, so a rebuild has a free joint to
-# carry as well as the robot's own.
+# A two-joint arm with a bob on a ball joint, so a rebuild has a joint to
+# carry whose positions and speeds differ in width. The base carries the
+# robot.
 _ARM = """<mujoco model="arm">
   <compiler angle="radian"/>
   <option timestep="0.002" integrator="implicitfast"/>
@@ -49,10 +50,10 @@ _ARM = """<mujoco model="arm">
           <geom type="capsule" fromto="0 0 0 0 0 0.15" size="0.015" mass="0.1"/>
         </body>
       </body>
-    </body>
-    <body name="prop" pos="0.4 0 0.3">
-      <freejoint name="prop"/>
-      <geom type="box" size="0.02 0.02 0.02" mass="0.05"/>
+      <body name="bob" pos="0.1 0 0">
+        <joint name="bob" type="ball"/>
+        <geom type="sphere" size="0.02" mass="0.05"/>
+      </body>
     </body>
   </worldbody>
   <actuator>
@@ -60,22 +61,11 @@ _ARM = """<mujoco model="arm">
     <position name="flex" joint="flex" kp="20" kv="1" ctrlrange="-1.5 1.5"/>
   </actuator>
 </mujoco>"""
-_ARM_ENTRY = {
-    "arms": [{"name": "arm", "joints": ["lift", "flex"]}],
-    "start_posture": _POSTURE,
-}
-_CAMERA_ARM_ENTRY = {
-    **_ARM_ENTRY,
-    "cameras": [{
-        "name": "wrist",
-        "parent_link": "fore",
-        "pos": [0.0, 0.0, 0.1],
-        "quat_wxyz": [1.0, 0.0, 0.0, 0.0],
-        "fovy_deg": 60.0,
-        "color": {"width": 8, "height": 4},
-        "fps": 10,
-    }],
-}
+_ARM_ENTRY = entry("arm", arms={"arm": ["lift", "flex"]}, start_posture=_POSTURE)
+_CAMERA_ARM_ENTRY = replace(
+    _ARM_ENTRY,
+    cameras=(camera("wrist", "fore", (0.0, 0.0, 0.1), (1.0, 0.0, 0.0, 0.0), 60.0, 8, 4, 10),),
+)
 
 
 class FakeIO:
@@ -121,9 +111,8 @@ def assets_fixture(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _known(entry=None, **engine):
-    parsed = parse_entry("arm", "arm.json5", entry or _ARM_ENTRY)
-    return parse(EngineModel(entry=parsed, engine={"scene": _SCENE, **engine}))
+def _known(robot=None, **release):
+    return known_model("arm", robot or _ARM_ENTRY, mujoco_models.ASSETS_DIR / _SCENE, "base", **release)
 
 
 def _launcher(world: World) -> SimLauncher:
@@ -144,9 +133,9 @@ def _frame_ids(launcher: SimLauncher) -> dict:
     return launcher._extension._camera_sensor.counters()  # pylint: disable=W0212
 
 
-def _stand(launcher: SimLauncher, world: World, name: str) -> None:
+def _stand(launcher: SimLauncher, world: World, name: str, known=None) -> None:
     """A robot joining, the way an edit from the contract server does it."""
-    world.add(name, _known(), world.free_spot())
+    world.add(name, known or _known(), world.free_spot())
     launcher.unbind()
     launcher.rebind()
 
@@ -163,7 +152,7 @@ def _ctrl(launcher: SimLauncher, actuator: str) -> float:
 
 class TestTheSceneAsRobotsComeAndGo:
     def test_an_empty_scene_steps_and_stands_nobody(self):
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
 
         launcher.rebind()
@@ -172,7 +161,7 @@ class TestTheSceneAsRobotsComeAndGo:
         launcher._view.step(lambda: False)  # pylint: disable=W0212
 
     def test_a_robot_that_joins_starts_in_its_models_posture(self):
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
 
@@ -184,7 +173,7 @@ class TestTheSceneAsRobotsComeAndGo:
     def test_a_robot_standing_keeps_its_own_state_when_another_joins(self):
         """Its joints, their speeds and the targets its actuators hold are
         carried onto the scene composed around the robot that arrived."""
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
         _stand(launcher, world, "alpha")
@@ -202,25 +191,25 @@ class TestTheSceneAsRobotsComeAndGo:
         # The robot that just joined starts where its model's posture puts it.
         assert _qpos(launcher, "bravo/lift") == pytest.approx(_POSTURE["lift"])
 
-    def test_a_prop_a_robot_carries_keeps_its_pose_across_a_rebuild(self):
-        """A free joint carries seven positions and six speeds, which is a
+    def test_a_ball_joint_a_robot_carries_keeps_its_pose_across_a_rebuild(self):
+        """A ball joint carries four positions and three speeds, which is a
         width the model states and the carry reads."""
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
         _stand(launcher, world, "alpha")
         model, data = launcher._model, launcher._data  # pylint: disable=W0212
-        address = model.joint("alpha/prop").qposadr[0]
-        data.qpos[address : address + 7] = [0.1, 0.2, 0.3, 1.0, 0.0, 0.0, 0.0]
+        address = model.joint("alpha/bob").qposadr[0]
+        data.qpos[address : address + 4] = [0.6, 0.8, 0.0, 0.0]
 
         _stand(launcher, world, "bravo")
 
         moved, moved_data = launcher._model, launcher._data  # pylint: disable=W0212
-        carried = moved.joint("alpha/prop").qposadr[0]
-        assert moved_data.qpos[carried : carried + 3].tolist() == pytest.approx([0.1, 0.2, 0.3])
+        carried = moved.joint("alpha/bob").qposadr[0]
+        assert moved_data.qpos[carried : carried + 4].tolist() == pytest.approx([0.6, 0.8, 0.0, 0.0])
 
     def test_a_robot_that_leaves_takes_only_itself_out(self):
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
         _stand(launcher, world, "alpha")
@@ -239,7 +228,7 @@ class TestTheSceneAsRobotsComeAndGo:
     def test_the_engine_clock_runs_on_across_a_rebuild(self):
         """The fleet reads one clock, so it never goes back when a robot
         joins."""
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
         _stand(launcher, world, "alpha")
@@ -258,7 +247,7 @@ class TestTheThreadThatStepsTheScene:
     def test_it_makes_the_changes_waiting_and_stops_when_it_is_told_to(self):
         """Standing a robot runs on this thread, and the loop ends on the
         stop the node sets when it shuts down."""
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         edits = Edits()
         stop = threading.Event()
         launcher = _Unwatched(
@@ -283,7 +272,7 @@ class TestTheThreadThatStepsTheScene:
         assert [robot.instance for robot in world.robots()] == ["alpha"]
 
     def test_a_change_still_waiting_when_the_engine_stops_is_told_so(self):
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         edits = Edits()
         stop = threading.Event()
         stop.set()
@@ -302,7 +291,7 @@ class TestTheThreadThatStepsTheScene:
         """A consumer pairs a frame with its depth by the id it carries, so
         the count runs on into the scene its robot is carried onto."""
         monkeypatch.setattr(camera_sensor.MujocoCameraSensor, "start", lambda self: None)
-        world = World(head_camera_pack=None, renders=True)
+        world = World(renders=True)
         launcher = _launcher(world)
         world.add("alpha", _known(_CAMERA_ARM_ENTRY), world.free_spot())
         launcher.rebind()
@@ -321,7 +310,7 @@ class TestTheThreadThatStepsTheScene:
         """An engine holding no scene steps nothing and publishes no clock.
         The node stops saying so, and the robots standing in it join the
         engine that comes back."""
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         world.add("alpha", _known(), world.free_spot())
 
@@ -348,7 +337,7 @@ class TestTheThreadThatStepsTheScene:
         """An engine still holding a view or a scene that failed to close
         steps physics for nobody while reporting healthy, so letting go is
         total however badly it goes."""
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = _launcher(world)
         world.add("alpha", _known(), world.free_spot())
         launcher.rebind()
@@ -374,7 +363,7 @@ class TestTheThreadThatStepsTheScene:
         assert launcher._camera_counters == {}  # pylint: disable=W0212
 
     def test_a_scene_no_robot_stands_in_is_shown_to_nobody(self):
-        launcher = _launcher(World(head_camera_pack=None, renders=False))
+        launcher = _launcher(World(renders=False))
 
         launcher.rebind()
 
@@ -388,7 +377,7 @@ class TestTheThreadThatStepsTheScene:
             raise RuntimeError("the viewer port is taken")
 
         monkeypatch.setattr(launcher_module, "_BrowserView", refuse)
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         launcher = SimLauncher(
             world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ,
             headless=True, viewer_host="0.0.0.0", viewer_port=8080,
@@ -426,7 +415,7 @@ class TestTheThreadThatStepsTheScene:
 
         monkeypatch.setitem(sys.modules, "viser", types.SimpleNamespace(ViserServer=_Server))
         monkeypatch.setitem(sys.modules, "mjviser", types.SimpleNamespace(Viewer=_refuse))
-        world = World(head_camera_pack=None, renders=False)
+        world = World(renders=False)
         world.add("alpha", _known(), world.free_spot())
         model = world.compose().compile()
 
@@ -450,7 +439,7 @@ class TestTheThreadThatStepsTheScene:
             launcher_module, "_WindowView", lambda *args: opened.append("window") or _NoView()
         )
         for headless in (True, False):
-            world = World(head_camera_pack=None, renders=False)
+            world = World(renders=False)
             launcher = SimLauncher(
                 world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ,
                 headless=headless, viewer_host="0.0.0.0", viewer_port=8080,
@@ -464,15 +453,10 @@ class TestTheThreadThatStepsTheScene:
     def test_a_joint_the_scene_leaves_unnamed_is_left_where_its_model_puts_it(self):
         """A model may leave a joint unnamed, and an unnamed joint is one the
         scene before this one has no name to look up."""
-        unnamed = _ARM.replace('<freejoint name="prop"/>', "<freejoint/>")
+        unnamed = _ARM.replace('<joint name="bob" type="ball"/>', '<joint type="ball"/>')
         (mujoco_models.ASSETS_DIR / "arm" / "unnamed.xml").write_text(unnamed)
-        known = parse(
-            EngineModel(
-                entry=parse_entry("arm", "arm.json5", _ARM_ENTRY),
-                engine={"scene": "arm/unnamed.xml"},
-            )
-        )
-        world = World(head_camera_pack=None, renders=False)
+        known = known_model("arm", _ARM_ENTRY, mujoco_models.ASSETS_DIR / "arm" / "unnamed.xml", "base")
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
         world.add("alpha", known, world.free_spot())
@@ -489,17 +473,20 @@ class TestTheThreadThatStepsTheScene:
         """Its damping comes from the scene's home configuration, so a robot
         carried into a scene composed around a robot that joined keeps the
         control law it was standing under."""
-        world = World(head_camera_pack=None, renders=False)
+        servoed = _known(arm_gains={"arm": [(20.0, 0.0), (20.0, 0.0)]})
+        world = World(renders=False)
         launcher = _launcher(world)
         launcher.rebind()
-        _stand(launcher, world, "alpha")
+        _stand(launcher, world, "alpha", servoed)
         model, data = launcher._model, launcher._data  # pylint: disable=W0212
         lift = model.actuator("alpha/lift").id
         tuned = float(model.actuator_biasprm[lift][2])
+        # The damping is raised to critical against the joint's inertia.
+        assert tuned < 0.0
         data.qpos[model.joint("alpha/lift").qposadr[0]] = 1.4
         data.qpos[model.joint("alpha/flex").qposadr[0]] = -1.4
 
-        _stand(launcher, world, "bravo")
+        _stand(launcher, world, "bravo", servoed)
 
         moved = launcher._model  # pylint: disable=W0212
         assert float(moved.actuator_biasprm[moved.actuator("alpha/lift").id][2]) == pytest.approx(
@@ -572,7 +559,7 @@ class _Viewer:
 def _open_view(kind: str, scene: _CountingScene, monkeypatch):
     """A view of `kind` on a scene one robot stands in, stepping `scene`,
     with its window or its browser server faked."""
-    world = World(head_camera_pack=None, renders=False)
+    world = World(renders=False)
     world.add("alpha", _known(), world.free_spot())
     model = world.compose().compile()
     data = mujoco.MjData(model)
@@ -603,7 +590,7 @@ class TestTheStepsAViewOwes:
     so a robot leaving waits for one step, not for all of them."""
 
     def test_every_step_owed_is_taken_while_the_scene_stands_as_it_is(self, kind, monkeypatch):
-        launcher = _launcher(World(head_camera_pack=None, renders=False))
+        launcher = _launcher(World(renders=False))
         scene = _CountingScene()
         view = _open_view(kind, scene, monkeypatch)
         _owe_a_whole_turn(view)
@@ -615,7 +602,7 @@ class TestTheStepsAViewOwes:
     def test_a_change_asked_during_the_steps_owed_ends_them_at_the_next_one(
         self, kind, monkeypatch
     ):
-        launcher = _launcher(World(head_camera_pack=None, renders=False))
+        launcher = _launcher(World(renders=False))
 
         def ask_for_a_change(steps: int) -> None:
             if steps == 3:
@@ -630,7 +617,7 @@ class TestTheStepsAViewOwes:
         assert scene.steps == 3
 
     def test_an_engine_stopping_takes_no_step_owed(self, kind, monkeypatch):
-        launcher = _launcher(World(head_camera_pack=None, renders=False))
+        launcher = _launcher(World(renders=False))
         launcher._stop.set()  # pylint: disable=W0212
         scene = _CountingScene()
         view = _open_view(kind, scene, monkeypatch)

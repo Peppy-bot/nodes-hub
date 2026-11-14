@@ -1,17 +1,17 @@
 //! Observed-source flow: the harness seeds one mock source per pairing
 //! observer slot; publishing `joint_states` / `gripper_states` from those
 //! sources must surface as the panel's live feedback, and once measurements
-//! exist the operator can arm a side's deadman, at which point the node
-//! streams that side's setpoints on the leader pairing slots (received here by
+//! exist the operator can enable an arm's deadman, at which point the node
+//! streams that arm's setpoints on the leader pairing slots (received here by
 //! the pairing peer mocks).
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
 use std::time::{Duration, SystemTime};
 
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 use peppygen::paired_topics::observed_left_arm::joint_states;
 use peppygen::paired_topics::observed_left_gripper::gripper_states;
 
@@ -31,13 +31,10 @@ fn joints_of(value: &serde_json::Value) -> Option<Vec<f64>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn observed_states_feed_the_panel_and_gate_streaming() -> peppygen::Result<()> {
-    let (harness, mut mocks) = Harness::start_with(
-        Config {
-            parameters: Some(helpers::test_parameters(PANEL_PORT)),
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (harness, mut mocks) = helpers::start(Config {
+        parameters: Some(helpers::test_parameters(PANEL_PORT)),
+        ..Config::default()
+    })
     .await?;
 
     // The observed sources publish the followers' measured state. The first
@@ -65,35 +62,37 @@ async fn observed_states_feed_the_panel_and_gate_streaming() -> peppygen::Result
         })
         .await?;
 
-    // The panel must render both measurements as the left side's feedback
-    // while the never-fed right side stays null.
+    // The panel must render both measurements as the left arm's feedback
+    // while the never-fed right arm stays null.
     let mut ws = helpers::WsClient::connect(PANEL_PORT).await;
     let snapshot = ws
-        .snapshot_until(Duration::from_secs(10), "left-side feedback", |s| {
-            joints_of(&s["left_arm"]["feedback"])
+        .snapshot_until(Duration::from_secs(10), "left arm feedback", |s| {
+            let left = helpers::arm(s, "left_arm");
+            joints_of(&left["arm"]["feedback"])
                 .is_some_and(|j| helpers::approx_eq(&j, &MEASURED_JOINTS))
-                && s["left_gripper"]["feedback"].as_f64() == Some(MEASURED_OPENING)
+                && left["gripper"]["feedback"].as_f64() == Some(MEASURED_OPENING)
         })
         .await;
     assert_eq!(
-        snapshot["left_gripper"]["effort_ceiling"].as_f64(),
+        helpers::arm(&snapshot, "left_arm")["gripper"]["effort_ceiling"].as_f64(),
         Some(EFFORT_CEILING),
         "the gripper's reported ceiling must reach the panel"
     );
+    let right = helpers::arm(&snapshot, "right_arm");
     assert!(
-        snapshot["right_arm"]["feedback"].is_null(),
-        "the unfed side must stay without feedback"
+        right["arm"]["feedback"].is_null(),
+        "the unfed arm must stay without feedback"
     );
-    assert!(snapshot["right_gripper"]["feedback"].is_null());
+    assert!(right["gripper"]["feedback"].is_null());
 
     // Measurements exist, so the deadman may arm: the target was established
     // from the first measured pose and the gripper seeds from measured, and
     // the command stream starts publishing exactly those on the left slots.
-    ws.send_text(r#"{"cmd":"set_enabled","side":"left","on":true}"#)
+    ws.send_text(r#"{"cmd":"set_enabled","arm":"left_arm","on":true}"#)
         .await
         .expect("send set_enabled");
-    ws.snapshot_until(Duration::from_secs(10), "left side enabled", |s| {
-        s["left_enabled"] == true
+    ws.snapshot_until(Duration::from_secs(10), "left arm enabled", |s| {
+        helpers::arm(s, "left_arm")["enabled"] == true
     })
     .await;
 
@@ -125,8 +124,8 @@ async fn observed_states_feed_the_panel_and_gate_streaming() -> peppygen::Result
         "no operator cap set: the wire encodes 0 (no preference)"
     );
 
-    // The right side never armed, so its slots stay silent even while the
-    // left streams (bounded absence check, ~20 left-side ticks long).
+    // The right arm never armed, so its slots stay silent even while the
+    // left streams (bounded absence check, ~20 left-arm ticks long).
     let quiet = tokio::time::timeout(
         Duration::from_millis(400),
         mocks.pairings.right_arm.joint_setpoints.next(),

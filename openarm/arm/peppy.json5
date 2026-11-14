@@ -1,6 +1,6 @@
-// Instantiate openarm_arm twice, one per side, with a distinct `arm_id`. The
-// feedforward comes from the in-process srs_model, built from the embedded
-// description of `hardware_version`.
+// Instantiate openarm_arm once per arm of the robot, each with its arm's place as
+// `arm_id`. The feedforward comes from the in-process srs_model, built from the
+// bundled description of the model the robot's initializer names.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -11,8 +11,12 @@
       "It follows the governed setpoints of openarm_backbone over a joint_link pairing and streams the measured joint states back. It runs the control loop of the hardware (gravity, Coriolis and friction feedforward, plus MIT control) and has no motion logic of its own: the backbone plans and governs every move. It also reports its readiness, the health of each motor, and alerts for a motor that runs hot, is overloaded or has a fault.",
     ],
     implements: [
-      // Per-component readiness a real robot's robot_initializer aggregates:
-      // ready once motors are enabled and the control loop is serving.
+      // Per-component readiness a real robot's robot_initializer aggregates.
+      // The initializer tells the arm the robot's model (set_model): the arm
+      // configures for it, then enables the motors, and is ready once the
+      // control loop is serving. A model whose arm at `arm_id` this node does
+      // not drive gets an error reply naming the models it drives, and ends
+      // the node.
       { name: "component_ready", tag: "v1", link_id: "ready" },
       // Per-motor health telemetry: severity, effort fraction, and
       // temperatures, naming this arm as its source.
@@ -46,6 +50,7 @@
     },
     services: {
       exposes: [
+        { link_id: "ready", name: "set_model" },
         { link_id: "ready", name: "is_ready" },
       ],
     },
@@ -59,13 +64,12 @@
       mount_paths: ["/tmp/peppy_instance_locks"],
     },
     parameters: {
+      // The arm this instance drives: its place among the arms of the model's
+      // description, counted from 0. Each arm of the robot runs one instance, and
+      // a place the description has no arm at is refused, at the first readiness
+      // call, naming each place with its arm.
       arm_id: "u8",
       can_interface: "string",
-      // Which OpenArm hardware generation this arm drives: "v1" or "v2". Selects the
-      // embedded description (URDF, joint limits, elbow margin) the in-process model is
-      // built from. Required, not defaulted: running the wrong generation's model on the
-      // hardware would mis-compensate gravity/Coriolis, so the launcher must be explicit.
-      hardware_version: "string",
       // Hardware-loop rate (Hz). Required: pick deliberately per deployment, and
       // confirm `overruns=0` at the target rate during bring-up.
       control_rate_hz: "u32",

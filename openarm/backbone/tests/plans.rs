@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use hegel::TestCase;
 use hegel::generators as gs;
+use robot_description::states;
 use srs_model::chain_kinematics::{interpolate, pose_miss};
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, Unit, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy, ELBOW, JointVec, plan_line};
@@ -126,7 +127,8 @@ fn an_easy_move_sweeps_no_joint() {
     let model = v2_right_arm();
     let mut end = ready_pose(&model);
     end.translation.vector.z += 0.05;
-    let walk = plan_line(&model, &end, READY).expect("small lift from ready is planned");
+    let walk = plan_line(&model, &end, posture(V2, "right_arm", states::READY))
+        .expect("small lift from ready is planned");
     let swing = swing_of(&walk);
     assert!(swing <= QUIET_SWING_RAD, "the lift swings {swing} rad");
 }
@@ -168,7 +170,8 @@ fn a_pure_reorientation_plans_a_line() {
     let start = ready_pose(&model);
     let mut end = start;
     end.rotation = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 0.7) * end.rotation;
-    let walk = plan_line(&model, &end, READY).expect("a 0.7 rad turn from Ready tracks");
+    let walk = plan_line(&model, &end, posture(V2, "right_arm", states::READY))
+        .expect("a 0.7 rad turn from Ready tracks");
     assert!(time_of(&walk) > 0.0);
     assert_lands_on(&model, &walk[walk.len() - 1], &end);
 }
@@ -348,10 +351,16 @@ fn drawn_move(tc: &TestCase) -> (Arm, JointVec, Isometry3<f64>) {
     match tc.draw(gs::integers::<u8>().max_value(3)) {
         1 => seed[WRIST_BEND] = tc.draw(gs::floats().min_value(-0.05).max_value(0.05)),
         2 => {
-            let floor = limits[ELBOW].lo;
-            seed[ELBOW] = tc.draw(gs::floats().min_value(floor).max_value(floor + 0.2));
+            let straight = limits[ELBOW].lo;
+            seed[ELBOW] = tc.draw(gs::floats().min_value(straight).max_value(straight + 0.2));
         }
-        3 => seed = if right { READY } else { READY_LEFT },
+        3 => {
+            seed = posture(
+                V2,
+                if right { "right_arm" } else { "left_arm" },
+                states::READY,
+            )
+        }
         _ => {}
     }
     let (direction, axis) = (drawn_unit(tc), drawn_unit(tc));

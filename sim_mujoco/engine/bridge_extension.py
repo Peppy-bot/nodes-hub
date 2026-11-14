@@ -17,7 +17,7 @@ import logging
 import time
 
 from sim_robot_core.cameras import FramePacer
-from sim_robot_core.models import FingerSpan, finger_span
+from sim_robot_core.models import FingerSpan
 
 from exts import (
     MujocoActuatorCtrl,
@@ -50,9 +50,13 @@ class _RobotLimbs:
         self.actuator = MujocoActuatorCtrl(model, data, params=self._gains())
         self.gripper_sensors: dict[str, MujocoGripperSensor] = {}
         # Each finger joint's closed position and signed travel to fully
-        # open, read from the model at setup; commanded opening fractions
-        # scale onto it.
+        # open, as the robot's description gives them; commanded opening
+        # fractions scale onto it, and measured positions read back as one.
         self.finger_spans: dict[str, list[FingerSpan]] = {}
+        # The fingers of each gripper an actuator drives, by their scene
+        # names, with their spans. A finger an equality couples to a driven
+        # one follows it and is measured alone.
+        self.driven_fingers: dict[str, list[tuple[str, FingerSpan]]] = {}
         # Last force limit written per gripper, so the cap is not re-sent per
         # tick.
         self.applied_effort: dict[str, float] = {}
@@ -89,9 +93,19 @@ class _RobotLimbs:
         }
         if not self.actuator.setup(inertia):
             raise RuntimeError(f"MujocoActuatorCtrl setup failed for '{self.robot.instance}'")
-        self.actuator.require_force_limited(
-            [self.scene_name(joint) for joint in self.entry.finger_joints()]
-        )
+        for gripper in self.entry.grippers:
+            driven = [
+                (self.scene_name(joint), span)
+                for joint, span in zip(gripper.joints, gripper.spans)
+                if self.actuator.drives(self.scene_name(joint))
+            ]
+            if not driven:
+                raise RuntimeError(
+                    f"no actuator of the scene standing '{self.robot.instance}' drives a finger "
+                    f"of gripper '{gripper.name}': {list(gripper.joints)}"
+                )
+            self.actuator.require_force_limited([name for name, _ in driven])
+            self.driven_fingers[gripper.name] = driven
         for gripper in self.entry.grippers:
             fingers = [self.scene_name(joint) for joint in gripper.joints]
             sensor = MujocoGripperSensor(self._model, self._data, finger_joints=fingers)
@@ -101,32 +115,23 @@ class _RobotLimbs:
                     f"'{self.robot.instance}'"
                 )
             self.gripper_sensors[gripper.name] = sensor
-            self.finger_spans[gripper.name] = [
-                self._finger_span(joint, gripper.closed_at) for joint in fingers
-            ]
-
-    def _finger_span(self, scene_joint: str, closed_at: str) -> FingerSpan:
-        import mujoco  # pylint: disable=C0415
-
-        jid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, scene_joint)
-        lower, upper = (float(value) for value in self._model.jnt_range[jid])
-        return finger_span(scene_joint, lower, upper, closed_at)
+            self.finger_spans[gripper.name] = list(gripper.spans)
 
     def start_in_posture(self) -> None:
         """Puts this robot in the posture its model starts in, and holds it
-        there: the joints are placed and their actuators target the same
-        positions, so the arm stands still until its first setpoint. A model
-        whose entry names no posture starts where its file puts it."""
+        there: the joints are placed and the actuator of each joint one drives
+        targets the same position, so the arm stands still until its first
+        setpoint. A finger an equality couples to another has no actuator."""
         import mujoco  # pylint: disable=C0415
 
         posture = self.entry.start_posture
-        if not posture:
-            return
         placed = {self.scene_name(joint): position for joint, position in posture.items()}
         for joint, position in placed.items():
             jid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, joint)
             self._data.qpos[self._model.jnt_qposadr[jid]] = position
-        self.actuator.write_targets(placed)
+        self.actuator.write_targets(
+            {joint: position for joint, position in placed.items() if self.actuator.drives(joint)}
+        )
 
     def teardown(self) -> None:
         self.actuator.teardown()
@@ -261,19 +266,19 @@ class MujocoBridgeExtension:
                 if command is None:
                     continue
                 opening, max_effort = command
-                joints = [limbs.scene_name(joint) for joint in gripper.joints]
+                driven = limbs.driven_fingers[gripper.name]
+                joints = [name for name, _ in driven]
                 # Re-applied only on change: the cap is a model write, not a
                 # per-tick target.
                 if limbs.applied_effort.get(gripper.name) != max_effort:
                     # Recorded only once written, so a not-ready tick retries.
                     if limbs.actuator.set_force_limit(joints, max_effort):
                         limbs.applied_effort[gripper.name] = max_effort
-                # Map the opening fraction onto each finger's own span, so the
-                # same command drives prismatic fingers, revolute ones and a
-                # single jaw.
-                spans = limbs.finger_spans[gripper.name]
+                # Map the opening fraction onto each driven finger's own span,
+                # so the same command drives prismatic fingers, revolute ones
+                # and a single jaw.
                 limbs.actuator.write_targets(
-                    {name: span.position(opening) for name, span in zip(joints, spans)}
+                    {name: span.position(opening) for name, span in driven}
                 )
 
     def _publish_state(self) -> None:

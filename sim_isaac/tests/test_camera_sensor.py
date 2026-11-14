@@ -13,12 +13,13 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 
+import _world
 import camera_sensor
 import isaac_models
 from camera_geometry import pinhole
 from camera_sensor import _MAX_CAPTURE_FAILURES, IsaacCameraSensor
+from entries import entry
 from sim_robot_core.cameras import CameraConfig, DepthSpec
-from sim_robot_core.models import Arm, EngineModel, ModelEntry, shipped_entry
 
 _WIDTH, _HEIGHT = 4, 2
 _FPS = 10
@@ -84,15 +85,9 @@ class FakeIO:
 
 def _known(*cameras, **engine):
     """A model carrying `cameras`, as this engine knows it."""
-    entry = ModelEntry(
-        model="rig",
-        arms=(Arm(name="arm", joints=("joint",)),),
-        grippers=(),
-        cameras=tuple(cameras),
-        start_posture={},
-    )
+    rig = entry("rig", arms={"arm": ["joint"]}, cameras=tuple(cameras))
     raw = {"stage": "rig/rig.usd", "articulation_root": ".", **engine}
-    return isaac_models.parse(EngineModel(entry=entry, engine=raw))
+    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {})
 
 
 @pytest.fixture
@@ -333,11 +328,11 @@ class TestWhereAModelsCamerasHang:
         ]
 
     def test_the_rig_is_the_cameras_of_the_robots_own_model(self):
-        so101 = isaac_models.IsaacModels.read().of("so101")
+        so101 = _world.known("so101")
         sensor = IsaacCameraSensor("charlo", "/World/charlo", so101, FakeIO())
         assert list(sensor._cameras) == ["wrist"]
 
-        openarm = isaac_models.IsaacModels.read().of("openarm_v2")
+        openarm = _world.known("openarm_v2")
         sensor = IsaacCameraSensor("alpha", "/World/alpha", openarm, FakeIO())
         assert list(sensor._cameras) == ["wrist_left", "wrist_right", "chest"]
 
@@ -350,13 +345,13 @@ class TestWhereAModelsCamerasHang:
             "/World/bravo/gripper_link",
             "/World/charlo/gripper_link",
         )
-        so101 = isaac_models.IsaacModels.read().of("so101")
+        so101 = _world.known("so101")
 
         assert self._hang(stage, "/World/charlo", so101) == ["/World/charlo/gripper_link/wrist"]
 
         camera = stage.GetPrimAtPath("/World/charlo/gripper_link/wrist")
         assert camera.IsA(UsdGeom.Camera)
-        (wrist,) = shipped_entry("so101").cameras
+        (wrist,) = _world.known("so101").entry.cameras
         translate, _orient = UsdGeom.Xformable(camera).GetOrderedXformOps()
         assert tuple(translate.Get()) == pytest.approx(wrist.pos)
         assert not stage.GetPrimAtPath("/World/bravo/gripper_link/wrist").IsValid()
@@ -367,7 +362,7 @@ class TestWhereAModelsCamerasHang:
             "/World/alpha/openarm_left_ee_base_link",
             "/World/alpha/openarm_right_ee_base_link",
         )
-        openarm = isaac_models.IsaacModels.read().of("openarm_v2")
+        openarm = _world.known("openarm_v2")
 
         assert self._hang(stage, "/World/alpha", openarm) == [
             "/World/alpha/openarm_left_ee_base_link/wrist_left",
@@ -377,14 +372,14 @@ class TestWhereAModelsCamerasHang:
 
     def test_a_link_hangs_from_the_prim_its_models_entry_maps_it_to(self):
         stage = self._stage("/World/charlo/gripper")
-        (wrist,) = shipped_entry("so101").cameras
+        (wrist,) = _world.known("so101").entry.cameras
         known = _known(wrist, link_prims={"gripper_link": "gripper"})
 
         assert self._hang(stage, "/World/charlo", known) == ["/World/charlo/gripper/wrist"]
 
     def test_a_parent_link_the_robots_stage_lacks_is_refused_with_what_it_has(self):
         stage = self._stage("/World/charlo/shoulder_link")
-        so101 = isaac_models.IsaacModels.read().of("so101")
+        so101 = _world.known("so101")
 
         with pytest.raises(RuntimeError) as refused:
             self._hang(stage, "/World/charlo", so101)

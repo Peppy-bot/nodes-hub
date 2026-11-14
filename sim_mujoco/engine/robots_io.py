@@ -18,11 +18,14 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 from peppygen.exposed_actions.robots import attach
 from peppygen.exposed_services.robots import is_ready
+from robot_description_py import RobotDescription
 
+from sim_robot_core.models import hold_to_bundled
 from sim_robot_core.registry import Caller, Registry, Robot, StillJoining
 
 from edits import Edits
@@ -47,6 +50,15 @@ _READY_RETRY_BACKOFF_S = 0.05
 # goal of the same caller holds the robot.
 _HANDED_OVER = "another goal of the same caller holds the robot now"
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _Promise:
+    """What an admitted robot that does not stand yet was promised: where it
+    stands, and the model it stands as, as its description describes it."""
+
+    placement: Placement
+    known: MujocoModel
 
 
 class Ending(enum.Enum):
@@ -115,10 +127,10 @@ class RobotsIO:
         self._rebind = lambda: None
         self._unbind = lambda: None
         # Where the robots admitted but not standing yet were promised to
-        # stand, beside the name the admission in flight reserved. The node
-        # loop admits, stands and forgets, so one admission finishes with
-        # both before the next reads either.
-        self._placements: dict[str, Placement] = {}
+        # stand and the model each stands as, beside the name the admission
+        # in flight reserved. The node loop admits, stands and forgets, so
+        # one admission finishes with both before the next reads either.
+        self._promises: dict[str, _Promise] = {}
         self._tasks: list[asyncio.Task] = []
         self._stays: set[asyncio.Task] = set()
         # The signal that ends each robot's stay without taking the robot out
@@ -263,17 +275,18 @@ class RobotsIO:
         return max(self._pair_grace_s * _PAIR_GRACE_CHECK_SHARE, _PAIR_GRACE_CHECK_FLOOR_S)
 
     def _admit(self, request: attach.GoalRequest) -> attach.GoalDecision:
-        """Whether a robot may join, and the limbs it will drive, under the
-        names its own model gives them: the model must be one this engine
-        stands, the placement must be free, and the name must be free or
-        already this caller's own robot. Admitting reserves the name, or
-        hands this caller's standing robot over to the goal being admitted.
+        """Whether a robot may join: the model must be one this engine
+        stands, its entry must fit the robot's description, the placement
+        must be free, and the name must be free or already this caller's own
+        robot. Admitting reserves the name, or hands this caller's standing
+        robot over to the goal being admitted.
 
         A request this engine never takes (a name it cannot stand a robot
-        under, a model it has no entry for, a placement that is not finite)
-        is refused with `rejected`. The robot of the caller while it still
-        joins is refused with `busy`: the same attach takes it over once it
-        stands. A request the scene cannot take now (a name or a spot
+        under, a model it has no entry for, a description that does not read,
+        that the entry does not fit or that is not the one this simulation was
+        built with, a placement that is not finite) is refused with
+        `rejected`. The robot of the caller while it still joins is refused
+        with `busy`: the same attach takes it over once it stands. A request the scene cannot take now (a name or a spot
         another robot holds, a second robot of the caller, another model for
         the robot the caller stands) is refused with `precondition_failed`.
         The name of a robot that leaves is free once its stay ends, before
@@ -283,17 +296,14 @@ class RobotsIO:
         self._admitted = None
         try:
             robot_name = name_in_the_scene(request.data.robot)
-            entry = self._models.of(request.data.model).entry
+            description = RobotDescription.parse(request.data.urdf, request.data.srdf)
+            known = self._models.of(request.data.model, description)
+            hold_to_bundled(request.data.model, description)
             asked = _asked_placement(request.data.placement)
         except ValueError as error:
             return attach.GoalDecision.refuse(attach.FailureKind.REJECTED, str(error))
-        limbs = attach.GoalResponse(
-            arm_names=entry.arm_names(),
-            arm_joints=entry.arm_joint_counts(),
-            gripper_names=entry.gripper_names(),
-        )
         try:
-            adopted = self._robots.admit(robot_name, entry, caller)
+            adopted = self._robots.admit(robot_name, known.entry, caller)
         except StillJoining as error:
             return attach.GoalDecision.refuse(attach.FailureKind.BUSY, str(error))
         except ValueError as error:
@@ -302,15 +312,15 @@ class RobotsIO:
             # The robot stands where it stands; only its host changes,
             # and the stay taking it over is what ends the one hosting
             # it now.
-            return attach.GoalDecision.accept(limbs)
+            return attach.GoalDecision.accept()
         try:
             placement = self._placement(asked, robot_name)
         except ValueError as error:
             self._robots.release(robot_name)
             return attach.GoalDecision.refuse(attach.FailureKind.PRECONDITION_FAILED, str(error))
-        self._placements[robot_name] = placement
+        self._promises[robot_name] = _Promise(placement=placement, known=known)
         self._admitted = robot_name
-        return attach.GoalDecision.accept(limbs)
+        return attach.GoalDecision.accept()
 
     def _placement(self, asked: Optional[Placement], name: str) -> Placement:
         """Where the robot stands: what it asked for, or a spot of the
@@ -318,7 +328,7 @@ class RobotsIO:
         robots in one place resolve their overlap by throwing each other.
         Standing a robot happens later, on the thread that steps the scene,
         so the spots already promised count as taken too."""
-        promised = tuple(self._placements.values())
+        promised = tuple(promise.placement for promise in self._promises.values())
         if asked is None:
             return self._world.free_spot(promised, name)
         holder = self._whoever_holds(asked, name)
@@ -342,8 +352,8 @@ class RobotsIO:
         promised = next(
             (
                 held
-                for held, spot in self._placements.items()
-                if within_one_spot(placement, spot)
+                for held, promise in self._promises.items()
+                if within_one_spot(placement, promise.placement)
             ),
             None,
         )
@@ -401,8 +411,8 @@ class RobotsIO:
         robot leaves while its stand still waits for the thread that steps
         the scene (cancelled): that stand is withdrawn and the name given
         back at once. False when the robot never stood."""
-        placement = self._placements.get(name)
-        if placement is None:
+        promise = self._promises.get(name)
+        if promise is None:
             # Whatever took the spot back took the name with it, and this
             # goal is the one holding it now.
             self._robots.release(name)
@@ -411,8 +421,7 @@ class RobotsIO:
                 "the name was given back before the robot stood",
             )
             return False
-        known = self._models.of(model)
-        edit = self._edits.submit(lambda: self.stand(name, known, placement))
+        edit = self._edits.submit(lambda: self.stand(name, promise.known, promise.placement))
         standing = asyncio.wrap_future(edit)
         leaving = asyncio.ensure_future(context.cancel_signal())
         try:
@@ -559,7 +568,7 @@ class RobotsIO:
     def _forget(self, name: str) -> None:
         """Drops what this robot's joining held, leaving the scene alone."""
         self._handovers.pop(name, None)
-        self._placements.pop(name, None)
+        self._promises.pop(name, None)
 
     async def _serve_ready(self) -> None:
         """Answers is_ready for the life of the node. When the service stops,

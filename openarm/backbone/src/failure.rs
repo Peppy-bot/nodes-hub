@@ -52,10 +52,9 @@ impl Failure {
         }
     }
 
-    /// The same failure with `label` before its message: the side of the
-    /// arm whose share of a posture goal failed, or the name of the arm whose
-    /// share of a path of both arms failed, or that refused a path of both
-    /// arms.
+    /// The same failure with `label` before its message: the name of the limb
+    /// whose share of a posture goal failed, or of the arm whose share of a
+    /// path of both arms failed, or that refused a path of both arms.
     pub fn labelled(self, label: impl std::fmt::Display) -> Self {
         Self {
             message: format!("{label}: {}", self.message),
@@ -108,8 +107,8 @@ member_failure_kinds!(check_arm_move::FailureKind, unreachable => AttemptFailed)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use openarm_description::Side;
+    use crate::robot::LIMBS;
+    use crate::test_support::LEFT;
 
     /// Each member gets the kind of the same name, and a member whose
     /// contract lists no `unreachable` gets `attempt_failed` for it.
@@ -149,8 +148,11 @@ mod tests {
     fn a_labelled_failure_keeps_its_kind_and_names_the_label_first() {
         let failure = Failure::new(FailureKind::Timeout, "still 0.2 rad from the target");
         assert_eq!(
-            failure.labelled(Side::Left),
-            Failure::new(FailureKind::Timeout, "left: still 0.2 rad from the target")
+            failure.labelled(LIMBS.arm_name(LEFT)),
+            Failure::new(
+                FailureKind::Timeout,
+                format!("{}: still 0.2 rad from the target", LIMBS.arm_name(LEFT))
+            )
         );
     }
 

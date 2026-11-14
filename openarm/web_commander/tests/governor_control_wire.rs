@@ -6,13 +6,13 @@
 //! speed cap and the gripper opening rate are adjacent f64 arguments, so a
 //! transposition of those two is exactly what this pins.
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
 use std::time::Duration;
 
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 
 const PANEL_PORT: u16 = 18637;
 
@@ -25,13 +25,10 @@ const MAX_GRIPPER_RATE_FRAC_S: f64 = 5.555;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_governor_control_reaches_the_field_it_names() -> peppygen::Result<()> {
-    let (mut harness, _mocks) = Harness::start_with(
-        Config {
-            parameters: Some(helpers::test_parameters(PANEL_PORT)),
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (mut harness, _mocks) = helpers::start(Config {
+        parameters: Some(helpers::test_parameters(PANEL_PORT)),
+        ..Config::default()
+    })
     .await?;
 
     let mut ws = helpers::WsClient::connect(PANEL_PORT).await;

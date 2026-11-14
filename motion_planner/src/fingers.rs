@@ -7,9 +7,9 @@
 
 use collision_geometry::chain::Rider;
 use motion_planning_core::{PlanningScene, RiderOffTheArm};
+use robot_description::PerArm;
 use self_collision_model::FingerError;
 
-use crate::arm_set::PerArm;
 use crate::own_body::OwnBody;
 use crate::robot::ArmModel;
 
@@ -26,10 +26,9 @@ pub enum FingerFault {
 /// The fingers of every arm of `arms` at the openings of `own`.
 pub fn riders_of_the_arms<'g, const N: usize, const K: usize>(
     own: &OwnBody<N, K>,
-    arms: &'g PerArm<ArmModel<N>>,
-) -> Result<PerArm<Vec<Rider<'g>>>, FingerFault> {
-    arms.each(|id, arm| own.fingers(id, &arm.geometry))
-        .transpose()
+    arms: &'g PerArm<ArmModel<N>, K>,
+) -> Result<PerArm<Vec<Rider<'g>>, K>, FingerFault> {
+    PerArm::from_fn(|arm| own.fingers(arm, &arms[arm].geometry)).transpose()
 }
 
 /// Every body the arm `arm` carries: `fingers`, its fingers, and the shapes of the objects
@@ -41,6 +40,6 @@ pub fn with_held_objects<'a, const N: usize>(
 ) -> Vec<Rider<'a>> {
     fingers
         .into_iter()
-        .chain(scene.riders(arm.grasp_link, &arm.geometry))
+        .chain(scene.riders(&arm.grasp_link, &arm.geometry))
         .collect()
 }

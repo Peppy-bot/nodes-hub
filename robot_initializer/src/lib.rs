@@ -11,8 +11,8 @@
 //!
 //! Every robot says who it is as well: the name it stands under, the model
 //! it is and the core node hosting it, which is the name it joins a scene
-//! under. And it gives its guide: the park pose of each arm that its
-//! launcher wrote one for.
+//! under, and the description of that model. And it gives its guide: the
+//! park pose of each arm that its description gives one.
 
 #![forbid(unsafe_code)]
 
@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peppygen::{NodeRunner, Parameters, Result};
+use robot_description::Model;
 
+mod description;
 mod guide;
 mod identity;
 mod join;
@@ -37,16 +39,11 @@ pub(crate) fn refused(message: impl Into<String>) -> peppygen::Error {
     peppygen::Error::Node(std::io::Error::other(message.into()).into())
 }
 
-/// The model this robot is, as the launcher wrote it. Which models exist is
-/// a simulation's to say: it refuses one it does not stand, naming the ones
-/// it does, so the only model refused here is one that names nothing.
-fn model_of(model: &str) -> Result<&str> {
-    if model.trim().is_empty() {
-        return Err(refused(format!(
-            "model names the robot's model as a simulation's catalogue does, for example openarm_v2 or so101, and this robot's is {model:?}"
-        )));
-    }
-    Ok(model)
+/// The model this robot is, as the launcher wrote it: a model of
+/// robot_description, whose description the node serves and joins a scene
+/// with.
+fn model_of(model: &str) -> Result<&'static Model> {
+    robot_description::model(model).map_err(|unknown| refused(format!("model: {unknown}")))
 }
 
 pub async fn setup(params: Parameters, runner: Arc<NodeRunner>) -> Result<()> {
@@ -61,12 +58,14 @@ pub async fn setup_with_clock<C: StandClock>(
     runner: Arc<NodeRunner>,
     clock: impl FnOnce(Duration) -> C + Send,
 ) -> Result<()> {
-    let identity = Identity::of(&runner, model_of(&params.model)?);
-    let guide = Guide::from_park_poses(&params.park_poses)?;
+    let model = model_of(&params.model)?;
+    let description = model.description();
+    let identity = Identity::of(&runner, model.id());
     identity::serve(identity.clone(), runner.clone());
-    guide::serve(guide, runner.clone());
-    match join::scene(&identity, &params.placement, &runner, clock).await? {
-        Joined::OwnHardware | Joined::Standing => readiness::serve(runner),
+    description::serve(model, runner.clone());
+    guide::serve(Guide::of(&description), runner.clone());
+    match join::scene(&identity, &description, &params.placement, &runner, clock).await? {
+        Joined::OwnHardware | Joined::Standing => readiness::serve(runner, model.id()),
         // A node that is stopping serves no readiness.
         Joined::Stopped => Ok(()),
     }
@@ -78,19 +77,23 @@ mod tests {
 
     #[test]
     fn a_model_is_taken_as_the_launcher_wrote_it() {
-        for model in ["openarm_v2", "so101"] {
-            assert_eq!(model_of(model).unwrap(), model);
+        for bundled in robot_description::models() {
+            assert_eq!(model_of(bundled.id()).unwrap().id(), bundled.id());
         }
     }
 
     #[test]
-    fn a_model_that_names_nothing_is_refused() {
-        for model in ["", " ", "\t\n"] {
+    fn a_model_of_no_description_is_refused_naming_the_models() {
+        let models: Vec<String> = robot_description::models()
+            .map(|bundled| format!("{:?}", bundled.id()))
+            .collect();
+        for model in ["", " ", "openarm", "OpenArm_v2"] {
             let refusal = model_of(model).unwrap_err().to_string();
-            assert!(
-                refusal.contains("model names the robot's model"),
-                "{refusal}"
+            let expected = format!(
+                "model: no robot model is named {model:?}; the models are {}",
+                models.join(", ")
             );
+            assert!(refusal.contains(&expected), "{refusal}");
         }
     }
 }

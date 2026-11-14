@@ -22,9 +22,11 @@ from typing import Optional
 import pytest
 from unittest.mock import Mock
 
+import robot_description_py
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
+from _world import known
 import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
 
@@ -32,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from isaac_models import IsaacModels  # noqa: E402  pylint: disable=C0413
-from robots_io import Ending, RobotsIO  # noqa: E402  pylint: disable=C0413
+from robots_io import Ending, RobotsIO, _Promise  # noqa: E402  pylint: disable=C0413
 from world import Placement, Robot, World  # noqa: E402  pylint: disable=C0413
 
 MODELS = IsaacModels.read()
@@ -44,12 +46,18 @@ CORE_NODE = "sim16"
 ORIGIN = Placement.of((0.0, 0.0, 0.0), 0.0)
 
 
+def _promised(model: str = "openarm_v2", placement: Placement = ORIGIN) -> _Promise:
+    """What the admission of a robot of `model` promises it: `placement` and
+    its model."""
+    return _Promise(placement=placement, known=known(model))
+
+
 def _stage(*standing: tuple[str, str, Placement]) -> World:
     """The stage as the thread that steps the scene leaves it, each robot
     given as the name it stands under, the model it is, and where."""
     world = World(head_camera_pack=None)
     world._robots = {  # pylint: disable=W0212
-        name: Robot(instance=name, known=MODELS.of(model), placement=at)
+        name: Robot(instance=name, known=known(model), placement=at)
         for name, model, at in standing
     }
     return world
@@ -75,7 +83,7 @@ def _robots_io(world) -> RobotsIO:
     io._world = world
     io._loop = SimpleNamespace(time=lambda: 0.0)
     io._handovers = {}
-    io._placements = {}
+    io._promises = {}
     io._admitted = None
     return io
 
@@ -85,14 +93,24 @@ def _request(
     model: str = "openarm_v2",
     placement=None,
     instance: Optional[str] = None,
+    described_as: Optional[str] = None,
+    srdf: Optional[str] = None,
 ):
-    """What a copy attaches with: the robot it joins as, the model it is, and
-    where it asks to stand. A request naming no copy runs as the robot's
-    first one."""
+    """What a copy attaches with: the robot it joins as, the model it is,
+    where it asks to stand, and its description, the bundled one of
+    `described_as` (`model` when None) with its SRDF written as `srdf` when
+    one is given. A request naming no copy runs as the robot's first one."""
+    files = robot_description_py.model(described_as or model)
     return SimpleNamespace(
         core_node=CORE_NODE,
         instance_id=instance or f"{robot}_init_inst",
-        data=SimpleNamespace(robot=robot, model=model, placement=placement),
+        data=SimpleNamespace(
+            robot=robot,
+            model=model,
+            placement=placement,
+            urdf=files.urdf,
+            srdf=files.srdf if srdf is None else srdf,
+        ),
     )
 
 
@@ -162,7 +180,19 @@ def test_a_name_carrying_the_prim_separator_is_refused_before_a_spot_is_looked_f
 
     assert "peppy stack join LAUNCHER -i left_arm" in _refused(decision, FailureKind.REJECTED)
     assert io._robots.robots() == []
-    assert io._placements == {}
+    assert io._promises == {}
+
+
+def test_another_description_of_the_model_than_the_simulation_was_built_with_is_rejected():
+    io = _robots_io(_ClosedStage())
+    srdf = robot_description_py.model("so101").srdf.replace("<robot", "<robot ", 1)
+
+    decision = io._admit(_request(model="so101", srdf=srdf))
+
+    message = _refused(decision, FailureKind.REJECTED)
+    assert message.startswith("model so101: the robot attaches with another description"), message
+    assert io._robots.robots() == []
+    assert io._promises == {}
 
 
 def test_a_taken_spot_is_refused_naming_who_holds_it_and_what_to_ask_for():
@@ -183,7 +213,7 @@ def test_a_taken_spot_is_refused_naming_who_holds_it_and_what_to_ask_for():
     assert "'bravo' is about to stand within 1.5 m of [3.4, 0.0, 0.0]" in on_bravo
     assert "turn its `placement.auto` on" in on_alpha
     assert io._robots.of_name("charlo") is None
-    assert "charlo" not in io._placements
+    assert "charlo" not in io._promises
 
 
 @pytest.mark.parametrize("asked", [None, _asks_for(0.0)], ids=["auto", "the spot it had"])
@@ -197,7 +227,7 @@ def test_a_copy_that_comes_straight_back_is_promised_the_spot_it_stands_on(asked
     decision = io._admit(_request(instance="alpha_init_2", placement=asked))
 
     assert _accepted(decision)
-    assert io._placements["alpha"] == ORIGIN
+    assert io._promises["alpha"].placement == ORIGIN
 
 
 def test_a_copy_admitted_while_its_robot_leaves_is_stood_afresh():
@@ -226,7 +256,7 @@ def test_a_copy_admitted_while_its_robot_leaves_is_stood_afresh():
     copy = io._robots.of_name("alpha")
     assert copy.caller.instance_id == "alpha_init_2"
     assert not copy.standing()
-    assert io._placements["alpha"] == ORIGIN
+    assert io._promises["alpha"].placement == ORIGIN
 
 
 def test_a_goal_that_never_reached_its_stay_gives_back_its_name_and_its_spot():
@@ -240,7 +270,7 @@ def test_a_goal_that_never_reached_its_stay_gives_back_its_name_and_its_spot():
     io._withdraw()
 
     assert io._robots.of_name("alpha") is None
-    assert io._placements == {}
+    assert io._promises == {}
     assert _accepted(io._admit(_request(instance="alpha_init_2")))
 
 
@@ -255,7 +285,7 @@ def test_withdrawing_again_leaves_the_copy_that_took_the_name_alone():
     # The name the withdrawal freed is taken by a copy of its own.
     io._robots.admit(
         "alpha",
-        MODELS.of("openarm_v2").entry,
+        known("openarm_v2").entry,
         Caller(core_node=CORE_NODE, instance_id="alpha_init_2"),
     )
     io._robots.stand("alpha")
@@ -289,7 +319,7 @@ def test_a_goal_lost_on_the_way_back_frees_the_name_it_was_admitted_under():
 
     assert [_accepted(decision) for decision in handle.decisions] == [True]
     assert io._robots.of_name("alpha") is None
-    assert io._placements == {}
+    assert io._promises == {}
 
 
 def test_a_handover_that_never_reached_its_stay_leaves_the_robot_standing():
@@ -299,13 +329,13 @@ def test_a_handover_that_never_reached_its_stay_leaves_the_robot_standing():
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
     assert _accepted(io._admit(_request()))
     io._robots.stand("alpha")
-    promised = io._placements["alpha"]
+    promised = io._promises["alpha"]
 
     assert _accepted(io._admit(_request()))
     io._withdraw()
 
     assert io._robots.of_name("alpha").standing()
-    assert io._placements["alpha"] == promised
+    assert io._promises["alpha"] == promised
 
 
 def test_a_copy_re_registering_its_own_robot_takes_it_over_where_it_stands():
@@ -321,7 +351,6 @@ def test_a_copy_re_registering_its_own_robot_takes_it_over_where_it_stands():
     decision = io._admit(_request())
 
     assert _accepted(decision)
-    assert decision.response.arm_names == ["left_arm", "right_arm"]
     assert io._admitted is None
     assert not hosted.is_set()
     assert list(io._robots.standing()) == ["alpha"]
@@ -437,9 +466,9 @@ def _ending_io() -> RobotsIO:
     """A RobotsIO whose robot `alpha` stands and whose stage takes a robot
     out at once."""
     io = _robots_io(_stage(("alpha", "openarm_v2", ORIGIN)))
-    io._robots.admit("alpha", MODELS.of("openarm_v2").entry, Caller(CORE_NODE, "alpha_init_inst"))
+    io._robots.admit("alpha", known("openarm_v2").entry, Caller(CORE_NODE, "alpha_init_inst"))
     io._robots.stand("alpha")
-    io._placements["alpha"] = ORIGIN
+    io._promises["alpha"] = _promised()
     io._edits = Mock(spec=["submit"])
     io._edits.submit.return_value = _done()
     io._pair_grace_s = 2.0
@@ -496,7 +525,7 @@ def _bare_io() -> RobotsIO:
     """A RobotsIO with only the parts a pair grace check and a forget
     touch."""
     io = RobotsIO.__new__(RobotsIO)
-    io._placements = {}
+    io._promises = {}
     io._handovers = {}
     return io
 
@@ -533,12 +562,12 @@ def test_forgetting_a_robot_drops_its_spot_and_its_signal():
     """What a robot's joining held is a spot promised and a signal its own
     goal waits on, and a name given back leaves neither behind."""
     io = _bare_io()
-    io._placements["alpha"] = Placement.of((0.0, 0.0, 0.0), 0.0)
+    io._promises["alpha"] = _promised()
     io._handover("alpha")
 
     io._forget("alpha")
 
-    assert io._placements == {}
+    assert io._promises == {}
     assert io._handovers == {}
 
 
@@ -617,13 +646,13 @@ def test_a_placement_the_stage_cannot_stand_a_robot_on_is_rejected():
 
     assert "a placement is finite in every coordinate" in _refused(decision, FailureKind.REJECTED)
     assert io._robots.robots() == []
-    assert io._placements == {}
+    assert io._promises == {}
 
 
 def test_a_model_the_engine_has_no_entry_for_is_rejected():
     io = _robots_io(_ClosedStage())
 
-    decision = io._admit(_request(model="openarm_v9"))
+    decision = io._admit(_request(model="openarm_v9", described_as="openarm_v2"))
 
     assert "unknown model 'openarm_v9'" in _refused(decision, FailureKind.REJECTED)
     assert io._robots.robots() == []

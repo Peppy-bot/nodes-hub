@@ -4,25 +4,22 @@
 //! every pairing setpoint stream silent while the deadmen are off, and render
 //! the unbound slots as unbound on its panel.
 //!
-//! One booting test per binary: `ui::init_limits` is once-per-process.
+//! One booting test per binary: `limits::init_limits` is once-per-process.
 
 mod helpers;
 
 use std::time::Duration;
 
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::Config;
 
 const PANEL_PORT: u16 = 18631;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boots_clean_with_empty_zero_or_more_slots() -> peppygen::Result<()> {
-    let (mut harness, mut mocks) = Harness::start_with(
-        Config {
-            parameters: Some(helpers::test_parameters(PANEL_PORT)),
-            ..Config::default()
-        },
-        openarm_web_commander::setup,
-    )
+    let (mut harness, mut mocks) = helpers::start(Config {
+        parameters: Some(helpers::test_parameters(PANEL_PORT)),
+        ..Config::default()
+    })
     .await?;
 
     // The governor stream has no deadman: it re-publishes the launch controls
@@ -40,7 +37,7 @@ async fn boots_clean_with_empty_zero_or_more_slots() -> peppygen::Result<()> {
     assert!((governor.d_safe - 0.02).abs() < 1e-12);
     assert!((governor.max_stream_ee_velocity_m_s - 0.5).abs() < 1e-12);
 
-    // With every deadman off the command frame holds None per side, so the
+    // With every deadman off the command frame holds None per arm, so the
     // pairing setpoint streams must publish nothing. Bounded absence check:
     // ~20 governor ticks pass in this window while the arm stays silent.
     let quiet = tokio::time::timeout(
@@ -73,11 +70,12 @@ async fn boots_clean_with_empty_zero_or_more_slots() -> peppygen::Result<()> {
         .await;
     assert!(snapshot["recorder"].is_null(), "no recorder bound");
     assert_eq!(snapshot["health"]["bound"], false);
-    assert_eq!(snapshot["health"]["left"]["status"], "not_wired");
-    assert_eq!(snapshot["health"]["right"]["status"], "not_wired");
+    for name in ["left_arm", "right_arm"] {
+        let arm = helpers::arm(&snapshot, name);
+        assert_eq!(arm["health"]["status"], "not_wired", "{name}");
+        assert_eq!(arm["enabled"], false, "{name}");
+    }
     assert_eq!(snapshot["alerts_bound"], false);
-    assert_eq!(snapshot["left_enabled"], false);
-    assert_eq!(snapshot["right_enabled"], false);
     assert!(snapshot["proximity"].is_null(), "no backbone report yet");
 
     harness.shutdown().await

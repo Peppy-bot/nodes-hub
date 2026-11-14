@@ -15,15 +15,17 @@ use axum::extract::State;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
-use openarm_description::Side;
+use control_core::requested_arms::place_of_arm;
 use peppylib::runtime::CancellationToken;
-use serde::Deserialize;
+use robot_description::ArmId;
+use serde::{Deserialize, Deserializer};
 use srs_model::JointVec;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use crate::owner::UiMsg;
+use crate::robot;
 
 /// Why the operator panel never opened, or stopped serving. Every variant
 /// wraps an `io::Error` and names the step that produced it.
@@ -201,11 +203,24 @@ async fn ws_handle(mut socket: WebSocket, app: AppState) {
 
 // --------------------------- wire protocol ---------------------------
 
+/// The arm a command names by its name, the one the wire carries. A name of no
+/// arm of this robot is a command this node cannot read, refused naming the
+/// robot's arms.
+fn arm_by_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ArmId, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    place_of_arm("arm", &name, &robot::LIMBS.arm_names())
+        .map(ArmId::new)
+        .map_err(serde::de::Error::custom)
+}
+
+/// A command the panel sends. A limb's command names its arm in `arm`, by the
+/// arm's name; a gripper's command drives that arm's gripper.
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub(crate) enum Command {
     FireArm {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         joints: JointVec,
         // Requested move duration (s); 0 = fastest safe.
         duration_s: f64,
@@ -214,24 +229,27 @@ pub(crate) enum Command {
         settle_tolerance_rad: f64,
         settle_timeout_s: f64,
     },
-    // Toggle the streaming deadman for one side. While enabled, the command stream
-    // emits that side's arm target and gripper opening on its pairing slots;
-    // while disabled it emits nothing for the side.
+    // Toggle the streaming deadman for one arm. While enabled, the command stream
+    // emits the arm's target and its gripper's opening on their pairing slots;
+    // while disabled it emits nothing for either.
     SetEnabled {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         on: bool,
     },
     // Update an enabled arm's streamed target: the joint jog ramps the setpoint
     // toward it. Ignored while disabled.
     SetArmTarget {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         joints: JointVec,
     },
     // Fire the backbone's planned Cartesian move_arm to a composed world-frame pose
     // (Actions-mode Execute): a governed straight-line move, not a jog. Refused
-    // while the side streams, like fire_arm.
+    // while the arm streams, like fire_arm.
     FireArmPose {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         position: [f64; 3],
         orientation: [f64; 4],
         // Requested move duration (s); 0 = fastest safe.
@@ -244,20 +262,23 @@ pub(crate) enum Command {
     },
     // Update an enabled gripper's streamed opening. Ignored while disabled.
     SetGripperTarget {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         position: f64,
     },
     // Set the gripper's effort cap, applied to both the streamed opening and
     // discrete moves. Not deadman-gated: Actions mode fires while disabled.
     SetGripperEffort {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         max_effort: f64,
     },
     // Fire the backbone's discrete move_gripper (Actions-mode gripper Execute): a governed
-    // open/close to the opening fraction `position`, not the streamed opening. Refused while the side
+    // open/close to the opening fraction `position`, not the streamed opening. Refused while the arm
     // streams or a prior gripper move is in flight.
     FireGripper {
-        side: Side,
+        #[serde(deserialize_with = "arm_by_name")]
+        arm: ArmId,
         position: f64,
         // The longest (s) the backbone waits after the planned end of the travel
         // for the jaws to stand still.
@@ -274,12 +295,12 @@ pub(crate) enum Command {
         max_stream_ee_velocity_m_s: f64,
         max_gripper_rate_frac_s: f64,
     },
-    // Play a named gesture from the baked library. Refused while its sides
+    // Play a named gesture from the baked library. Refused while its arms
     // stream, a move is in flight, or another gesture is playing.
     RunGesture {
         name: String,
     },
-    // Stop the playing gesture; the involved sides hold where they are.
+    // Stop the playing gesture; the involved arms hold where they are.
     StopGesture,
     // Start recording a dataset episode labeled with the operator's task text.
     // Refused when no recorder is bound or an episode is already recording.
@@ -298,12 +319,13 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use openarm_description::ARM_DOF;
+    use crate::test_support::RIGHT;
+    use srs_model::ARM_DOF;
 
     /// The value a panel input with `id` is prefilled with.
     fn prefilled(id: &str) -> f64 {
         let at = INDEX_HTML
-            .find(&format!("id=\"${{side}}_{id}\" value=\""))
+            .find(&format!("id=\"${{arm}}_{id}\" value=\""))
             .unwrap_or_else(|| panic!("the panel has no {id} input"));
         let value = &INDEX_HTML[at..]
             .split('"')
@@ -368,7 +390,7 @@ mod tests {
                 .map(|key| {
                     let value = match key.as_str() {
                         "cmd" => serde_json::json!(cmd),
-                        "side" => serde_json::json!("left"),
+                        "arm" => serde_json::json!(robot::LIMBS.arm_name(RIGHT)),
                         other => shaped
                             .iter()
                             .find(|(name, _)| *name == other)
@@ -383,22 +405,25 @@ mod tests {
     }
 
     #[test]
-    fn a_command_names_its_side_in_lowercase_only() {
-        let set_enabled = |side: &str| {
+    fn a_command_names_its_arm_by_the_arms_name() {
+        let set_enabled = |arm: &str| {
             serde_json::from_str::<Command>(&format!(
-                r#"{{"cmd":"set_enabled","side":"{side}","on":true}}"#
+                r#"{{"cmd":"set_enabled","arm":"{arm}","on":true}}"#
             ))
         };
         assert!(matches!(
-            set_enabled("right"),
+            set_enabled(robot::LIMBS.arm_name(RIGHT)),
             Ok(Command::SetEnabled {
-                side: Side::Right,
+                arm: RIGHT,
                 on: true
             })
         ));
-        let refused = set_enabled("Left").err().expect("refused").to_string();
+        let refused = set_enabled("right").err().expect("refused").to_string();
         assert!(
-            refused.starts_with("unknown variant `Left`, expected `left` or `right`"),
+            refused.starts_with(
+                "arm names \"right\", no arm of this robot: its arms are \"left_arm\" and \
+                 \"right_arm\""
+            ),
             "{refused}"
         );
     }

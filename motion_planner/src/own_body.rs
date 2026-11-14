@@ -7,9 +7,9 @@ use std::num::NonZeroUsize;
 
 use collision_geometry::chain::{ChainGeometry, Rider};
 use collision_geometry::gjk::Placed;
+use robot_description::{ArmId, PerArm};
 use self_collision_model::SelfCollisionModel;
 
-use crate::arm_set::{ArmId, PerArm};
 use crate::fingers::FingerFault;
 use crate::history::ArmJoints;
 use crate::self_model::{EveryArm, HeldOtherArms};
@@ -23,8 +23,8 @@ pub struct OwnBody<const N: usize, const K: usize> {
 
 impl<const N: usize, const K: usize> OwnBody<N, K> {
     /// Puts the grippers at `openings`.
-    pub fn set_openings(&mut self, openings: &PerArm<f64>) {
-        self.model.set_gripper_openings(&in_model_order(openings));
+    pub fn set_openings(&mut self, openings: &PerArm<f64, K>) {
+        self.model.set_gripper_openings(&openings.into_array());
     }
 
     /// The fingers of `arm`, whose links `geometry` holds, as riders of its links at its
@@ -43,9 +43,9 @@ impl<const N: usize, const K: usize> OwnBody<N, K> {
         &self,
         copies: NonZeroUsize,
         arm: ArmId,
-        standing: &ArmJoints<N>,
+        standing: &ArmJoints<N, K>,
     ) -> HeldOtherArms<N, K> {
-        HeldOtherArms::new(&self.model, copies, arm, in_model_order(standing))
+        HeldOtherArms::new(&self.model, copies, arm, standing.into_array())
     }
 
     /// The self model of a plan of every arm, a state of `D` joints holding each arm's in
@@ -55,22 +55,12 @@ impl<const N: usize, const K: usize> OwnBody<N, K> {
     }
 
     /// Each piece of the robot with its arms at `standing`, by the name of its link.
-    pub fn standing_pieces(&mut self, standing: &ArmJoints<N>) -> Vec<(&str, Placed<'_>)> {
+    pub fn standing_pieces(&mut self, standing: &ArmJoints<N, K>) -> Vec<(&str, Placed<'_>)> {
         self.model
-            .world_pieces(&in_model_order(standing))
+            .world_pieces(&standing.into_array())
             .expect("the history holds finite joint positions")
             .into_iter()
             .flat_map(|(link, pieces)| pieces.into_iter().map(move |piece| (link, piece)))
             .collect()
     }
-}
-
-/// The value of each of the `K` arms of `values`, an arm's at its place in the robot's model.
-fn in_model_order<T: Copy, const K: usize>(values: &PerArm<T>) -> [T; K] {
-    assert_eq!(
-        values.iter().count(),
-        K,
-        "a value for each arm of the robot"
-    );
-    std::array::from_fn(|place| values[ArmId::new(place)])
 }

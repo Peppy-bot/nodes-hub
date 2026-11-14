@@ -121,7 +121,9 @@ async def land_move(h) -> move_arm.GoalRequest:
     limbs.stamp += 1.0
     await publish_limbs(h)
     await active.complete(
-        move_arm.ResultResponseData(final_position=request.position, final_orientation=request.orientation, action_time=1.0)
+        move_arm.ResultResponseData(
+            final_position=request.position, final_orientation=request.orientation, ended_on_contact=False, action_time=1.0
+        )
     )
     return request
 

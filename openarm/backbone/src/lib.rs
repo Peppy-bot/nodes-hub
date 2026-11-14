@@ -12,22 +12,26 @@
 //!
 //! The library crate exists so the harness-driven integration tests can boot
 //! the node in-process: [`setup`] is the node's whole entry point, and
-//! `src/main.rs` only hands it to `NodeBuilder::run`.
+//! `src/main.rs` only hands it to `NodeBuilder::run` with the fault the node
+//! exits with.
 
 #![forbid(unsafe_code)]
 
 mod actions;
+mod arm_order;
 mod camera_mounts;
 mod coordinator;
 mod failure;
 mod governor;
 mod gripper_move;
+mod identity;
 mod liveness;
 mod move_slot;
 mod node;
 mod path_checks;
 mod planner;
 mod publish;
+mod robot;
 mod settle;
 mod startup;
 mod streams;

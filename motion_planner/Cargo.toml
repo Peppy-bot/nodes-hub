@@ -18,14 +18,14 @@ control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package
 motion_planning_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "motion_planning_core" }
 occupancy_map = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "occupancy_map" }
 ompl_bridge = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "ompl_bridge" }
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["meshes"] }
+robot_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "robot_description" }
 self_collision_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "self_collision_model" }
-so101_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "so101_description" }
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
 urdf-rs = "0.10"
-openarm_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "openarm_description", features = ["kinematics"] }
+robot_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "robot_description", features = ["meshes"] }
+srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
 
 [profile.dev.package.self_collision_model]
 opt-level = 3

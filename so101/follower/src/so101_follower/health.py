@@ -7,7 +7,7 @@ import math
 import time
 from dataclasses import dataclass
 
-from so101_description.units import MOTOR_NAMES
+from so101.units import MOTOR_NAMES
 
 LEVEL_NOMINAL = 0
 LEVEL_WARNING = 1

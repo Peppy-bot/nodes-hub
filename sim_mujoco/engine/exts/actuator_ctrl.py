@@ -125,6 +125,11 @@ class MujocoActuatorCtrl:
         self._name_to_id = {}
         self._kd_over_kp = {}
 
+    def drives(self, name: str) -> bool:
+        """Whether an actuator of the model drives the joint `name`, or is
+        named it."""
+        return name in self._name_to_id
+
     def require_force_limited(self, names: list[str]) -> None:
         """Refuse fingers whose actuators cannot be force-capped: MuJoCo
         honors a runtime forcerange write only for actuators compiled with

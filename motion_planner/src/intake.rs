@@ -6,24 +6,23 @@
 
 use collision_geometry::chain::{BodyGeometry, Padding, Rider};
 use motion_planning_core::{PlanningScene, PosedChain, RobotMask};
+use robot_description::PerArm;
 
-use crate::arm_set::PerArm;
 use crate::history::ArmJoints;
 use crate::robot::ArmModel;
 
 /// The robot of `models` and `body`, its arms at `arms` carrying `carried`, each arm's
 /// fingers and held objects ([`with_held_objects`](crate::fingers::with_held_objects)),
 /// with the objects of `scene` that no link carries, grown by `padding`.
-pub fn robot_mask<'a, const N: usize>(
-    models: &'a PerArm<ArmModel<N>>,
+pub fn robot_mask<'a, const N: usize, const K: usize>(
+    models: &'a PerArm<ArmModel<N>, K>,
     body: &'a BodyGeometry,
-    arms: &ArmJoints<N>,
-    carried: &'a PerArm<Vec<Rider<'a>>>,
+    arms: &ArmJoints<N, K>,
+    carried: &'a PerArm<Vec<Rider<'a>>, K>,
     scene: &'a PlanningScene,
     padding: Padding,
 ) -> RobotMask<'a, N> {
-    let chains: Vec<PosedChain<'a, N>> = models
-        .ids()
+    let chains: Vec<PosedChain<'a, N>> = PerArm::<(), K>::ids()
         .map(|arm| PosedChain {
             geometry: &models[arm].geometry,
             joints: arms[arm],

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from sim_robot_core.cameras import FramePacer
-from sim_robot_core.models import FingerSpan, finger_span
+from sim_robot_core.models import FingerSpan
 from sim_robot_core.registry import Registry
 
 from world import Robot, World
@@ -67,10 +67,14 @@ class RobotLimbs:
         prim = robot.articulation()
         view = robot.instance or "standing"
         self.articulation = IsaacArticulation(prim, name=f"articulation_{view}")
-        # One actuator controller per limb: the gains and effort ceilings of
-        # the model's entry are applied to that limb's PhysX drives at setup,
-        # and the limb's commands are written through it. A limb whose model
-        # carries no gains keeps the drives its stage authors.
+        # One actuator controller per limb: the gains of the model's entry,
+        # each drive capped at its joint's effort limit in the description,
+        # are applied to that limb's PhysX drives at setup, and the limb's
+        # commands are written through it. A gripper's controller drives its
+        # fingers that move of their own; every other finger follows one of
+        # them through the coupling the stage authors as the robot joins. A
+        # limb whose model carries no gains keeps the drives its stage
+        # authors.
         self.arm_actuators = {
             arm.name: IsaacActuatorCtrl(
                 prim,
@@ -83,7 +87,7 @@ class RobotLimbs:
         self.gripper_actuators = {
             gripper.name: IsaacActuatorCtrl(
                 prim,
-                joint_names=list(gripper.joints),
+                joint_names=list(gripper.driven_joints()),
                 params=known.gripper_params(gripper),
                 name=f"{gripper.name}_{view}",
             )
@@ -95,8 +99,8 @@ class RobotLimbs:
         }
         self.joint_index: dict[str, int] = {}
         # Each finger joint's closed position and signed travel to fully
-        # open, read from the articulation at setup; commanded opening
-        # fractions scale onto it.
+        # open, as the robot's description gives them; measured positions
+        # read back as an opening fraction through it.
         self.spans: dict[str, list[FingerSpan]] = {}
         # Last force limit written per gripper, so the cap is not re-sent per tick.
         self.applied_effort: dict[str, float] = {}
@@ -131,20 +135,8 @@ class RobotLimbs:
                 f"the {self.entry.model} entry names joints not on the articulation of "
                 f"'{self.robot.instance or self.robot.model}': {missing}"
             )
-        limits = self.articulation.get_joint_limits()
-        if limits is None:
-            return False
-        lower, upper = limits
         for gripper in self.entry.grippers:
-            self.spans[gripper.name] = [
-                finger_span(
-                    name,
-                    lower[self.joint_index[name]],
-                    upper[self.joint_index[name]],
-                    gripper.closed_at,
-                )
-                for name in gripper.joints
-            ]
+            self.spans[gripper.name] = list(gripper.spans)
         self.ready = True
         return True
 
@@ -346,15 +338,13 @@ class IsaacBridgeExtension:
             # articulation call, not a per-tick target.
             if limbs.applied_effort.get(gripper.name) != setpoint.max_effort:
                 # Recorded only once written, so a not-ready tick retries.
-                if actuator.set_force_limit(list(gripper.joints), setpoint.max_effort):
+                if actuator.set_force_limit(list(gripper.driven_joints()), setpoint.max_effort):
                     limbs.applied_effort[gripper.name] = setpoint.max_effort
-            # Map the opening fraction onto each finger's own span, so the same
-            # command drives prismatic fingers, revolute ones and a single jaw.
+            # Map the opening fraction onto each driven finger's own span, so
+            # the same command drives prismatic fingers, revolute ones and a
+            # single jaw.
             actuator.write_targets(
-                {
-                    name: span.position(setpoint.opening)
-                    for name, span in zip(gripper.joints, limbs.spans[gripper.name])
-                }
+                {name: span.position(setpoint.opening) for name, span in gripper.driven()}
             )
 
     def _publish_state(self, ready: list[RobotLimbs]) -> None:

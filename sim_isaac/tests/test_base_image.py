@@ -54,7 +54,7 @@ def test_base_image_copies_asset_pin_before_the_download_layer():
     dockerfile = (IMAGES_DIR / "Dockerfile.isaac").read_text()
     copy = "COPY download_assets.sh isaac_assets.env /tmp/"
     assert dockerfile.index(copy) < dockerfile.index(
-        "bash /tmp/download_assets.sh --variant isaac"
+        "bash /tmp/download_assets.sh"
     )
     pins = (IMAGES_DIR / "isaac_assets.env").read_text()
     assert shell_value(pins, "ISAAC_ASSETS_BUCKET") == "isaac-sim-assets"
@@ -91,17 +91,19 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
     )
 
 
-def test_base_image_installs_the_package_the_engines_share():
+def test_base_image_installs_the_packages_the_engines_share():
     # The registry, the four slots, the model entries and the camera
-    # configuration come from sim_robot_core, pinned to the commit these
-    # suites run the engine against.
+    # configuration come from sim_robot_core, and the robots' descriptions
+    # from robot_description_py, both pinned to the commit these suites run
+    # the engine against.
     pinned = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
-    rev = pinned["tool"]["uv"]["sources"]["sim_robot_core"]["rev"]
+    sources = pinned["tool"]["uv"]["sources"]
     requirements = (IMAGES_DIR / "requirements.isaac.txt").read_text().splitlines()
-    assert [line for line in requirements if line.startswith("sim_")] == [
-        "sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
-        f"@{rev}"
-        "#subdirectory=sim_robot_core"
+    assert [line for line in requirements if "public-peppy-libs" in line] == [
+        f"{package} @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
+        f"@{sources[package]['rev']}"
+        f"#subdirectory={package}"
+        for package in ("sim_robot_core", "robot_description_py")
     ]
 
 
@@ -193,32 +195,18 @@ def _bundle(path: Path, files: dict[str, bytes]) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-# Each bucket has its own R2 token, so each variant reads with its own pair.
-_R2_CREDENTIAL_NAMES = {
-    "isaac": ("WALDO_R2_ACCESS_KEY_ID", "WALDO_R2_SECRET_ACCESS_KEY"),
-    "mujoco": ("PEPPY_R2_DATA01_ACCESS_KEY_ID", "PEPPY_R2_DATA01_SECRET_ACCESS_KEY"),
-}
-
-
-def _r2_credentials_env(variants) -> dict[str, str]:
-    """The R2 key pair of each variant in `variants`, each with values of its own."""
-    env = {}
-    for variant in variants:
-        key_name, secret_name = _R2_CREDENTIAL_NAMES[variant]
-        env[key_name] = f"{variant}-key"
-        env[secret_name] = f"{variant}-secret"
-    return env
+# The R2 token of the isaac-sim-assets bucket.
+_R2_CREDENTIALS = {"WALDO_R2_ACCESS_KEY_ID": "isaac-key", "WALDO_R2_SECRET_ACCESS_KEY": "isaac-secret"}
 
 
 def _run_installer(
     tmp_path,
     *,
-    variant="isaac",
     corrupt=False,
     download_fails=False,
     checksum=None,
     stage_checksum=None,
-    credential_variants=("isaac", "mujoco"),
+    credentials=True,
 ):
     # The two bundles the installer fetches: what the output holds after a
     # run, one directory per robot.
@@ -235,31 +223,27 @@ def _run_installer(
     script_dir.mkdir()
     script = script_dir / "download_assets.sh"
     shutil.copyfile(IMAGES_DIR / script.name, script)
-    if variant == "isaac":
-        pins = (IMAGES_DIR / "isaac_assets.env").read_text()
-        for name, value in (
-            ("ISAAC_ASSETS_KEY", _BUNDLE_KEY),
-            ("ISAAC_ASSETS_SHA256", digest if checksum is None else checksum),
-            ("SO101_ASSETS_KEY", _SO101_BUNDLE_KEY),
-            ("SO101_ASSETS_SHA256", so101_digest),
-            (
-                "SO101_STAGE_SHA256",
-                hashlib.sha256(_SO101_FILES["so101.usd"]).hexdigest()
-                if stage_checksum is None
-                else stage_checksum,
-            ),
-        ):
-            pins = re.sub(rf"^{name}=.*$", f'{name}="{value}"', pins, flags=re.MULTILINE)
-        (script_dir / "isaac_assets.env").write_text(pins)
+    pins = (IMAGES_DIR / "isaac_assets.env").read_text()
+    for name, value in (
+        ("ISAAC_ASSETS_KEY", _BUNDLE_KEY),
+        ("ISAAC_ASSETS_SHA256", digest if checksum is None else checksum),
+        ("SO101_ASSETS_KEY", _SO101_BUNDLE_KEY),
+        ("SO101_ASSETS_SHA256", so101_digest),
+        (
+            "SO101_STAGE_SHA256",
+            hashlib.sha256(_SO101_FILES["so101.usd"]).hexdigest()
+            if stage_checksum is None
+            else stage_checksum,
+        ),
+    ):
+        pins = re.sub(rf"^{name}=.*$", f'{name}="{value}"', pins, flags=re.MULTILINE)
+    (script_dir / "isaac_assets.env").write_text(pins)
 
     output = tmp_path / "output"
     output.mkdir()
     (output / "stale.usd").write_bytes(b"existing staging contents")
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    mujoco_source = tmp_path / "mujoco-source"
-    mujoco_source.mkdir()
-    (mujoco_source / "robot.xml").write_bytes(b"MuJoCo robot")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     rclone = bin_dir / "rclone"
@@ -281,8 +265,6 @@ if os.environ["MOCK_RCLONE_FAIL"] == "1":
     sys.exit(9)
 if sys.argv[1] == "copyto":
     shutil.copyfile(json.loads(os.environ["MOCK_BUNDLES"])[sys.argv[2]], sys.argv[3])
-elif sys.argv[1] == "copy":
-    shutil.copytree(os.environ["MOCK_MUJOCO_SOURCE"], sys.argv[3], dirs_exist_ok=True)
 else:
     sys.exit("Unexpected rclone command")
 """
@@ -303,19 +285,18 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
     tar.chmod(0o755)
     rclone_log = tmp_path / "rclone.jsonl"
     result = subprocess.run(
-        ["bash", str(script), "--variant", variant, "--output-dir", str(output)],
+        ["bash", str(script), "--output-dir", str(output)],
         cwd=tmp_path,
         env={
             "PATH": f"{bin_dir}{os.pathsep}{os.defpath}",
             "TMPDIR": str(scratch),
-            **_r2_credentials_env(credential_variants),
+            **(_R2_CREDENTIALS if credentials else {}),
             "MOCK_RCLONE_LOG": str(rclone_log),
             "MOCK_RCLONE_FAIL": "1" if download_fails else "0",
             "MOCK_BUNDLES": json.dumps({
                 f"r2:isaac-sim-assets/{_BUNDLE_KEY}": str(archive),
                 f"r2:isaac-sim-assets/{_SO101_BUNDLE_KEY}": str(so101_archive),
             }),
-            "MOCK_MUJOCO_SOURCE": str(mujoco_source),
             "MOCK_TAR_LOG": str(tmp_path / "tar.jsonl"),
             "REAL_TAR": shutil.which("tar", path=os.defpath),
         },
@@ -335,10 +316,10 @@ def _tar_calls(tmp_path) -> list[list[str]]:
     return [json.loads(line) for line in (tmp_path / "tar.jsonl").read_text().splitlines()]
 
 
-def _assert_reaches_r2_with_the_credentials_of(variant, call):
+def _assert_reaches_r2_with_the_isaac_credentials(call):
     assert call["endpoint"] == _R2_ENDPOINT
-    assert call["access_key_id"] == f"{variant}-key"
-    assert call["secret_access_key"] == f"{variant}-secret"
+    assert call["access_key_id"] == _R2_CREDENTIALS["WALDO_R2_ACCESS_KEY_ID"]
+    assert call["secret_access_key"] == _R2_CREDENTIALS["WALDO_R2_SECRET_ACCESS_KEY"]
 
 
 def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under_its_robot(tmp_path):
@@ -351,7 +332,7 @@ def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under
     for call in calls:
         assert call["args"][3:] == ["--progress"]
         assert Path(call["args"][2]).is_relative_to(tmp_path / "scratch")
-        _assert_reaches_r2_with_the_credentials_of("isaac", call)
+        _assert_reaches_r2_with_the_isaac_credentials(call)
     output = tmp_path / "output"
     assert {
         str(path.relative_to(output)): path.read_bytes()
@@ -413,34 +394,10 @@ def test_isaac_installer_refuses_a_bundle_whose_stage_is_not_the_pinned_one(tmp_
     assert list(output.iterdir()) == [output / "stale.usd"]
 
 
-def test_mujoco_installer_keeps_its_directory_copy_without_isaac_pin(tmp_path):
-    result, calls, _ = _run_installer(tmp_path, variant="mujoco")
-    assert result.returncode == 0, result.stderr
-    assert len(calls) == 1
-    assert calls[0]["args"] == [
-        "copy",
-        "r2:peppy-data01/openarm01/mujoco/assets/",
-        f"{tmp_path}/output/",
-        "--progress",
-    ]
-    _assert_reaches_r2_with_the_credentials_of("mujoco", calls[0])
-    output = tmp_path / "output"
-    assert list(output.iterdir()) == [output / "robot.xml"]
-    assert (output / "robot.xml").read_bytes() == b"MuJoCo robot"
-    assert not (tmp_path / "tar.jsonl").exists()
-
-
-@pytest.mark.parametrize("variant, other", [("isaac", "mujoco"), ("mujoco", "isaac")])
-def test_installer_refuses_to_run_without_the_credentials_of_its_bucket(
-    tmp_path, variant, other
-):
-    # R2 refuses the token of the other bucket, so the installer must not fall
-    # back to it.
-    result, calls, _ = _run_installer(
-        tmp_path, variant=variant, credential_variants=(other,)
-    )
+def test_installer_refuses_to_run_without_the_token_of_its_bucket(tmp_path):
+    result, calls, _ = _run_installer(tmp_path, credentials=False)
     assert result.returncode != 0
-    assert f"{_R2_CREDENTIAL_NAMES[variant][0]} must be set" in result.stderr
+    assert "WALDO_R2_ACCESS_KEY_ID must be set" in result.stderr
     assert calls == []
     output = tmp_path / "output"
     assert list(output.iterdir()) == [output / "stale.usd"]

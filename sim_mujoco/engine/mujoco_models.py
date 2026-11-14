@@ -1,22 +1,29 @@
 """The models this engine stands, one entry per model under models/.
 
 What a robot of a model is made of (its limbs, joints, cameras and start
-posture) is sim_robot_core's entry of the same name, shared with every
-engine. What is here is what MuJoCo alone knows about it: the MJCF it loads,
-how the robot's URDF links map onto that file's bodies, its servo gains, and
-where the file is corrected to the robot's description. A model with no
-entry here is refused, and none falls back to another's.
+posture) comes from the description its attach goal carries, through
+sim_robot_core's entry of the same model, shared with every engine. Its
+MuJoCo model (the MJCF it is attached from, the body that carries it, the
+body of each URDF link the file names otherwise, its weight compensation and
+its servo gains) is the release of Waldo's catalogue the base image bakes
+(catalogue_robots), which Waldo stands its robots from too. What is here is
+what this engine alone decides about a model: the light rig and the floor.
+The engine reads every entry here when it starts, and holds one to a robot's
+description when the robot attaches. A model with no entry here is refused,
+and none falls back to another's.
 """
 
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-from sim_robot_core.models import EngineModel, ModelEntry, Models
+import catalogue_robots
+from catalogue_robots import CatalogueRobot, ServoGains
+from robot_description_py import RobotDescription
+from sim_robot_core.errors import ModelEntryError
+from sim_robot_core.models import ModelEntry, Models
 
 ENTRIES_DIR = Path(__file__).parent / "models"
 
@@ -25,72 +32,34 @@ ASSETS_DIR = Path(
     os.environ.get("PEPPY_ROBOT_ASSETS_DIR", str(Path(__file__).parent / "assets" / "robots"))
 )
 
-_ENTRY_KEYS = frozenset(
-    {
-        "scene",
-        "world_links",
-        "link_bodies",
-        "arm_gains",
-        "gravity_compensation",
-        "camera_lights",
-        "floor",
-        "head_camera",
-        "joint_ranges",
-        "site_poses",
-        "solver",
-    }
-)
-_GAIN_KEYS = frozenset({"kp", "kd"})
-_SITE_POSE_KEYS = frozenset({"pos", "quat_wxyz"})
+_ENTRY_KEYS = frozenset({"camera_lights", "floor"})
 
 
 @dataclass(frozen=True)
-class ArmGains:
-    """MIT servo gains, one per joint of an arm, applied to every arm of the
-    model."""
+class Servo:
+    """The position servo a joint is driven through: its gains, and whether
+    its damping is raised to critical against the joint's inertia, as it is
+    on an arm joint (the real gearbox damps what the simulated joint does
+    not)."""
 
-    kp: tuple[float, ...]
-    kd: tuple[float, ...]
-
-
-@dataclass(frozen=True)
-class SitePose:
-    """A site's pose in its body's frame."""
-
-    pos: tuple[float, float, float]
-    quat_wxyz: tuple[float, float, float, float]
+    gains: ServoGains
+    critical: bool
 
 
 @dataclass(frozen=True)
 class MujocoModel:
-    """One model this engine stands."""
+    """One model this engine stands, as a robot of it stands: what the robot
+    is made of, from its description, its MuJoCo model, from the release,
+    and what this engine's entry says of the model."""
 
     entry: ModelEntry
-    # The robot's MJCF, relative to the baked assets. It brings the robot;
-    # the scene it is attached into is composed from every model standing.
-    scene: str
-    # URDF links the MJCF compiler folds into the world body, so whatever
-    # hangs from one hangs from the world.
-    world_links: frozenset
-    # URDF link name to the MJCF body that is that link, where they differ.
-    link_bodies: dict
-    # None for a model driven by its file's own actuator model.
-    arm_gains: Optional[ArmGains]
-    gravity_compensation: bool
+    robot: CatalogueRobot
     # Whether rendering adds the engine's light rig, for a scene that ships
     # no light of its own.
     camera_lights: bool
     # Whether the robot works against a floor, which the scene lays once for
     # every robot standing that asks for one.
     floor: bool
-    # Whether the robot draws the OpenArm v2 head camera pack.
-    head_camera: bool
-    # Where the file is corrected to the robot's description.
-    joint_ranges: dict
-    site_poses: dict
-    # The solver settings the model stands under, read from the entry's
-    # `<option>` element. None leaves the ones its file asks for.
-    solver: object = None
 
     @property
     def model(self) -> str:
@@ -98,7 +67,7 @@ class MujocoModel:
 
     def scene_path(self) -> Path:
         """The MJCF on disk."""
-        path = ASSETS_DIR / self.scene
+        path = self.robot.file
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} is missing: the models are baked into the container image"
@@ -107,38 +76,45 @@ class MujocoModel:
 
     def body_of(self, link: str) -> str:
         """The MJCF body a URDF link is."""
-        return self.link_bodies.get(link, link)
+        return self.robot.body_of(link)
+
+    def servos(self) -> dict[str, Servo]:
+        """The position servo of each joint the release gives gains for: each
+        arm joint, in its group's order, and each finger joint of a gripper
+        that has gains."""
+        servos = {}
+        for arm in self.entry.arms:
+            for joint, gains in zip(arm.joints, self.robot.arm_gains.get(arm.name, ())):
+                servos[joint] = Servo(gains=gains, critical=True)
+        # A description gives each arm its gripper, in the arms' order.
+        for arm, gripper in zip(self.entry.arms, self.entry.grippers):
+            finger = self.robot.gripper_gains.get(arm.name)
+            if finger is not None:
+                servos.update(
+                    {joint: Servo(gains=finger, critical=False) for joint in gripper.joints}
+                )
+        return servos
 
     def actuator_params(self) -> dict:
-        """The gains of every arm joint, the same per-joint gains on each
-        arm."""
-        gains = self.arm_gains
-        arms = self.entry.arms
+        """The gains of each arm joint, which the actuator controller writes
+        again once the scene is compiled, its damping raised to critical
+        against the joint's inertia there."""
+        arm = {joint: servo.gains for joint, servo in self.servos().items() if servo.critical}
         return {
-            "joint_names": self.entry.arm_joints() if gains else [],
-            "kp": list(gains.kp) * len(arms) if gains else [],
-            "kd": list(gains.kd) * len(arms) if gains else [],
+            "joint_names": list(arm),
+            "kp": [gains.kp for gains in arm.values()],
+            "kd": [gains.kd for gains in arm.values()],
         }
 
 
-def _fail(model: str, reason: str) -> RuntimeError:
-    return RuntimeError(f"models/{model}.json5: {reason}")
+def _fail(model: str, reason: str) -> ModelEntryError:
+    return ModelEntryError(f"models/{model}.json5: {reason}")
 
 
 def _reject_unknown_keys(model: str, obj: dict, allowed: frozenset, what: str) -> None:
     unknown = sorted(set(obj) - allowed)
     if unknown:
         raise _fail(model, f"{what} has unknown key(s) {unknown}; allowed: {sorted(allowed)}")
-
-
-def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _numbers(model: str, value, length: int, what: str) -> tuple[float, ...]:
-    if not isinstance(value, list) or len(value) != length or not all(map(_is_number, value)):
-        raise _fail(model, f"{what} must be {length} finite numbers, got {value!r}")
-    return tuple(float(v) for v in value)
 
 
 def _flag(model: str, raw: dict, key: str) -> bool:
@@ -148,162 +124,61 @@ def _flag(model: str, raw: dict, key: str) -> bool:
     return value
 
 
-def _names(model: str, value, what: str) -> list[str]:
-    if not isinstance(value, list) or not all(isinstance(name, str) and name for name in value):
-        raise _fail(model, f"{what} must be a list of names, got {value!r}")
-    return value
-
-
-def _arm_gains(model: str, entry: ModelEntry, raw) -> Optional[ArmGains]:
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise _fail(model, f"arm_gains must be an object, got {raw!r}")
-    _reject_unknown_keys(model, raw, _GAIN_KEYS, "arm_gains")
-    joint_counts = set(entry.arm_joint_counts())
-    if len(joint_counts) != 1:
-        raise _fail(model, f"arm_gains serve arms of one joint count, and these have {sorted(joint_counts)}")
-    (joints,) = joint_counts
-    return ArmGains(
-        kp=_numbers(model, raw.get("kp"), joints, "arm_gains.kp"),
-        kd=_numbers(model, raw.get("kd"), joints, "arm_gains.kd"),
-    )
-
-
-def _link_bodies(model: str, raw) -> dict:
-    if not isinstance(raw, dict) or not all(
-        isinstance(body, str) and body for body in raw.values()
-    ):
-        raise _fail(model, f"link_bodies must map link names to body names, got {raw!r}")
-    return dict(raw)
-
-
-def _joint_ranges(model: str, entry: ModelEntry, raw) -> dict:
-    if not isinstance(raw, dict):
-        raise _fail(model, f"joint_ranges must map joints to [lower, upper], got {raw!r}")
-    unknown = sorted(set(raw) - set(entry.joints()))
-    if unknown:
-        raise _fail(model, f"joint_ranges names joints no limb moves: {unknown}")
-    ranges = {}
-    for joint, limits in raw.items():
-        lower, upper = _numbers(model, limits, 2, f"joint_ranges.{joint}")
-        if not lower < upper:
-            raise _fail(model, f"joint_ranges.{joint} [{lower}, {upper}] is not a range")
-        ranges[joint] = (lower, upper)
-    return ranges
-
-
-def _site_poses(model: str, raw) -> dict:
-    if not isinstance(raw, dict):
-        raise _fail(model, f"site_poses must map sites to a pose, got {raw!r}")
-    poses = {}
-    for site, pose in raw.items():
-        if not isinstance(pose, dict):
-            raise _fail(model, f"site_poses.{site} must be an object, got {pose!r}")
-        _reject_unknown_keys(model, pose, _SITE_POSE_KEYS, f"site_poses.{site}")
-        quat = _numbers(model, pose.get("quat_wxyz"), 4, f"site_poses.{site}.quat_wxyz")
-        norm = math.sqrt(sum(v * v for v in quat))
-        if not math.isclose(norm, 1.0, abs_tol=1e-3):
-            raise _fail(model, f"site_poses.{site}.quat_wxyz norm {norm} is not 1")
-        poses[site] = SitePose(
-            pos=_numbers(model, pose.get("pos"), 3, f"site_poses.{site}.pos"), quat_wxyz=quat
-        )
-    return poses
-
-
-def parse(known: EngineModel) -> MujocoModel:
+def parse(model: str, raw: dict) -> dict:
     """This engine's entry of one model, refusing anything it does not spell
-    out."""
-    entry, raw = known.entry, known.engine
-    model = entry.model
+    out: every field of a MujocoModel but the robot's entry and its MuJoCo
+    model."""
     _reject_unknown_keys(model, raw, _ENTRY_KEYS, "the entry")
-    scene = raw.get("scene")
-    if not isinstance(scene, str) or not scene:
-        raise _fail(model, f"scene must name the model's MJCF, got {scene!r}")
-    return MujocoModel(
-        entry=entry,
-        scene=scene,
-        world_links=frozenset(_names(model, raw.get("world_links", []), "world_links")),
-        link_bodies=_link_bodies(model, raw.get("link_bodies", {})),
-        arm_gains=_arm_gains(model, entry, raw.get("arm_gains")),
-        gravity_compensation=_flag(model, raw, "gravity_compensation"),
-        camera_lights=_flag(model, raw, "camera_lights"),
-        floor=_flag(model, raw, "floor"),
-        head_camera=_flag(model, raw, "head_camera"),
-        joint_ranges=_joint_ranges(model, entry, raw.get("joint_ranges", {})),
-        site_poses=_site_poses(model, raw.get("site_poses", {})),
-        solver=_solver(model, raw.get("solver")),
-    )
+    return {
+        "camera_lights": _flag(model, raw, "camera_lights"),
+        "floor": _flag(model, raw, "floor"),
+    }
 
 
-def _solver(model: str, raw):
-    """The solver settings a model stands under, from the one MJCF
-    `<option>` element its entry names. What the scene steps is read here,
-    where every entry is read, so a model whose settings a scene cannot take
-    is answered for with the file that names them and not by the first robot
-    to attach as it.
-
-    The element replaces the settings the model's own file asks for, so it
-    is held to being exactly that: one `<option>`, with attributes MuJoCo
-    takes, stepping a timestep a scene can pace on."""
-    if raw is None:
-        return None
-    if not isinstance(raw, str):
-        raise _fail(model, f"solver must be an MJCF `<option>` element, got {raw!r}")
-    import xml.etree.ElementTree as ElementTree  # pylint: disable=C0415
-
-    import mujoco  # pylint: disable=C0415,E0401
-
-    try:
-        element = ElementTree.fromstring(raw)
-    except ElementTree.ParseError as error:
-        raise _fail(model, f"solver is no MJCF `<option>` element: {error}") from error
-    if element.tag != "option":
-        raise _fail(model, f"solver is one MJCF `<option>` element, and this is <{element.tag}>")
-    try:
-        option = mujoco.MjSpec.from_string(f"<mujoco>{raw}<worldbody/></mujoco>").option
-    except Exception as error:  # pylint: disable=W0718
-        raise _fail(model, f"solver is no MJCF `<option>` element: {error}") from error
-    for setting, value in _unsettled(option):
-        raise _fail(model, f"solver is finite in every setting, and {setting} is {value}")
-    if option.timestep <= 0.0:
-        raise _fail(model, f"solver steps a timestep above zero, got {option.timestep:g}")
-    return option
+def robot_fail(robot: CatalogueRobot, reason: str) -> ModelEntryError:
+    return ModelEntryError(f"{catalogue_robots.ROBOTS_FILE}: robot '{robot.model}': {reason}")
 
 
-def _unsettled(option):
-    """The settings of an `<option>` that are not finite numbers. A scene
-    steps every one of them, and a NaN among them steps every robot standing
-    in it to NaN and publishes that."""
-    import numpy as np  # pylint: disable=C0415
-
-    for setting in dir(option):
-        if setting.startswith("_"):
-            continue
-        value = getattr(option, setting)
-        if callable(value):
-            continue
-        numbers = np.asarray(value)
-        if numbers.dtype.kind in "fc" and not np.all(np.isfinite(numbers)):
-            yield setting, value
+def stood(entry: ModelEntry, robot: CatalogueRobot, fields: dict) -> MujocoModel:
+    """The model `robot` and `fields` of this engine's entry describe, as the
+    robot that `entry` describes stands: the release's gains name the arms of
+    the description, with one gain per joint."""
+    arms = {arm.name: arm for arm in entry.arms}
+    for name in sorted(set(robot.arm_gains) | set(robot.gripper_gains)):
+        if name not in arms:
+            raise robot_fail(
+                robot, f"gains name the arm '{name}', and the description's arms are {sorted(arms)}"
+            )
+    for name, gains in robot.arm_gains.items():
+        if len(gains) != len(arms[name].joints):
+            raise robot_fail(
+                robot,
+                f"arm '{name}' has gains for {len(gains)} joints, and its group moves "
+                f"{len(arms[name].joints)}",
+            )
+    return MujocoModel(entry=entry, robot=robot, **fields)
 
 
 class MujocoModels:
     """The models this engine stands, by the id a robot attaches with."""
 
-    def __init__(self, models: Models) -> None:
+    def __init__(self, models: Models, robots: dict[str, CatalogueRobot]) -> None:
         self._models = models
-        self._parsed = {name: parse(models.of(name)) for name in models.names()}
+        self._robots = robots
+        self._parsed = {name: parse(name, models.of(name).engine) for name in models.names()}
 
     @staticmethod
-    def read(entries_dir: Path = ENTRIES_DIR) -> "MujocoModels":
-        return MujocoModels(Models.read(entries_dir))
+    def read(entries_dir: Path = ENTRIES_DIR, assets_dir: Path | None = None) -> MujocoModels:
+        models = Models.read(entries_dir)
+        return MujocoModels(models, catalogue_robots.read(assets_dir or ASSETS_DIR, models.names()))
 
     def names(self) -> list[str]:
         return self._models.names()
 
-    def of(self, model: str) -> MujocoModel:
-        """The model a robot attaches as; an id this engine has no entry for
-        is refused naming the ones it stands."""
-        self._models.of(model)
-        return self._parsed[model]
+    def of(self, model: str, description: RobotDescription) -> MujocoModel:
+        """The model a robot attaches as, as the robot `description`
+        describes stands. An id this engine has no entry for, and a
+        description the entry does not fit, are refused with ModelEntryError
+        naming why."""
+        known = self._models.of(model)
+        return stood(known.entry(description), self._robots[model], self._parsed[model])
