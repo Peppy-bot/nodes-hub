@@ -185,27 +185,49 @@ jobs:
   discover-and-run:
     name: All Rust and Python tests
     needs: wait-for-peppy
-    # 8 vCPU with 16 or 32 GB on the AMD families c7a and m7a, where one vCPU
-    # is a full core. The nodes build and test one after the other, and a full
-    # run keeps fewer than 8 cores busy (a warm run uses 3 on average) and
-    # peaks near 7 GB. The root disk holds the run's uv environments (a full
-    # run writes near 27 GB there), and the sticky disk holds the caches named
-    # below (a cold full run fills about 77 GB of it).
+    # An instance with 8 physical cores and 16 to 64 GB, of one of 9 types:
+    # the 2xlarge of the AMD families c7a, m7a and r7a, where one vCPU is a
+    # full core, and the 4xlarge of the Intel families c6i, m6i, c7i, m7i,
+    # c8i and m8i, where two vCPU share a core. The nodes build and test one
+    # after the other, and a full run keeps fewer than 8 cores busy (a warm
+    # run uses 3 on average) and peaks near 7 GB. The root disk holds the
+    # run's uv environments (a full run writes near 27 GB there), and the
+    # sticky disk holds the caches named below (a cold full run fills about
+    # 77 GB of it).
     #
-    # c7a and m7a alone, as AWS interrupts the spot instances of the newer AMD
-    # families more often. From 2026-10-24 to 2026-11-11, it interrupted 13 of
-    # the 48 spot jobs of the test jobs of nodes-hub and private-nodes-hub on
-    # c8a and m8a (56 per 100 spot hours), and 26 of the 257 on c7a and m7a
-    # (23 per 100 spot hours). An interruption costs more than the work it
-    # stops: RunsOn mostly runs the job again on an on-demand instance, and
-    # repeated interruptions open the spot circuit breaker. Two families in
-    # the three zones of the runners' VPC give six spot pools; when none of
-    # them has an instance, RunsOn launches an on-demand one.
+    # `family` holds one wildcard for each generation with its size, because
+    # a family name alone selects by vCPU count, and 8 vCPU of an Intel
+    # family are 4 cores. cpu and ram give the range that holds the 9 types;
+    # the 64 GB limit keeps out the Intel 4xlarge with 128 GB that the
+    # wildcards also match. The wildcards keep the label short: RunsOn gives
+    # no runner to a job whose label, with the run id and `/spot=false` in
+    # it, is longer than 255 characters.
+    #
+    # The job has 9 types to take a spot instance from because it is the
+    # longest of the workflow, and AWS can interrupt a spot instance for as
+    # long as it runs. AWS interrupts an instance to take back capacity from
+    # its pool, which is its type in its zone: 9 types in the three zones of
+    # the runners' VPC give 27 spot pools. `spot=pco` asks for the
+    # price-capacity-optimized allocation strategy in place of the
+    # capacity-optimized one of the org runner: among the pools with enough
+    # free capacity, each request gets the one with the lowest price, so the
+    # Intel types, which cost more for the same cores, serve only when the
+    # AMD pools are short. When no pool has an instance, RunsOn launches an
+    # on-demand one, of the type with the lowest price, c7a.2xlarge.
+    #
+    # The 8a generation of AMD is not in the label, as AWS interrupts its
+    # spot instances more often. From 2026-10-24 to 2026-11-11, it
+    # interrupted 13 of the 48 spot jobs of the test jobs of nodes-hub and
+    # private-nodes-hub on c8a and m8a (56 per 100 spot hours), and 26 of the
+    # 257 on c7a and m7a (23 per 100 spot hours). An interruption costs more
+    # than the work it stops: the job runs again from its start on an
+    # on-demand instance, and repeated interruptions open the spot circuit
+    # breaker.
     #
     # RunsOn keeps a sticky disk per architecture, so moving this job onto an
     # arm runner starts from an empty cache rather than a wrong-arch one. The
     # base images and the librealsense apt repository are published for both.
-    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8/ram=16+32/family=c7a+m7a/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb:lazy-init${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '' }}  # custom Peppy AMI
+    runs-on: runs-on=${{ github.run_id }}/runner=peppy-ci-ubuntu-24.04-x86_64/image=peppy-ubuntu24/cpu=8+16/ram=16+64/family=*7a.2xlarge+*6i.4xlarge+*7i.4xlarge+*8i.4xlarge/volume=60gb:gp3:500mbs:6000iops/sticky=node-tests:200gb:lazy-init${{ fromJSON(github.run_attempt) >= 3 && '/spot=false' || '/spot=pco' }}  # custom Peppy AMI
     # A cold run compiles nine crates' full dependency trees and resolves
     # lerobot's, torch included. The sticky disk keeps warm runs far under
     # this, but a run that starts from an empty disk is legitimately slow.
