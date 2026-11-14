@@ -518,13 +518,15 @@ async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_
         await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(start_joint_positions=AT_PRE, waypoints=[], fraction=1.0, map_stamp=None))
         pending = await h.mocks.deps.limb_motion.execute_joint_path.next_goal(WAIT)
         [run] = pending.request.arms
+        assert pending.request.contact_gap_m == 0.0
         assert (run.arm_name, run.expected_start_joint_positions, [w.joint_positions for w in run.waypoints]) == ("left_arm", START, [AT_PRE])
         limbs = limbs_of(h)
         limbs.left_position, limbs.left_orientation = [0.0, 0.0, 1.05], down
         limbs.stamp += 1.0
         await publish_limbs(h)
         await (await pending.accept()).complete(execute_joint_path.ResultResponseData(
-            arms=[execute_joint_path.ResultResponseDataArmsItem(arm_name="left_arm", final_joint_positions=AT_PRE)], action_time=2.0,
+            arms=[execute_joint_path.ResultResponseDataArmsItem(arm_name="left_arm", final_joint_positions=AT_PRE, ended_on_contact=False)],
+            action_time=2.0,
         ))
         pending = await planner.plan_cartesian_path.next_goal(WAIT)
         checked = pending.request
