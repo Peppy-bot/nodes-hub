@@ -27,18 +27,18 @@ dependencies:
         commit: 'sha1-6d4fd22b20465ccc0f7354476588e8df7c9ca0e0'
         owner_id: 44036562
         repo_id: 192625525
-    'actions/upload-artifact@v7':
-        ref: 'v7'
+    'actions/upload-artifact@v7.0.2':
+        ref: 'v7.0.2'
         commit: 'sha1-cf430e030ddbb5b0abf93d22962f4752f3646cd9'
         owner_id: 44036562
         repo_id: 192625955
     'peppy-bot/peppy@dev':
         ref: 'dev'
-        commit: 'sha1-10812a6ebcdbf1284707fa0277e0fcb8a19cb8b3'
+        commit: 'sha1-9696fb82d735a91bd9d2c754c104a156a66aaba3'
         owner_id: 211768652
         repo_id: 1028771363
         uses:
-            - 'actions/upload-artifact@v7'
+            - 'actions/upload-artifact@v7.0.2'
     'runs-on/action@v2.6.0':
         ref: 'v2.6.0'
         commit: 'sha1-284bff869d4a825f778ac7c38e50f1e31ef198fd'

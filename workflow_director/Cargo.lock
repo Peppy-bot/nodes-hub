@@ -486,10 +486,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
- "js-sys",
  "num-traits",
  "serde",
- "wasm-bindgen",
  "windows-link",
 ]
 
@@ -625,7 +623,6 @@ dependencies = [
  "bytes",
  "capnp",
  "capnpc",
- "chrono",
  "gix-url",
  "libc",
  "peppy-config-model",
@@ -2537,8 +2534,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
- "tracing",
- "walkdir",
  "zenoh-keyexpr",
 ]
 
@@ -2744,7 +2739,6 @@ name = "pmi"
 version = "0.0.1"
 dependencies = [
  "base64 0.23.1",
- "build-helpers",
  "bytes",
  "derive_more",
  "flume 0.12.0",
