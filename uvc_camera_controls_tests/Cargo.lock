@@ -2577,7 +2577,6 @@ name = "pmi"
 version = "0.0.1"
 dependencies = [
  "base64 0.23.1",
- "build-helpers",
  "bytes",
  "derive_more",
  "flume 0.12.0",
