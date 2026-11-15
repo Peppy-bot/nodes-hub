@@ -14,8 +14,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import mujoco
-import mujoco.viewer
 import pytest
+import viewer_fakes
 from entries import camera, entry, known as known_model
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the launcher imports)
@@ -27,6 +27,7 @@ import _launcher as launcher_module  # noqa: E402  pylint: disable=C0413
 from _launcher import SimLauncher, _NoView  # noqa: E402  pylint: disable=C0413
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from exts import camera_sensor  # noqa: E402  pylint: disable=C0413
+from viewer_server import ViewerServer  # noqa: E402  pylint: disable=C0413
 from world import World  # noqa: E402  pylint: disable=C0413
 
 _SCENE = "arm/arm.xml"
@@ -95,11 +96,22 @@ class FakeIO:
 
 
 class _Unwatched(SimLauncher):
-    """A launcher whose scene nobody watches, so these tests need neither a
-    browser nor a display."""
+    """A launcher whose scene nobody watches, for the tests that hold the
+    scene itself and not how it is shown."""
 
     def _open_view(self, model, data, extension):
         return _NoView(model, extension)
+
+
+def _viewer_server() -> ViewerServer:
+    """The viewer's server over a viser that serves nobody."""
+    return ViewerServer(viewer_fakes.Viser())
+
+
+@pytest.fixture(name="mjviser")
+def mjviser_fixture(monkeypatch):
+    """mjviser as the browser view imports it, drawing nothing."""
+    monkeypatch.setitem(sys.modules, "mjviser", types.SimpleNamespace(Viewer=viewer_fakes.Viewer))
 
 
 @pytest.fixture(name="assets", autouse=True)
@@ -116,16 +128,12 @@ def _known(robot=None, **release):
 
 
 def _launcher(world: World) -> SimLauncher:
-    return _Unwatched(
-        world,
-        Edits(),
-        threading.Event(),
-        FakeIO(),
-        _STATE_RATE_HZ,
-        headless=True,
-        viewer_host="0.0.0.0",
-        viewer_port=8080,
-    )
+    return _Unwatched(world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ, _viewer_server())
+
+
+def _watched(world: World, viewer_server: ViewerServer) -> SimLauncher:
+    """A launcher that shows its scene on `viewer_server`."""
+    return SimLauncher(world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ, viewer_server)
 
 
 def _frame_ids(launcher: SimLauncher) -> dict:
@@ -250,10 +258,7 @@ class TestTheThreadThatStepsTheScene:
         world = World(renders=False)
         edits = Edits()
         stop = threading.Event()
-        launcher = _Unwatched(
-            world, edits, stop, FakeIO(), _STATE_RATE_HZ,
-            headless=True, viewer_host="0.0.0.0", viewer_port=8080,
-        )
+        launcher = _Unwatched(world, edits, stop, FakeIO(), _STATE_RATE_HZ, _viewer_server())
         made = []
 
         def stand():
@@ -276,10 +281,7 @@ class TestTheThreadThatStepsTheScene:
         edits = Edits()
         stop = threading.Event()
         stop.set()
-        launcher = _Unwatched(
-            world, edits, stop, FakeIO(), _STATE_RATE_HZ,
-            headless=True, viewer_host="0.0.0.0", viewer_port=8080,
-        )
+        launcher = _Unwatched(world, edits, stop, FakeIO(), _STATE_RATE_HZ, _viewer_server())
         waiting = edits.submit(lambda: None)
 
         launcher.run()
@@ -362,26 +364,16 @@ class TestTheThreadThatStepsTheScene:
         # A scene that did not shut down counted frames nobody carries on.
         assert launcher._camera_counters == {}  # pylint: disable=W0212
 
-    def test_a_scene_no_robot_stands_in_is_shown_to_nobody(self):
-        launcher = _launcher(World(renders=False))
-
-        launcher.rebind()
-
-        assert isinstance(launcher._view, _NoView)  # pylint: disable=W0212
-
     def test_a_view_that_cannot_open_leaves_the_scene_stepping(self, caplog, monkeypatch):
         """The robots standing keep their physics, their state and the clock
         this engine publishes; the operator is told why there is no picture."""
 
         def refuse(*_args, **_kwargs):
-            raise RuntimeError("the viewer port is taken")
+            raise RuntimeError("the scene draws from no camera")
 
         monkeypatch.setattr(launcher_module, "_BrowserView", refuse)
         world = World(renders=False)
-        launcher = SimLauncher(
-            world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ,
-            headless=True, viewer_host="0.0.0.0", viewer_port=8080,
-        )
+        launcher = _watched(world, _viewer_server())
         launcher.rebind()
         world.add("alpha", _known(), world.free_spot())
 
@@ -394,61 +386,6 @@ class TestTheThreadThatStepsTheScene:
         before = launcher._extension.engine_time_s()  # pylint: disable=W0212
         launcher._extension.step()  # pylint: disable=W0212
         assert launcher._extension.engine_time_s() > before  # pylint: disable=W0212
-
-    def test_a_browser_view_that_cannot_finish_hands_back_its_server(self, monkeypatch):
-        """The server holds the viewer's address and its own non-daemon
-        threads from the moment it is built, so a view that cannot finish
-        gives them up: the view of the scene composed next takes the same
-        address, and the process still exits once the sim loop ends."""
-        servers = []
-
-        class _Server:
-            def __init__(self, host, port):
-                self.host, self.port, self.stopped = host, port, False
-                servers.append(self)
-
-            def stop(self):
-                self.stopped = True
-
-        def _refuse(*_args, **_kwargs):
-            raise RuntimeError("the scene draws from no camera")
-
-        monkeypatch.setitem(sys.modules, "viser", types.SimpleNamespace(ViserServer=_Server))
-        monkeypatch.setitem(sys.modules, "mjviser", types.SimpleNamespace(Viewer=_refuse))
-        world = World(renders=False)
-        world.add("alpha", _known(), world.free_spot())
-        model = world.compose().compile()
-
-        with pytest.raises(RuntimeError, match="the scene draws from no camera"):
-            # The view fails before the scene is ever stepped through the
-            # extension, so it needs none.
-            launcher_module._BrowserView(  # pylint: disable=W0212
-                model, mujoco.MjData(model), None, "0.0.0.0", 8080
-            )
-
-        assert [server.stopped for server in servers] == [True]
-
-    def test_a_scene_with_a_robot_in_it_is_shown_in_a_browser_when_headless(self, monkeypatch):
-        """Which view a scene is watched through is the engine's launch: a
-        browser one where it runs headless, a window where it does not."""
-        opened = []
-        monkeypatch.setattr(
-            launcher_module, "_BrowserView", lambda *args: opened.append("browser") or _NoView()
-        )
-        monkeypatch.setattr(
-            launcher_module, "_WindowView", lambda *args: opened.append("window") or _NoView()
-        )
-        for headless in (True, False):
-            world = World(renders=False)
-            launcher = SimLauncher(
-                world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ,
-                headless=headless, viewer_host="0.0.0.0", viewer_port=8080,
-            )
-            launcher.rebind()  # nothing stands: no view of either kind
-            world.add("alpha", _known(), world.free_spot())
-            launcher.rebind()
-
-        assert opened == ["browser", "window"]
 
     def test_a_joint_the_scene_leaves_unnamed_is_left_where_its_model_puts_it(self):
         """A model may leave a joint unnamed, and an unnamed joint is one the
@@ -494,6 +431,121 @@ class TestTheThreadThatStepsTheScene:
         )
 
 
+@pytest.mark.usefixtures("mjviser")
+class TestTheSceneOnTheViewersServer:
+    """Every scene is shown on the one server the node bound when it set up,
+    so the address the node announced shows the scene that stands now."""
+
+    def test_a_scene_no_robot_stands_in_is_shown_too(self):
+        viewer_server = _viewer_server()
+        launcher = _watched(World(renders=False), viewer_server)
+
+        launcher.rebind()
+
+        assert isinstance(launcher._view, launcher_module._BrowserView)  # pylint: disable=W0212
+        assert viewer_server.viser.nodes == ["/fixed_bodies"]
+
+    def test_a_scene_composed_again_is_drawn_on_the_same_server_in_place_of_the_one_before(self):
+        """A browser open on the viewer stays on the server it reached, and
+        sees the scene a robot joined and nothing of the one before it."""
+        viewer_server = _viewer_server()
+        world = World(renders=False)
+        launcher = _watched(world, viewer_server)
+        launcher.rebind()
+
+        _stand(launcher, world, "alpha")
+
+        viser = viewer_server.viser
+        assert viser.events == ["draw", "render", "wipe", "draw", "render"]
+        assert not viser.stopped
+        # What one scene leaves on the server, once: what mjviser shows and
+        # registers, and the callback of the view itself.
+        assert viser.nodes == ["/fixed_bodies"]
+        assert viser.controls == ["Controls"]
+        assert len(viser.click_callbacks) == 1
+        assert len(viser.connect_callbacks) == 2
+
+    def test_a_scene_the_engine_lets_go_of_leaves_nothing_on_the_server(self):
+        viewer_server = _viewer_server()
+        launcher = _watched(World(renders=False), viewer_server)
+        launcher.rebind()
+
+        launcher.unbind()
+
+        assert viewer_server.viser.left_on_it() == []
+        assert not viewer_server.viser.stopped
+
+    def test_a_browser_view_that_cannot_finish_wipes_what_it_drew(self, monkeypatch):
+        """The server outlives the view, so what a view drew before it failed
+        is taken off it: the view of the scene composed next starts on a
+        server that holds nothing."""
+
+        class _Unfinished(viewer_fakes.Viewer):
+            def _setup_gui(self) -> None:
+                super()._setup_gui()
+                raise RuntimeError("the scene draws from no camera")
+
+        monkeypatch.setitem(sys.modules, "mjviser", types.SimpleNamespace(Viewer=_Unfinished))
+        viewer_server = _viewer_server()
+        world = World(renders=False)
+        world.add("alpha", _known(), world.free_spot())
+        model = world.compose().compile()
+
+        with pytest.raises(RuntimeError, match="the scene draws from no camera"):
+            # The view fails before the scene is ever stepped through the
+            # extension, so it needs none.
+            launcher_module._BrowserView(  # pylint: disable=W0212
+                model, mujoco.MjData(model), None, viewer_server
+            )
+
+        assert viewer_server.viser.left_on_it() == []
+        assert not viewer_server.viser.stopped
+
+    def test_a_browser_already_open_on_the_viewer_is_sent_the_scene_once_it_is_whole(self):
+        """viser runs a connect callback at once for a browser already open,
+        on a thread of its own, and the callback reads the scene: it is
+        registered after the first frame, when the scene is whole."""
+        viewer_server = _viewer_server()
+        viewer_server.viser.clients.append("a browser")
+        launcher = _watched(World(renders=False), viewer_server)
+
+        launcher.rebind()
+
+        assert viewer_server.viser.events == ["draw", "render", "refresh"]
+
+    def test_the_server_stops_once_the_thread_that_steps_the_scene_ends(self):
+        """The scene is wiped off the server before it stops, so nothing
+        draws on a server that is gone."""
+        viewer_server = _viewer_server()
+        launcher = _watched(World(renders=False), viewer_server)
+        launcher._stop.set()  # pylint: disable=W0212
+
+        launcher.run()
+
+        assert viewer_server.viser.events == ["draw", "render", "wipe", "stop"]
+
+    def test_a_server_that_will_not_stop_does_not_hide_what_ended_the_loop(
+        self, caplog, monkeypatch
+    ):
+        viewer_server = _viewer_server()
+        launcher = _watched(World(renders=False), viewer_server)
+
+        def compile_nothing():
+            raise RuntimeError("this scene compiles nothing")
+
+        def refuse():
+            raise RuntimeError("this server will not stop")
+
+        monkeypatch.setattr(launcher, "rebind", compile_nothing)
+        monkeypatch.setattr(viewer_server, "stop", refuse)
+
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(RuntimeError, match="this scene compiles nothing"):
+                launcher.run()
+
+        assert "the viewer's server did not stop" in caplog.text
+
+
 class _CountingScene:
     """The bridge extension as a view steps it: each step is counted, then
     handed to `after_step` with the count so far."""
@@ -507,71 +559,16 @@ class _CountingScene:
         self._after_step(self.steps)
 
 
-class _Window:
-    """MuJoCo's passive window, open and shown to nobody."""
-
-    def is_running(self) -> bool:
-        return True
-
-    def sync(self) -> None:
-        return None
-
-    def close(self) -> None:
-        return None
-
-
-class _Server:
-    """viser's server as the browser view uses it, serving nobody."""
-
-    def __init__(self, host, port) -> None:
-        self.host, self.port = host, port
-        self.gui = types.SimpleNamespace(
-            add_button=lambda _label: types.SimpleNamespace(on_click=lambda handler: handler)
-        )
-
-    def on_client_connect(self, handler):
-        return handler
-
-    def stop(self) -> None:
-        return None
-
-
-class _Viewer:
-    """mjviser's viewer as the browser view drives it: a tick steps the scene
-    through the callback the view handed it, and nothing is drawn."""
-
-    def __init__(self, model, data, server, step_fn) -> None:
-        self._model, self._data, self._server, self._step_fn = model, data, server, step_fn
-
-    def _tick(self) -> None:
-        self._step_fn(self._model, self._data)
-
-    def _setup_gui(self) -> None:
-        return None
-
-    def _render(self) -> None:
-        return None
-
-    def _refresh_scene_from_gui(self) -> None:
-        return None
-
-
-def _open_view(kind: str, scene: _CountingScene, monkeypatch):
-    """A view of `kind` on a scene one robot stands in, stepping `scene`,
-    with its window or its browser server faked."""
+def _open_view(kind: str, scene: _CountingScene):
+    """A view of `kind` on a scene one robot stands in, stepping `scene`."""
     world = World(renders=False)
     world.add("alpha", _known(), world.free_spot())
     model = world.compose().compile()
     data = mujoco.MjData(model)
     if kind == "none":
         return launcher_module._NoView(model, scene)  # pylint: disable=W0212
-    if kind == "window":
-        monkeypatch.setattr(mujoco.viewer, "launch_passive", lambda _model, _data: _Window())
-        return launcher_module._WindowView(model, data, scene)  # pylint: disable=W0212
-    monkeypatch.setitem(sys.modules, "viser", types.SimpleNamespace(ViserServer=_Server))
-    monkeypatch.setitem(sys.modules, "mjviser", types.SimpleNamespace(Viewer=_Viewer))
     return launcher_module._BrowserView(  # pylint: disable=W0212
-        model, data, scene, "0.0.0.0", 8080
+        model, data, scene, _viewer_server()
     )
 
 
@@ -582,26 +579,25 @@ def _owe_a_whole_turn(view) -> None:
     view._pacer._stepped_to_s -= 3600.0  # pylint: disable=W0212
 
 
-@pytest.mark.parametrize("kind", ["none", "window", "browser"])
+@pytest.mark.usefixtures("mjviser")
+@pytest.mark.parametrize("kind", ["none", "browser"])
 class TestTheStepsAViewOwes:
     """A view takes the steps its scene owes the wall clock one at a time,
     and stops before the first one the scene is changing at. On a box that
     steps the scene slower than real time the whole of them lasts seconds,
     so a robot leaving waits for one step, not for all of them."""
 
-    def test_every_step_owed_is_taken_while_the_scene_stands_as_it_is(self, kind, monkeypatch):
+    def test_every_step_owed_is_taken_while_the_scene_stands_as_it_is(self, kind):
         launcher = _launcher(World(renders=False))
         scene = _CountingScene()
-        view = _open_view(kind, scene, monkeypatch)
+        view = _open_view(kind, scene)
         _owe_a_whole_turn(view)
 
         view.step(launcher._scene_is_changing)  # pylint: disable=W0212
 
         assert scene.steps == launcher_module._MAX_CATCHUP_STEPS  # pylint: disable=W0212
 
-    def test_a_change_asked_during_the_steps_owed_ends_them_at_the_next_one(
-        self, kind, monkeypatch
-    ):
+    def test_a_change_asked_during_the_steps_owed_ends_them_at_the_next_one(self, kind):
         launcher = _launcher(World(renders=False))
 
         def ask_for_a_change(steps: int) -> None:
@@ -609,18 +605,18 @@ class TestTheStepsAViewOwes:
                 launcher._edits.submit(lambda: None)  # pylint: disable=W0212
 
         scene = _CountingScene(after_step=ask_for_a_change)
-        view = _open_view(kind, scene, monkeypatch)
+        view = _open_view(kind, scene)
         _owe_a_whole_turn(view)
 
         view.step(launcher._scene_is_changing)  # pylint: disable=W0212
 
         assert scene.steps == 3
 
-    def test_an_engine_stopping_takes_no_step_owed(self, kind, monkeypatch):
+    def test_an_engine_stopping_takes_no_step_owed(self, kind):
         launcher = _launcher(World(renders=False))
         launcher._stop.set()  # pylint: disable=W0212
         scene = _CountingScene()
-        view = _open_view(kind, scene, monkeypatch)
+        view = _open_view(kind, scene)
         _owe_a_whole_turn(view)
 
         view.step(launcher._scene_is_changing)  # pylint: disable=W0212
