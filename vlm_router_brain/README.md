@@ -49,12 +49,13 @@ model is never named `none` or `scripted`.
 
 `scripted` is brain_core's `ScriptedManipulator` on its `CentreProposer`, and
 makes no model call. A `grab_item` takes the item's seen point lowered 2.5 cm
-(a grab by pose takes the pose itself), checks with the backbone's
-`check_arm_move` that the pre-grasp point 7.5 cm above, the grasp point and
-the lifted point 7.5 cm above all plan, trying the gripper pointing down at 8
-rolls (a grab by pose with an orientation tries that one alone), then opens,
-reaches, closes with the goal's `max_effort` and lifts. It opens the jaws as
-wide as the item and 1.5 cm on each side, fully for an item of no known width.
+(a grab by pose takes the pose itself), opens the jaws as wide as the item and
+1.5 cm on each side (fully for an item of no known width), then checks with
+the backbone's `check_arm_move` that the pre-grasp point 7.5 cm above, the
+grasp point and the lifted point 7.5 cm above all plan, trying the gripper
+pointing down at 8 rolls (a grab by pose with an orientation tries that one
+alone), then reaches, closes with the goal's `max_effort` and lifts. A grab
+that no roll reaches ends with the jaws open.
 It judges the hold
 twice: from the close's `final_opening`, below 0.05 of which the grab fails
 with `closed on nothing`, then from the first `limb_states` snapshot captured
@@ -64,8 +65,10 @@ fails with `slipped while lifting`. A grab
 that fails once the descent was sent first opens the gripper and moves the
 arm straight back up to the pre-grasp point, unless a stop ended the step.
 `drop_item` opens the gripper where it is; `place_item` carries the item to
-7.5 cm above the pose, lowers it to the pose and opens there, or where the
-item comes to rest on something on the way, and climbs back to 7.5 cm above. Every move goes through the
+15 cm above the pose (7.5 cm where the backbone has no plan that high), lowers
+it to 5 cm above the pose and opens there, so the arm does not press the item
+on what it is set on, or where the item comes to rest on something on the way,
+and climbs back. Every move goes through the
 backbone that the `limb_motion` slot binds, and the `limb_state` slot gives
 the measured openings and grasp points, so the launcher binds both to the
 robot's backbone. Each arm move completes once the backbone has measured the
@@ -78,6 +81,35 @@ brain reads where the arm stopped from `limb_states`.
 Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
 item is down; `get_state`'s gripper opening shows the open jaws.
+
+## The motion planner
+
+The `motion_planning` slot is optional. When the launcher binds it to the
+robot's motion planner (`motion_planner` of nodes-hub), the scripted grab and
+place, with or without the alignment step, take the arm to the point above the
+item, and above the spot of a place, by a planned path in place of the
+backbone's line: for each roll, the planner plans a path of the grasp link to
+that point around what the chest camera sees and what its planning scene
+holds, within 1 mm and 0.01 rad in 0.5 s, and tests from the end of the plan
+that the lines that follow reach; the first roll that passes runs its plan
+through the backbone's `execute_joint_path`. A grab or a place that no roll
+plans fails before the arm moves, with the planner's failure kind and words,
+such as `start_in_collision` and the link that stands too near; no line takes
+the place of a plan. The descent, the lift, the retreat and the climb stay the
+backbone's lines.
+
+The brain keeps the planner's scene equal to what it holds. Before a grab
+plans, it adds the item's object, `brain/<item_id>`, at the item's place (an
+upright box around the item's depth points, or a 5 cm sphere for an item no
+look measured) and lets the gripper's links touch it; a grab that fails or
+stops removes it; a grab that holds moves it with the hand and attaches it to
+the arm, so a place plans with the item riding; a place or a drop that lets go
+detaches and removes it. Each grab and each place first makes the scene equal
+to what the brain holds, which repairs a brain or a planner that restarted.
+Just before the descent, a grab logs what a collision-checked descent from
+where the arm stands would answer (`checked descent of item ...`); it descends
+by lines whatever the answer. Without the slot the brain moves by the
+backbone's lines alone.
 
 ## The alignment step
 
@@ -112,8 +144,8 @@ forget the item. A `place_item` with the same model gets the same step above
 the spot the held item goes to: the model centres the held item over the
 container or the free patch the target point is in, within 10 cm of that point
 (a container that already holds items is still the spot: the item may rest on
-them), and `ready` lowers the item until it rests or the point is reached,
-opens and climbs back. An arm the backbone stops short on the way down,
+them), and `ready` lowers the item until it rests or the point 5 cm above the
+target is reached, opens and climbs back. An arm the backbone stops short on the way down,
 anywhere from the pre-place point down and within 5 cm of the line down, has
 set the item on what is under it (a tall fruit meets a bowl's floor well above
 the target; a fruit set on another slides off its top by a few centimetres),

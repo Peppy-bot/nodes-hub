@@ -16,7 +16,7 @@
     tag: "v1",
     description: [
       "A brain whose models are hosted vision-language models that it reaches over the network. It finds items by words in the images of the robot, then picks them up and puts them down. It needs no GPU, but it needs the network and the API key of a model provider.",
-      "It implements item_perception, item_manipulation and brain_model, which also switches the model of a role while the brain runs. It reads the API key from its environment: GEMINI_API_KEY for Google, OPENROUTER_API_KEY for OpenRouter. It finds items through one RGB-D camera, the geometry of that camera and its mount on the robot: without them, it refuses each search. The default perception model is Gemini Robotics-ER on the Google API. The default manipulation model grabs an item from above at the point where the brain saw it, and calls no model. A catalog model in the manipulation role also looks through the wrist camera of the arm and corrects the place and the turn of the gripper before the descent.",
+      "It implements item_perception, item_manipulation and brain_model, which also switches the model of a role while the brain runs. It reads the API key from its environment: GEMINI_API_KEY for Google, OPENROUTER_API_KEY for OpenRouter. It finds items through one RGB-D camera, the geometry of that camera and its mount on the robot: without them, it refuses each search. The default perception model is Gemini Robotics-ER on the Google API. The default manipulation model grabs an item from above at the point where the brain saw it, and calls no model. A catalog model in the manipulation role also looks through the wrist camera of the arm and corrects the place and the turn of the gripper before the descent. With the robot's motion planner bound, the arm goes to the point above an item, and above the spot of a place, by a path planned around what the chest camera sees.",
     ],
     implements: [
       { name: "item_perception", tag: "v1", link_id: "item_perception" },
@@ -59,6 +59,14 @@
         // searches are refused naming the slot until it answers and names
         // the camera.
         { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+        // The robot's motion planner: it plans the arm's transit to the
+        // point above an item and above the spot of a place around what the
+        // chest camera sees and what its planning scene holds, and the brain
+        // runs each plan with limb_motion's execute_joint_path. The brain
+        // keeps the scene equal to what it holds: the object of an item it
+        // grabs, attached to the arm. Optional: without it the brain moves
+        // by move_arm lines alone, which check nothing around the arm.
+        { name: "motion_planning", tag: "v1", link_id: "motion_planning", cardinality: "zero_or_one" },
       ],
     },
   },
@@ -76,6 +84,9 @@
       consumes: [
         { link_id: "limb_motion", name: "move_arm" },
         { link_id: "limb_motion", name: "move_gripper" },
+        { link_id: "limb_motion", name: "execute_joint_path" },
+        { link_id: "motion_planning", name: "plan_joint_path" },
+        { link_id: "motion_planning", name: "plan_cartesian_path" },
       ],
     },
     topics: {
@@ -95,6 +106,11 @@
       ],
       consumes: [
         { link_id: "limb_motion", name: "check_arm_move" },
+        { link_id: "motion_planning", name: "describe_arms" },
+        { link_id: "motion_planning", name: "get_planning_scene" },
+        { link_id: "motion_planning", name: "apply_collision_objects" },
+        { link_id: "motion_planning", name: "apply_attached_collision_object" },
+        { link_id: "motion_planning", name: "set_allowed_collision" },
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_color_intrinsics" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
