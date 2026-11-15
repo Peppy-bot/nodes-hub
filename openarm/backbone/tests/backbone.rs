@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 mod helpers;
 use helpers::MODEL;
-use helpers::fixtures::posture;
+use helpers::fixtures::{description, posture};
 use helpers::params::params;
 use robot_description::states;
 
@@ -86,9 +86,7 @@ const READ_WINDOW: Duration = Duration::from_secs(2);
 
 /// The names of the cameras openarm_v2's description carries, in its order.
 fn v2_camera_names() -> Vec<String> {
-    robot_description::model("openarm_v2")
-        .expect("a bundled model")
-        .description()
+    description(V2)
         .cameras()
         .iter()
         .map(|camera| camera.name.clone())
@@ -192,19 +190,20 @@ macro_rules! pump_states {
 }
 
 /// Static joint-state pump for one arm follower, parked at `$home`, its arm's
-/// Home ([`home_of`]).
+/// Home ([`home_of`]). The pump reads `$home` once, before its first state.
 macro_rules! pump_arm_at_home {
-    ($publisher:expr, $message:path, $home:expr $(,)?) => {
+    ($publisher:expr, $message:path, $home:expr $(,)?) => {{
+        let home: [f64; 7] = $home;
         pump_states!($publisher, || {
             use $message as message;
             message::Message {
                 timestamp: SystemTime::now(),
-                positions: $home.to_vec(),
+                positions: home.to_vec(),
                 velocities: vec![0.0; 7],
                 efforts: Vec::new(),
             }
         })
-    };
+    }};
 }
 
 /// Static aperture pump for one gripper follower, half open.
