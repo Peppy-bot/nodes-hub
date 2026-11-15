@@ -1,0 +1,93 @@
+// rerun_viewer: draws, live in one 3D view in a browser, what a robot stack
+// already has on the wire: the chest camera, its depth as points in the robot
+// frame, the arms, the motion planner's voxel map, and its planning scene
+// with a shell of the clearance around each object and a log of each change.
+// It only listens: it never moves the robot and never changes the scene. It
+// draws only the contracts it lists here. See README.md.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "rerun_viewer",
+    tag: "v1",
+    description: [
+      "Serves the Rerun web viewer and draws in it, live, what a robot stack has on the wire: the color and depth images of one camera, the depth samples as points in the robot frame, each arm's grasp point with a trail, each gripper's opening and each joint's position as plots, the occupied cubes of motion_planning's voxel map as occupancy_map publishes them, and the planning scene of motion_planning: each object as its shapes, each attached object at its arm's grasp point, the allowed pairs, a see-through shell of the scene's clearance around each object, and a text log of each change of the scene.",
+      "It only listens. It never moves the robot and never changes the planning scene.",
+    ],
+    depends_on: {
+      contracts: [
+        // The arms and the grippers: joint positions, grasp-point poses and
+        // openings.
+        { name: "limb_state", tag: "v1", link_id: "limb_state" },
+        // The camera to draw: its frames (camera), its geometry (geometry)
+        // and where the robot carries it (camera_mounts). Without camera and
+        // geometry, the viewer draws no images and no points.
+        { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
+        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+        // The planning scene, the voxel map, and the names of the arms'
+        // joints and links. Without it, the viewer draws no scene and no
+        // map, and names each joint by its index.
+        { name: "motion_planning", tag: "v1", link_id: "motion_planning", cardinality: "zero_or_one" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      consumes: [
+        { link_id: "limb_state", name: "limb_states" },
+        { link_id: "camera", name: "video_stream" },
+        { link_id: "camera", name: "depth_stream" },
+        { link_id: "motion_planning", name: "occupancy_map" },
+      ],
+    },
+    services: {
+      consumes: [
+        { link_id: "camera", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
+        { link_id: "camera_mounts", name: "get_camera_poses" },
+        { link_id: "motion_planning", name: "describe_arms" },
+        { link_id: "motion_planning", name: "get_planning_scene" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The address the viewer serves on. 127.0.0.1 serves this machine
+      // only; give the machine's Tailscale address to open the viewer from
+      // another machine, or 0.0.0.0 for every interface.
+      bind_ip: { $type: "string", $default: "127.0.0.1" },
+      // The port of the web page of the viewer.
+      web_port: { $type: "u16", $default: 9090 },
+      // The port the page reads the data from (gRPC).
+      grpc_port: { $type: "u16", $default: 9876 },
+      // How much data the viewer's server keeps for a page that opens late,
+      // as "1GB" or "25%" of the memory of the machine. Past it, the oldest
+      // data goes first.
+      memory_limit: { $type: "string", $default: "1GB" },
+      // A file to save the recording to (.rrd), for a replay; empty saves
+      // none. The file holds the whole run.
+      recording_path: { $type: "string", $default: "" },
+      // The most color and depth images a second the viewer draws: above 0.
+      image_rate_hz: { $type: "f64", $default: 2.0 },
+      // The most depth frames a second the viewer turns into points: above
+      // 0.
+      cloud_rate_hz: { $type: "f64", $default: 2.0 },
+      // The points come from every cloud_stride-th pixel across and down: 1
+      // or more.
+      cloud_stride: { $type: "u32", $default: 4 },
+      // How many times a second the viewer reads the planning scene: above 0.
+      scene_poll_hz: { $type: "f64", $default: 2.0 },
+      // How many past grasp-point positions each arm's trail holds: 1 or
+      // more.
+      trail_length: { $type: "u32", $default: 100 },
+      // The camera of camera_mounts that the camera link is, by the name the
+      // robot runs it under.
+      camera_name: { $type: "string", $default: "chest" },
+    },
+  },
+}

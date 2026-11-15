@@ -1,0 +1,260 @@
+//! The arms: limb_state's snapshots, parsed and drawn as they come.
+
+use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
+use control_core::latched_log::LatchedLog;
+use control_core::receiving;
+use peppygen::NodeRunner;
+use peppygen::consumed_services::motion_planning::describe_arms;
+use peppygen::consumed_topics::limb_state::limb_states;
+use tracing::error;
+
+use crate::canvas::Canvas;
+use crate::draw::arms::draw_arms;
+use crate::model::arms::{ArmState, ArmsDescription, ArmsSnapshot, GripperState, Trails};
+use crate::model::placement::Placement;
+use crate::wire::{Shared, sendable, stopped};
+
+/// A limb_states message whose arrays do not fit its names.
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum SnapshotError {
+    #[error("joints_per_arm has {got} entries for {arms} arms")]
+    JointCounts { arms: usize, got: usize },
+    #[error("joint_positions has {got} values, joints_per_arm adds up to {expected}")]
+    JointPositions { expected: usize, got: usize },
+    #[error("positions has {got} values, 3 for each of {arms} arms is {}", 3 * arms)]
+    Positions { arms: usize, got: usize },
+    #[error("orientations has {got} values, 4 for each of {arms} arms is {}", 4 * arms)]
+    Orientations { arms: usize, got: usize },
+    #[error("gripper_openings has {got} values for {grippers} grippers")]
+    Grippers { grippers: usize, got: usize },
+    #[error("the grasp point of {arm}: {reason}")]
+    Grasp { arm: String, reason: String },
+}
+
+/// The snapshot `message` holds.
+pub fn parse_limb_states(message: &limb_states::Message) -> Result<ArmsSnapshot, SnapshotError> {
+    let arms = message.arm_names.len();
+    if message.joints_per_arm.len() != arms {
+        return Err(SnapshotError::JointCounts {
+            arms,
+            got: message.joints_per_arm.len(),
+        });
+    }
+    let expected = message.joints_per_arm.iter().map(|&n| n as usize).sum();
+    if message.joint_positions.len() != expected {
+        return Err(SnapshotError::JointPositions {
+            expected,
+            got: message.joint_positions.len(),
+        });
+    }
+    let (positions, rest) = message.positions.as_chunks::<3>();
+    if positions.len() != arms || !rest.is_empty() {
+        return Err(SnapshotError::Positions {
+            arms,
+            got: message.positions.len(),
+        });
+    }
+    let (orientations, rest) = message.orientations.as_chunks::<4>();
+    if orientations.len() != arms || !rest.is_empty() {
+        return Err(SnapshotError::Orientations {
+            arms,
+            got: message.orientations.len(),
+        });
+    }
+    let grippers = message.gripper_names.len();
+    if message.gripper_openings.len() != grippers {
+        return Err(SnapshotError::Grippers {
+            grippers,
+            got: message.gripper_openings.len(),
+        });
+    }
+    let mut joints = message.joint_positions.as_slice();
+    let mut arm_states = Vec::with_capacity(arms);
+    for (index, name) in message.arm_names.iter().enumerate() {
+        let (own, rest) = joints.split_at(message.joints_per_arm[index] as usize);
+        joints = rest;
+        let grasp = Placement::parse(positions[index], orientations[index]).map_err(|e| {
+            SnapshotError::Grasp {
+                arm: name.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        arm_states.push(ArmState {
+            name: name.clone(),
+            joint_positions: own.to_vec(),
+            grasp,
+        });
+    }
+    let gripper_states = message
+        .gripper_names
+        .iter()
+        .zip(&message.gripper_openings)
+        .map(|(name, opening)| GripperState {
+            name: name.clone(),
+            opening: *opening,
+        })
+        .collect();
+    Ok(ArmsSnapshot {
+        at: message.timestamp,
+        arms: arm_states,
+        grippers: gripper_states,
+    })
+}
+
+/// Draws each snapshot of limb_states as it comes, until the node stops. With the
+/// planner linked, the joints are plotted once the planner has named them.
+pub async fn follow_arms(
+    runner: Arc<NodeRunner>,
+    canvas: Arc<dyn Canvas>,
+    trail_length: NonZeroUsize,
+    shared: Arc<Shared>,
+) {
+    let planner_linked = describe_arms::bound_producer(&runner).is_some();
+    let cancelled = stopped(&runner);
+    let mut subscription = match sendable(limb_states::subscribe(&runner)).await {
+        Ok(subscription) => subscription,
+        Err(e) => {
+            error!("limb_states: no subscription, no arms drawn: {e}");
+            return;
+        }
+    };
+    let mut follower = ArmsFollower {
+        canvas,
+        shared,
+        planner_linked,
+        trails: Trails::new(trail_length),
+        unreadable: LatchedLog::warn("reading limb_states"),
+    };
+    receiving::receive(
+        "limb_states",
+        cancelled,
+        async move || subscription.next().await,
+        async move |(_producer, message)| {
+            follower.on_snapshot(&message);
+            ControlFlow::Continue(())
+        },
+    )
+    .await;
+}
+
+/// The arms follower's state: the trails so far.
+struct ArmsFollower {
+    canvas: Arc<dyn Canvas>,
+    shared: Arc<Shared>,
+    /// Whether the motion_planning link, which names the joints, is bound.
+    planner_linked: bool,
+    trails: Trails,
+    unreadable: LatchedLog,
+}
+
+impl ArmsFollower {
+    fn on_snapshot(&mut self, message: &limb_states::Message) {
+        match parse_limb_states(message) {
+            Ok(snapshot) => {
+                self.unreadable.success();
+                self.trails.push(&snapshot);
+                // Without the planner, each joint is named by its index.
+                let joint_names = if self.planner_linked {
+                    self.shared.arms.borrow().clone()
+                } else {
+                    Some(ArmsDescription::default())
+                };
+                draw_arms(
+                    self.canvas.as_ref(),
+                    &snapshot,
+                    &self.trails,
+                    joint_names.as_ref(),
+                );
+            }
+            Err(e) => self.unreadable.failure(e),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    /// A snapshot of two arms of 2 and 1 joints and one gripper.
+    pub(crate) fn two_arms() -> limb_states::Message {
+        limb_states::Message {
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+            arm_names: vec!["left_arm".to_string(), "right_arm".to_string()],
+            joints_per_arm: vec![2, 1],
+            joint_positions: vec![0.1, 0.2, 0.3],
+            positions: vec![0.3, 0.2, 0.4, 0.3, -0.2, 0.4],
+            orientations: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            gripper_names: vec!["right_gripper".to_string()],
+            gripper_openings: vec![0.5],
+        }
+    }
+
+    #[test]
+    fn a_snapshot_splits_the_joints_and_poses_of_each_arm() {
+        let snapshot = parse_limb_states(&two_arms()).expect("a valid message");
+        assert_eq!(snapshot.at, SystemTime::UNIX_EPOCH + Duration::from_secs(3));
+        assert_eq!(snapshot.arms[0].name, "left_arm");
+        assert_eq!(snapshot.arms[0].joint_positions, [0.1, 0.2]);
+        assert_eq!(snapshot.arms[0].grasp.position, [0.3, 0.2, 0.4]);
+        assert_eq!(snapshot.arms[1].name, "right_arm");
+        assert_eq!(snapshot.arms[1].joint_positions, [0.3]);
+        assert_eq!(snapshot.arms[1].grasp.position, [0.3, -0.2, 0.4]);
+        assert_eq!(
+            snapshot.grippers,
+            [GripperState {
+                name: "right_gripper".to_string(),
+                opening: 0.5
+            }]
+        );
+    }
+
+    #[test]
+    fn each_array_that_does_not_fit_the_names_is_refused() {
+        let mut message = two_arms();
+        message.joints_per_arm = vec![2];
+        assert_eq!(
+            parse_limb_states(&message),
+            Err(SnapshotError::JointCounts { arms: 2, got: 1 })
+        );
+        let mut message = two_arms();
+        message.joint_positions.pop();
+        assert_eq!(
+            parse_limb_states(&message),
+            Err(SnapshotError::JointPositions {
+                expected: 3,
+                got: 2
+            })
+        );
+        let mut message = two_arms();
+        message.positions.pop();
+        assert_eq!(
+            parse_limb_states(&message),
+            Err(SnapshotError::Positions { arms: 2, got: 5 })
+        );
+        let mut message = two_arms();
+        message.orientations.push(0.0);
+        assert_eq!(
+            parse_limb_states(&message),
+            Err(SnapshotError::Orientations { arms: 2, got: 9 })
+        );
+        let mut message = two_arms();
+        message.gripper_openings.clear();
+        assert_eq!(
+            parse_limb_states(&message),
+            Err(SnapshotError::Grippers {
+                grippers: 1,
+                got: 0
+            })
+        );
+        let mut message = two_arms();
+        message.orientations[3] = 2.0;
+        assert!(matches!(
+            parse_limb_states(&message),
+            Err(SnapshotError::Grasp { arm, .. }) if arm == "left_arm"
+        ));
+    }
+}

@@ -101,6 +101,11 @@
         path: "realsense_d4xx/peppy.json5"
       }
     },
+    rerun_viewer: {
+      v1: {
+        path: "rerun_viewer/peppy.json5"
+      }
+    },
     robot_initializer: {
       v1: {
         path: "robot_initializer/peppy.json5"
