@@ -20,6 +20,7 @@ from mujoco_models import MujocoModels
 from robots_io import RobotsIO
 from sim_robot_core.registry import Registry
 from sim_topics import SimTopicIO
+from viewer_server import ViewerServer
 from world import World
 
 _stop = threading.Event()
@@ -30,6 +31,24 @@ async def _run_sim(params, node_runner) -> list:
     # bad one fails node setup, before a robot attaches as it; a robot's
     # description is held to its model's entry when it attaches.
     models = MujocoModels.read()
+    # The viewer is bound here, before a robot attaches, and serves every
+    # scene the engine composes from then on. The thread that steps the scene
+    # stops it once it ends, so a setup that fails before that thread starts
+    # stops it here.
+    viewer_server = ViewerServer.serve(params.viewer_host, params.viewer_port)
+    try:
+        return await _start_sim(params, node_runner, models, viewer_server)
+    except BaseException:
+        viewer_server.stop()
+        raise
+
+
+async def _start_sim(params, node_runner, models: MujocoModels, viewer_server: ViewerServer) -> list:
+    """Announces the viewer, exposes the engine's contract and starts the
+    thread that steps the scene, which draws every scene on `viewer_server`."""
+    # The daemon renders the URLs an operator opens from this announcement,
+    # one per address of the machine.
+    node_runner.announce_endpoint("viewer", "http", viewer_server.host, viewer_server.port)
     # Typed peppygen pub/sub lives on this loop; declare publishers and start the
     # command-consume tasks before the sim thread starts reading from them.
     loop = asyncio.get_running_loop()
@@ -49,16 +68,7 @@ async def _run_sim(params, node_runner) -> list:
         params.robot_pair_grace_ms / 1000.0,
     )
     await robots_io.start()
-    launcher = SimLauncher(
-        world,
-        edits,
-        _stop,
-        io,
-        params.state_rate_hz,
-        params.headless,
-        params.viewer_host,
-        params.viewer_port,
-    )
+    launcher = SimLauncher(world, edits, _stop, io, params.state_rate_hz, viewer_server)
     # Standing a robot and taking one out both compose the scene again, on
     # the thread that steps it.
     robots_io.binds_with(launcher.rebind, launcher.unbind)

@@ -8,12 +8,8 @@ From: peppybot/sim-mujoco:4.0.0-6
 %environment
     export PYTHONPATH="/opt/sim_mujoco/.peppy/libs/peppygen:/opt/sim_mujoco/.peppy/libs/peppylib:$PYTHONPATH"
     export PEPPYGEN_OUTPUT_PATH="/opt/sim_mujoco/.peppy/libs/peppygen"
-    export PEPPY_BRIDGE_HEADLESS=${PEPPY_BRIDGE_HEADLESS:-1}
     export PEPPY_BRIDGE_NODE_NAME=sim
     export MUJOCO_GL=${MUJOCO_GL:-egl}
-    export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
-    export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
-    export DISPLAY=${DISPLAY:-}
     export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets}
 
 %files

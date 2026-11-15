@@ -635,14 +635,15 @@ Stop the stack, clear the shader cache with `rm -rf ~/.cache/isaac-sim`, and lau
 **Port 8080 is already in use**
 An older instance is still running. Find it with `peppy stack list` and stop it with `peppy node stop <instance_id>`.
 
-**A commander panel is not on 8765 or 8766**
-Both commanders prefer their configured port and take one from the operating
-system when another process holds it, so a second copy on a host comes up on a
-port of its own. The URLs the launch printed under `Web pages:` carry the port
-each took, and so do `peppy stack list` and `peppy node info`:
+**A commander panel is not on 8765 or 8766, or the MuJoCo viewer is not on 8080**
+Both commanders and the MuJoCo viewer prefer their configured port and take one
+from the operating system when another process holds it, so a second copy on a
+host comes up on a port of its own. The URLs the launch printed under
+`Web pages:` carry the port each took, and so do `peppy stack list` and
+`peppy node info`:
 
 ```bash
-peppy node info openarm_web_commander:v1     # or scene_commander:v1; lists each instance's panel URLs
+peppy node info openarm_web_commander:v1     # or scene_commander:v1, sim_mujoco:v1; lists each instance's page URLs
 ```
 
 ## Adding an item to this repository

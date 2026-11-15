@@ -198,6 +198,9 @@ def _install() -> None:
     peppylib_clock = types.ModuleType("peppylib.clock")
     peppylib_clock.ClockPublisher = _ClockPublisher
     peppylib.clock = peppylib_clock
+    peppylib_runtime = types.ModuleType("peppylib.runtime")
+    peppylib_runtime.NodeBuilder = object
+    peppylib.runtime = peppylib_runtime
 
     peppygen = types.ModuleType("peppygen")
     peppygen.__path__ = []
@@ -226,6 +229,7 @@ def _install() -> None:
     modules = {
         "peppylib": peppylib,
         "peppylib.clock": peppylib_clock,
+        "peppylib.runtime": peppylib_runtime,
         "peppygen": peppygen,
         "peppygen.clock": peppygen_clock,
         "peppygen.exposed_actions": types.ModuleType("peppygen.exposed_actions"),
