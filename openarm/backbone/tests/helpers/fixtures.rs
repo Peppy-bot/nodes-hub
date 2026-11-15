@@ -1,10 +1,11 @@
 //! The OpenArm models, the launcher's limits and the field-recorded poses the
 //! plan regressions run on.
 
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
-use robot_description::states;
+use robot_description::{RobotDescription, states};
 use srs_model::chain_kinematics::pose_miss;
 use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 use srs_model::{ARM_DOF, Arm, ArmAnglePolicy, JointVec};
@@ -24,18 +25,37 @@ pub const V_MAX_V2: JointVec = [
     16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
 ];
 
+/// The description of each bundled model, by the model's id, parsed at the
+/// first call of [`description`] in the test binary. A fixture reads a
+/// description from here and never parses one itself: a parse takes longer
+/// than a follower mock's state period, so a mock that parsed one for each
+/// state it publishes would hold a thread of the test's runtime, and the
+/// node would get the states of the other followers late.
+static DESCRIPTIONS: LazyLock<Vec<(&'static str, RobotDescription)>> = LazyLock::new(|| {
+    robot_description::models()
+        .map(|model| (model.id(), model.description()))
+        .collect()
+});
+
+/// The description of the bundled model `model`.
+pub fn description(model: &str) -> &'static RobotDescription {
+    let (_, description) = DESCRIPTIONS
+        .iter()
+        .find(|(id, _)| *id == model)
+        .expect("a bundled model");
+    description
+}
+
 /// The arm of the description of the model `model` named `arm_name`, as the
 /// backbone builds it.
 fn arm_of(model: &str, arm_name: &str) -> Arm {
-    let description = robot_description::model(model)
-        .expect("a bundled model")
-        .description();
+    let description = description(model);
     let arm = description
         .arms()
         .iter()
         .find(|arm| arm.name == arm_name)
         .expect("an arm of the model");
-    Arm::from_description(&description, arm).expect("the bundled description builds")
+    Arm::from_description(description, arm).expect("the bundled description builds")
 }
 
 /// The model the plan regressions run on.
@@ -44,10 +64,7 @@ pub const V2: &str = "openarm_v2";
 /// The posture `state` of the arm `arm_name` of the model `model`, where the
 /// backbone's posture moves put it.
 pub fn posture(model: &str, arm_name: &str, state: &str) -> JointVec {
-    let description = robot_description::model(model)
-        .expect("a bundled model")
-        .description();
-    description
+    description(model)
         .state(arm_name, state)
         .expect("each arm's posture")
         .try_into()
