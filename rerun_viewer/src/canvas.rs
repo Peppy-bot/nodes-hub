@@ -60,8 +60,13 @@ pub trait Canvas: Send + Sync {
     fn log_line(&self, path: &str, line: &str);
     /// Places the entity at `pose` and draws its axes, each `axis_length` long.
     fn frame(&self, path: &str, pose: &Pose, axis_length: f32);
+    /// Places the entity at `pose`, and draws nothing there.
+    fn place(&self, path: &str, pose: &Pose);
     /// Places the entity at the shape's pose and draws the shape there.
     fn shape(&self, path: &str, shape: &PlacedShape, look: Look);
+    /// Draws the shape as `shape` does, for the whole recording, whatever the time: a
+    /// part of the robot that moves only with the entity above it.
+    fn static_shape(&self, path: &str, shape: &PlacedShape, look: Look);
     fn points(&self, path: &str, points: &[[f32; 3]], color: Rgba, radius: f32);
     /// Cubes of side `side` around `centers`.
     fn cubes(&self, path: &str, centers: &[[f32; 3]], side: f32, color: Rgba);
@@ -242,24 +247,33 @@ impl RerunCanvas {
         }
     }
 
-    /// Logs `shape` at `path`, placed at its pose.
-    fn log_shape(&self, path: &str, shape: &PlacedShape, look: Look) {
-        self.log(path, &transform_of(&shape.pose));
+    /// Logs `shape` at `path`, placed at its pose, with `log`.
+    fn log_shape(
+        &self,
+        path: &str,
+        shape: &PlacedShape,
+        look: Look,
+        log: fn(&Self, &str, &dyn AsComponents),
+    ) {
+        log(self, path, &transform_of(&shape.pose));
         let color = rerun_color(look.color);
         match &shape.kind {
-            ShapeKind::Box { size } => self.log(
+            ShapeKind::Box { size } => log(
+                self,
                 path,
                 &Boxes3D::from_sizes([size.map(|side| side as f32)])
                     .with_colors([color])
                     .with_fill_mode(fill_mode(look)),
             ),
-            ShapeKind::Sphere { radius } => self.log(
+            ShapeKind::Sphere { radius } => log(
+                self,
                 path,
                 &Ellipsoids3D::from_radii([*radius as f32])
                     .with_colors([color])
                     .with_fill_mode(fill_mode(look)),
             ),
-            ShapeKind::Cylinder { height, radius } => self.log(
+            ShapeKind::Cylinder { height, radius } => log(
+                self,
                 path,
                 &Cylinders3D::from_lengths_and_radii([*height as f32], [*radius as f32])
                     .with_colors([color])
@@ -268,7 +282,8 @@ impl RerunCanvas {
             ShapeKind::Mesh {
                 vertices,
                 triangles,
-            } => self.log(
+            } => log(
+                self,
                 path,
                 &Mesh3D::new(vertices.iter().map(|vertex| vertex.map(|c| c as f32)))
                     .with_triangle_indices(triangles.iter().copied())
@@ -338,12 +353,20 @@ impl Canvas for RerunCanvas {
     }
 
     fn frame(&self, path: &str, pose: &Pose, axis_length: f32) {
-        self.log(path, &transform_of(pose));
+        self.place(path, pose);
         self.log(path, &TransformAxes3D::new(axis_length));
     }
 
+    fn place(&self, path: &str, pose: &Pose) {
+        self.log(path, &transform_of(pose));
+    }
+
     fn shape(&self, path: &str, shape: &PlacedShape, look: Look) {
-        self.log_shape(path, shape, look);
+        self.log_shape(path, shape, look, Self::log);
+    }
+
+    fn static_shape(&self, path: &str, shape: &PlacedShape, look: Look) {
+        self.log_shape(path, shape, look, Self::log_static);
     }
 
     fn points(&self, path: &str, points: &[[f32; 3]], color: Rgba, radius: f32) {

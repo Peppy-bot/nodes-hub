@@ -6,4 +6,6 @@ pub mod camera;
 pub mod changes;
 pub mod placement;
 pub mod planner_map;
+pub mod robot;
 pub mod scene;
+pub mod stl;

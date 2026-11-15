@@ -1,4 +1,5 @@
-//! The arms: limb_state's snapshots, parsed and drawn as they come.
+//! The arms: limb_state's snapshots, parsed and drawn as they come, and the links of
+//! the robot's body placed where each snapshot's joints put them.
 
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -13,6 +14,7 @@ use tracing::error;
 
 use crate::canvas::Canvas;
 use crate::draw::arms::draw_arms;
+use crate::draw::robot::draw_link_poses;
 use crate::model::arms::{ArmState, ArmsDescription, ArmsSnapshot, GripperState, Trails};
 use crate::model::placement::Placement;
 use crate::wire::{Shared, sendable, stopped};
@@ -127,6 +129,7 @@ pub async fn follow_arms(
         planner_linked,
         trails: Trails::new(trail_length),
         unreadable: LatchedLog::warn("reading limb_states"),
+        unplaced: LatchedLog::warn("placing the robot's links"),
     };
     receiving::receive(
         "limb_states",
@@ -148,6 +151,7 @@ struct ArmsFollower {
     planner_linked: bool,
     trails: Trails,
     unreadable: LatchedLog,
+    unplaced: LatchedLog,
 }
 
 impl ArmsFollower {
@@ -168,8 +172,24 @@ impl ArmsFollower {
                     &self.trails,
                     joint_names.as_ref(),
                 );
+                self.place_links(&snapshot);
             }
             Err(e) => self.unreadable.failure(e),
+        }
+    }
+
+    /// Places the links of the robot's body for `snapshot`, once the description is
+    /// read.
+    fn place_links(&self, snapshot: &ArmsSnapshot) {
+        let Some(body) = self.shared.body.borrow().clone() else {
+            return;
+        };
+        match body.link_poses(snapshot) {
+            Ok(poses) => {
+                self.unplaced.success();
+                draw_link_poses(self.canvas.as_ref(), snapshot.at, &poses);
+            }
+            Err(e) => self.unplaced.failure(e),
         }
     }
 }

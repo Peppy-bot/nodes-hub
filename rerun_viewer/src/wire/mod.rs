@@ -5,16 +5,19 @@
 pub mod arms;
 pub mod camera;
 pub mod planner_map;
+pub mod robot;
 pub mod scene;
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use peppygen::NodeRunner;
 use tokio::sync::watch;
 
 use crate::model::arms::ArmsDescription;
+use crate::model::robot::RobotBody;
 
 /// How long the viewer waits for a service to answer.
 pub const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,12 +27,16 @@ pub struct Shared {
     /// The arms as the motion planner describes them: the joints' names for the plots
     /// and the grasp links that carry objects. None until the planner answers.
     pub arms: watch::Sender<Option<ArmsDescription>>,
+    /// The robot's body as its description gives it, whose links the arms follower
+    /// places. None until the description is read.
+    pub body: watch::Sender<Option<Arc<RobotBody>>>,
 }
 
 impl Default for Shared {
     fn default() -> Self {
         Self {
             arms: watch::Sender::new(None),
+            body: watch::Sender::new(None),
         }
     }
 }

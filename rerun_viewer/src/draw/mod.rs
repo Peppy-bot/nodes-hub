@@ -6,6 +6,9 @@
 //! - `world/arms/<arm>/grasp`: each arm's grasp point, with its axes; the objects the
 //!   arm carries are drawn under it, in `attached/<id>`.
 //! - `world/arms/<arm>/trail`: the past positions of the grasp point.
+//! - `world/robot/<link>`: each link of the robot's description that has collision
+//!   shapes, where the joints of the last snapshot put it; its shapes are drawn under
+//!   it, in `collision_<index>_<kind>`.
 //! - `world/camera/points`: the camera's depth now, in the robot frame.
 //! - `world/planner/map`: the occupied cubes of the motion planner's voxel map, and
 //!   `planner/map` what the map holds.
@@ -18,6 +21,7 @@
 pub mod arms;
 pub mod camera;
 pub mod planner_map;
+pub mod robot;
 pub mod scene;
 
 use crate::canvas::Canvas;

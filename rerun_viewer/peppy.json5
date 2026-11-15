@@ -1,16 +1,17 @@
 // rerun_viewer: draws, live in one 3D view in a browser, what a robot stack
 // already has on the wire: the chest camera, its depth as points in the robot
-// frame, the arms, the motion planner's voxel map, and its planning scene
-// with a shell of the clearance around each object and a log of each change.
-// It only listens: it never moves the robot and never changes the scene. It
-// draws only the contracts it lists here. See README.md.
+// frame, the arms and the collision shapes of the robot's links, the motion
+// planner's voxel map, and its planning scene with a shell of the clearance
+// around each object and a log of each change. It only listens: it never
+// moves the robot and never changes the scene. It draws only the contracts it
+// lists here. See README.md.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "rerun_viewer",
     tag: "v1",
     description: [
-      "Serves the Rerun web viewer and draws in it, live, what a robot stack has on the wire: the color and depth images of one camera, the depth samples as points in the robot frame, each arm's grasp point with a trail, each gripper's opening and each joint's position as plots, the occupied cubes of motion_planning's voxel map as occupancy_map publishes them, and the planning scene of motion_planning: each object as its shapes, each attached object at its arm's grasp point, the allowed pairs, a see-through shell of the scene's clearance around each object, and a text log of each change of the scene.",
+      "Serves the Rerun web viewer and draws in it, live, what a robot stack has on the wire: the color and depth images of one camera, the depth samples as points in the robot frame, each arm's grasp point with a trail, each gripper's opening and each joint's position as plots, the collision shapes of each link of the robot's description (robot_identity) where the joints put them, the occupied cubes of motion_planning's voxel map as occupancy_map publishes them, and the planning scene of motion_planning: each object as its shapes, each attached object at its arm's grasp point, the allowed pairs, a see-through shell of the scene's clearance around each object, and a text log of each change of the scene.",
       "It only listens. It never moves the robot and never changes the planning scene.",
     ],
     depends_on: {
@@ -18,6 +19,10 @@
         // The arms and the grippers: joint positions, grasp-point poses and
         // openings.
         { name: "limb_state", tag: "v1", link_id: "limb_state" },
+        // The robot's description: its URDF, its SRDF and its collision
+        // meshes, which the viewer draws each link with. Without it, the
+        // viewer draws no links.
+        { name: "robot_identity", tag: "v1", link_id: "identity", cardinality: "zero_or_one" },
         // The camera to draw: its frames (camera), its geometry (geometry)
         // and where the robot carries it (camera_mounts). Without camera and
         // geometry, the viewer draws no images and no points.
@@ -42,6 +47,7 @@
     },
     services: {
       consumes: [
+        { link_id: "identity", name: "get_description" },
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
         { link_id: "geometry", name: "get_depth_to_color_extrinsics" },

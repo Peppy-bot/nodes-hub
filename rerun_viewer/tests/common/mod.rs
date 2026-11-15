@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use peppygen::Parameters;
+use peppygen::consumed_services::identity::get_description;
 use peppygen::consumed_services::motion_planning::{describe_arms, get_planning_scene};
 use peppygen::consumed_topics::limb_state::limb_states;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use rerun_viewer::config::default_parameters;
-use rerun_viewer::testing::FakeCanvas;
+use rerun_viewer::testing::{FakeCanvas, MINI_SRDF, MINI_URDF, mini_meshes};
 
 /// Bounds every wait on the node. Generous: the tests are about what is drawn, never
 /// about how fast.
@@ -25,6 +26,7 @@ pub const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 pub fn every_optional_link_vacant() -> Config {
     Config {
         parameters: Some(default_parameters()),
+        identity_vacant: true,
         camera_vacant: true,
         geometry_vacant: true,
         camera_mounts_vacant: true,
@@ -38,6 +40,7 @@ pub fn every_optional_link_vacant() -> Config {
 pub fn bound(links: &[&str], parameters: Parameters) -> Config {
     Config {
         parameters: Some(parameters),
+        identity_vacant: !links.contains(&"identity"),
         camera_vacant: !links.contains(&"camera"),
         geometry_vacant: !links.contains(&"geometry"),
         camera_mounts_vacant: !links.contains(&"camera_mounts"),
@@ -156,4 +159,32 @@ pub fn held_lime() -> get_planning_scene::ResponseDataAttachedObjectsItem {
 /// True when the canvas drew anything at `path`.
 pub fn drew_at(drawn: &[rerun_viewer::testing::Drawn], path: &str) -> bool {
     drawn.iter().any(|call| call.path() == Some(path))
+}
+
+/// The description of the test robot `mini` (`rerun_viewer::testing`), as robot_identity
+/// gives it.
+pub fn mini_description() -> get_description::ResponseData {
+    get_description::ResponseData::new(
+        MINI_URDF.to_string(),
+        MINI_SRDF.to_string(),
+        mini_meshes()
+            .into_iter()
+            .map(|(name, data)| get_description::ResponseDataMeshesItem { name, data })
+            .collect(),
+        "mini".to_string(),
+    )
+}
+
+/// A snapshot of `mini`'s arm at `lift` and `reach` and its gripper at `opening`.
+pub fn mini_snapshot(lift: f64, reach: f64, opening: f64) -> limb_states::Message {
+    limb_states::Message {
+        timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        arm_names: vec!["arm".to_string()],
+        joints_per_arm: vec![2],
+        joint_positions: vec![lift, reach],
+        positions: vec![0.0, 0.0, 0.3],
+        orientations: IDENTITY.to_vec(),
+        gripper_names: vec!["gripper".to_string()],
+        gripper_openings: vec![opening],
+    }
 }

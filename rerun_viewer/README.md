@@ -8,6 +8,7 @@ the wire. It serves the [Rerun](https://rerun.io) web viewer (Rerun 0.41.0) and 
 - the motion planner's voxel map: the occupied cubes that its plans keep their clearance
   from, as the planner publishes them;
 - each arm's grasp point with its axes and a trail of its past positions;
+- each link of the robot as its collision shapes, where the joints put it;
 - each joint's position and each gripper's opening, as plots;
 - the planning scene of `motion_planning:v1`: each object as its shapes, each attached
   object at the grasp point of the arm that carries it, a see-through shell of the
@@ -18,7 +19,8 @@ the wire. It serves the [Rerun](https://rerun.io) web viewer (Rerun 0.41.0) and 
 It only listens. It never moves the robot and never changes the planning scene.
 
 It draws only the contracts that its `peppy.json5` lists: `limb_state:v1`,
-`rgbd_camera:v1`, `camera_geometry:v1`, `camera_mounts:v1` and `motion_planning:v1`.
+`robot_identity:v1`, `rgbd_camera:v1`, `camera_geometry:v1`, `camera_mounts:v1` and
+`motion_planning:v1`.
 
 ## The cubes are the planner's map
 
@@ -37,6 +39,7 @@ The text entity `notes/cubes` says this too.
 | Link | Contract | Cardinality | Without it |
 |---|---|---|---|
 | `limb_state` | `limb_state:v1` | one | the node does not start |
+| `identity` | `robot_identity:v1` | zero_or_one | no robot links |
 | `camera` | `rgbd_camera:v1` | zero_or_one | no images, no points |
 | `geometry` | `camera_geometry:v1` | zero_or_one | no points |
 | `camera_mounts` | `camera_mounts:v1` | zero_or_one | no points |
@@ -57,6 +60,29 @@ them; without it, each joint is named by its index (`joint_0`, `joint_1`, ...).
 An attached object is drawn at the grasp point of the arm whose `grasp_link`
 (`describe_arms`) carries it. An object that another link carries is logged and not drawn.
 
+## The robot's links
+
+The viewer asks `get_description` of `robot_identity` once, again until it answers, and
+reads the URDF, the SRDF and the collision meshes (binary STL) with `robot_description`.
+It draws each link that has collision shapes, under `world/robot/<link>`: a box, a
+cylinder, a sphere, a mesh, and a capsule as its cylinder and two spheres. These are the
+shapes that the motion planner reads from the same description, not the finer visual
+meshes that RViz shows, which `robot_identity` does not give. The planner checks convex
+pieces that it fits around these shapes, a little larger than them, and keeps its
+clearance from those pieces; the viewer does not draw the pieces.
+
+For each `limb_states` snapshot, the viewer places each link by forward kinematics over
+the URDF: each arm's joints, in the order of the arm's chain in the SRDF, at the
+snapshot's positions, and each finger joint in proportion to its gripper's opening,
+between the gripper's `closed` and `open` states. A joint that moves and that no arm and
+no gripper drives stands at 0. A snapshot that lacks an arm or a gripper of the
+description, or gives an arm another number of joints, is logged once, and the links stay
+where the last snapshot put them. A description that does not read is logged, and the
+viewer draws no links.
+
+The shapes go to the viewer once, for the whole recording; each snapshot sends only the
+pose of each link. Before the first snapshot, the shapes stand at the robot frame's origin.
+
 ## Attach it to a running stack
 
 No launcher deploys the viewer. Start it beside a running stack and link it to the
@@ -66,7 +92,7 @@ simulated OpenArm:
 ```bash
 peppy node add ./rerun_viewer -sb
 peppy node run rerun_viewer:v1 --instance-id alpha_viewer --clock simulation \
-  --link limb_state@alpha_backbone_inst \
+  --link limb_state@alpha_backbone_inst --link identity@alpha_init_inst \
   --link camera@alpha_chest --link geometry@alpha_chest \
   --link camera_mounts@alpha_backbone_inst --link motion_planning@alpha_planner_inst \
   bind_ip=<address>
@@ -135,7 +161,8 @@ Each part of the node knows only what its comment says:
 - `src/wire/`: peppy. The subscriptions and the service calls, and the parse of each
   message into a value of the model, once, at the edge.
 - `src/model/`: pure Rust. The values that the viewer draws and their arithmetic: depth to
-  points, a scene to shapes and shells, the change log, and the planner's voxel map.
+  points, a scene to shapes and shells, the change log, the planner's voxel map, and the
+  robot's body (its description and STL meshes to shapes, joints to link poses).
 - `src/draw/`: the canvas only. How each value is drawn, and the paths of the entities.
 - `src/canvas.rs`: Rerun. The `Canvas` trait that the drawers use, and `RerunCanvas`, the
   only code that calls Rerun. The tests draw on `FakeCanvas` (`src/testing.rs`).

@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use peppygen::NodeRunner;
+use peppygen::consumed_services::identity::get_description;
 use peppygen::consumed_services::motion_planning::get_planning_scene;
 use peppygen::consumed_topics::camera::video_stream;
 use tracing::info;
@@ -15,11 +16,12 @@ use crate::wire::Shared;
 use crate::wire::arms::follow_arms;
 use crate::wire::camera::{DepthSettings, follow_color, follow_depth};
 use crate::wire::planner_map::follow_planner_map;
+use crate::wire::robot::follow_robot;
 use crate::wire::scene::follow_scene;
 
-/// Starts the followers that draw on `canvas`: the arms always, the camera when the
-/// camera link is bound, and the planning scene and the planner's voxel map when the
-/// motion_planning link is bound.
+/// Starts the followers that draw on `canvas`: the arms always, the robot's body when
+/// the identity link is bound, the camera when the camera link is bound, and the
+/// planning scene and the planner's voxel map when the motion_planning link is bound.
 pub async fn setup(
     config: Config,
     runner: Arc<NodeRunner>,
@@ -34,6 +36,11 @@ pub async fn setup(
         config.trail_length,
         shared.clone(),
     ));
+    if get_description::bound_producer(&runner).is_some() {
+        tokio::spawn(follow_robot(runner.clone(), canvas.clone(), shared.clone()));
+    } else {
+        info!("the identity link is vacant: the robot's links are not drawn");
+    }
     if video_stream::bound_producer(&runner).is_some() {
         tokio::spawn(follow_color(
             runner.clone(),
