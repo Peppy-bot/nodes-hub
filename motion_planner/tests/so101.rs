@@ -116,7 +116,7 @@ fn tool_point(q: &[f64; ARM_DOF]) -> [f64; 3] {
 }
 
 /// The parameters SO-101's launchers give the planner, as its motion_planner fragment sets
-/// them.
+/// them, and the default of the one they leave out.
 fn so101_parameters() -> Parameters {
     Parameters {
         goal_samples: 10,
@@ -130,6 +130,7 @@ fn so101_parameters() -> Parameters {
         max_range_m: 1.36,
         max_update_rate_hz: 5.0,
         min_clearance_m: 0.0,
+        occupancy_map_rate_hz: 1.0,
         padding_offset_m: 0.0,
         padding_scale: 1.0,
         planning_attempts: 1,

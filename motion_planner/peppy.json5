@@ -77,6 +77,9 @@
       ],
     },
     topics: {
+      emits: [
+        { link_id: "motion_planning", name: "occupancy_map" },
+      ],
       consumes: [
         { link_id: "limb_state", name: "limb_states" },
         { link_id: "camera", name: "depth_stream" },
@@ -122,6 +125,8 @@
       max_range_m: "f64",
       // The most depth frames a second the map takes in: above 0.
       max_update_rate_hz: "f64",
+      // How many times a second occupancy_map publishes the map: above 0.
+      occupancy_map_rate_hz: { $type: "f64", $default: 1.0 },
       // The most goals each attempt of a plan samples, as MoveIt's
       // max_goal_samples bounds the goals its goal sampler adds: 1 or more.
       goal_samples: "u32",

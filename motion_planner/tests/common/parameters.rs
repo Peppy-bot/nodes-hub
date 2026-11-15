@@ -1,5 +1,5 @@
 //! The parameters the OpenArm v2 launchers give the planner, as their motion_planner
-//! fragment sets them. The harness tests reach this file as `common::parameters`, and the
+//! fragment sets them, and the default of the one they leave out. The harness tests reach this file as `common::parameters`, and the
 //! node's own tests as `config::launched`.
 
 use peppygen::Parameters;
@@ -18,6 +18,7 @@ pub fn parameters() -> Parameters {
         max_range_m: 1.36,
         max_update_rate_hz: 5.0,
         min_clearance_m: 0.04,
+        occupancy_map_rate_hz: 1.0,
         padding_offset_m: 0.04,
         padding_scale: 1.0,
         planning_attempts: 1,

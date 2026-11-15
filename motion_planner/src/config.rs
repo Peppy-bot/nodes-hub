@@ -25,6 +25,8 @@ pub struct Config {
     pub max_range_m: PositiveFinite,
     /// The least time between two depth frames the map takes in.
     pub frame_interval: Duration,
+    /// The time between two messages of occupancy_map.
+    pub map_interval: Duration,
     pub goal_samples: NonZeroUsize,
     pub max_iterations: NonZeroU64,
     pub planning_attempts: NonZeroU32,
@@ -71,6 +73,19 @@ fn at_least_one<T>(name: &'static str, value: Option<T>) -> Result<T, ConfigErro
     value.map_or_else(|| refuse(name, 0, "it is 1 or more"), Ok)
 }
 
+/// The time between two events at `name`, a rate a second: refused unless the rate is a
+/// finite number above 0 whose interval fits the clock.
+fn interval(name: &'static str, rate_hz: f64) -> Result<Duration, ConfigError> {
+    let rate = positive(name, rate_hz)?;
+    Duration::try_from_secs_f64(1.0 / rate.get()).or_else(|_| {
+        refuse(
+            name,
+            rate.get(),
+            format!("it is more than 0 and its interval, 1 / {name} s, fits the clock"),
+        )
+    })
+}
+
 /// The map's box from its lowest and its highest corner: each coordinate finite, and
 /// each of the lowest below the highest's.
 fn map_bounds(min: [f64; 3], max: [f64; 3]) -> Result<Bounds, ConfigError> {
@@ -100,14 +115,8 @@ impl Config {
             [params.map_min_x_m, params.map_min_y_m, params.map_min_z_m],
             [params.map_max_x_m, params.map_max_y_m, params.map_max_z_m],
         )?;
-        let rate = positive("max_update_rate_hz", params.max_update_rate_hz)?;
-        let frame_interval = Duration::try_from_secs_f64(1.0 / rate.get()).or_else(|_| {
-            refuse(
-                "max_update_rate_hz",
-                rate.get(),
-                "it is more than 0 and its frame interval, 1 / max_update_rate_hz s, fits the clock",
-            )
-        })?;
+        let frame_interval = interval("max_update_rate_hz", params.max_update_rate_hz)?;
+        let map_interval = interval("occupancy_map_rate_hz", params.occupancy_map_rate_hz)?;
         Ok(Self {
             min_clearance_m: distance("min_clearance_m", params.min_clearance_m)?,
             start_tolerance: positive("start_tolerance_rad", params.start_tolerance_rad)?,
@@ -116,6 +125,7 @@ impl Config {
             bounds,
             max_range_m: positive("max_range_m", params.max_range_m)?,
             frame_interval,
+            map_interval,
             goal_samples: at_least_one(
                 "goal_samples",
                 NonZeroUsize::new(params.goal_samples as usize),
@@ -146,13 +156,14 @@ pub(crate) mod tests {
     }
 
     // The launchers' parameters parse: the map's box, a frame interval of a fifth of a
-    // second, and the attempts.
+    // second, a second between two messages of the map, and the attempts.
     #[test]
     fn the_launchers_parameters_parse() {
         let config = Config::parse(&parameters()).expect("a config");
         assert_eq!(config.bounds.min, [-0.66, -0.82, 0.04]);
         assert_eq!(config.bounds.max, [0.66, 0.82, 1.36]);
         assert_eq!(config.frame_interval, Duration::from_millis(200));
+        assert_eq!(config.map_interval, Duration::from_secs(1));
         assert_eq!(config.planning_attempts.get(), 1);
         assert_eq!(config.start_tolerance.get(), 0.05);
     }
@@ -229,8 +240,25 @@ pub(crate) mod tests {
         };
         assert_eq!(
             refused(glacial),
-            "max_update_rate_hz is 0.00000000000000000001; it is more than 0 and its frame \
+            "max_update_rate_hz is 0.00000000000000000001; it is more than 0 and its \
              interval, 1 / max_update_rate_hz s, fits the clock"
+        );
+        let unpublished = Parameters {
+            occupancy_map_rate_hz: f64::NAN,
+            ..parameters()
+        };
+        assert_eq!(
+            refused(unpublished),
+            "occupancy_map_rate_hz is NaN; it is a finite number more than 0"
+        );
+        let rare = Parameters {
+            occupancy_map_rate_hz: 1e-20,
+            ..parameters()
+        };
+        assert_eq!(
+            refused(rare),
+            "occupancy_map_rate_hz is 0.00000000000000000001; it is more than 0 and its \
+             interval, 1 / occupancy_map_rate_hz s, fits the clock"
         );
     }
 }

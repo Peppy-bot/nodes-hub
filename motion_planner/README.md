@@ -157,6 +157,11 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   depth model or pose, a frame skipped and why, or a fault in the robot's description,
   which ends the asking: no perception camera named, none placed by that name, one
   placed at no pose, or one an arm carries.
+- `occupancy_map` publishes the map `occupancy_map_rate_hz` times a second, whether or
+  not it changed: the center of each occupied voxel in the robot frame, the side of the
+  voxels, and, while the map holds no frame of a camera it reads, what it waits on, each
+  message stamped when the node read the map, on its clock. A read waits on a frame's
+  intake, which holds the map.
 
 ## A plan
 
@@ -526,8 +531,8 @@ sampling, which departs too, is in "The robot".
 
 ## Parameters and links
 
-See `peppy.json5` for the commented list. Every parameter is required, and the
-launcher sets each one. `min_clearance_m` stands at or above the backbone's
+See `peppy.json5` for the commented list. Every parameter but `occupancy_map_rate_hz`
+(1.0 by default) is required, and the launcher sets each one. `min_clearance_m` stands at or above the backbone's
 `d_safe_m`, so the backbone's guard does not slow the arm on a planned path. A
 parameter outside its range stops the node with a message that names it.
 
