@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-use openarm_description::ArmPair;
+use crate::robot::ARMS;
+use robot_description::PerArm;
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::TryRecvError;
 
@@ -124,8 +125,8 @@ impl Judging {
     ///   ([`resume_judged_path`]).
     fn resume(
         self,
-        planners: &mut ArmPair<Planner>,
-        measured: &ArmPair<Measurement>,
+        planners: &mut PerArm<Planner, ARMS>,
+        measured: &PerArm<Measurement, ARMS>,
         checker: &Arc<Mutex<dyn PathGuard>>,
         guard: GuardAt,
         now: Instant,
@@ -194,8 +195,8 @@ impl PathChecks {
     /// has yet to be measured, waits on.
     pub fn resume_judged(
         &mut self,
-        planners: &mut ArmPair<Planner>,
-        measured: &ArmPair<Measurement>,
+        planners: &mut PerArm<Planner, ARMS>,
+        measured: &PerArm<Measurement, ARMS>,
         guard: GuardAt,
         now: Instant,
     ) {
@@ -223,7 +224,7 @@ impl PathChecks {
     /// shares at `now`, each arm measured where it is held, as
     /// [`PathChecks::resume_judged`] does.
     #[cfg(test)]
-    pub async fn resume_once_judged(&mut self, planners: &mut ArmPair<Planner>, now: Instant) {
+    pub async fn resume_once_judged(&mut self, planners: &mut PerArm<Planner, ARMS>, now: Instant) {
         for judging in &mut self.judging {
             judging.state.come().await;
         }
@@ -238,8 +239,8 @@ impl PathChecks {
     #[cfg(test)]
     pub fn resume_judged_by_test_guard(
         &mut self,
-        planners: &mut ArmPair<Planner>,
-        measured: &ArmPair<Measurement>,
+        planners: &mut PerArm<Planner, ARMS>,
+        measured: &PerArm<Measurement, ARMS>,
         now: Instant,
     ) {
         let guard = crate::test_support::test_guard(planners);

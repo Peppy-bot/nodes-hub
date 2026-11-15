@@ -42,12 +42,14 @@
 //! governor's collision model.
 
 use control_core::positive_finite::PositiveFinite;
-use openarm_description::{ARM_DOF, ARMS, ArmPair, DUAL_DOF, HardwareVersion, Side};
-use self_collision_model::DistanceGradient;
-use srs_model::JointVec;
+use robot_description::{ArmId, PerArm, RobotDescription};
+use self_collision_model::{DistanceGradient, SelfCollisionModel};
+use srs_model::{ARM_DOF, JointVec};
 use tracing::{info, warn};
 
-use crate::types::{DualJointVec, arm_joints};
+use crate::robot::{ARMS, DUAL_DOF};
+use crate::streams::GovernorConfig;
+use crate::types::{DualJointVec, arm_joints, dual_joints};
 
 mod barrier;
 mod limiters;
@@ -87,25 +89,29 @@ pub enum GovernorError {
     CollisionModel(#[from] self_collision_model::CollisionError),
 }
 
-/// Every governed degree of freedom: both arms' joints, then the left and
-/// right grippers. One vector so the barrier, the floor scan, the separating
-/// hold, and the measured-state monitor treat a gripper exactly like a joint.
-const GOV_DOF: usize = DUAL_DOF + 2;
-const LEFT_GRIPPER: usize = DUAL_DOF;
-const RIGHT_GRIPPER: usize = DUAL_DOF + 1;
+/// Every governed degree of freedom: every arm's joints, then every arm's
+/// gripper, each in place order. One vector so the barrier, the floor scan, the
+/// separating hold, and the measured-state monitor treat a gripper exactly like
+/// a joint.
+const GOV_DOF: usize = DUAL_DOF + ARMS;
+
+/// The governed DOF of `arm`'s gripper.
+fn gripper_dof(arm: ArmId) -> usize {
+    DUAL_DOF + arm.place()
+}
 
 /// One governed configuration: both arms' joints and both grippers. The single
 /// state [`Governor::govern_along`] throttles, scans, and monitors, so every
 /// guarantee the arms get covers the fingers identically.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GovState {
-    pub arms: ArmPair<JointVec>,
-    /// Gripper opening fraction per side: 0 closed, 1 fully open.
-    pub grippers: ArmPair<f64>,
+    pub arms: PerArm<JointVec, ARMS>,
+    /// Gripper opening fraction per arm: 0 closed, 1 fully open.
+    pub grippers: PerArm<f64, ARMS>,
 }
 
 impl GovState {
-    pub fn new(arms: ArmPair<JointVec>, grippers: ArmPair<f64>) -> Self {
+    pub fn new(arms: PerArm<JointVec, ARMS>, grippers: PerArm<f64, ARMS>) -> Self {
         Self { arms, grippers }
     }
 }
@@ -114,20 +120,20 @@ impl GovState {
 /// joints, the left arm's then the right's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PathArms {
-    One(Side),
+    One(ArmId),
     Both,
 }
 
 impl PathArms {
     /// The governed DOF of the joints the path moves.
     fn joints(self) -> impl Iterator<Item = usize> + Clone {
-        (0..DUAL_DOF).filter(move |&i| self.moves(dof_side(i)))
+        (0..DUAL_DOF).filter(move |&i| self.moves(dof_arm(i)))
     }
 
-    /// Whether the path moves `side`'s arm.
-    fn moves(self, side: Side) -> bool {
+    /// Whether the path moves the arm `arm`.
+    fn moves(self, arm: ArmId) -> bool {
         match self {
-            Self::One(moved) => moved == side,
+            Self::One(moved) => moved == arm,
             Self::Both => true,
         }
     }
@@ -137,11 +143,11 @@ impl PathArms {
     fn placed(self, held: &GovState, point: &[f64]) -> GovState {
         let point: &DualJointVec = point.try_into().expect("a point of both arms' joints");
         GovState {
-            arms: ArmPair::from_fn(|side| {
-                if self.moves(side) {
-                    arm_joints(point, side)
+            arms: PerArm::from_fn(|arm| {
+                if self.moves(arm) {
+                    arm_joints(point, arm)
                 } else {
-                    held.arms[side]
+                    held.arms[arm]
                 }
             }),
             grippers: held.grippers,
@@ -254,41 +260,23 @@ pub struct NearestPair {
     pub link_b: String,
 }
 
-pub struct Governor {
-    model: ConfiguredModel,
-    /// Closing is fully stopped at or under this signed surface distance (m).
+/// The governor's launch settings, each checked: the band, the largest single-joint
+/// speed, the stream EE cap, the opening rate, and whether the governor starts enabled.
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
     d_stop: f64,
-    /// Outside this signed surface distance (m) the barrier is inactive.
     d_safe: f64,
-    /// Largest single-joint speed (rad/s). The `DofSpeed` limiter clamps every
-    /// step to it, which is what bounds the floor scan's probe count.
     max_joint_velocity_rad_s: f64,
-    /// The operator's cap on a streamed hand's linear speed (m/s), applied by
-    /// the EE-speed limiter to each side that carries a stream basis.
     max_stream_ee_velocity_m_s: PositiveFinite,
-    /// Largest rate (opening fraction per second) the coordinator's chase may
-    /// drive an opening: the opening analog of the joint speed cap, bounding
-    /// each tick's opening step. The `DofSpeed` clamp and the floor scan's
-    /// probe sizing key off it, so raising it buys stroke speed at the cost of
-    /// probes per tick. The gripper node and its motor own the real opening
-    /// speed; this only bounds what the governor has to scan.
     max_gripper_rate_frac_s: f64,
     enabled: bool,
-    guard: Guard,
-    /// Whether the measured-state monitor is currently holding. Latched with
-    /// hysteresis: set when the real clearance closes past `MONITOR_TRIP_FRACTION *
-    /// d_stop`, cleared once it recovers past `d_stop`.
-    monitor_tripped: bool,
 }
 
-impl Governor {
-    /// Build the self-collision model of `version` (with the tight torso proxy) and
-    /// validate the band. Fails loudly on a bad mesh dir or an invalid band, so a
-    /// misconfigured backbone aborts at bringup instead of running ungoverned.
-    #[allow(clippy::too_many_arguments)] // distinct model inputs + band + speed bound + toggle
-    pub fn build(
-        version: HardwareVersion,
-        meshes_dir: &str,
+impl Settings {
+    /// The settings, or the first one the governor cannot run on: a band other than
+    /// finite `0 < d_stop < d_safe`, a joint speed that is not positive and finite, or
+    /// an opening rate under the governor's floor.
+    pub fn parse(
         d_stop: f64,
         d_safe: f64,
         max_joint_velocity_rad_s: f64,
@@ -311,7 +299,77 @@ impl Governor {
         if !valid_gripper_rate(max_gripper_rate_frac_s) {
             return Err(GovernorError::GripperRate(max_gripper_rate_frac_s));
         }
-        let model = ConfiguredModel::new(self_collision_model::openarm(version, meshes_dir)?);
+        Ok(Self {
+            d_stop,
+            d_safe,
+            max_joint_velocity_rad_s,
+            max_stream_ee_velocity_m_s,
+            max_gripper_rate_frac_s,
+            enabled,
+        })
+    }
+
+    /// The controls the governor runs on until the first governor_control message.
+    pub fn launch_config(&self) -> GovernorConfig {
+        GovernorConfig {
+            enabled: self.enabled,
+            d_stop: self.d_stop,
+            d_safe: self.d_safe,
+            max_stream_ee_velocity_m_s: self.max_stream_ee_velocity_m_s.get(),
+            max_gripper_rate_frac_s: self.max_gripper_rate_frac_s,
+        }
+    }
+}
+
+pub struct Governor {
+    model: ConfiguredModel,
+    /// Closing is fully stopped at or under this signed surface distance (m).
+    d_stop: f64,
+    /// Outside this signed surface distance (m) the barrier is inactive.
+    d_safe: f64,
+    /// Largest single-joint speed (rad/s). The `DofSpeed` limiter clamps every
+    /// step to it, which is what bounds the floor scan's probe count.
+    max_joint_velocity_rad_s: f64,
+    /// The operator's cap on a streamed hand's linear speed (m/s), applied by
+    /// the EE-speed limiter to each arm that carries a stream basis.
+    max_stream_ee_velocity_m_s: PositiveFinite,
+    /// Largest rate (opening fraction per second) the coordinator's chase may
+    /// drive an opening: the opening analog of the joint speed cap, bounding
+    /// each tick's opening step. The `DofSpeed` clamp and the floor scan's
+    /// probe sizing key off it, so raising it buys stroke speed at the cost of
+    /// probes per tick. The gripper node and its motor own the real opening
+    /// speed; this only bounds what the governor has to scan.
+    max_gripper_rate_frac_s: f64,
+    enabled: bool,
+    guard: Guard,
+    /// Whether the measured-state monitor is currently holding. Latched with
+    /// hysteresis: set when the real clearance closes past `MONITOR_TRIP_FRACTION *
+    /// d_stop`, cleared once it recovers past `d_stop`.
+    monitor_tripped: bool,
+}
+
+impl Governor {
+    /// Build the self-collision model of the robot `description` describes, its
+    /// collision meshes in `meshes_dir`, governed by `settings`. Fails loudly on a bad
+    /// mesh dir, so a misconfigured backbone aborts at bringup instead of running
+    /// ungoverned.
+    pub fn build(
+        description: &RobotDescription,
+        meshes_dir: &str,
+        settings: Settings,
+    ) -> Result<Self, GovernorError> {
+        let model = ConfiguredModel::new(SelfCollisionModel::from_description(
+            description,
+            meshes_dir,
+        )?);
+        let Settings {
+            d_stop,
+            d_safe,
+            max_joint_velocity_rad_s,
+            max_stream_ee_velocity_m_s,
+            max_gripper_rate_frac_s,
+            enabled,
+        } = settings;
         Ok(Self {
             model,
             d_stop,
@@ -433,8 +491,8 @@ impl Governor {
     ///    order-independence safe rather than merely convenient.
     ///
     /// `measured` is the real joint state and opening fractions, which only the
-    /// measured-state tripwire reads. `hands` carries each side's [`HandBasis`]
-    /// while that side follows the operator's stream; a planned move rides with
+    /// measured-state tripwire reads. `hands` carries each arm's [`HandBasis`]
+    /// while that arm follows the operator's stream; a planned move rides with
     /// `None` there, because the joint limits timed it and the cap covers streams.
     /// The arms of each path in `paths` are
     /// governed along their step: the limits take one fraction across the
@@ -450,7 +508,7 @@ impl Governor {
         prev: &GovState,
         cand: &GovState,
         measured: &GovState,
-        hands: &ArmPair<Option<HandBasis>>,
+        hands: &PerArm<Option<HandBasis>, ARMS>,
         paths: &[PathArms],
         dt: f64,
     ) -> GovState {
@@ -521,7 +579,7 @@ impl Governor {
     /// speed cap. Nothing here reads the model or another limiter's output, so
     /// the order of this list changes only which name is recorded on a tie,
     /// never the governed step.
-    fn limit_speed(&self, step: &Step, hands: &ArmPair<Option<HandBasis>>, dt: f64) -> Limits {
+    fn limit_speed(&self, step: &Step, hands: &PerArm<Option<HandBasis>, ARMS>, dt: f64) -> Limits {
         let dof_speed = DofSpeed {
             max_step: std::array::from_fn(|i| self.dof_speed_limit(i) * dt),
         };
@@ -538,8 +596,8 @@ impl Governor {
 
     /// This tick's collision disposition, judged from the collision mechanisms
     /// alone (the tripwire's limits plus the barrier and floor scan): the speed
-    /// caps shape ordinary motion and must not read as a collision event. A
-    /// side denied outright, or a step already at the wall, reads as a stop;
+    /// caps shape ordinary motion and must not read as a collision event. An
+    /// arm denied outright, or a step already at the wall, reads as a stop;
     /// anything else the collision machinery restricted reads as throttling.
     fn disposition(&self, sensed: &Sensed, trip_limits: &Limits, shaped: bool) -> Guard {
         if !(shaped || trip_limits.restricted()) {
@@ -632,25 +690,22 @@ fn valid_gripper_rate(rate_frac_s: f64) -> bool {
     rate_frac_s.is_finite() && rate_frac_s >= MIN_GRIPPER_RATE_FRAC_S
 }
 
-/// Pack a governed configuration into one vector: left joints, right joints,
-/// left opening, right opening.
+/// Pack a governed configuration into one vector: every arm's joints, then
+/// every arm's opening, each in place order.
 fn concat(s: &GovState) -> [f64; GOV_DOF] {
+    let joints = dual_joints(&s.arms);
     std::array::from_fn(|i| match i {
-        LEFT_GRIPPER => s.grippers.left,
-        RIGHT_GRIPPER => s.grippers.right,
-        i if i < ARM_DOF => s.arms.left[i],
-        i => s.arms.right[i - ARM_DOF],
+        i if i < DUAL_DOF => joints[i],
+        i => s.grippers[ArmId::new(i - DUAL_DOF)],
     })
 }
 
 /// Split a governed vector back into the configuration.
 fn split(q: &[f64; GOV_DOF]) -> GovState {
+    let joints: &DualJointVec = q[..DUAL_DOF].try_into().expect("every arm's joints");
     GovState {
-        arms: ArmPair::new(
-            std::array::from_fn(|i| q[i]),
-            std::array::from_fn(|i| q[ARM_DOF + i]),
-        ),
-        grippers: ArmPair::new(q[LEFT_GRIPPER], q[RIGHT_GRIPPER]),
+        arms: PerArm::from_fn(|arm| arm_joints(joints, arm)),
+        grippers: PerArm::from_fn(|arm| q[gripper_dof(arm)]),
     }
 }
 
@@ -663,8 +718,8 @@ fn step_change(prev: &[f64; GOV_DOF], target: &[f64; GOV_DOF]) -> GovState {
 /// the layout [`concat`] packs a configuration in.
 fn governed_gradient(g: &DistanceGradient<'_, ARM_DOF, ARMS>) -> [f64; GOV_DOF] {
     concat(&GovState::new(
-        ArmPair::from_fn(|side| g.joints[side.index()]),
-        ArmPair::from_fn(|side| g.openings[side.index()]),
+        PerArm::from_fn(|arm| g.joints[arm.place()]),
+        PerArm::from_fn(|arm| g.openings[arm.place()]),
     ))
 }
 
@@ -691,13 +746,12 @@ fn along_paths(grad: &[f64; GOV_DOF], step: &Step, paths: &[PathArms]) -> [f64; 
     along
 }
 
-/// The side governed DOF `i` belongs to: the joints of its arm and its
-/// opening.
-fn dof_side(i: usize) -> Side {
-    if i < ARM_DOF || i == LEFT_GRIPPER {
-        Side::Left
-    } else {
-        Side::Right
+/// The arm governed DOF `i` belongs to: the joints of the arm and its
+/// gripper's opening.
+fn dof_arm(i: usize) -> ArmId {
+    match i {
+        i if i < DUAL_DOF => ArmId::new(i / ARM_DOF),
+        i => ArmId::new(i - DUAL_DOF),
     }
 }
 
@@ -712,28 +766,32 @@ mod tests {
 
     use super::limiters::measured_tripwire::MONITOR_TRIP_FRACTION;
     use super::*;
-    use crate::test_support::bundled_arm;
-    use crate::test_support::{NO_PATHS, NO_STOP};
-    use crate::types::dual_joints;
+    use crate::robot::LIMBS;
+    use crate::test_support::{
+        LEFT, NO_PATHS, NO_STOP, RIGHT, V1, V2, bundled_arm, description, postures,
+    };
     use control_core::chase::{chase_step, rate_limited};
     use control_core::path_timing::RoundedPath;
+    use robot_description::states;
 
-    /// Materialize a generation's bundled collision meshes so the file-based collision
-    /// builder can fit hulls; the URDF itself comes from the same `HardwareVersion`.
-    /// Written once per generation into a unique tempdir held for the test process:
+    /// Materialize a model's bundled collision meshes so the file-based collision
+    /// builder can fit hulls; the description itself is the same model's.
+    /// Written once per model into a unique tempdir held for the test process:
     /// `cargo test` runs these in parallel, so re-writing per call would let one test
     /// truncate a mesh mid-read of another's `build()`; a unique path also avoids
     /// clashing with a concurrent test process on the same host.
-    fn fixture_meshes_dir(version: openarm_description::HardwareVersion) -> std::path::PathBuf {
+    fn fixture_meshes_dir(model: &str) -> std::path::PathBuf {
         static V1_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         static V2_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        let cell = match version {
-            openarm_description::HardwareVersion::V1 => &V1_DIR,
-            openarm_description::HardwareVersion::V2 => &V2_DIR,
+        let cell = match model {
+            V1 => &V1_DIR,
+            V2 => &V2_DIR,
+            other => panic!("no meshes dir for {other}"),
         };
         cell.get_or_init(|| {
             let dir = tempfile::tempdir().expect("create scratch dir for collision meshes");
-            version
+            robot_description::model(model)
+                .expect("a bundled model")
                 .write_meshes_to(dir.path())
                 .expect("materialize collision meshes");
             dir
@@ -745,12 +803,9 @@ mod tests {
     const D_STOP: f64 = 0.005;
     const D_SAFE: f64 = 0.02;
     const DT: f64 = 0.01;
-    /// No side carries a stream basis: collision scenarios exercise the
+    /// No arm carries a stream basis: collision scenarios exercise the
     /// collision stages, not the EE cap.
-    const NO_HANDS: &ArmPair<Option<HandBasis>> = &ArmPair {
-        left: None,
-        right: None,
-    };
+    const NO_HANDS: &PerArm<Option<HandBasis>, ARMS> = &PerArm::new([None, None]);
     /// Generous so the `DofSpeed` clamp never binds on the synthetic
     /// direct-jump configs these tests use; the clamp itself is covered separately.
     const MAX_JOINT_VELOCITY_RAD_S: f64 = 1000.0;
@@ -765,59 +820,61 @@ mod tests {
     /// Fast enough that a test never sees the opening rate bind first.
     const TEST_GRIPPER_RATE_FRAC_S: f64 = 6.0;
 
-    /// In-limit home; the elbow's one-sided lower limit is 0.05.
-    fn home() -> ArmPair<JointVec> {
-        ArmPair::new(
-            [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0],
-        )
+    /// Both arms in the Home posture of [`V2`]'s description.
+    fn home() -> PerArm<JointVec, ARMS> {
+        postures(V2, states::HOME)
     }
+
+    /// An arm hanging straight down beside the torso, its elbow bent 0.05 rad:
+    /// there an opening jaw comes under the stop against the torso.
+    const HANGING: JointVec = [0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0];
 
     /// Arms at `arms` with both grippers fully open: the widest finger envelope, which
     /// is what the arm-barrier scenarios governed against before grippers were
     /// governed DOF, so their tuned poses and distances carry over unchanged.
-    fn at(arms: ArmPair<JointVec>) -> GovState {
-        GovState::new(arms, ArmPair::new(1.0, 1.0))
+    fn at(arms: PerArm<JointVec, ARMS>) -> GovState {
+        GovState::new(arms, PerArm::new([1.0, 1.0]))
     }
 
-    fn governor_for(version: openarm_description::HardwareVersion, enabled: bool) -> Governor {
-        let meshes_dir = fixture_meshes_dir(version);
+    fn governor_for(model: &str, enabled: bool) -> Governor {
+        let meshes_dir = fixture_meshes_dir(model);
         Governor::build(
-            version,
+            description(model),
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            D_STOP,
-            D_SAFE,
-            MAX_JOINT_VELOCITY_RAD_S,
-            test_ee_cap(),
-            TEST_GRIPPER_RATE_FRAC_S,
-            enabled,
+            Settings::parse(
+                D_STOP,
+                D_SAFE,
+                MAX_JOINT_VELOCITY_RAD_S,
+                test_ee_cap(),
+                TEST_GRIPPER_RATE_FRAC_S,
+                enabled,
+            )
+            .expect("the test settings"),
         )
         .expect("build governor from bundled description")
     }
 
     fn governor(enabled: bool) -> Governor {
-        governor_for(openarm_description::HardwareVersion::V1, enabled)
+        governor_for(V1, enabled)
     }
 
     fn v2_governor(enabled: bool) -> Governor {
-        governor_for(openarm_description::HardwareVersion::V2, enabled)
+        governor_for(V2, enabled)
     }
 
-    /// Both arms in the Ready posture, the resting posture a bring-up moves to.
-    fn ready() -> ArmPair<JointVec> {
-        ArmPair::new(
-            openarm_description::ready(openarm_description::Side::Left),
-            openarm_description::ready(openarm_description::Side::Right),
-        )
+    /// Both arms in the Ready posture of [`V2`]'s description, the resting posture
+    /// a bring-up moves to.
+    fn ready() -> PerArm<JointVec, ARMS> {
+        postures(V2, states::READY)
     }
 
     /// The left wrist swung up and back over the pedestal's head, the right arm
     /// left at Ready. A sweep of the shoulder and elbow ranges puts the deepest
     /// overlap with the head camera here: 52 mm of wrist inside the camera when
     /// nothing governs it.
-    fn over_the_head() -> ArmPair<JointVec> {
+    fn over_the_head() -> PerArm<JointVec, ARMS> {
         let mut arms = ready();
-        arms.left = [
+        arms[LEFT] = [
             -2.8798,
             -0.6981,
             std::f64::consts::FRAC_PI_2,
@@ -845,95 +902,65 @@ mod tests {
             );
         }
         let arrived = drive(&mut g, at(home()), &at(ready()), 300);
-        for arm in arrived.arms.iter() {
+        for arm in PerArm::<(), ARMS>::ids() {
+            let (reached, ready) = (arrived.arms[arm], ready()[arm]);
             assert!(
-                arm.iter()
-                    .zip(openarm_description::READY_R)
-                    .all(|(q, r)| (q.abs() - r.abs()).abs() < 1e-3),
-                "the governed move to Ready stalled at {arm:?}"
+                reached.iter().zip(ready).all(|(q, r)| (q - r).abs() < 1e-3),
+                "the governed move to Ready stalled {} at {reached:?}",
+                LIMBS.arm_name(arm)
             );
         }
     }
 
-    /// The governor keeps only the robot's own bodies apart. Every body of
-    /// every checked pair is a collision link of the v2 URDF:
-    /// - the torso and the head camera;
-    /// - the links of each arm;
-    /// - the fingers of each gripper.
-    ///
-    /// Thus the floor, a table, an object or a held item is in no pair.
+    /// The governor keeps the robot's own bodies apart, and only them: the
+    /// bodies of the checked pairs are the links of the v2 URDF that carry
+    /// collision geometry, the torso and the camera on it, the links of each
+    /// arm and the fingers of each gripper. Thus the floor, a table, an object
+    /// or a held item is in no pair.
     #[test]
     fn the_governor_checks_only_the_robots_own_links() {
         let g = v2_governor(true);
-        let mut robot_links: BTreeSet<String> = ["openarm_body_link0", "openarm_head_camera"]
-            .map(String::from)
-            .into();
-        for side in ["left", "right"] {
-            let arm_links = ["base_link", "ee_base_link", "ee_link1", "ee_link2"]
-                .into_iter()
-                .map(String::from)
-                .chain((1..=6).map(|i| format!("link{i}")));
-            robot_links.extend(arm_links.map(|link| format!("openarm_{side}_{link}")));
-        }
-        assert_eq!(robot_links.len(), 22);
-
-        let checked: BTreeSet<String> = g
+        let robot_links: BTreeSet<&str> = description(V2)
+            .robot()
+            .links
+            .iter()
+            .filter(|link| !link.collision.is_empty())
+            .map(|link| link.name.as_str())
+            .collect();
+        let checked: BTreeSet<&str> = g
             .model
             .checked_pairs()
             .into_iter()
-            .flat_map(|(a, b)| [a.to_string(), b.to_string()])
+            .flat_map(|(a, b)| [a, b])
             .collect();
-        let foreign: Vec<&String> = checked.difference(&robot_links).collect();
-        assert!(
-            foreign.is_empty(),
-            "checked bodies outside the robot: {foreign:?}"
-        );
-        for link in ["openarm_body_link0", "openarm_head_camera"] {
-            assert!(checked.contains(link), "{link} is in no checked pair");
-        }
+        assert_eq!(checked, robot_links);
     }
 
-    /// On openarm_v2 with both grippers fully open, the jaws at Home sit
-    /// closer to the torso than the stop distance. So the governor holds
-    /// both arms short of Home on a move from Ready, while the same move
-    /// with closed grippers arrives.
+    /// On openarm_v2 with both grippers fully open, the jaws at Home stand
+    /// farther from the torso than the band reaches. So a move from Ready
+    /// arrives at Home, the grippers open or closed.
     #[test]
-    fn the_v2_open_jaws_at_home_sit_under_the_stop_against_the_torso() {
+    fn the_v2_open_jaws_at_home_stand_outside_the_band_and_a_move_arrives() {
         let mut g = v2_governor(true);
         let p = g.proximity(&at(home())).expect("query");
-        let names = format!("{} <-> {}", p.link_a, p.link_b);
         assert!(
-            0.0 < p.distance && p.distance < D_STOP,
-            "open jaws at Home sit {:+.5} m from {names}",
-            p.distance
+            p.distance > D_SAFE,
+            "open jaws at Home sit {:+.5} m from {} <-> {}",
+            p.distance,
+            p.link_a,
+            p.link_b
         );
-        assert!(
-            names.contains("body") && names.contains("ee_link"),
-            "the nearest pair at Home is a finger against the torso, got {names}"
-        );
-
-        let held = drive(&mut g, at(ready()), &at(home()), 400);
-        assert!(distance(&mut g, &held) >= D_STOP - 1e-9);
-        let home_elbow = home().left[3];
-        for side in Side::BOTH {
-            let arm = held.arms[side];
-            assert!(
-                arm[3] > home_elbow + 0.1,
-                "the {} elbow reached {:.4}, Home is {home_elbow}",
-                side,
-                arm[3]
-            );
-        }
-
-        let closed = |arms| GovState::new(arms, ArmPair::new(0.0, 0.0));
-        let arrived = drive(&mut g, closed(ready()), &closed(home()), 1000);
-        for side in Side::BOTH {
-            let (arm, rest) = (arrived.arms[side], home()[side]);
-            assert!(
-                arm.iter().zip(rest).all(|(q, r)| (q - r).abs() < 1e-3),
-                "with closed grippers the {} arm stalled at {arm:?}",
-                side
-            );
+        for opening in [0.0, 1.0] {
+            let gripped = |arms| GovState::new(arms, PerArm::new([opening, opening]));
+            let arrived = drive(&mut g, gripped(ready()), &gripped(home()), 1000);
+            for arm in PerArm::<(), ARMS>::ids() {
+                let (reached, rest) = (arrived.arms[arm], home()[arm]);
+                assert!(
+                    reached.iter().zip(rest).all(|(q, r)| (q - r).abs() < 1e-3),
+                    "with the grippers at {opening} {} stalled at {reached:?}",
+                    LIMBS.arm_name(arm)
+                );
+            }
         }
     }
 
@@ -950,8 +977,6 @@ mod tests {
             reach.distance
         );
 
-        // From Ready: at Home the v2's own open jaws sit 3.5 mm off the torso,
-        // under this band's floor, and that clearance belongs to the torso.
         let mut q = at(ready());
         for _ in 0..250 {
             let prev = q;
@@ -987,18 +1012,18 @@ mod tests {
     }
 
     #[test]
-    fn v2_finger_opening_changes_live_clearance_on_both_sides() {
+    fn v2_finger_opening_changes_live_clearance_on_both_arms() {
         // The real v2 assets, not a fixture: sweep the wrists inward until a
         // finger (ee_link) is the nearest body with the grippers open, then pin
         // that closing the grippers strictly recovers clearance. v2 mirrors its
         // right gripper by flipping the finger joint limit range, so this fails
-        // if either side's open/closed sense is read off the URDF limit order
+        // if either arm's open/closed sense is read off the URDF limit order
         // instead of the meshes.
         let mut g = v2_governor(true);
         let pose_at = |t: f64| {
             let mut p = home();
-            p.left[2] = t;
-            p.right[2] = -t;
+            p[LEFT][2] = t;
+            p[RIGHT][2] = -t;
             p
         };
         let pose = (0..=40)
@@ -1010,7 +1035,7 @@ mod tests {
             .expect("some wrists-inward pose has a finger as the nearest body when open");
         let d_open = g.proximity(&at(pose)).expect("query").distance;
         let d_closed = g
-            .proximity(&GovState::new(pose, ArmPair::new(0.0, 0.0)))
+            .proximity(&GovState::new(pose, PerArm::new([0.0, 0.0])))
             .expect("query")
             .distance;
         assert!(
@@ -1027,25 +1052,28 @@ mod tests {
         // `DofSpeed` clamps to the bound, so the scan keeps its resolution
         // precondition without the node going down over an upstream bug.
         let velocity = 0.05;
-        let meshes_dir = fixture_meshes_dir(openarm_description::HardwareVersion::V1);
+        let meshes_dir = fixture_meshes_dir(V1);
         let mut g = Governor::build(
-            openarm_description::HardwareVersion::V1,
+            description(V1),
             meshes_dir.to_str().expect("meshes dir path is valid UTF-8"),
-            D_STOP,
-            D_SAFE,
-            velocity,
-            test_ee_cap(),
-            TEST_GRIPPER_RATE_FRAC_S,
-            true,
+            Settings::parse(
+                D_STOP,
+                D_SAFE,
+                velocity,
+                test_ee_cap(),
+                TEST_GRIPPER_RATE_FRAC_S,
+                true,
+            )
+            .expect("the test settings"),
         )
         .expect("build governor from bundled description");
         let prev = at(home());
         let mut cand = prev;
-        cand.arms.left[0] += 0.5; // 0.5 rad >> the 5e-4 rad velocity-limited bound
+        cand.arms[LEFT][0] += 0.5; // 0.5 rad >> the 5e-4 rad velocity-limited bound
 
         let governed = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
         let bound = velocity * DT;
-        let taken = governed.arms.left[0] - prev.arms.left[0];
+        let taken = governed.arms[LEFT][0] - prev.arms[LEFT][0];
         assert!(
             taken > 0.0,
             "an over-limit command must still move, just slower"
@@ -1054,11 +1082,9 @@ mod tests {
             taken <= bound * (1.0 + 1e-9),
             "step {taken:.6} exceeded its velocity-limited bound {bound:.6}"
         );
-        for (i, (&q, &p)) in governed
-            .arms
-            .right
+        for (i, (&q, &p)) in governed.arms[RIGHT]
             .iter()
-            .zip(prev.arms.right.iter())
+            .zip(prev.arms[RIGHT].iter())
             .enumerate()
         {
             assert_eq!(q, p, "uncommanded right joint {i} moved");
@@ -1066,11 +1092,11 @@ mod tests {
     }
 
     /// Both arms elbow-bent, j3 wrapping the wrists toward the centerline by `t`.
-    fn wrists_inward(t: f64) -> ArmPair<JointVec> {
-        ArmPair::new(
+    fn wrists_inward(t: f64) -> PerArm<JointVec, ARMS> {
+        PerArm::new([
             [0.0, 0.0, t, 0.4, 0.0, 0.0, 0.0],
             [0.0, 0.0, -t, 0.4, 0.0, 0.0, 0.0],
-        )
+        ])
     }
 
     /// Signed clearance at a governed configuration (fingers placed at its grippers).
@@ -1080,9 +1106,13 @@ mod tests {
 
     /// Step `from` toward `to` by at most `max` rad on each joint: one tick of
     /// the velocity-limited chase that feeds the governor in the real loop.
-    fn chase(from: &ArmPair<JointVec>, to: &ArmPair<JointVec>, max: f64) -> ArmPair<JointVec> {
+    fn chase(
+        from: &PerArm<JointVec, ARMS>,
+        to: &PerArm<JointVec, ARMS>,
+        max: f64,
+    ) -> PerArm<JointVec, ARMS> {
         let one = |f: &JointVec, t: &JointVec| chase_step(f, t, &[max; ARM_DOF], 1.0);
-        ArmPair::from_fn(|side| one(&from[side], &to[side]))
+        PerArm::from_fn(|arm| one(&from[arm], &to[arm]))
     }
 
     /// Govern a chase from home toward a deeply folded pose until the clearance
@@ -1102,11 +1132,11 @@ mod tests {
     }
 
     /// The arm of the one-arm paths of these tests.
-    const LEFT_ARM: PathArms = PathArms::One(Side::Left);
+    const LEFT_ARM: PathArms = PathArms::One(LEFT);
 
     /// The path through `waypoints`, each both arms' joints, its corners
     /// rounded as a joint path's.
-    fn path_through(waypoints: &[ArmPair<JointVec>]) -> RoundedPath {
+    fn path_through(waypoints: &[PerArm<JointVec, ARMS>]) -> RoundedPath {
         let waypoints: Vec<Vec<f64>> = waypoints
             .iter()
             .map(|arms| dual_joints(arms).to_vec())
@@ -1115,8 +1145,8 @@ mod tests {
     }
 
     /// The left arm at `left`, the right arm at home.
-    fn left_at(left: JointVec) -> ArmPair<JointVec> {
-        ArmPair::new(left, home().right)
+    fn left_at(left: JointVec) -> PerArm<JointVec, ARMS> {
+        PerArm::new([left, home()[RIGHT]])
     }
 
     // A left path that folds the wrist into the torso fails the check, naming
@@ -1129,13 +1159,13 @@ mod tests {
         let mut checker = g.path_checker();
         let held = at(home());
         let guard = g.guard_at(held);
-        let folded = at(left_at(wrists_inward(1.2).left));
+        let folded = at(left_at(wrists_inward(1.2)[LEFT]));
         assert!(distance(&mut g, &held) > D_SAFE, "the arms start clear");
         assert!(
             distance(&mut g, &folded) < D_STOP,
             "the fold meets the body"
         );
-        let clear = path_through(&[home(), left_at(wrists_inward(0.4).left)]);
+        let clear = path_through(&[home(), left_at(wrists_inward(0.4)[LEFT])]);
         assert!(
             checker
                 .check_path(LEFT_ARM, &guard, &clear, &NO_STOP)
@@ -1157,7 +1187,7 @@ mod tests {
                 .is_ok()
         );
 
-        let inside = at(left_at(wrists_inward(0.8).left));
+        let inside = at(left_at(wrists_inward(0.8)[LEFT]));
         assert!(distance(&mut g, &inside) < D_STOP, "the start is inside");
         let deeper = path_through(&[inside.arms, folded.arms]);
         assert!(matches!(
@@ -1180,7 +1210,7 @@ mod tests {
         let mut g = governor(true);
         let mut checker = g.path_checker();
         let held = at(home());
-        let into = path_through(&[home(), left_at(wrists_inward(1.2).left)]);
+        let into = path_through(&[home(), left_at(wrists_inward(1.2)[LEFT])]);
         let enabled = g.guard_at(held);
         g.set_enabled(false);
         assert!(matches!(
@@ -1201,7 +1231,7 @@ mod tests {
         let g = governor(true);
         let mut checker = g.path_checker();
         let guard = g.guard_at(at(home()));
-        let into = path_through(&[home(), left_at(wrists_inward(1.2).left)]);
+        let into = path_through(&[home(), left_at(wrists_inward(1.2)[LEFT])]);
         assert!(matches!(
             checker.check_path(LEFT_ARM, &guard, &into, &NO_STOP),
             Err(PathBlocked::UnderStop { .. })
@@ -1225,10 +1255,10 @@ mod tests {
     fn the_check_judges_a_path_from_its_start_wherever_the_guard_holds_its_arms() {
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let inside = at(left_at(wrists_inward(0.8).left));
+        let inside = at(left_at(wrists_inward(0.8)[LEFT]));
         assert!(distance(&mut g, &inside) < D_STOP, "the start is inside");
         let out = path_through(&[inside.arms, home()]);
-        let deeper = path_through(&[inside.arms, left_at(wrists_inward(1.2).left)]);
+        let deeper = path_through(&[inside.arms, left_at(wrists_inward(1.2)[LEFT])]);
         for held in [at(home()), inside] {
             let guard = g.guard_at(held);
             assert!(checker.check_path(LEFT_ARM, &guard, &out, &NO_STOP).is_ok());
@@ -1240,7 +1270,7 @@ mod tests {
 
         let swung = |shoulder: f64| {
             let mut q = at(home());
-            q.arms.left[1] = shoulder;
+            q.arms[LEFT][1] = shoulder;
             q
         };
         let (far, farther) = (swung(3.2), swung(3.3));
@@ -1269,7 +1299,7 @@ mod tests {
     fn a_path_that_opens_past_the_stop_and_closes_back_inside_fails_the_check() {
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let inside = at(left_at(wrists_inward(0.8).left));
+        let inside = at(left_at(wrists_inward(0.8)[LEFT]));
         assert!(distance(&mut g, &inside) < D_STOP, "the start is inside");
         assert!(
             distance(&mut g, &at(home())) > D_STOP,
@@ -1296,7 +1326,7 @@ mod tests {
     fn a_path_that_closes_the_gap_between_its_probes_inside_the_stop_fails_the_check() {
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let wrist_in = |t: f64| left_at(wrists_inward(t)[LEFT]);
         let t = (400..1200)
             .map(|k| f64::from(k) * 0.001)
             .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
@@ -1304,7 +1334,7 @@ mod tests {
         let inside = at(wrist_in(t));
         assert!(distance(&mut g, &inside) > 0.0, "the start is clear");
         let mut out = wrist_in(t - 0.3);
-        out.left[6] += 0.03;
+        out[LEFT][6] += 0.03;
         let path = path_through(&[inside.arms, wrist_in(t + 0.002), out]);
         let spacing = PositiveFinite::parse(MAX_PROBE_ARC_RAD).expect("a positive resolution");
         let probed: Vec<f64> = path
@@ -1350,7 +1380,7 @@ mod tests {
     fn a_path_that_opens_the_gap_and_closes_it_inside_the_stop_names_where_it_closes_it() {
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let wrist_in = |t: f64| left_at(wrists_inward(t)[LEFT]);
         let t = (400..1200)
             .map(|k| f64::from(k) * 0.001)
             .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
@@ -1394,7 +1424,7 @@ mod tests {
     fn a_path_that_starts_in_contact_and_sweeps_deeper_fails_in_the_words_of_a_contact() {
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let wrist_in = |t: f64| left_at(wrists_inward(t)[LEFT]);
         let t = (400..1200)
             .map(|k| f64::from(k) * 0.001)
             .find(|&t| distance(&mut g, &at(wrist_in(t))) < -0.001)
@@ -1430,7 +1460,7 @@ mod tests {
     fn inside_the_stop_distance_a_probe_vouches_for_no_stretch_after_it() {
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let wrist_in = |t: f64| left_at(wrists_inward(t)[LEFT]);
         let t = (400..1200)
             .map(|k| f64::from(k) * 0.001)
             .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
@@ -1440,7 +1470,7 @@ mod tests {
         let guard = g.guard_at(inside);
         let rolled = |roll: f64| {
             let mut q = inside;
-            q.arms.left[6] += roll;
+            q.arms[LEFT][6] += roll;
             q
         };
         let roll_out = |roll: f64| path_through(&[inside.arms, rolled(roll).arms]);
@@ -1473,7 +1503,7 @@ mod tests {
         let mut g = governor(true);
         let mut checker = g.path_checker();
         let guard = g.guard_at(at(home()));
-        let folded = ArmPair::new(home().left, wrists_inward(1.2).right);
+        let folded = PerArm::new([home()[LEFT], wrists_inward(1.2)[RIGHT]]);
         assert!(
             distance(&mut g, &at(folded)) < D_STOP,
             "the right fold meets the body"
@@ -1502,15 +1532,15 @@ mod tests {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
+        use crate::arm_order::ArmOrder;
         use crate::failure::FailureKind;
         use crate::planner::{Outcome, Resumed, judge_path, resume_judged_path, start_path};
         use crate::settle::Settle;
         use crate::test_support::{claimed, path_goal_through, planner_holding, share_reply};
-        use openarm_description::ArmOrder;
 
         let mut g = governor(true);
         let mut checker = g.path_checker();
-        let wrist_in = |t: f64| left_at(wrists_inward(t).left);
+        let wrist_in = |t: f64| left_at(wrists_inward(t)[LEFT]);
         let t = (400..1200)
             .map(|k| f64::from(k) * 0.001)
             .find(|&t| distance(&mut g, &at(wrist_in(t))) < D_STOP)
@@ -1521,7 +1551,7 @@ mod tests {
                 && (0.0..D_STOP).contains(&distance(&mut g, &run)),
             "both starts stand inside the stop distance"
         );
-        let mut planners = ArmPair::from_fn(|side| planner_holding(side, taken.arms[side]));
+        let mut planners = PerArm::from_fn(|arm| planner_holding(arm, taken.arms[arm]));
         let arms = ArmOrder::parse(&["left_arm"]).expect("the left arm");
         let move_slots = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
@@ -1535,9 +1565,9 @@ mod tests {
             Duration::ZERO,
             settle,
             reply,
-            |side| &move_slots[side],
+            |arm| &move_slots[arm],
         );
-        let measuring = |q: &GovState| ArmPair::from_fn(|side| Ok(q.arms[side]));
+        let measuring = |q: &GovState| PerArm::from_fn(|arm| Ok(q.arms[arm]));
         let judgment =
             start_path(&mut planners, goal, &measuring(&taken)).expect("the goal is taken");
         let guard = g.guard_at(taken);
@@ -1552,8 +1582,8 @@ mod tests {
         let now = Instant::now();
         let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &measuring(&run), now);
         assert_eq!(
-            planners.left.setpoint(),
-            taken.arms.left,
+            planners[LEFT].setpoint(),
+            taken.arms[LEFT],
             "the command holds while the path is judged again"
         );
         let Resumed::JudgeAgain(again) = resumed else {
@@ -1574,8 +1604,8 @@ mod tests {
         assert!(matches!(resumed, Resumed::Done), "the path ends");
         assert!(!again.is_awaited(&planners), "no share waits for the path");
         assert_eq!(
-            planners.left.setpoint(),
-            taken.arms.left,
+            planners[LEFT].setpoint(),
+            taken.arms[LEFT],
             "the command holds"
         );
         let report = done_rx.try_recv().expect("the share reports");
@@ -1604,7 +1634,7 @@ mod tests {
             [1.0; DUAL_DOF],
             std::time::Duration::ZERO,
         );
-        for alone in [PathArms::One(Side::Left), PathArms::One(Side::Right)] {
+        for alone in [PathArms::One(LEFT), PathArms::One(RIGHT)] {
             let judged = judge_path(&plan, alone, &guard, &mut checker, &NO_STOP);
             assert!(judged.is_ok(), "{alone:?} alone stays clear: {judged:?}");
         }
@@ -1619,10 +1649,22 @@ mod tests {
         let Some((a, b)) = pair else {
             panic!("the path brings a pair under the stop: {}", judged.message);
         };
+        // The place of the arm whose base link `link` is or hangs below.
+        let robot = description(V2).robot();
         let arm_of = |link: &str| {
-            ["openarm_left_", "openarm_right_"]
-                .iter()
-                .position(|arm| link.starts_with(arm))
+            description(V2).arms().iter().position(|arm| {
+                let mut at = link;
+                loop {
+                    if at == arm.base_link {
+                        return true;
+                    }
+                    let Some(joint) = robot.joints.iter().find(|joint| joint.child.link == at)
+                    else {
+                        return false;
+                    };
+                    at = &joint.parent.link;
+                }
+            })
         };
         let mut arms = [arm_of(a), arm_of(b)];
         arms.sort();
@@ -1636,7 +1678,7 @@ mod tests {
     #[test]
     fn a_step_along_a_path_is_scaled_along_it_and_never_turned() {
         let mut g = governor(true);
-        let folded = ArmPair::new(wrists_inward(1.2).left, home().right);
+        let folded = PerArm::new([wrists_inward(1.2)[LEFT], home()[RIGHT]]);
         let mut start = at(home());
         while distance(&mut g, &start) >= D_SAFE {
             let cand = at(chase(&start.arms, &folded, 0.01));
@@ -1646,11 +1688,11 @@ mod tests {
         // a single joint's and the gradient lies off it.
         let mut cand = start;
         for (joint, by) in [(1, 0.005), (2, 0.04), (4, 0.03)] {
-            cand.arms.left[joint] += by;
+            cand.arms[LEFT][joint] += by;
         }
-        let step: JointVec = std::array::from_fn(|i| cand.arms.left[i] - start.arms.left[i]);
+        let step: JointVec = std::array::from_fn(|i| cand.arms[LEFT][i] - start.arms[LEFT][i]);
         let taken = |governed: &GovState| -> JointVec {
-            std::array::from_fn(|i| governed.arms.left[i] - start.arms.left[i])
+            std::array::from_fn(|i| governed.arms[LEFT][i] - start.arms[LEFT][i])
         };
         let share_of = |taken: &JointVec| {
             taken.iter().zip(&step).map(|(t, s)| t * s).sum::<f64>()
@@ -1662,7 +1704,7 @@ mod tests {
                 .map(|i| (taken[i] - share * step[i]).abs())
                 .fold(0.0, f64::max)
         };
-        let on_left = &[PathArms::One(Side::Left)];
+        let on_left = &[PathArms::One(LEFT)];
         let along = taken(&g.govern_along(&start, &cand, &start, NO_HANDS, on_left, DT));
         assert!(share_of(&along) < 1.0, "the barrier throttles the step");
         assert!(
@@ -1683,7 +1725,7 @@ mod tests {
     #[test]
     fn a_step_along_a_both_arms_path_is_scaled_as_one() {
         let mut g = governor(true);
-        let folded = ArmPair::new(wrists_inward(1.2).left, home().right);
+        let folded = PerArm::new([wrists_inward(1.2)[LEFT], home()[RIGHT]]);
         let mut start = at(home());
         while distance(&mut g, &start) >= D_SAFE {
             let cand = at(chase(&start.arms, &folded, 0.01));
@@ -1691,15 +1733,15 @@ mod tests {
         }
         let mut cand = start;
         for (joint, by) in [(1, 0.005), (2, 0.04), (4, 0.03)] {
-            cand.arms.left[joint] += by;
+            cand.arms[LEFT][joint] += by;
         }
-        cand.arms.right[3] += 0.02;
-        let step = dual_joints(&ArmPair::from_fn(|side| {
-            std::array::from_fn(|i| cand.arms[side][i] - start.arms[side][i])
+        cand.arms[RIGHT][3] += 0.02;
+        let step = dual_joints(&PerArm::from_fn(|arm| {
+            std::array::from_fn(|i| cand.arms[arm][i] - start.arms[arm][i])
         }));
         let governed = g.govern_along(&start, &cand, &start, NO_HANDS, &[PathArms::Both], DT);
-        let taken = dual_joints(&ArmPair::from_fn(|side| {
-            std::array::from_fn(|i| governed.arms[side][i] - start.arms[side][i])
+        let taken = dual_joints(&PerArm::from_fn(|arm| {
+            std::array::from_fn(|i| governed.arms[arm][i] - start.arms[arm][i])
         }));
         let share = taken.iter().zip(&step).map(|(t, s)| t * s).sum::<f64>()
             / step.iter().map(|s| s * s).sum::<f64>();
@@ -1710,8 +1752,9 @@ mod tests {
         assert!(off_line <= 1e-12, "the path step turned by {off_line}");
     }
 
-    // On v2 at Home, the left gripper opening toward the torso brings its jaw
-    // under the stop while both arms take a step of a path of both arms, so
+    // On v2 with both arms hanging beside the torso ([`HANGING`]), the left
+    // gripper opening toward the torso brings its jaw under the stop while
+    // both arms take a step of a path of both arms, so
     // the floor scan clips the step. Both arms take one share of their step:
     // the right arm, whose own step leaves the clearance where it is, stops
     // with the left. The same step streamed lets the right arm take its whole
@@ -1720,11 +1763,11 @@ mod tests {
     #[test]
     fn a_clip_keeps_the_arms_of_a_path_of_both_on_one_share_of_their_step() {
         let mut g = v2_governor(true);
-        let prev = GovState::new(home(), ArmPair::new(0.0, 0.0));
+        let prev = GovState::new(PerArm::new([HANGING, HANGING]), PerArm::new([0.0, 0.0]));
         let mut target = prev;
-        target.grippers.left = 1.0;
-        target.arms.left[0] += 0.004;
-        target.arms.right[0] += 0.004;
+        target.grippers[LEFT] = 1.0;
+        target.arms[LEFT][0] += 0.004;
+        target.arms[RIGHT][0] += 0.004;
         let d_now = distance(&mut g, &prev);
         let clip = |g: &mut Governor, paths: &[PathArms]| match g.clip_to_floor_along(
             &concat(&prev),
@@ -1736,12 +1779,12 @@ mod tests {
             Clip::Clipped(q) => split(&q),
             Clip::Clear => panic!("the opening jaw is not clipped: d_now {d_now:+.5}"),
         };
-        let step = dual_joints(&ArmPair::from_fn(|side| {
-            std::array::from_fn(|i| target.arms[side][i] - prev.arms[side][i])
+        let step = dual_joints(&PerArm::from_fn(|arm| {
+            std::array::from_fn(|i| target.arms[arm][i] - prev.arms[arm][i])
         }));
         let taken = |governed: &GovState| {
-            dual_joints(&ArmPair::from_fn(|side| {
-                std::array::from_fn(|i| governed.arms[side][i] - prev.arms[side][i])
+            dual_joints(&PerArm::from_fn(|arm| {
+                std::array::from_fn(|i| governed.arms[arm][i] - prev.arms[arm][i])
             }))
         };
 
@@ -1756,11 +1799,11 @@ mod tests {
 
         let streamed = clip(&mut g, NO_PATHS);
         assert_eq!(
-            streamed.arms.right, target.arms.right,
+            streamed.arms[RIGHT], target.arms[RIGHT],
             "the streamed right arm did not take its whole step, so this case shows nothing"
         );
         assert_ne!(
-            streamed.arms.left, target.arms.left,
+            streamed.arms[LEFT], target.arms[LEFT],
             "the left arm is clipped"
         );
     }
@@ -1768,7 +1811,7 @@ mod tests {
     #[test]
     fn disabled_passes_a_speed_legal_step_bit_exact() {
         // With the collision machinery down and no speed limiter binding (the
-        // test velocity bound is huge; no side carries a stream basis), the
+        // test velocity bound is huge; no arm carries a stream basis), the
         // candidate must come back bit-exact: the followers require an
         // unrestricted DOF to carry the commanded value itself.
         let mut g = governor(false);
@@ -1802,8 +1845,8 @@ mod tests {
         // past d_safe it is not an active constraint, and the exact floor scan
         // is what backstops the steps it passes.
         let mut g = governor(true);
-        let start = at(wrists_inward(0.50));
-        let cand = at(wrists_inward(0.62));
+        let start = at(wrists_inward(0.40));
+        let cand = at(wrists_inward(0.52));
         let d_start = distance(&mut g, &start);
         assert!(d_start > D_SAFE, "the step must start outside the band");
         let closing = d_start - distance(&mut g, &cand);
@@ -1873,18 +1916,18 @@ mod tests {
         // Command only the left arm further toward the centerline (closing); hold
         // the right exactly where it is.
         let pushed = chase(&q.arms, &wrists_inward(1.5), 0.02);
-        let cand = GovState::new(ArmPair::new(pushed.left, q.arms.right), q.grippers);
+        let cand = GovState::new(PerArm::new([pushed[LEFT], q.arms[RIGHT]]), q.grippers);
         let governed = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         // The held right arm must not be jogged by the barrier's correction.
         assert_eq!(
-            governed.arms.right, q.arms.right,
+            governed.arms[RIGHT], q.arms[RIGHT],
             "held right arm was jogged"
         );
         // Each commanded left joint's governed step stays within [0, commanded]:
         // same sign as the command, never larger, never reversed.
         for i in 0..ARM_DOF {
-            let cmd = cand.arms.left[i] - q.arms.left[i];
-            let gov = governed.arms.left[i] - q.arms.left[i];
+            let cmd = cand.arms[LEFT][i] - q.arms[LEFT][i];
+            let gov = governed.arms[LEFT][i] - q.arms[LEFT][i];
             assert!(
                 gov * cmd >= -1e-12 && gov.abs() <= cmd.abs() + 1e-12,
                 "left joint {i}: governed step {gov} outside [0, {cmd}]"
@@ -1913,11 +1956,11 @@ mod tests {
         let governed = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         for i in 0..ARM_DOF {
             assert!(
-                (governed.arms.left[i] - cand.arms.left[i]).abs() < 1e-9,
+                (governed.arms[LEFT][i] - cand.arms[LEFT][i]).abs() < 1e-9,
                 "left tangential joint {i} was throttled"
             );
             assert!(
-                (governed.arms.right[i] - cand.arms.right[i]).abs() < 1e-9,
+                (governed.arms[RIGHT][i] - cand.arms[RIGHT][i]).abs() < 1e-9,
                 "right tangential joint {i} was throttled"
             );
         }
@@ -1929,7 +1972,7 @@ mod tests {
         // the floor exceeds the model's step bound. Engineer one closing step
         // whose bound sits just under that margin (skip may fire) and one just
         // over (the scan must run), and require the floor contract to hold on
-        // both sides, so an off-by-margin or an underestimating bound cannot
+        // both arms, so an off-by-margin or an underestimating bound cannot
         // silently reintroduce endpoint-trusting.
         let mut g = governor(true);
         let q = drive_into_band(&mut g);
@@ -2051,7 +2094,7 @@ mod tests {
         fn in_range(&mut self, lo: f64, hi: f64) -> f64 {
             lo + (hi - lo) * self.next_f64()
         }
-        fn pose(&mut self) -> ArmPair<JointVec> {
+        fn pose(&mut self) -> PerArm<JointVec, ARMS> {
             let mut one = || -> JointVec {
                 [
                     self.in_range(-1.6, 1.6),
@@ -2063,7 +2106,7 @@ mod tests {
                     self.in_range(-1.2, 1.2),
                 ]
             };
-            ArmPair::from_fn(|_| one())
+            PerArm::from_fn(|_| one())
         }
     }
 
@@ -2091,7 +2134,7 @@ mod tests {
             let budget_us = 1e6 / rate_hz;
             let mut g = v2_governor(true);
             let mut rng = Lcg(0x5eed_1729);
-            let mut q = GovState::new(home(), ArmPair::new(0.0, 0.0));
+            let mut q = GovState::new(home(), PerArm::new([0.0, 0.0]));
             let mut target = rng.pose();
             let ticks = (rate_hz as usize) * 20;
             let mut times = Vec::with_capacity(ticks);
@@ -2165,13 +2208,13 @@ max={} us | over budget {over}/{}",
         );
 
         // The speed limiters alone (no model).
-        let hands = ArmPair::new(
+        let hands = PerArm::new([
             Some(HandBasis::flat(srs_model::Jacobian::zeros())),
             Some(HandBasis::flat(srs_model::Jacobian::zeros())),
-        );
+        ]);
         let prev = at(home());
         let mut cand = prev;
-        cand.arms.left[2] += 0.01;
+        cand.arms[LEFT][2] += 0.01;
         let step = Step::new(&prev, &cand).unwrap();
         let gl = governor(true);
         time_us(
@@ -2185,7 +2228,7 @@ max={} us | over budget {over}/{}",
         // Whole ticks by regime. `closed` keeps the v2 home pose out of the
         // wide-gripper torso overlap, so "far apart" really is far apart; the
         // overlap gets its own regime at the end.
-        let closed = |arms: ArmPair<JointVec>| GovState::new(arms, ArmPair::new(0.0, 0.0));
+        let closed = |arms: PerArm<JointVec, ARMS>| GovState::new(arms, PerArm::new([0.0, 0.0]));
         let regimes: [(&str, GovState, GovState, GovState); 5] = [
             (
                 "tick: far apart (skip)",
@@ -2236,8 +2279,7 @@ max={} us | over budget {over}/{}",
         // The planner's per-tick kinematics outside the governor, for the
         // whole-loop picture: the Jacobian a streamed tick hands out.
         {
-            let version = openarm_description::HardwareVersion::V2;
-            let arm = bundled_arm(version, Side::Left);
+            let arm = bundled_arm(V2, LEFT);
             let q = [0.1, -0.2, 0.3, 0.5, 0.1, -0.1, 0.2];
             time_us(
                 "planner: jacobian at measured",
@@ -2248,13 +2290,13 @@ max={} us | over budget {over}/{}",
             );
         }
         // The exemption path stacks the most queries: parked at the wall,
-        // one side escaping (its solo scan must prove itself) while the other
+        // one arm escaping (its solo scan must prove itself) while the other
         // keeps pushing (its clip bisects). Built from the live fixture
         // rather than a synthetic pose so the hold is actually granted.
         {
             let mut g = v2_governor(true);
             // Park AT the stop (not merely in-band): govern an approach until
-            // it settles, so the pushing side's clip and the escaping side's
+            // it settles, so the pushing arm's clip and the escaping arm's
             // exemption both actually engage.
             let mut parked = at(wrists_inward(1.05));
             for _ in 0..250 {
@@ -2262,10 +2304,10 @@ max={} us | over budget {over}/{}",
                 parked = g.govern_along(&parked, &cand, &parked, NO_HANDS, NO_PATHS, DT);
             }
             let mut cand = parked;
-            cand.arms.left = chase(&parked.arms, &home(), 0.02).left;
-            cand.arms.right = chase(&parked.arms, &wrists_inward(1.5), 0.02).right;
+            cand.arms[LEFT] = chase(&parked.arms, &home(), 0.02)[LEFT];
+            cand.arms[RIGHT] = chase(&parked.arms, &wrists_inward(1.5), 0.02)[RIGHT];
             time_us(
-                "tick: wall, one side escaping (exemption)",
+                "tick: wall, one arm escaping (exemption)",
                 300,
                 Box::new(move || {
                     std::hint::black_box(
@@ -2305,7 +2347,7 @@ max={} us | over budget {over}/{}",
                 distance(&mut g, &closed(fold)) < D_SAFE,
                 "the fold passes through the band"
             );
-            let waypoints: Vec<ArmPair<JointVec>> = std::iter::once(home())
+            let waypoints: Vec<PerArm<JointVec, ARMS>> = std::iter::once(home())
                 .chain((0..10).flat_map(|_| [fold, home()]))
                 .collect();
             let path = path_through(&waypoints);
@@ -2353,7 +2395,7 @@ max={} us | over budget {over}/{}",
                     .collect();
                 PathPlan::through(
                     waypoints,
-                    dual_joints(&ArmPair::new(arm_velocity, arm_velocity)),
+                    dual_joints(&PerArm::new([arm_velocity, arm_velocity])),
                     [5.0; DUAL_DOF],
                     std::time::Duration::ZERO,
                 )
@@ -2399,9 +2441,7 @@ max={} us | over budget {over}/{}",
             let chase_rad = jog_rad_s * DT;
             let mut g = v2_governor(true);
             let mut rng = Lcg(0x5eed_1729);
-            // Closed grippers: the v2 open-gripper home overlaps, and the
-            // penetration-recovery floor is a different regime than an approach.
-            let mut q = GovState::new(home(), ArmPair::new(0.0, 0.0));
+            let mut q = GovState::new(home(), PerArm::new([0.0, 0.0]));
             let mut target = rng.pose();
             let mut times = Vec::with_capacity(4000);
             for tick in 0..4000 {
@@ -2435,11 +2475,11 @@ max={} us | over budget {over}/{}",
     /// the binding pair, and the governor refused it for 19 s straight.
     fn wedged_open_gripper_at_the_torso() -> GovState {
         GovState::new(
-            ArmPair::new(
+            PerArm::new([
                 [-0.0743, -0.0735, 0.8353, 0.3973, 0.0009, -0.0074, 0.1502],
                 [0.0682, 0.0724, -0.8067, 0.3973, 0.0006, 0.0076, -0.1422],
-            ),
-            ArmPair::new(1.0, 1.0),
+            ]),
+            PerArm::new([1.0, 1.0]),
         )
     }
 
@@ -2461,10 +2501,10 @@ max={} us | over budget {over}/{}",
         // The escape that failed in the field: a tucked pose with the wrists
         // inward. It closes the torso-finger gap, so whatever the governor
         // passes must not breach the floor.
-        let tucked = ArmPair::new(
+        let tucked = PerArm::new([
             [0.0, 0.0, 0.2, 0.5, 0.0, 0.0, 0.0],
             [0.0, 0.0, -0.2, 0.5, 0.0, 0.0, 0.0],
-        );
+        ]);
         let mut q = wedge;
         for _ in 0..100 {
             let cand = GovState::new(chase(&q.arms, &tucked, 0.02), q.grippers);
@@ -2482,7 +2522,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..200 {
             let cand = GovState::new(
                 q.arms,
-                ArmPair::from_fn(|side| rate_limited(q.grippers[side], 0.0, rate, DT)),
+                PerArm::from_fn(|arm| rate_limited(q.grippers[arm], 0.0, rate, DT)),
             );
             q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
@@ -2497,10 +2537,10 @@ max={} us | over budget {over}/{}",
         // (Sequencing matters: bundling the outward swing with the still-open
         // grippers is itself a closing command here, since the chase's first step
         // toward a distant pose sweeps the fingers through the torso.)
-        let outward = ArmPair::new(
+        let outward = PerArm::new([
             [0.0, 0.0, -0.4, 0.5, 0.0, 0.0, 0.0],
             [0.0, 0.0, 0.4, 0.5, 0.0, 0.0, 0.0],
-        );
+        ]);
         for _ in 0..300 {
             let cand = GovState::new(chase(&q.arms, &outward, 0.02), q.grippers);
             q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
@@ -2521,16 +2561,13 @@ max={} us | over budget {over}/{}",
     /// 3. a commanded step is never frozen outright while its own endpoint is
     ///    admissible, so no jog can be refused with somewhere to go.
     ///
-    /// Invariant 2 is what caught the separating-side exemption scanning a
+    /// Invariant 2 is what caught the separating-arm exemption scanning a
     /// two-leg path the arms never travel; a scalar endpoint check cannot see
     /// that, so the path is sampled rather than assumed.
     #[test]
     fn the_realized_path_holds_the_floor_under_a_random_walk() {
-        for version in [
-            openarm_description::HardwareVersion::V1,
-            openarm_description::HardwareVersion::V2,
-        ] {
-            let mut g = governor_for(version, true);
+        for model in [V1, V2] {
+            let mut g = governor_for(model, true);
             let rate = g.max_gripper_rate_frac_s();
             let mut rng = Lcg(0x5EED_1234_ABCD_0001);
             let mut q = at(home());
@@ -2543,7 +2580,7 @@ max={} us | over budget {over}/{}",
                 if k % 60 == 0 {
                     target = GovState::new(
                         rng.pose(),
-                        ArmPair::new(rng.in_range(0.0, 1.0), rng.in_range(0.0, 1.0)),
+                        PerArm::new([rng.in_range(0.0, 1.0), rng.in_range(0.0, 1.0)]),
                     );
                 }
                 let prev = q;
@@ -2553,8 +2590,8 @@ max={} us | over budget {over}/{}",
                 };
                 let cand = GovState::new(
                     chase(&prev.arms, &target.arms, 0.02),
-                    ArmPair::from_fn(|side| {
-                        rate_limited(prev.grippers[side], target.grippers[side], rate, DT)
+                    PerArm::from_fn(|arm| {
+                        rate_limited(prev.grippers[arm], target.grippers[arm], rate, DT)
                     }),
                 );
                 q = g.govern_along(&prev, &cand, &prev, NO_HANDS, NO_PATHS, DT);
@@ -2571,7 +2608,7 @@ max={} us | over budget {over}/{}",
                 let d_governed = g.distance_at(&concat(&q)).unwrap_or(f64::NEG_INFINITY);
                 assert!(
                     d_governed >= floor - 1e-9,
-                    "{version:?} k={k}: governed below the floor, {d_governed:+.6} < {floor:+.6}"
+                    "{model} k={k}: governed below the floor, {d_governed:+.6} < {floor:+.6}"
                 );
 
                 worst_dip = worst_dip.max(floor - segment_min(&mut g, &prev, &q, 16));
@@ -2585,16 +2622,16 @@ max={} us | over budget {over}/{}",
                 let d_cand = g.distance_at(&concat(&cand)).unwrap_or(f64::NEG_INFINITY);
                 assert!(
                     moved > 0.0 || commanded <= 1e-12 || d_cand < floor,
-                    "{version:?} k={k}: frozen with a way out, d_cand={d_cand:+.6} floor={floor:+.6}"
+                    "{model} k={k}: frozen with a way out, d_cand={d_cand:+.6} floor={floor:+.6}"
                 );
             }
             assert!(
                 in_band > 1_000,
-                "{version:?}: the walk barely entered the band ({in_band} ticks); it proves nothing"
+                "{model}: the walk barely entered the band ({in_band} ticks); it proves nothing"
             );
             assert!(
                 worst_dip <= SCAN_PATH_RESIDUE_M,
-                "{version:?}: the realized path dipped {worst_dip:.6} m under the floor, over the {SCAN_PATH_RESIDUE_M:.6} m scan residue"
+                "{model}: the realized path dipped {worst_dip:.6} m under the floor, over the {SCAN_PATH_RESIDUE_M:.6} m scan residue"
             );
         }
     }
@@ -2612,17 +2649,17 @@ max={} us | over budget {over}/{}",
     #[test]
     fn a_wide_gripper_overlapping_the_torso_is_never_a_trap() {
         let mut g = v2_governor(true);
-        let wide = GovState::new(home(), ArmPair::new(1.0, 1.0));
+        let wide = GovState::new(home(), PerArm::new([1.0, 1.0]));
         // Tucking the shoulders swings the splayed fingers into the torso; stop
         // short of the depth where a whole link, not a finger, becomes nearest.
         let tucked = GovState::new(
             {
                 let mut arms = home();
-                arms.left[1] = 0.1;
-                arms.right[1] = 0.1;
+                arms[LEFT][1] = 0.1;
+                arms[RIGHT][1] = 0.1;
                 arms
             },
-            ArmPair::new(1.0, 1.0),
+            PerArm::new([1.0, 1.0]),
         );
         let overlapped = config_at_distance(&mut g, &wide, &tucked, -0.003);
         let d0 = distance(&mut g, &overlapped);
@@ -2643,7 +2680,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..200 {
             let cand = GovState::new(
                 q.arms,
-                ArmPair::from_fn(|side| rate_limited(q.grippers[side], 0.0, rate, DT)),
+                PerArm::from_fn(|arm| rate_limited(q.grippers[arm], 0.0, rate, DT)),
             );
             q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
         }
@@ -2655,8 +2692,8 @@ max={} us | over budget {over}/{}",
         // So is swinging the arms out with the grippers left wide.
         let mut q = overlapped;
         let mut out = home();
-        out.left[1] = -0.6;
-        out.right[1] = 0.6;
+        out[LEFT][1] = -0.6;
+        out[RIGHT][1] = 0.6;
         for _ in 0..200 {
             let cand = GovState::new(chase(&q.arms, &out, 0.02), q.grippers);
             q = g.govern_along(&q, &cand, &q, NO_HANDS, NO_PATHS, DT);
@@ -2716,7 +2753,7 @@ max={} us | over budget {over}/{}",
         let mut g = governor(true);
         let prev = at(home());
         let mut bad = at(wrists_inward(0.2));
-        bad.arms.left[0] = f64::NAN;
+        bad.arms[LEFT][0] = f64::NAN;
         // Enabled: the up-front guard holds prev rather than steering on NaN.
         assert_eq!(
             g.govern_along(&prev, &bad, &prev, NO_HANDS, NO_PATHS, DT),
@@ -2725,7 +2762,7 @@ max={} us | over budget {over}/{}",
         assert_eq!(g.guard(), Guard::Stopped, "a fault hold reads stopped");
         // A non-finite OPENING is the same class of upstream glitch.
         let mut bad_opening = at(wrists_inward(0.2));
-        bad_opening.grippers.left = f64::NAN;
+        bad_opening.grippers[LEFT] = f64::NAN;
         assert_eq!(
             g.govern_along(&prev, &bad_opening, &prev, NO_HANDS, NO_PATHS, DT),
             prev
@@ -2830,8 +2867,8 @@ max={} us | over budget {over}/{}",
         let mut g = v2_governor(true);
         let arms = finger_into_other_arm();
         let (shut, wide) = (
-            GovState::new(arms, ArmPair::new(0.0, 0.0)),
-            GovState::new(arms, ArmPair::new(1.0, 0.0)),
+            GovState::new(arms, PerArm::new([0.0, 0.0])),
+            GovState::new(arms, PerArm::new([1.0, 0.0])),
         );
         // The finger sweeps through the other arm and back out, so the dip is
         // strictly interior: a bisection over the whole segment can miss it.
@@ -2893,7 +2930,7 @@ max={} us | over budget {over}/{}",
     /// it gives configurations at any chosen clearance for the monitor tests.
     fn deep_collision() -> GovState {
         let mut p = at(home());
-        p.arms.left[1] = 1.4;
+        p.arms[LEFT][1] = 1.4;
         p
     }
 
@@ -2903,12 +2940,13 @@ max={} us | over budget {over}/{}",
         // band, one operator keeps pushing an arm in (its solo motion closes
         // past the stop floor) while the other retreats (its solo motion
         // opens). The shared-segment clip retracts both arms to the same
-        // parameter; the separating-side hold must let the retreating arm move
+        // parameter; the separating-arm hold must let the retreating arm move
         // its full commanded step while the pushing arm is held at the floor.
         // The retreating arm parks deeper than the pushing one, so its finger
         // alone binds the clearance and its retreat opens it. Either arm can
         // be the one retreating.
-        for (pushing, retreating) in [(Side::Left, Side::Right), (Side::Right, Side::Left)] {
+        for (pushing, retreating) in [(LEFT, RIGHT), (RIGHT, LEFT)] {
+            let retreating_name = LIMBS.arm_name(retreating);
             let mut g = governor(true);
             let mut parked = wrists_inward(0.6);
             parked[pushing] = wrists_inward(0.55)[pushing];
@@ -2918,10 +2956,10 @@ max={} us | over budget {over}/{}",
                 (D_STOP..D_SAFE).contains(&d_wall),
                 "setup: parked in the band, got {d_wall:+.5}"
             );
-            // `q` with the joints of `side` at `joints`.
-            let with = |side: Side, joints: JointVec| {
+            // `q` with the joints of `arm` at `joints`.
+            let with = |arm: ArmId, joints: JointVec| {
                 let mut arms = q.arms;
-                arms[side] = joints;
+                arms[arm] = joints;
                 GovState::new(arms, q.grippers)
             };
             let pushed = chase(&q.arms, &wrists_inward(1.6), 0.2)[pushing];
@@ -2933,7 +2971,7 @@ max={} us | over budget {over}/{}",
             let solo_retreat = distance(&mut g, &with(retreating, pulled));
             assert!(
                 solo_retreat > d_wall + 1e-3,
-                "setup: the {retreating} retreat alone opens the clearance, got {solo_retreat:+.5}"
+                "setup: the {retreating_name} retreat alone opens the clearance, got {solo_retreat:+.5}"
             );
 
             let mut commanded = q.arms;
@@ -2949,13 +2987,13 @@ max={} us | over budget {over}/{}",
             );
             assert!(
                 distance(&mut g, &governed) >= D_STOP - 1e-6,
-                "the governed step breached the stop floor, {retreating} arm retreating"
+                "the governed step breached the stop floor, {retreating_name} retreating"
             );
             // The shared clip alone would cut the retreat with the push.
             let opened = distance(&mut g, &with(retreating, governed.arms[retreating]));
             assert!(
                 opened >= d_wall + 0.9 * (solo_retreat - d_wall),
-                "the {retreating} retreat was cut short: opened to {opened:+.5} of solo \
+                "the {retreating_name} retreat was cut short: opened to {opened:+.5} of solo \
                  {solo_retreat:+.5} from wall {d_wall:+.5}"
             );
         }
@@ -2966,17 +3004,17 @@ max={} us | over budget {over}/{}",
         // The field scenario: with the monitor tripped, one operator keeps
         // pushing arm A into the breach while the other retreats arm B. The
         // joint candidate closes (A dominates), but B's own motion opens the
-        // real gap, so the per-side gate must hold A and let B escape; a
+        // real gap, so the per-arm gate must hold A and let B escape; a
         // whole-candidate hold would freeze B for as long as A pushes.
         let mut g = governor(true);
         // A shallow breach (positive clearance under the trip floor) keeps the
         // distance field smooth, and this asymmetric converging pose binds a
         // CROSS-ARM pair, so both arms' motion genuinely moves the gap (a
         // torso-bound pair would make the retreating arm irrelevant).
-        let deep = at(ArmPair::new(
+        let deep = at(PerArm::new([
             [0.0, 0.0, 1.15, 0.4, 0.1, 0.0, 0.2],
             [0.0, 0.0, -1.25, 0.4, -0.1, 0.1, 0.0],
-        ));
+        ]));
         assert!(
             distance(&mut g, &deep) < 0.5 * MONITOR_TRIP_FRACTION * D_STOP,
             "setup: the deep pose must pass the breach target"
@@ -2995,18 +3033,18 @@ max={} us | over budget {over}/{}",
         let prev = measured;
         // Find a push/pull step pair where the joint candidate closes (the push
         // dominates) while the retreating arm alone opens: the mixed case the
-        // per-side gate exists for.
+        // per-arm gate exists for.
         let mut found = None;
         for (push_step, pull_step) in [(0.05, 0.01), (0.1, 0.01), (0.15, 0.02), (0.2, 0.02)] {
             let push = chase(&measured.arms, &deep.arms, push_step);
             let pull = chase(&measured.arms, &home(), pull_step);
-            let cand = GovState::new(ArmPair::new(push.left, pull.right), measured.grippers);
+            let cand = GovState::new(PerArm::new([push[LEFT], pull[RIGHT]]), measured.grippers);
             let solo_right = GovState::new(
-                ArmPair::new(prev.arms.left, cand.arms.right),
+                PerArm::new([prev.arms[LEFT], cand.arms[RIGHT]]),
                 measured.grippers,
             );
             let solo_left = GovState::new(
-                ArmPair::new(cand.arms.left, prev.arms.right),
+                PerArm::new([cand.arms[LEFT], prev.arms[RIGHT]]),
                 measured.grippers,
             );
             if distance(&mut g, &cand) <= d_measured
@@ -3021,11 +3059,11 @@ max={} us | over budget {over}/{}",
 
         let governed = g.govern_along(&prev, &cand, &measured, NO_HANDS, NO_PATHS, DT);
         assert_eq!(
-            governed.arms.left, prev.arms.left,
+            governed.arms[LEFT], prev.arms[LEFT],
             "the pushing arm must be held"
         );
         assert_ne!(
-            governed.arms.right, prev.arms.right,
+            governed.arms[RIGHT], prev.arms[RIGHT],
             "the retreating arm was frozen"
         );
         assert!(
@@ -3205,7 +3243,7 @@ max={} us | over budget {over}/{}",
         let prev = at(home());
         let cand = at(wrists_inward(0.2));
         let mut measured = at(home());
-        measured.arms.left[0] = f64::NAN;
+        measured.arms[LEFT][0] = f64::NAN;
         assert_eq!(
             g.govern_along(&prev, &cand, &measured, NO_HANDS, NO_PATHS, DT),
             cand,
@@ -3288,25 +3326,25 @@ max={} us | over budget {over}/{}",
     }
 
     #[test]
-    fn each_governed_dof_belongs_to_the_side_concat_packs_it_from() {
+    fn each_governed_dof_belongs_to_the_arm_concat_packs_it_from() {
         let marked = GovState::new(
-            ArmPair::new([1.0; ARM_DOF], [-1.0; ARM_DOF]),
-            ArmPair::new(1.0, -1.0),
+            PerArm::new([[1.0; ARM_DOF], [-1.0; ARM_DOF]]),
+            PerArm::new([1.0, -1.0]),
         );
         for (i, value) in concat(&marked).into_iter().enumerate() {
-            let packed_from = if value > 0.0 { Side::Left } else { Side::Right };
-            assert_eq!(dof_side(i), packed_from, "governed DOF {i}");
+            let packed_from = if value > 0.0 { LEFT } else { RIGHT };
+            assert_eq!(dof_arm(i), packed_from, "governed DOF {i}");
         }
     }
 
     #[test]
     fn concat_split_round_trip() {
         let state = GovState::new(
-            ArmPair::new(
+            PerArm::new([
                 [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
                 [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0],
-            ),
-            ArmPair::new(0.25, 0.75),
+            ]),
+            PerArm::new([0.25, 0.75]),
         );
         assert_eq!(split(&concat(&state)), state);
         let flat: [f64; GOV_DOF] = std::array::from_fn(|i| i as f64);
@@ -3340,7 +3378,7 @@ max={} us | over budget {over}/{}",
         let prev = at(home());
         let cand = {
             let mut p = at(home());
-            p.arms.left[1] = 3.2;
+            p.arms[LEFT][1] = 3.2;
             p
         };
         assert!(
@@ -3379,11 +3417,11 @@ max={} us | over budget {over}/{}",
     /// A wrists-inward v2 pose whose left finger sweeps toward the right palm as
     /// the gripper opens: with the grippers closed the palms are ~23 mm clear, fully open
     /// the finger penetrates. The gripper scenarios open into it.
-    fn finger_into_other_arm() -> ArmPair<JointVec> {
-        ArmPair::new(
+    fn finger_into_other_arm() -> PerArm<JointVec, ARMS> {
+        PerArm::new([
             [0.0, 0.0, 0.6, 0.4, -0.4, 0.4, -0.4],
             [0.0, 0.0, -0.6, 0.4, 0.0, 0.0, 0.0],
-        )
+        ])
     }
 
     /// Drive `start` toward `target` through the governor tick by tick with
@@ -3397,7 +3435,7 @@ max={} us | over budget {over}/{}",
         for _ in 0..ticks {
             let cand = GovState::new(
                 chase(&s.arms, &target.arms, 0.02),
-                ArmPair::from_fn(|side| chase_frac(s.grippers[side], target.grippers[side])),
+                PerArm::from_fn(|arm| chase_frac(s.grippers[arm], target.grippers[arm])),
             );
             s = g.govern_along(&s, &cand, &s, NO_HANDS, NO_PATHS, DT);
             let d = distance(g, &s);
@@ -3410,22 +3448,22 @@ max={} us | over budget {over}/{}",
     fn gripper_opening_into_the_other_arm_settles_at_the_stop() {
         let mut g = v2_governor(true);
         let arms = finger_into_other_arm();
-        let start = GovState::new(arms, ArmPair::new(0.0, 0.0));
+        let start = GovState::new(arms, PerArm::new([0.0, 0.0]));
         assert!(
             distance(&mut g, &start) >= D_SAFE,
             "setup: closed grippers start clear of the band"
         );
         // Command the left gripper fully open; the barrier admits a useful partial
         // opening and parks it at the floor, holding the floor on every tick.
-        let target = GovState::new(arms, ArmPair::new(1.0, 0.0));
+        let target = GovState::new(arms, PerArm::new([1.0, 0.0]));
         let settled = drive(&mut g, start, &target, 300);
         assert!(
-            (1e-4..1.0 - 1e-4).contains(&settled.grippers.left),
+            (1e-4..1.0 - 1e-4).contains(&settled.grippers[LEFT]),
             "opening into the other arm should settle to a safe partial, got {}",
-            settled.grippers.left
+            settled.grippers[LEFT]
         );
         assert_eq!(
-            settled.grippers.right, 0.0,
+            settled.grippers[RIGHT], 0.0,
             "uncommanded right gripper opened"
         );
         // Settled NEAR the stop, not stalled far above it.
@@ -3454,21 +3492,21 @@ max={} us | over budget {over}/{}",
         // recovering past the parked value.
         let parked = drive(
             &mut g,
-            GovState::new(arms, ArmPair::new(0.0, 0.0)),
-            &GovState::new(arms, ArmPair::new(1.0, 0.0)),
+            GovState::new(arms, PerArm::new([0.0, 0.0])),
+            &GovState::new(arms, PerArm::new([1.0, 0.0])),
             300,
         );
         let d_parked = distance(&mut g, &parked);
         let closed = drive(
             &mut g,
             parked,
-            &GovState::new(arms, ArmPair::new(0.0, 0.0)),
+            &GovState::new(arms, PerArm::new([0.0, 0.0])),
             300,
         );
         assert!(
-            closed.grippers.left < 1e-6,
+            closed.grippers[LEFT] < 1e-6,
             "the gripper did not close: settled at {}",
-            closed.grippers.left
+            closed.grippers[LEFT]
         );
         assert!(
             distance(&mut g, &closed) > d_parked,
@@ -3483,13 +3521,13 @@ max={} us | over budget {over}/{}",
         // closed the pose is clear of the band, with both fully open the fingers
         // interpenetrate, so opening EITHER gripper closes the same gap.
         let pose = wrists_inward(0.55);
-        let start = GovState::new(pose, ArmPair::new(0.0, 0.0));
+        let start = GovState::new(pose, PerArm::new([0.0, 0.0]));
         assert!(
             distance(&mut g, &start) >= D_SAFE,
             "setup: closed grippers start clear of the band"
         );
         assert!(
-            distance(&mut g, &GovState::new(pose, ArmPair::new(1.0, 1.0))) < 0.0,
+            distance(&mut g, &GovState::new(pose, PerArm::new([1.0, 1.0]))) < 0.0,
             "setup: both grippers open must interpenetrate"
         );
         // Command BOTH grippers fully open at once. One shared barrier budgets the
@@ -3499,7 +3537,7 @@ max={} us | over budget {over}/{}",
         let settled = drive(
             &mut g,
             start,
-            &GovState::new(pose, ArmPair::new(1.0, 1.0)),
+            &GovState::new(pose, PerArm::new([1.0, 1.0])),
             300,
         );
         let d = distance(&mut g, &settled);
@@ -3508,9 +3546,9 @@ max={} us | over budget {over}/{}",
             "bilateral grippers should park the shared clearance at the stop, got {d:+.5}"
         );
         // Both grippers made real progress: the budget was shared, not starved onto
-        // one side.
+        // one arm.
         assert!(
-            settled.grippers.left > 1e-3 && settled.grippers.right > 1e-3,
+            settled.grippers[LEFT] > 1e-3 && settled.grippers[RIGHT] > 1e-3,
             "both grippers should open partially, got {:?}",
             settled.grippers
         );
@@ -3520,13 +3558,13 @@ max={} us | over budget {over}/{}",
     fn mixed_arm_push_and_opening_same_tick_holds_the_floor() {
         let mut g = v2_governor(true);
         let arms = finger_into_other_arm();
-        let start = GovState::new(arms, ArmPair::new(0.0, 0.0));
+        let start = GovState::new(arms, PerArm::new([0.0, 0.0]));
         // Drive the left arm further inward AND its gripper open in the same ticks:
         // the shared barrier budgets the combined closing motion, and the floor
         // holds on every tick (asserted inside drive).
         let mut pushed = arms;
-        pushed.left[2] += 0.3;
-        let target = GovState::new(pushed, ArmPair::new(1.0, 0.0));
+        pushed[LEFT][2] += 0.3;
+        let target = GovState::new(pushed, PerArm::new([1.0, 0.0]));
         let settled = drive(&mut g, start, &target, 300);
         let d = distance(&mut g, &settled);
         assert!(
@@ -3545,15 +3583,15 @@ max={} us | over budget {over}/{}",
         // (~0.55 at this pose) so closing is the motion that retracts it;
         // asserted below so a geometry change fails as setup, not as a
         // governor regression.
-        let stuck = GovState::new(arms, ArmPair::new(0.5, 0.0));
+        let stuck = GovState::new(arms, PerArm::new([0.5, 0.0]));
         let d_stuck = distance(&mut g, &stuck);
         assert!(
             d_stuck < D_STOP,
             "setup: the forced state breaches the floor"
         );
         let gripper_step = g.max_gripper_rate_frac_s() * DT;
-        let deeper = GovState::new(arms, ArmPair::new(0.5 + gripper_step, 0.0));
-        let closing = GovState::new(arms, ArmPair::new(0.5 - gripper_step, 0.0));
+        let deeper = GovState::new(arms, PerArm::new([0.5 + gripper_step, 0.0]));
+        let closing = GovState::new(arms, PerArm::new([0.5 - gripper_step, 0.0]));
         assert!(
             distance(&mut g, &deeper) < d_stuck && distance(&mut g, &closing) > d_stuck,
             "setup: at this pose opening must deepen and closing must recover"
@@ -3575,30 +3613,30 @@ max={} us | over budget {over}/{}",
 
     #[test]
     fn a_streamed_hand_is_capped_and_the_toggle_does_not_uncap_it() {
-        // A basis-carrying side is capped through the whole pipeline, enabled
+        // A basis-carrying arm is capped through the whole pipeline, enabled
         // or not, and the guard does not read a comfort cap as a collision
         // event. Joint 0 moves the hand 1 m/rad, so a 0.1 rad step over DT is
         // 10 m/s against the 0.5 m/s test cap: the governed step must be the
-        // cap's fraction of the command, on the streamed side only.
+        // cap's fraction of the command, on the streamed arm only.
         for enabled in [true, false] {
             let mut g = governor(enabled);
             let mut jac = srs_model::Jacobian::zeros();
             jac[(0, 0)] = 1.0;
-            let hands = ArmPair::new(Some(HandBasis::flat(jac)), None);
+            let hands = PerArm::new([Some(HandBasis::flat(jac)), None]);
             let prev = at(home());
             let mut cand = prev;
-            cand.arms.left[0] += 0.1;
-            cand.arms.right[0] += 0.1;
+            cand.arms[LEFT][0] += 0.1;
+            cand.arms[RIGHT][0] += 0.1;
             let governed = g.govern_along(&prev, &cand, &prev, &hands, NO_PATHS, DT);
-            let expected = prev.arms.left[0] + TEST_EE_CAP_M_S * DT;
+            let expected = prev.arms[LEFT][0] + TEST_EE_CAP_M_S * DT;
             assert!(
-                (governed.arms.left[0] - expected).abs() < 1e-12,
-                "streamed side not at the cap (enabled={enabled}): {}",
-                governed.arms.left[0]
+                (governed.arms[LEFT][0] - expected).abs() < 1e-12,
+                "streamed arm not at the cap (enabled={enabled}): {}",
+                governed.arms[LEFT][0]
             );
             assert_eq!(
-                governed.arms.right[0], cand.arms.right[0],
-                "the basis-free side is not capped"
+                governed.arms[RIGHT][0], cand.arms[RIGHT][0],
+                "the basis-free arm is not capped"
             );
             assert_eq!(
                 g.guard(),
@@ -3618,18 +3656,17 @@ max={} us | over budget {over}/{}",
         let mut g = v2_governor(false);
         let arms = finger_into_other_arm();
         let legal_step = g.max_gripper_rate_frac_s() * DT;
-        let prev = GovState::new(arms, ArmPair::new(0.0, 0.0));
-        let open = GovState::new(arms, ArmPair::new(legal_step, 0.0));
+        let prev = GovState::new(arms, PerArm::new([0.0, 0.0]));
+        let open = GovState::new(arms, PerArm::new([legal_step, 0.0]));
         assert_eq!(
             g.govern_along(&prev, &open, &prev, NO_HANDS, NO_PATHS, DT),
             open,
             "disabled governor throttled a rate-legal colliding opening"
         );
-        let jump = GovState::new(arms, ArmPair::new(1.0, 0.0));
+        let jump = GovState::new(arms, PerArm::new([1.0, 0.0]));
         assert_eq!(
             g.govern_along(&prev, &jump, &prev, NO_HANDS, NO_PATHS, DT)
-                .grippers
-                .left,
+                .grippers[LEFT],
             legal_step,
             "an over-rate jump is rate-limited even while disabled"
         );
@@ -3643,18 +3680,18 @@ max={} us | over budget {over}/{}",
         // (tracking divergence: the commanded gripper is still nearly closed).
         let measured = config_at_distance(
             &mut g,
-            &GovState::new(arms, ArmPair::new(0.0, 0.0)),
-            &GovState::new(arms, ArmPair::new(1.0, 0.0)),
+            &GovState::new(arms, PerArm::new([0.0, 0.0])),
+            &GovState::new(arms, PerArm::new([1.0, 0.0])),
             0.5 * MONITOR_TRIP_FRACTION * D_STOP,
         );
         assert!(
             distance(&mut g, &measured) < MONITOR_TRIP_FRACTION * D_STOP,
             "setup: measured fingers breach the monitor floor"
         );
-        let prev = GovState::new(arms, ArmPair::new(0.1, 0.0));
+        let prev = GovState::new(arms, PerArm::new([0.1, 0.0]));
         let gripper_step = g.max_gripper_rate_frac_s() * DT;
         // Opening further closes the commanded-space gap: held.
-        let open_more = GovState::new(arms, ArmPair::new(0.1 + gripper_step, 0.0));
+        let open_more = GovState::new(arms, PerArm::new([0.1 + gripper_step, 0.0]));
         assert!(
             distance(&mut g, &open_more) < distance(&mut g, &prev),
             "setup: opening closes the gap"
@@ -3666,7 +3703,7 @@ max={} us | over budget {over}/{}",
         );
         assert_eq!(g.guard(), Guard::Stopped, "a monitor hold reads stopped");
         // Closing (separation) still passes: the operator is never trapped.
-        let close = GovState::new(arms, ArmPair::new(0.1 - gripper_step, 0.0));
+        let close = GovState::new(arms, PerArm::new([0.1 - gripper_step, 0.0]));
         assert_ne!(
             g.govern_along(&prev, &close, &measured, NO_HANDS, NO_PATHS, DT),
             prev,
@@ -3684,14 +3721,13 @@ max={} us | over budget {over}/{}",
         use crate::planner::{PlanConfig, Planner};
         use crate::test_support::{claimed_move_slot, plan_config};
         use crate::upstream::Upstream;
-        use openarm_description::{HardwareVersion, Side};
         use srs_model::JointVec;
         use tokio::sync::mpsc;
 
         const VELOCITY_RAD_S: JointVec = [
             16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
         ];
-        let model = bundled_arm(HardwareVersion::V2, Side::Left);
+        let model = bundled_arm(V2, LEFT);
         let limits = model.limits();
         let cfg = PlanConfig {
             max_joint_velocity_rad_s: VELOCITY_RAD_S,
@@ -3710,8 +3746,8 @@ max={} us | over budget {over}/{}",
             )
         });
         let streams_pose = tc.draw(hegel::generators::booleans());
-        let mut planner = Planner::new(Side::Left, model, cfg);
-        planner.commit(start.left);
+        let mut planner = Planner::new(LEFT, model, cfg);
+        planner.commit(start[LEFT]);
         let command = if streams_pose {
             Upstream::Pose(planner.world_ee_pose(&far))
         } else {
@@ -3730,29 +3766,29 @@ max={} us | over budget {over}/{}",
         let mut fastest = 0.0_f64;
         for k in 0..300u32 {
             let tick = runtime.block_on(planner.tick(
-                held.arms.left,
+                held.arms[LEFT],
                 Some(command),
                 &mut goals,
                 &move_slot,
                 t0 + period * k,
             ));
             let mut candidate = held;
-            candidate.arms.left = tick.candidate;
-            let hands = ArmPair::new(tick.streamed_hand, None);
+            candidate.arms[LEFT] = tick.candidate;
+            let hands = PerArm::new([tick.streamed_hand, None]);
             let governed = governor.govern_along(&held, &candidate, &held, &hands, NO_PATHS, DT);
             for (i, limit) in VELOCITY_RAD_S.iter().enumerate() {
-                let speed = (governed.arms.left[i] - held.arms.left[i]).abs() / DT;
+                let speed = (governed.arms[LEFT][i] - held.arms[LEFT][i]).abs() / DT;
                 assert!(
                     speed <= limit * (1.0 + 1e-9),
                     "joint {i} at {speed} rad/s at tick {k}"
                 );
             }
             let (from, to) = (
-                planner.world_ee_pose(&held.arms.left),
-                planner.world_ee_pose(&governed.arms.left),
+                planner.world_ee_pose(&held.arms[LEFT]),
+                planner.world_ee_pose(&governed.arms[LEFT]),
             );
             fastest = fastest.max((to.translation.vector - from.translation.vector).norm() / DT);
-            planner.commit(governed.arms.left);
+            planner.commit(governed.arms[LEFT]);
             held = governed;
         }
         assert!(
@@ -3763,5 +3799,107 @@ max={} us | over budget {over}/{}",
             fastest >= TEST_EE_CAP_M_S * 0.5,
             "the stream never pressed against the cap: {fastest} m/s"
         );
+    }
+    // A teleop stream through the straight arm: the operator streams the right arm
+    // from Ready out to where it stands straight, its elbow at its lower limit, then
+    // back to Ready, as joint targets (KER's stream) and as poses (a headset's).
+    // Through the planner's tick and the governor, the governed joint targets reach
+    // the straight arm, the governed poses bring the hand to its pose within the
+    // precision a line holds, and each tick moves each joint by no more than its
+    // velocity limit takes in a control period.
+    #[test]
+    fn a_teleop_stream_through_the_straight_arm_steps_within_the_velocity_limits() {
+        use crate::planner::{PlanConfig, Planner};
+        use crate::test_support::{claimed_move_slot, plan_config};
+        use crate::upstream::Upstream;
+        use srs_model::chain_kinematics::{PRECISION_M, pose_miss};
+        use srs_model::{ELBOW, JointVec};
+        use tokio::sync::mpsc;
+
+        const VELOCITY_RAD_S: JointVec = [
+            16.754666, 16.754666, 5.445426, 5.445426, 20.943946, 20.943946, 20.943946,
+        ];
+        /// Ticks the stream holds each way: 5 s at the test period.
+        const TICKS_EACH_WAY: u32 = 500;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let start = ready();
+        for streams_pose in [false, true] {
+            let model = bundled_arm(V2, RIGHT);
+            let cfg = PlanConfig {
+                max_joint_velocity_rad_s: VELOCITY_RAD_S,
+                stream_ee_velocity_m_s: TEST_EE_CAP_M_S,
+                limits: model.limits(),
+                cycle_period: std::time::Duration::from_secs_f64(DT),
+                ..plan_config()
+            };
+            let mut straight = start[RIGHT];
+            straight[ELBOW] = cfg.limits[ELBOW].lo;
+            let bound: JointVec = std::array::from_fn(|i| {
+                cfg.max_joint_velocity_rad_s[i] * cfg.cycle_period.as_secs_f64()
+            });
+            let mut planner = Planner::new(RIGHT, model, cfg);
+            planner.commit(start[RIGHT]);
+            let straight_pose = planner.world_ee_pose(&straight);
+            let commands = if streams_pose {
+                [
+                    Upstream::Pose(straight_pose),
+                    Upstream::Pose(planner.world_ee_pose(&start[RIGHT])),
+                ]
+            } else {
+                [Upstream::Joints(straight), Upstream::Joints(start[RIGHT])]
+            };
+            let mut governor = v2_governor(true);
+            let (_goal_tx, mut goals) = mpsc::channel(1);
+            let move_slot = claimed_move_slot();
+            let t0 = std::time::Instant::now();
+            let period = std::time::Duration::from_secs_f64(DT);
+            let mut held = at(start);
+            let mut straightest = held.arms[RIGHT][ELBOW];
+            let mut closest = f64::INFINITY;
+            for (way, command) in (0u32..).zip(commands) {
+                for k in 0..TICKS_EACH_WAY {
+                    let now = t0 + period * (way * TICKS_EACH_WAY + k);
+                    let tick = runtime.block_on(planner.tick(
+                        held.arms[RIGHT],
+                        Some(command),
+                        &mut goals,
+                        &move_slot,
+                        now,
+                    ));
+                    let mut candidate = held;
+                    candidate.arms[RIGHT] = tick.candidate;
+                    let hands = PerArm::new([None, tick.streamed_hand]);
+                    let governed =
+                        governor.govern_along(&held, &candidate, &held, &hands, NO_PATHS, DT);
+                    let steps = governed.arms[RIGHT]
+                        .iter()
+                        .zip(&held.arms[RIGHT])
+                        .map(|(to, from)| (to - from).abs());
+                    for (i, (step, bound)) in steps.zip(bound).enumerate() {
+                        assert!(
+                            step <= bound * (1.0 + 1e-9),
+                            "joint {i} steps {step} rad at tick {k} of way {way}, past its \
+                             {bound} rad (pose stream: {streams_pose})"
+                        );
+                    }
+                    straightest = straightest.min(governed.arms[RIGHT][ELBOW]);
+                    let hand = planner.world_ee_pose(&governed.arms[RIGHT]);
+                    closest = closest.min(pose_miss(&hand, &straight_pose).position_m);
+                    planner.commit(governed.arms[RIGHT]);
+                    held = governed;
+                }
+            }
+            if streams_pose {
+                assert!(
+                    closest <= PRECISION_M,
+                    "the hand came {closest} m from the straight arm's pose"
+                );
+            } else {
+                assert_eq!(straightest, straight[ELBOW], "the elbow reaches straight");
+            }
+        }
     }
 }

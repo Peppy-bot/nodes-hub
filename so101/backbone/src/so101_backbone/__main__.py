@@ -1,7 +1,8 @@
-"""Wiring: parse parameters, build the kinematics, limits, and coordinator,
-and run the control tick, the upstream consumers, the state relays, the limb
-name service, the stop and plan check services, one server per exposed
-action, and the workspace services."""
+"""Wiring: parse parameters, check the description the robot's initializer
+serves, build the kinematics, limits, and coordinator, and run the control
+tick, the upstream consumers, the state relays, the limb name service, the
+stop and plan check services, one server per exposed action, and the
+workspace services."""
 
 from __future__ import annotations
 
@@ -38,16 +39,12 @@ from peppygen.paired_topics.leader_gripper import gripper_states as leader_gripp
 from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_setpoints
 from peppygen.paired_topics.leader_pose import pose_states as leader_pose_states
 from peppygen.parameters import Parameters
-from so101_description import limits as limits_mod
-from so101_description import postures, units
-from so101_description.kinematics import Kinematics
-from so101_description.limbs import ARM_LIMB, GRIPPER_LIMB
-from so101_description.model import KINEMATICS_URDF_PATH
-from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setpoints
-from so101_description.staleness import WIRE_AGE_LIMIT_S
+from so101.setpoints import parse_gripper_setpoint, parse_joint_setpoints
+from so101.staleness import WIRE_AGE_LIMIT_S
 
+from so101_backbone import description_check, postures, workspace_service
+from so101_backbone import limits as limits_mod
 from so101_backbone import params as params_mod
-from so101_backbone import workspace_service
 from so101_backbone.actions import (
     ActionLayer,
     PendingSlot,
@@ -57,6 +54,8 @@ from so101_backbone.actions import (
 )
 from so101_backbone.coordinator import Coordinator
 from so101_backbone.failures import Refusal
+from so101_backbone.kinematics import Kinematics
+from so101_backbone.model import ARM, DESCRIPTION, urdf_path
 from so101_backbone.params import UpstreamMode
 from so101_backbone.reach import fit_reach_ball
 from so101_backbone.wire import parse_arm_states, parse_gripper_states, parse_pose_setpoint
@@ -70,9 +69,9 @@ _READOUT_PERIOD_S = 0.05
 
 # This robot's limb tables as limb_state carries them, one arm and one
 # gripper: the labels on every snapshot and the answer get_limb_names gives.
-_ARM_NAMES = [ARM_LIMB]
-_JOINTS_PER_ARM = [units.NUM_JOINTS]
-_GRIPPER_NAMES = [GRIPPER_LIMB]
+_ARM_NAMES = [ARM.name]
+_JOINTS_PER_ARM = [len(ARM.joints)]
+_GRIPPER_NAMES = [ARM.gripper.name]
 
 
 def _now_s() -> float:
@@ -288,21 +287,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     config = params_mod.parse(params)
     await peppygen.clock.init(node_runner)
 
-    # The postures and limits below are validated against the same model
-    # bytes the constants were verified on. The point-to-point solver is a
-    # second instance: move_arm solves run off the event loop and must not
-    # share the control tick's solver state. The plan check solves on a
-    # third, since a check and a move can solve at once.
-    kinematics = Kinematics(KINEMATICS_URDF_PATH)
-    point_solver = Kinematics(KINEMATICS_URDF_PATH)
-    check_solver = Kinematics(KINEMATICS_URDF_PATH)
-    limits = limits_mod.from_urdf(KINEMATICS_URDF_PATH)
-    for name, posture in (
-        ("HOME_POSITIONS_RAD", postures.HOME_POSITIONS_RAD),
-        ("READY_POSITIONS_RAD", postures.READY_POSITIONS_RAD),
-    ):
-        if not limits.contains(posture):
-            raise ValueError(f"{name} exceeds a joint position limit of the deployed URDF")
+    # The point-to-point solver is a second instance: move_arm solves run off
+    # the event loop and must not share the control tick's solver state. The
+    # plan check solves on a third, since a check and a move can solve at once.
+    kinematics = Kinematics(urdf_path())
+    point_solver = Kinematics(urdf_path())
+    check_solver = Kinematics(urdf_path())
+    limits = limits_mod.from_description(DESCRIPTION)
 
     reach = fit_reach_ball(kinematics, limits)
     runtime.log(
@@ -370,6 +361,10 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         asyncio.create_task(
             runtime.serve(node_runner, get_limb_names, _limb_names, "get_limb_names")
         ),
+        # The initializer that serves the description may start after this
+        # node: the check asks once setup has returned, and a description of
+        # another build ends the node.
+        asyncio.create_task(description_check.check(node_runner)),
     ]
     # Only the mode's slot kind is subscribed: a leader linked to the other
     # kind streams into a slot nothing reads.
@@ -467,7 +462,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # keeps its rate while a surface is measured.
     tasks.append(
         asyncio.create_task(
-            workspace_service.serve(node_runner, ReachWorker(KINEMATICS_URDF_PATH))
+            workspace_service.serve(node_runner, ReachWorker(urdf_path()))
         )
     )
     return tasks

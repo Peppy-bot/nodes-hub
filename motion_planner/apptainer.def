@@ -40,19 +40,26 @@ From: peppybot/rust-cargo-base:latest
     } > target/release/QHULL_COPYING.txt
     # The binary links OMPL through ompl_bridge, whose build writes OMPL's license
     # to ompl-2.0.2/LICENSE in its output directory, so OMPL's license ships beside
-    # it too, led by where OMPL's source is. The output directory is the one cargo
-    # names for ompl_bridge's build script when it reports the build again.
-    out_dirs=$(cargo build --release --message-format=json \
-        | grep -o '"out_dir":"[^"]*/build/ompl_bridge-[^/"]*/out"') || {
+    # it too, led by where OMPL's source is. The output directory is the `out_dir`
+    # of the one build-script-executed message that cargo prints for the
+    # ompl_bridge package when it reports the build again. The message is found by
+    # its package and not by the path of the directory, because the place of the
+    # directory in the target directory depends on the release of cargo.
+    messages=$(cargo build --release --message-format=json \
+        | grep '"reason":"build-script-executed"' \
+        | grep '"package_id":"[^"]*[/#]ompl_bridge[@#][^"]*"') || {
         echo "the build ran no ompl_bridge build script, whose OMPL license the image ships" >&2
         exit 1
     }
-    if [ "$(printf '%s\n' "$out_dirs" | wc -l)" -ne 1 ]; then
-        echo "the build ran more than one ompl_bridge build script: $out_dirs" >&2
+    if [ "$(printf '%s\n' "$messages" | wc -l)" -ne 1 ]; then
+        echo "the build ran more than one ompl_bridge build script: $messages" >&2
         exit 1
     fi
-    ompl_out=${out_dirs#\"out_dir\":\"}
-    ompl_out=${ompl_out%\"}
+    ompl_out=$(printf '%s\n' "$messages" | sed -n 's/.*"out_dir":"\([^"]*\)".*/\1/p')
+    if [ -z "$ompl_out" ]; then
+        echo "cargo named no output directory for the ompl_bridge build script: $messages" >&2
+        exit 1
+    fi
     {
         echo "motion_planner links OMPL. Its source is at https://github.com/ompl/ompl."
         echo

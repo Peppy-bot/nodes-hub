@@ -149,7 +149,9 @@ impl Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::governor::{DUAL_DOF, LEFT_GRIPPER};
+    use crate::governor::gripper_dof;
+    use crate::robot::DUAL_DOF;
+    use crate::test_support::LEFT;
 
     const A: &str = "a";
     const B: &str = "b";
@@ -245,7 +247,7 @@ mod tests {
         let free = Allowance::gate(|i| i < DUAL_DOF);
         assert_eq!(free.get(0), 1.0);
         assert_eq!(free.get(DUAL_DOF - 1), 1.0);
-        assert_eq!(free.get(LEFT_GRIPPER), 0.0);
+        assert_eq!(free.get(gripper_dof(LEFT)), 0.0);
     }
 
     #[test]

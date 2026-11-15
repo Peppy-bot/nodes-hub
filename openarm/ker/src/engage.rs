@@ -6,8 +6,10 @@
 
 use std::time::{Duration, Instant};
 
-use openarm_description::{ArmPair, Side};
+use robot_description::PerArm;
 use tracing::info;
+
+use crate::robot::{ARMS, LIMBS};
 
 /// Consecutive frames a trigger must read open before a squeeze can engage
 /// its arm. A checksum-passing frame can still carry a wrong angle, so the
@@ -49,10 +51,10 @@ impl TryFrom<f64> for EngageTriggerOpening {
 pub struct EngageLatch {
     engage_trigger_opening: EngageTriggerOpening,
     stale_timeout: Duration,
-    engaged: ArmPair<bool>,
+    engaged: PerArm<bool, ARMS>,
     /// Consecutive frames each trigger has read open for, held at
     /// [`FRAMES_TO_ARM`] once armed and cleared by a squeeze or a stall.
-    open_frames: ArmPair<u8>,
+    open_frames: PerArm<u8, ARMS>,
     last_frame_at: Option<Instant>,
 }
 
@@ -61,31 +63,31 @@ impl EngageLatch {
         Self {
             engage_trigger_opening,
             stale_timeout,
-            engaged: ArmPair::new(false, false),
-            open_frames: ArmPair::new(0, 0),
+            engaged: PerArm::new([false; ARMS]),
+            open_frames: PerArm::new([0; ARMS]),
             last_frame_at: None,
         }
     }
 
     /// Fold in one usable frame's trigger openings, captured at `at`.
-    pub fn update(&mut self, triggers: ArmPair<f64>, at: Instant) -> ArmPair<bool> {
+    pub fn update(&mut self, triggers: PerArm<f64, ARMS>, at: Instant) -> PerArm<bool, ARMS> {
         if self.stalled(at) {
             if self.engaged.iter().any(|&engaged| engaged) {
                 info!("KER frames stalled; both arms disengaged, release and squeeze to re-engage");
             }
-            self.engaged = ArmPair::new(false, false);
-            self.open_frames = ArmPair::new(0, 0);
+            self.engaged = PerArm::new([false; ARMS]);
+            self.open_frames = PerArm::new([0; ARMS]);
         }
         let threshold = self.engage_trigger_opening.fraction();
-        for side in Side::BOTH {
-            let open_frames = &mut self.open_frames[side];
-            if triggers[side] > threshold {
+        for arm in PerArm::<(), ARMS>::ids() {
+            let open_frames = &mut self.open_frames[arm];
+            if triggers[arm] > threshold {
                 *open_frames = (*open_frames + 1).min(FRAMES_TO_ARM);
                 continue;
             }
-            if *open_frames >= FRAMES_TO_ARM && !self.engaged[side] {
-                self.engaged[side] = true;
-                info!("KER {side} arm engaged, tracking the leader");
+            if *open_frames >= FRAMES_TO_ARM && !self.engaged[arm] {
+                self.engaged[arm] = true;
+                info!("KER {} engaged, tracking the leader", LIMBS.arm_name(arm));
             }
             // A squeeze ends the run of open frames, armed or not.
             *open_frames = 0;
@@ -109,8 +111,8 @@ pub(crate) mod fixtures {
     pub(crate) const STALE: Duration = Duration::from_millis(250);
     /// The trigger opening a test launch engages at.
     pub(crate) const ENGAGE_AT: f64 = 0.2;
-    pub(crate) const NEITHER_ENGAGED: ArmPair<bool> = ArmPair::new(false, false);
-    pub(crate) const BOTH_ENGAGED: ArmPair<bool> = ArmPair::new(true, true);
+    pub(crate) const NEITHER_ENGAGED: PerArm<bool, ARMS> = PerArm::new([false; ARMS]);
+    pub(crate) const BOTH_ENGAGED: PerArm<bool, ARMS> = PerArm::new([true; ARMS]);
 
     pub(crate) fn engage_trigger_opening() -> EngageTriggerOpening {
         EngageTriggerOpening::try_from(ENGAGE_AT).expect("in range")
@@ -125,14 +127,14 @@ mod tests {
     const FRAME: Duration = Duration::from_millis(5);
     const OPEN: f64 = 1.0;
     const SQUEEZED: f64 = 0.02;
-    const LEFT_ENGAGED: ArmPair<bool> = ArmPair::new(true, false);
+    const LEFT_ENGAGED: PerArm<bool, ARMS> = PerArm::new([true, false]);
 
     fn latch() -> EngageLatch {
         EngageLatch::new(engage_trigger_opening(), STALE)
     }
 
-    fn triggers(left: f64, right: f64) -> ArmPair<f64> {
-        ArmPair::new(left, right)
+    fn triggers(left: f64, right: f64) -> PerArm<f64, ARMS> {
+        PerArm::new([left, right])
     }
 
     /// Feed `frames` open frames to both triggers, returning the time of the
@@ -173,11 +175,11 @@ mod tests {
         let at = arm_both(&mut latch, Instant::now());
         assert_eq!(
             latch.update(triggers(OPEN, SQUEEZED), at),
-            ArmPair::new(false, true)
+            PerArm::new([false, true])
         );
         assert_eq!(
             latch.update(triggers(OPEN, OPEN), at + FRAME),
-            ArmPair::new(false, true),
+            PerArm::new([false, true]),
             "releasing keeps the arm tracking"
         );
         assert_eq!(

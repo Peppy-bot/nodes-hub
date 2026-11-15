@@ -12,12 +12,12 @@
 use std::sync::Arc;
 
 use control_core::minimum_jerk::{QUINTIC_PEAK_VELOCITY, blend};
-use srs_model::JointVec;
+use robot_description::{ArmId, PerArm};
 use srs_model::nalgebra::{Quaternion, UnitQuaternion};
+use srs_model::{ARM_DOF, JointVec};
 
 use crate::pose::ArmModels;
-use openarm_description::{ARM_DOF, ArmPair, READY_R, Side, mirror};
-
+use crate::robot::{self, ARMS};
 use crate::state::{GesturePhase, GesturePlayback};
 
 /// Dense bake grid (s). Playback interpolates linearly between grid samples, so
@@ -43,22 +43,10 @@ const LEAD_IN_SPEED_FRACTION: f64 = 0.5;
 const LEAD_IN_MIN_S: f64 = 0.8;
 const LEAD_IN_MAX_S: f64 = 4.0;
 
-/// The Ready workspace pose per side, from the description's canonical
-/// postures (the backbone's move_to_ready lands on the same values). The
-/// panel's Ready Pose button drives the same pose, served to it through the
-/// snapshot, so the whole system has exactly one definition.
-pub(crate) const READY: ArmPair<JointVec> = ArmPair::new(
-    openarm_description::ready(Side::Left),
-    openarm_description::ready(Side::Right),
-);
-
-/// The Home park pose per side, from the same canonical postures: the elbow
-/// sits on the description's floor rather than the straight-arm singularity.
-/// The panel's Home Pose button and the backbone's move_to_home land here.
-pub(crate) const HOME: ArmPair<JointVec> = ArmPair::new(
-    openarm_description::home(Side::Left),
-    openarm_description::home(Side::Right),
-);
+/// The arm the roster's joint postures are written for; the other arm stands
+/// their [`mirror`] image. Every gesture anchors on each arm's own ready
+/// posture, the SRDF's.
+const AUTHORED_ARM: &str = "right_arm";
 
 // --------------------------- authoring types ---------------------------
 
@@ -70,13 +58,13 @@ struct Keyframe {
     gripper: Option<f64>,
 }
 
-/// A parametric Cartesian curve for one side: world-frame offsets (m) from the
-/// side's anchor as a function of progress `s` in [0, 1].
+/// A parametric Cartesian curve for one arm: world-frame offsets (m) from the
+/// arm's anchor as a function of progress `s` in [0, 1].
 type Curve = fn(f64) -> [f64; 3];
 
 enum Motion {
-    Joint(ArmPair<Option<Vec<Keyframe>>>),
-    Cartesian(ArmPair<Option<Curve>>),
+    Joint(PerArm<Option<Vec<Keyframe>>, ARMS>),
+    Cartesian(PerArm<Option<Curve>, ARMS>),
 }
 
 struct GestureDef {
@@ -88,7 +76,7 @@ struct GestureDef {
 
 // --------------------------- baked types ---------------------------
 
-/// One side's baked track: joint samples on the [`BAKE_DT_S`] grid, plus the
+/// One arm's baked track: joint samples on the [`BAKE_DT_S`] grid, plus the
 /// gripper opening per sample when the gesture drives it (`None` holds the
 /// opening measured at start).
 #[derive(Debug)]
@@ -98,37 +86,37 @@ struct BakedTrack {
 }
 
 /// A gesture resolved to streamable joint trajectories, one shared clock across
-/// its involved sides.
+/// its involved arms.
 #[derive(Debug)]
 pub struct BakedGesture {
     pub name: &'static str,
     pub label: &'static str,
     pub duration_s: f64,
-    tracks: ArmPair<Option<BakedTrack>>,
+    tracks: PerArm<Option<BakedTrack>, ARMS>,
 }
 
 impl BakedGesture {
-    pub fn involves(&self, side: Side) -> bool {
-        self.tracks[side].is_some()
+    pub fn involves(&self, arm: ArmId) -> bool {
+        self.tracks[arm].is_some()
     }
 
     /// The joint pose the lead-in blends toward.
-    pub fn first_joints(&self, side: Side) -> Option<JointVec> {
-        self.tracks[side].as_ref().map(|t| t.joints[0])
+    pub fn first_joints(&self, arm: ArmId) -> Option<JointVec> {
+        self.tracks[arm].as_ref().map(|t| t.joints[0])
     }
 
     /// The opening the gripper track starts at, when the gesture drives the jaw.
-    fn first_gripper(&self, side: Side) -> Option<f64> {
-        self.tracks[side]
+    fn first_gripper(&self, arm: ArmId) -> Option<f64> {
+        self.tracks[arm]
             .as_ref()
             .and_then(|t| t.gripper.as_ref())
             .map(|g| g[0])
     }
 
     /// Sample the track at `t` seconds (clamped to the trajectory), linearly
-    /// interpolated between grid samples. `None` for an uninvolved side.
-    pub fn sample(&self, side: Side, t: f64) -> Option<(JointVec, Option<f64>)> {
-        let track = self.tracks[side].as_ref()?;
+    /// interpolated between grid samples. `None` for an uninvolved arm.
+    pub fn sample(&self, arm: ArmId, t: f64) -> Option<(JointVec, Option<f64>)> {
+        let track = self.tracks[arm].as_ref()?;
         let last = track.joints.len() - 1;
         let x = (t / BAKE_DT_S).clamp(0.0, last as f64);
         let (lo, frac) = (x.floor() as usize, x.fract());
@@ -148,13 +136,13 @@ pub struct Registry(Vec<Arc<BakedGesture>>);
 
 impl Registry {
     /// Bake every definition against the live arm models, keeping each
-    /// side's joints within `ranges`, the per-joint `[min, max]` (rad) the
+    /// arm's joints within `ranges`, the per-joint `[min, max]` (rad) the
     /// panel clamps commands into. Panics on an infeasible definition: a
     /// gesture that cannot be streamed safely is a build error that bringup
     /// surfaces.
-    pub fn bake(models: &ArmModels, ranges: &ArmPair<[[f64; 2]; ARM_DOF]>) -> Self {
+    pub fn bake(models: &ArmModels, ranges: &PerArm<[[f64; 2]; ARM_DOF], ARMS>) -> Self {
         Self(
-            defs()
+            defs(models)
                 .iter()
                 .map(|def| Arc::new(bake(models, ranges, def)))
                 .collect(),
@@ -172,9 +160,9 @@ impl Registry {
 
 // --------------------------- playback ---------------------------
 
-/// Per-side playback output for one tick: the joint setpoint and, when the
+/// Per-arm playback output for one tick: the joint setpoint and, when the
 /// gesture drives it, the gripper opening.
-pub type GestureSamples = ArmPair<Option<(JointVec, Option<f64>)>>;
+pub type GestureSamples = PerArm<Option<(JointVec, Option<f64>)>, ARMS>;
 
 /// Size the lead-in blend so the fastest joint peaks at
 /// [`LEAD_IN_SPEED_FRACTION`] of its velocity budget, within the comfort band.
@@ -186,7 +174,7 @@ pub fn lead_in_duration(from: &JointVec, to: &JointVec, velocity_limits: &JointV
 }
 
 /// Advance playback one tick: the retained playback (`None` once complete) and
-/// each involved side's setpoints to apply. Pure, so the tick decision is
+/// each involved arm's setpoints to apply. Pure, so the tick decision is
 /// testable without an owner.
 pub fn advance_gesture_step(
     pb: &GesturePlayback,
@@ -213,8 +201,8 @@ pub fn advance_gesture_step(
                 );
             }
             let s = blend(t / duration_s);
-            let out = ArmPair::from_fn(|side| {
-                let (Some(start), Some(first)) = (from[side], pb.gesture.first_joints(side)) else {
+            let out = PerArm::from_fn(|arm| {
+                let (Some(start), Some(first)) = (from[arm], pb.gesture.first_joints(arm)) else {
                     return None;
                 };
                 let joints = std::array::from_fn(|i| lerp(start[i], first[i], s));
@@ -223,8 +211,8 @@ pub fn advance_gesture_step(
                 // holds (the owner keeps streaming the seeded opening).
                 let gripper = pb
                     .gesture
-                    .first_gripper(side)
-                    .and_then(|g0| gripper_from[side].map(|seed| lerp(seed, g0, s)));
+                    .first_gripper(arm)
+                    .and_then(|g0| gripper_from[arm].map(|seed| lerp(seed, g0, s)));
                 Some((joints, gripper))
             });
             (
@@ -250,7 +238,7 @@ pub fn advance_gesture_step(
 }
 
 fn sample_all(gesture: &BakedGesture, t: f64) -> GestureSamples {
-    ArmPair::from_fn(|side| gesture.sample(side, t))
+    PerArm::from_fn(|arm| gesture.sample(arm, t))
 }
 
 fn lerp(a: f64, b: f64, s: f64) -> f64 {
@@ -261,7 +249,7 @@ fn lerp(a: f64, b: f64, s: f64) -> f64 {
 
 fn bake(
     models: &ArmModels,
-    ranges: &ArmPair<[[f64; 2]; ARM_DOF]>,
+    ranges: &PerArm<[[f64; 2]; ARM_DOF], ARMS>,
     def: &GestureDef,
 ) -> BakedGesture {
     assert!(
@@ -270,25 +258,25 @@ fn bake(
         def.name
     );
     let clock_s = snap_to_grid(def.duration_s);
-    let track = |side: Side| match &def.motion {
-        Motion::Joint(tracks) => tracks[side]
+    let track = |arm: ArmId| match &def.motion {
+        Motion::Joint(tracks) => tracks[arm]
             .as_ref()
-            .map(|keys| bake_joint(models, &ranges[side], def, side, keys, clock_s)),
+            .map(|keys| bake_joint(models, &ranges[arm], def, arm, keys, clock_s)),
         Motion::Cartesian(curves) => {
-            curves[side].map(|curve| bake_cartesian(models, def, side, curve, clock_s))
+            curves[arm].map(|curve| bake_cartesian(models, def, arm, curve, clock_s))
         }
     };
-    let mut tracks = ArmPair::from_fn(track);
+    let mut tracks = PerArm::from_fn(track);
     assert!(
         tracks.iter().any(Option::is_some),
-        "gesture '{}': at least one side must have a track",
+        "gesture '{}': at least one arm must have a track",
         def.name
     );
     let coda_s = append_ready_coda(models, &mut tracks);
     // The coda samples answer to the same guards as the gesture proper.
-    for side in Side::BOTH {
-        if let Some(track) = tracks[side].as_ref() {
-            assert_steps_within_budget(models, def, side, &track.joints, &|k| k as f64 * BAKE_DT_S);
+    for arm in PerArm::<(), ARMS>::ids() {
+        if let Some(track) = tracks[arm].as_ref() {
+            assert_steps_within_budget(models, def, arm, &track.joints, &|k| k as f64 * BAKE_DT_S);
         }
     }
     BakedGesture {
@@ -299,19 +287,19 @@ fn bake(
     }
 }
 
-/// Every gesture ends at the Ready pose: when a track's last sample is not
-/// already there, append a quintic joint blend back to Ready (paced like the
-/// lead-in), holding any gripper track at its final value. Returns the coda
-/// duration added to the shared clock, 0 when every track already ends at
-/// Ready.
-fn append_ready_coda(models: &ArmModels, tracks: &mut ArmPair<Option<BakedTrack>>) -> f64 {
-    let coda_s = Side::BOTH
-        .into_iter()
-        .filter_map(|side| {
-            let track = tracks[side].as_ref()?;
+/// Every gesture ends at each arm's ready posture: when a track's last sample
+/// is not already there, append a quintic joint blend back to it (paced like
+/// the lead-in), holding any gripper track at its final value. Returns the
+/// coda duration added to the shared clock, 0 when every track already ends
+/// at its ready posture.
+fn append_ready_coda(models: &ArmModels, tracks: &mut PerArm<Option<BakedTrack>, ARMS>) -> f64 {
+    let coda_s = PerArm::<(), ARMS>::ids()
+        .filter_map(|arm| {
+            let track = tracks[arm].as_ref()?;
             let last = track.joints.last().expect("baked tracks are never empty");
-            let moved = (0..ARM_DOF).any(|j| (last[j] - READY[side][j]).abs() > 1e-9);
-            moved.then(|| lead_in_duration(last, &READY[side], models.velocity_limits(side)))
+            let ready = models.ready(arm);
+            let moved = (0..ARM_DOF).any(|j| (last[j] - ready[j]).abs() > 1e-9);
+            moved.then(|| lead_in_duration(last, &ready, models.velocity_limits(arm)))
         })
         .fold(0.0_f64, f64::max);
     if coda_s <= 0.0 {
@@ -319,16 +307,17 @@ fn append_ready_coda(models: &ArmModels, tracks: &mut ArmPair<Option<BakedTrack>
     }
     let coda_s = snap_to_grid(coda_s);
     let (n, at) = grid(coda_s);
-    for side in Side::BOTH {
-        let Some(track) = tracks[side].as_mut() else {
+    for arm in PerArm::<(), ARMS>::ids() {
+        let Some(track) = tracks[arm].as_mut() else {
             continue;
         };
         let from = *track.joints.last().expect("baked tracks are never empty");
+        let ready = models.ready(arm);
         for k in 1..n {
             let blend = blend(at(k) / coda_s);
-            track.joints.push(std::array::from_fn(|j| {
-                lerp(from[j], READY[side][j], blend)
-            }));
+            track
+                .joints
+                .push(std::array::from_fn(|j| lerp(from[j], ready[j], blend)));
         }
         if let Some(gripper) = track.gripper.as_mut() {
             let hold = *gripper.last().expect("gripper tracks are never empty");
@@ -354,7 +343,7 @@ fn bake_joint(
     models: &ArmModels,
     ranges: &[[f64; 2]; ARM_DOF],
     def: &GestureDef,
-    side: Side,
+    arm: ArmId,
     keys: &[Keyframe],
     clock_s: f64,
 ) -> BakedTrack {
@@ -382,8 +371,8 @@ fn bake_joint(
         for j in 0..ARM_DOF {
             assert!(
                 q[j] >= ranges[j][0] - LIMIT_SLACK_RAD && q[j] <= ranges[j][1] + LIMIT_SLACK_RAD,
-                "gesture '{name}' {side_l}: j{j1} = {v:.4} outside [{lo:.4}, {hi:.4}] at sample {k}",
-                side_l = side,
+                "gesture '{name}' {arm_name}: j{j1} = {v:.4} outside [{lo:.4}, {hi:.4}] at sample {k}",
+                arm_name = robot::LIMBS.arm_name(arm),
                 j1 = j + 1,
                 v = q[j],
                 lo = ranges[j][0],
@@ -391,7 +380,7 @@ fn bake_joint(
             );
         }
     }
-    assert_steps_within_budget(models, def, side, &joints, &at);
+    assert_steps_within_budget(models, def, arm, &joints, &at);
 
     BakedTrack {
         joints,
@@ -482,20 +471,22 @@ fn sample_gripper(gkeys: &[(f64, f64)], t: f64) -> f64 {
 fn bake_cartesian(
     models: &ArmModels,
     def: &GestureDef,
-    side: Side,
+    arm: ArmId,
     curve: Curve,
     clock_s: f64,
 ) -> BakedTrack {
     let name = def.name;
-    let anchor_pos = anchor_position(models, side);
-    // Hold the Ready orientation across the whole trace: only the position
+    let arm_name = robot::LIMBS.arm_name(arm);
+    let ready = models.ready(arm);
+    let anchor_pos = anchor_position(models, arm);
+    // Hold the ready orientation across the whole trace: only the position
     // draws (fixed world aims proved unreachable across these curves; the
     // wrist pitch limit is tight).
-    let q4 = models.ee_quat_world(side, &READY[side]);
+    let q4 = models.ee_quat_world(arm, &ready);
     let rotation = UnitQuaternion::from_quaternion(Quaternion::new(q4[3], q4[0], q4[1], q4[2]));
 
     let (n, at) = grid(clock_s);
-    let mut prev = READY[side];
+    let mut prev = ready;
     let joints: Vec<JointVec> = (0..n)
         .map(|k| {
             let off = curve(blend(at(k) / def.duration_s));
@@ -504,22 +495,20 @@ fn bake_cartesian(
                 anchor_pos[1] + off[1],
                 anchor_pos[2] + off[2],
             ];
-            let q = models
-                .solve_ik(side, p, rotation, &prev)
-                .unwrap_or_else(|| {
-                    panic!("gesture '{name}' {side}: unreachable curve point {p:?} at sample {k}")
-                });
-            let ee = models.ee_pose_world(side, &q);
+            let q = models.solve_ik(arm, p, rotation, &prev).unwrap_or_else(|| {
+                panic!("gesture '{name}' {arm_name}: unreachable curve point {p:?} at sample {k}")
+            });
+            let ee = models.ee_pose_world(arm, &q);
             let err = crate::pose::dist3([ee[0], ee[1], ee[2]], p);
             assert!(
                 err < CURVE_TRACK_TOL_M,
-                "gesture '{name}' {side}: IK landed {err:.4} m off the curve at sample {k}"
+                "gesture '{name}' {arm_name}: IK landed {err:.4} m off the curve at sample {k}"
             );
             prev = q;
             q
         })
         .collect();
-    assert_steps_within_budget(models, def, side, &joints, &at);
+    assert_steps_within_budget(models, def, arm, &joints, &at);
 
     BakedTrack {
         joints,
@@ -527,9 +516,9 @@ fn bake_cartesian(
     }
 }
 
-/// Curve offsets anchor on the side's own Ready end-effector position.
-fn anchor_position(models: &ArmModels, side: Side) -> [f64; 3] {
-    let p = models.ee_pose_world(side, &READY[side]);
+/// Curve offsets anchor on the arm's own ready end-effector position.
+fn anchor_position(models: &ArmModels, arm: ArmId) -> [f64; 3] {
+    let p = models.ee_pose_world(arm, &models.ready(arm));
     [p[0], p[1], p[2]]
 }
 
@@ -538,11 +527,11 @@ fn anchor_position(models: &ArmModels, side: Side) -> [f64; 3] {
 fn assert_steps_within_budget(
     models: &ArmModels,
     def: &GestureDef,
-    side: Side,
+    arm: ArmId,
     joints: &[JointVec],
     at: &impl Fn(usize) -> f64,
 ) {
-    let budget = models.velocity_limits(side);
+    let budget = models.velocity_limits(arm);
     for k in 1..joints.len() {
         let dt = at(k) - at(k - 1);
         if dt <= 0.0 {
@@ -554,7 +543,7 @@ fn assert_steps_within_budget(
                 step < MAX_BAKE_STEP_RAD,
                 "gesture '{}' {}: j{} steps {step:.3} rad at sample {k} (adjacent-sample guard; on an IK path this means a branch flip)",
                 def.name,
-                side,
+                robot::LIMBS.arm_name(arm),
                 j + 1
             );
             let cap = VELOCITY_BUDGET_FRACTION * budget[j] * dt;
@@ -562,7 +551,7 @@ fn assert_steps_within_budget(
                 step <= cap,
                 "gesture '{}' {}: j{} needs {:.2} rad/s at sample {k}, budget {:.2}",
                 def.name,
-                side,
+                robot::LIMBS.arm_name(arm),
                 j + 1,
                 step / dt,
                 VELOCITY_BUDGET_FRACTION * budget[j]
@@ -589,22 +578,49 @@ fn kfg(t: f64, joints: JointVec, gripper: f64) -> Keyframe {
     }
 }
 
-fn defs() -> Vec<GestureDef> {
-    vec![wave(), spiral(), figure_eight(), shrug(), clap()]
+fn defs(models: &ArmModels) -> Vec<GestureDef> {
+    vec![
+        wave(models),
+        spiral(),
+        figure_eight(),
+        shrug(models),
+        clap(models),
+    ]
+}
+
+/// A track on [`AUTHORED_ARM`] alone, from `track`.
+fn on_authored_arm<T>(track: impl Fn(ArmId) -> T) -> PerArm<Option<T>, ARMS> {
+    PerArm::from_fn(|arm| (robot::LIMBS.arm_name(arm) == AUTHORED_ARM).then(|| track(arm)))
+}
+
+/// A posture written for [`AUTHORED_ARM`], as `arm` stands it: as written on
+/// that arm, and its [`mirror`] image on the other.
+fn posed_for(arm: ArmId, authored: JointVec) -> JointVec {
+    if robot::LIMBS.arm_name(arm) == AUTHORED_ARM {
+        return authored;
+    }
+    mirror(authored)
+}
+
+/// The mirror image of a posture across the robot's xz-plane: j1..j3 flip
+/// sign, the elbow and the wrist do not. A posture whose wrist joints (j5..j7)
+/// are 0 stands the other arm as its mirror image.
+fn mirror(q: JointVec) -> JointVec {
+    [-q[0], -q[1], -q[2], q[3], q[4], q[5], q[6]]
 }
 
 /// The right hand raised in front at head height, forearm up, waving side to
 /// side with the gripper flapping open and closed on the beats.
-fn wave() -> GestureDef {
+fn wave(models: &ArmModels) -> GestureDef {
     let up = |j3: f64| [1.00, 0.35, j3, 1.90, 0.0, 0.0, 0.0];
     GestureDef {
         name: "wave",
         label: "Wave",
         duration_s: 8.0,
-        motion: Motion::Joint(ArmPair::new(
-            None,
-            Some(vec![
-                kfg(0.0, READY_R, 0.0),
+        motion: Motion::Joint(on_authored_arm(|arm| {
+            let ready = models.ready(arm);
+            vec![
+                kfg(0.0, ready, 0.0),
                 kfg(1.5, up(0.0), 0.35),
                 kfg(2.25, up(0.40), 0.5),
                 kfg(3.0, up(-0.40), 0.1),
@@ -612,28 +628,28 @@ fn wave() -> GestureDef {
                 kfg(4.5, up(-0.40), 0.1),
                 kfg(5.25, up(0.40), 0.5),
                 kfg(6.1, up(0.0), 0.25),
-                kfg(8.0, READY_R, 0.0),
-            ]),
-        )),
+                kfg(8.0, ready, 0.0),
+            ]
+        })),
     }
 }
 
 /// The right arm draws an Archimedean spiral in the vertical plane in front of
-/// it, winding out from its Ready point; arc length advances uniformly in the
+/// it, winding out from its ready point; arc length advances uniformly in the
 /// eased progress, so the outer rings do not sprint.
 fn spiral() -> GestureDef {
     GestureDef {
         name: "spiral",
         label: "Spiral",
         duration_s: 11.0,
-        motion: Motion::Cartesian(ArmPair::new(None, Some(spiral_curve as Curve))),
+        motion: Motion::Cartesian(on_authored_arm(|_| spiral_curve as Curve)),
     }
 }
 
 fn spiral_curve(s: f64) -> [f64; 3] {
     const TURNS: f64 = 3.0;
     const R_MAX: f64 = 0.10;
-    // The envelope at the held Ready orientation thins a few centimetres below
+    // The envelope at the held ready orientation thins a few centimeters below
     // the anchor, so the spiral winds around a lifted centre.
     const Z_LIFT_M: f64 = 0.07;
     let theta_max = TURNS * std::f64::consts::TAU;
@@ -650,7 +666,7 @@ fn figure_eight() -> GestureDef {
         name: "figure_eight",
         label: "Figure Eight",
         duration_s: 10.0,
-        motion: Motion::Cartesian(ArmPair::new(None, Some(figure_eight_curve as Curve))),
+        motion: Motion::Cartesian(on_authored_arm(|_| figure_eight_curve as Curve)),
     }
 }
 
@@ -664,58 +680,63 @@ fn figure_eight_curve(s: f64) -> [f64; 3] {
 }
 
 /// Both arms out with palms up and a double shoulder bounce: a shrug.
-fn shrug() -> GestureDef {
+fn shrug(models: &ArmModels) -> GestureDef {
     let open = |lift: f64| [0.55, 0.85 + lift, 0.0, 1.30, 0.0, 0.0, 0.0];
-    let right = vec![
-        kf(0.0, READY_R),
-        kf(1.2, open(0.0)),
-        kf(1.7, open(0.30)),
-        kf(2.2, open(0.0)),
-        kf(2.7, open(0.30)),
-        kf(3.4, open(0.0)),
-        kf(4.4, open(0.0)),
-        kf(6.0, READY_R),
-    ];
-    let left = right.iter().map(|k| kf(k.t, mirror(k.joints))).collect();
+    let track = |arm: ArmId| {
+        let ready = models.ready(arm);
+        let open = |lift| posed_for(arm, open(lift));
+        vec![
+            kf(0.0, ready),
+            kf(1.2, open(0.0)),
+            kf(1.7, open(0.30)),
+            kf(2.2, open(0.0)),
+            kf(2.7, open(0.30)),
+            kf(3.4, open(0.0)),
+            kf(4.4, open(0.0)),
+            kf(6.0, ready),
+        ]
+    };
     GestureDef {
         name: "shrug",
         label: "Shrug",
         duration_s: 6.0,
-        motion: Motion::Joint(ArmPair::new(Some(left), Some(right))),
+        motion: Motion::Joint(PerArm::from_fn(|arm| Some(track(arm)))),
     }
 }
 
 /// Hands brought together in front at mid height, then clapped with a rising
 /// tempo.
-fn clap() -> GestureDef {
+fn clap(models: &ArmModels) -> GestureDef {
     let clap = |j3: f64| [0.70, 0.50, j3, 1.45, 0.0, 0.0, 0.0];
     const APART: f64 = -0.55;
     const TOGETHER: f64 = -0.82;
     const CLOSED: f64 = 0.0;
     let beats = [1.4, 1.2, 1.0, 0.85, 0.75, 0.65];
-    let mut right = vec![kfg(0.0, READY_R, CLOSED), kfg(1.5, clap(APART), CLOSED)];
+    // When each hand meets and parts: the beats' times and the j3 of each.
+    let mut strokes = vec![(1.5, APART)];
     let mut t = 1.5;
     for beat in beats {
         t += beat;
-        right.push(kfg(t, clap(TOGETHER), CLOSED));
+        strokes.push((t, TOGETHER));
         t += beat * 0.6;
-        right.push(kfg(t, clap(APART), CLOSED));
+        strokes.push((t, APART));
     }
-    right.push(kfg(t + 2.0, READY_R, CLOSED));
     let duration_s = t + 2.0;
-    let left = right
-        .iter()
-        .map(|k| Keyframe {
-            t: k.t,
-            joints: mirror(k.joints),
-            gripper: k.gripper,
-        })
-        .collect();
+    let track = |arm: ArmId| -> Vec<Keyframe> {
+        let ready = models.ready(arm);
+        let strokes = strokes
+            .iter()
+            .map(|&(t, j3)| kfg(t, posed_for(arm, clap(j3)), CLOSED));
+        std::iter::once(kfg(0.0, ready, CLOSED))
+            .chain(strokes)
+            .chain([kfg(duration_s, ready, CLOSED)])
+            .collect()
+    };
     GestureDef {
         name: "clap",
         label: "Clap",
         duration_s,
-        motion: Motion::Joint(ArmPair::new(Some(left), Some(right))),
+        motion: Motion::Joint(PerArm::from_fn(|arm| Some(track(arm)))),
     }
 }
 
@@ -723,8 +744,10 @@ fn clap() -> GestureDef {
 mod tests {
     use super::*;
     use crate::limits::{arm_limits, init_limits_for_tests};
-    use crate::test_support::{models, registry};
-    use openarm_description::HardwareVersion;
+    use crate::test_support::{LEFT, RIGHT, driven, models, registry};
+
+    /// The elbow's place among an arm's joints: j4.
+    const ELBOW: usize = 3;
 
     fn test_keys() -> Vec<Keyframe> {
         vec![
@@ -839,27 +862,69 @@ mod tests {
     /// The clap holds the right elbow (j4) at 1.45 rad, so a right j4 range
     /// that ends at 1.40 refuses it.
     #[test]
-    #[should_panic(expected = "gesture 'clap' right: j4")]
+    #[should_panic(expected = "gesture 'clap' right_arm: j4")]
     fn a_gesture_outside_the_ranges_it_is_given_is_refused() {
-        let ranges = ArmPair::from_fn(|side| {
-            let mut ranges = HardwareVersion::V2.joint_limits(side);
-            if side == Side::Right {
-                ranges[3][1] = 1.40;
+        let m = models();
+        let ranges = driven("openarm_v2").joint_limits().map(|arm, mut ranges| {
+            if arm == RIGHT {
+                ranges[ELBOW][1] = 1.40;
             }
             ranges
         });
-        bake(&models(), &ranges, &clap());
+        bake(&m, &ranges, &clap(&m));
     }
 
     #[test]
     fn registry_bakes_every_gesture_on_v1() {
-        // The commander launches on either generation and the bake panics on an
+        // The commander launches on either model and the bake panics on an
         // infeasible definition, so v1 feasibility is a build gate too.
-        let version = HardwareVersion::V1;
-        Registry::bake(
-            &ArmModels::from_version(version),
-            &ArmPair::from_fn(|side| version.joint_limits(side)),
+        let v1 = driven("openarm_v1");
+        Registry::bake(&ArmModels::from_driven(&v1), &v1.joint_limits());
+    }
+
+    /// A track that straightens the right elbow onto its lower limit, the
+    /// straight arm, and bends it back bakes inside the ranges with every step
+    /// under the bake's own budget: the URDF velocity limit's
+    /// VELOCITY_BUDGET_FRACTION over one BAKE_DT_S grid step.
+    #[test]
+    fn a_bake_through_the_straight_arm_keeps_every_step_inside_the_budget() {
+        let m = models();
+        let ranges = driven("openarm_v2").joint_limits();
+        let straight_elbow = ranges[RIGHT][ELBOW][0];
+        let ready = m.ready(RIGHT);
+        let mut straight = ready;
+        straight[ELBOW] = straight_elbow;
+        let def = GestureDef {
+            name: "straighten",
+            label: "Straighten",
+            duration_s: 3.0,
+            motion: Motion::Joint(PerArm::from_fn(|arm| {
+                (arm == RIGHT).then(|| vec![kf(0.0, ready), kf(1.5, straight), kf(3.0, ready)])
+            })),
+        };
+        let baked = bake(&m, &ranges, &def);
+        let track = baked.tracks[RIGHT].as_ref().expect("the right arm's track");
+        let lowest = track
+            .joints
+            .iter()
+            .map(|q| q[ELBOW])
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            (lowest - straight_elbow).abs() < 1e-9,
+            "the elbow reaches its lower limit {straight_elbow}, not {lowest}"
         );
+        let budget = m.velocity_limits(RIGHT);
+        for (k, w) in track.joints.windows(2).enumerate() {
+            for j in 0..ARM_DOF {
+                let step = (w[1][j] - w[0][j]).abs();
+                let bound = VELOCITY_BUDGET_FRACTION * budget[j] * BAKE_DT_S;
+                assert!(
+                    step <= bound,
+                    "j{} steps {step} rad at sample {k}, over the {bound} rad bound",
+                    j + 1
+                );
+            }
+        }
     }
 
     #[test]
@@ -868,12 +933,12 @@ mod tests {
         init_limits_for_tests();
         let m = models();
         for g in registry().iter() {
-            for side in Side::BOTH {
-                let Some(track) = g.tracks[side].as_ref() else {
+            for arm in PerArm::<(), ARMS>::ids() {
+                let Some(track) = g.tracks[arm].as_ref() else {
                     continue;
                 };
-                let budget = m.velocity_limits(side);
-                let ranges = arm_limits(side);
+                let budget = m.velocity_limits(arm);
+                let ranges = arm_limits(arm);
                 for (k, w) in track.joints.windows(2).enumerate() {
                     for j in 0..ARM_DOF {
                         let step = (w[1][j] - w[0][j]).abs();
@@ -882,7 +947,7 @@ mod tests {
                             step <= VELOCITY_BUDGET_FRACTION * budget[j] * BAKE_DT_S + 1e-12,
                             "{} {} j{}: over budget at sample {k}",
                             g.name,
-                            side,
+                            robot::LIMBS.arm_name(arm),
                             j + 1
                         );
                     }
@@ -893,7 +958,7 @@ mod tests {
                             q[j] >= ranges[j][0] - 1e-9 && q[j] <= ranges[j][1] + 1e-9,
                             "{} {}: j{} out of limits",
                             g.name,
-                            side,
+                            robot::LIMBS.arm_name(arm),
                             j + 1
                         );
                     }
@@ -912,17 +977,21 @@ mod tests {
         let registry = registry();
         for name in ["spiral", "figure_eight"] {
             let g = registry.find(name).unwrap();
-            for side in Side::BOTH {
-                let Some(track) = g.tracks[side].as_ref() else {
+            for arm in PerArm::<(), ARMS>::ids() {
+                let Some(track) = g.tracks[arm].as_ref() else {
                     continue;
                 };
                 // Adjacent samples stay close in task space too: no Cartesian
                 // teleports between grid points.
                 for w in track.joints.windows(2) {
-                    let a = m.ee_pose_world(side, &w[0]);
-                    let b = m.ee_pose_world(side, &w[1]);
+                    let a = m.ee_pose_world(arm, &w[0]);
+                    let b = m.ee_pose_world(arm, &w[1]);
                     let d = crate::pose::dist3([a[0], a[1], a[2]], [b[0], b[1], b[2]]);
-                    assert!(d < 0.01, "{name} {side}: {d:.4} m EE jump");
+                    assert!(
+                        d < 0.01,
+                        "{name} {}: {d:.4} m EE jump",
+                        robot::LIMBS.arm_name(arm)
+                    );
                 }
             }
         }
@@ -930,19 +999,19 @@ mod tests {
 
     #[test]
     fn every_gesture_ends_at_ready() {
+        let m = models();
         for g in registry().iter() {
-            for side in Side::BOTH {
-                let Some((last, _)) = g.sample(side, g.duration_s) else {
+            for arm in PerArm::<(), ARMS>::ids() {
+                let Some((last, _)) = g.sample(arm, g.duration_s) else {
                     continue;
                 };
-                for j in 0..ARM_DOF {
+                for (j, (end, ready)) in last.iter().zip(m.ready(arm)).enumerate() {
                     assert!(
-                        (last[j] - READY[side][j]).abs() < 1e-9,
-                        "gesture '{}' {} j{} ends at {} not Ready",
+                        (end - ready).abs() < 1e-9,
+                        "gesture '{}' {} j{} ends at {end} not ready",
                         g.name,
-                        side,
+                        robot::LIMBS.arm_name(arm),
                         j + 1,
-                        last[j]
                     );
                 }
             }
@@ -959,18 +1028,12 @@ mod tests {
         // settles at 23 mm surface clearance with EE frames ~0.26 m apart.
         let m = models();
         for g in registry().iter() {
-            let (Some(l), Some(r)) = (
-                g.tracks[Side::Left].as_ref(),
-                g.tracks[Side::Right].as_ref(),
-            ) else {
+            let (Some(l), Some(r)) = (g.tracks[LEFT].as_ref(), g.tracks[RIGHT].as_ref()) else {
                 continue;
             };
             let mut min_gap = f64::INFINITY;
             for (ql, qr) in l.joints.iter().zip(r.joints.iter()) {
-                let (pl, pr) = (
-                    m.ee_pose_world(Side::Left, ql),
-                    m.ee_pose_world(Side::Right, qr),
-                );
+                let (pl, pr) = (m.ee_pose_world(LEFT, ql), m.ee_pose_world(RIGHT, qr));
                 let d = crate::pose::dist3([pl[0], pl[1], pl[2]], [pr[0], pr[1], pr[2]]);
                 min_gap = min_gap.min(d);
             }
@@ -985,20 +1048,17 @@ mod tests {
     #[test]
     fn sampling_interpolates_and_clamps() {
         let g = registry().find("wave").unwrap();
-        let (q0, _) = g.sample(Side::Right, 0.0).unwrap();
-        assert_eq!(q0, g.first_joints(Side::Right).unwrap());
-        assert!(
-            g.sample(Side::Left, 0.0).is_none(),
-            "wave is right-arm only"
-        );
+        let (q0, _) = g.sample(RIGHT, 0.0).unwrap();
+        assert_eq!(q0, g.first_joints(RIGHT).unwrap());
+        assert!(g.sample(LEFT, 0.0).is_none(), "wave is right-arm only");
         // Past the end holds the final pose.
-        let (qe, _) = g.sample(Side::Right, g.duration_s + 5.0).unwrap();
-        let (qd, _) = g.sample(Side::Right, g.duration_s).unwrap();
+        let (qe, _) = g.sample(RIGHT, g.duration_s + 5.0).unwrap();
+        let (qd, _) = g.sample(RIGHT, g.duration_s).unwrap();
         assert_eq!(qe, qd);
         // Between grid points, sampling lands between the neighbors.
-        let (qa, _) = g.sample(Side::Right, 1.005).unwrap();
-        let (ql, _) = g.sample(Side::Right, 1.0).unwrap();
-        let (qh, _) = g.sample(Side::Right, 1.01).unwrap();
+        let (qa, _) = g.sample(RIGHT, 1.005).unwrap();
+        let (ql, _) = g.sample(RIGHT, 1.0).unwrap();
+        let (qh, _) = g.sample(RIGHT, 1.01).unwrap();
         for j in 0..ARM_DOF {
             let (lo, hi) = (ql[j].min(qh[j]), ql[j].max(qh[j]));
             assert!(qa[j] >= lo - 1e-12 && qa[j] <= hi + 1e-12);
@@ -1026,8 +1086,8 @@ mod tests {
         let mut pb = GesturePlayback {
             gesture: gesture.clone(),
             phase: GesturePhase::LeadIn {
-                from: ArmPair::new(None, Some(start)),
-                gripper_from: ArmPair::new(None, Some(0.7)),
+                from: PerArm::new([None, Some(start)]),
+                gripper_from: PerArm::new([None, Some(0.7)]),
                 t: 0.0,
                 duration_s: 1.0,
             },
@@ -1038,8 +1098,8 @@ mod tests {
         let mut ticks = 0;
         loop {
             let (next, samples) = advance_gesture_step(&pb, dt);
-            assert!(samples[Side::Left].is_none());
-            if let Some((q, grip)) = samples[Side::Right] {
+            assert!(samples[LEFT].is_none());
+            if let Some((q, grip)) = samples[RIGHT] {
                 // The wave drives the jaw, so every tick carries an opening and
                 // it eases rather than snapping (0.7 seed to the 0.0 track start).
                 let grip = grip.expect("wave's gripper track streams throughout");
@@ -1065,7 +1125,7 @@ mod tests {
             ticks += 1;
             assert!(ticks < 10_000, "playback never completed");
         }
-        let (q_end, _) = gesture.sample(Side::Right, gesture.duration_s).unwrap();
+        let (q_end, _) = gesture.sample(RIGHT, gesture.duration_s).unwrap();
         assert_eq!(prev, q_end, "playback ends on the final sample");
     }
 }

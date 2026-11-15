@@ -20,7 +20,6 @@ use std::time::Duration;
 use chain_kinematics::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
 use collision_geometry::chain::RiderBody;
 use motion_planning_core::{pose_from_parts, pose_parts};
-use openarm_description::{ARM_DOF, Side};
 use peppygen::exposed_services::motion_planning::apply_collision_objects::{
     ApplyCollisionObjectsObjectsItem as Object, ApplyCollisionObjectsObjectsItemShapesItem as Shape,
 };
@@ -32,10 +31,10 @@ use peppygen::fixtures::exposed_services::motion_planning::{
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 
 use common::{
-    CLEAR_OR_ALLOW_WAY_OUT, Ended, OPENARM_V2, OVER_THE_TABLE, OWN_BODY_WAY_OUT, RIGHT_READY,
-    Solid, TIMEOUT, UNDER_THE_TABLE, arms, at_ms, check, left_path, looking_at, parameters, plan,
-    plan_to, planned_waypoints, publish_arms, render, start, start_with_camera,
-    start_without_camera, table_across, take_frame, wait_for_the_arms,
+    ARM_DOF, CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT, OPENARM_V2, OWN_BODY_WAY_OUT, RIGHT, Solid,
+    TIMEOUT, arms, at_ms, check, left_path, looking_at, over_the_table, parameters, plan, plan_to,
+    planned_waypoints, publish_arms, render, right_ready, start, start_with_camera,
+    start_without_camera, table_across, take_frame, under_the_table, wait_for_the_arms,
 };
 
 /// The left arm's grasp link.
@@ -43,15 +42,12 @@ const GRASP_LINK: &str = "openarm_left_tcp";
 
 /// The pose of the left arm's grasp link with the arm at `q`.
 fn grasp_pose(q: &[f64; ARM_DOF]) -> Isometry3<f64> {
-    OPENARM_V2.arms[Side::Left]
-        .geometry
-        .chain()
-        .world_ee_pose(q)
+    OPENARM_V2.arms[LEFT].geometry.chain().world_ee_pose(q)
 }
 
 /// The left gripper's links, which a held item may touch.
 fn gripper_links() -> Vec<String> {
-    OPENARM_V2.arms[Side::Left].gripper_links.clone()
+    OPENARM_V2.arms[LEFT].gripper_links.clone()
 }
 
 /// A primitive of `kind` and `dimensions` at `pose` in its object's frame.
@@ -231,7 +227,7 @@ async fn allow(
 /// `table_across` the motion from under the table to over it, raised by the clearance so the
 /// arm under it starts outside the clearance of it: a start inside it is refused.
 fn box_across() -> Solid {
-    let ((low, high), _) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
+    let ((low, high), _) = table_across(&under_the_table(), &over_the_table());
     let rise = parameters().min_clearance_m;
     let raised = |corner: [f64; 3]| [corner[0], corner[1], corner[2] + rise];
     (raised(low), raised(high))
@@ -256,11 +252,11 @@ async fn standing(harness: &Harness, q: [f64; ARM_DOF]) -> check_joint_path::Res
 // path fails once the box is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_box_between_start_and_goal_is_avoided_until_it_is_removed() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
     apply(&harness, vec![add_solid("box", box_across())])
         .await
         .expect("the box is added");
-    let straight = left_path(&[], &[OVER_THE_TABLE]);
+    let straight = left_path(&[], &[over_the_table()]);
     let through = check(&harness, &straight).await.expect("an answer");
     assert!(
         !through.clear
@@ -269,7 +265,7 @@ async fn a_box_between_start_and_goal_is_avoided_until_it_is_removed() -> peppyg
             && through.reason.contains(" from the map and the objects, "),
         "the straight path through the box, with no camera: {through:?}"
     );
-    let around = plan(&harness, &plan_to(&OVER_THE_TABLE))
+    let around = plan(&harness, &plan_to(&over_the_table()))
         .await
         .expect("a path around the box");
     let waypoints = planned_waypoints(&around);
@@ -287,7 +283,7 @@ async fn a_box_between_start_and_goal_is_avoided_until_it_is_removed() -> peppyg
         check(&harness, &straight).await.expect("an answer").clear,
         "the straight path once the box is removed"
     );
-    let free = plan(&harness, &plan_to(&OVER_THE_TABLE))
+    let free = plan(&harness, &plan_to(&over_the_table()))
         .await
         .expect("a path");
     let free_path = left_path(
@@ -345,7 +341,7 @@ fn farthest_z(points: impl IntoIterator<Item = Point3<f64>>) -> f64 {
 
 /// The left gripper where the arm stands at `q`.
 fn left_gripper(q: &[f64; ARM_DOF]) -> Gripper {
-    let arm = &OPENARM_V2.arms[Side::Left];
+    let arm = &OPENARM_V2.arms[LEFT];
     let posed = arm.geometry.chain().at(q);
     let to_grasp = grasp_pose(q).inverse();
     let fingers: Vec<Vec<Point3<f64>>> = OPENARM_V2
@@ -498,15 +494,15 @@ fn item_at_the_grasp_point(q: &[f64; ARM_DOF]) -> (Isometry3<f64>, Shape) {
 // check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let (pose, shape) = item_at_the_grasp_point(&UNDER_THE_TABLE);
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let (pose, shape) = item_at_the_grasp_point(&under_the_table());
     apply(&harness, vec![add("item", &pose, vec![shape])])
         .await
         .expect("the item is added");
     allow(&harness, "item", &gripper_links(), true)
         .await
         .expect("the item may touch the gripper");
-    let allowed = standing(&harness, UNDER_THE_TABLE).await;
+    let allowed = standing(&harness, under_the_table()).await;
     assert!(
         allowed.clear,
         "the item in the hand, which it may touch: {allowed:?}"
@@ -517,7 +513,7 @@ async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
     attach(&harness, "item", &[])
         .await
         .expect("the item is attached");
-    let touching = standing(&harness, UNDER_THE_TABLE).await;
+    let touching = standing(&harness, under_the_table()).await;
     assert!(
         !touching.clear
             && touching.clear_waypoints == 0
@@ -526,7 +522,7 @@ async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
                 .starts_with("the start is in contact: item touches openarm_left_"),
         "an attached item in the hand with no touch links: {touching:?}"
     );
-    let Err(Ended::Failed(collided)) = plan(&harness, &plan_to(&OVER_THE_TABLE)).await else {
+    let Err(Ended::Failed(collided)) = plan(&harness, &plan_to(&over_the_table())).await else {
         panic!("a plan from a start in contact fails once taken");
     };
     assert_eq!(collided.kind, FailureKind::StartInCollision, "{collided}");
@@ -540,7 +536,7 @@ async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
     apply(&harness, vec![add_solid("box", box_across())])
         .await
         .expect("the box is added");
-    let carried = plan(&harness, &plan_to(&OVER_THE_TABLE))
+    let carried = plan(&harness, &plan_to(&over_the_table()))
         .await
         .expect("a path carrying the item around the box");
     let waypoints = planned_waypoints(&carried);
@@ -562,11 +558,11 @@ async fn an_attached_item_is_carried_around_the_box() -> peppygen::Result<()> {
 // contact with them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_item_keeps_clear_of_the_other_arm_and_the_body() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let grasp = grasp_pose(&UNDER_THE_TABLE);
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let grasp = grasp_pose(&under_the_table());
     let mut model = OPENARM_V2.own.model.clone();
     let bodies = model
-        .world_pieces(&[UNDER_THE_TABLE, RIGHT_READY])
+        .world_pieces(&[under_the_table(), right_ready()])
         .expect("the bodies where the arms stand");
     let center_of = |body: &str| {
         let (_, pieces) = bodies
@@ -593,7 +589,7 @@ async fn a_held_item_keeps_clear_of_the_other_arm_and_the_body() -> peppygen::Re
         attach(&harness, "item", &gripper_links())
             .await
             .expect("the item is attached");
-        let touching = standing(&harness, UNDER_THE_TABLE).await;
+        let touching = standing(&harness, under_the_table()).await;
         assert!(
             !touching.clear
                 && touching.reason
@@ -616,9 +612,9 @@ async fn a_held_item_keeps_clear_of_the_other_arm_and_the_body() -> peppygen::Re
 // links. A detach leaves the item where the right arm held it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_item_the_right_arm_holds_stands_where_it_holds_it() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let right_grasp_link = OPENARM_V2.arms[Side::Right].grasp_link;
-    let (at_the_left_grasp, item) = item_at_the_grasp_point(&UNDER_THE_TABLE);
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let right_grasp_link = OPENARM_V2.arms[RIGHT].grasp_link.as_str();
+    let (at_the_left_grasp, item) = item_at_the_grasp_point(&under_the_table());
     for (touch_links, clear) in [(Vec::new(), false), (gripper_links(), true)] {
         apply(
             &harness,
@@ -629,7 +625,7 @@ async fn an_item_the_right_arm_holds_stands_where_it_holds_it() -> peppygen::Res
         attachment(&harness, "attach", "item", right_grasp_link, &touch_links)
             .await
             .expect("the right arm holds the item");
-        let standing_still = standing(&harness, UNDER_THE_TABLE).await;
+        let standing_still = standing(&harness, under_the_table()).await;
         assert_eq!(
             standing_still.clear, clear,
             "touch links {touch_links:?}: {standing_still:?}"
@@ -666,12 +662,12 @@ async fn an_item_the_right_arm_holds_stands_where_it_holds_it() -> peppygen::Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pairs_let_the_item_rest_on_the_table_and_the_fingers_close_on_it() -> peppygen::Result<()>
 {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let (pose, shape, end) = item_between_the_fingers(&UNDER_THE_TABLE);
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let (pose, shape, end) = item_between_the_fingers(&under_the_table());
     apply(&harness, vec![add("item", &pose, vec![shape])])
         .await
         .expect("the item is added");
-    let between = standing(&harness, UNDER_THE_TABLE).await;
+    let between = standing(&harness, under_the_table()).await;
     assert!(
         !between.clear && between.reason.contains("touches item"),
         "the fingers on an item no pair names: {between:?}"
@@ -679,7 +675,7 @@ async fn pairs_let_the_item_rest_on_the_table_and_the_fingers_close_on_it() -> p
     allow(&harness, "item", &gripper_links(), true)
         .await
         .expect("the item may touch the gripper");
-    let closed = standing(&harness, UNDER_THE_TABLE).await;
+    let closed = standing(&harness, under_the_table()).await;
     assert!(closed.clear, "the fingers close on the item: {closed:?}");
 
     attach(&harness, "item", &gripper_links())
@@ -688,7 +684,7 @@ async fn pairs_let_the_item_rest_on_the_table_and_the_fingers_close_on_it() -> p
     apply(&harness, vec![table_under(&end)])
         .await
         .expect("the table is added");
-    let resting = standing(&harness, UNDER_THE_TABLE).await;
+    let resting = standing(&harness, under_the_table()).await;
     assert!(
         !resting.clear && resting.reason.contains("item touches table"),
         "the held item on the table: {resting:?}"
@@ -696,7 +692,7 @@ async fn pairs_let_the_item_rest_on_the_table_and_the_fingers_close_on_it() -> p
     allow(&harness, "item", &["table".to_string()], true)
         .await
         .expect("the item may touch the table");
-    let set_down = standing(&harness, UNDER_THE_TABLE).await;
+    let set_down = standing(&harness, under_the_table()).await;
     assert!(
         set_down.clear,
         "the held item rests on the table: {set_down:?}"
@@ -719,22 +715,22 @@ const SHORT_M: f64 = 0.02;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_item_keeps_out_of_contact_with_the_links_it_may_not_touch() -> peppygen::Result<()>
 {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let gripper = left_gripper(&UNDER_THE_TABLE);
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let gripper = left_gripper(&under_the_table());
     assert!(DEEP_M < world_clearance_m());
     for (from, touching) in [
         (gripper.wrist + DEEP_M, false),
         (gripper.wrist - INTO_M, true),
     ] {
         let (pose, shape, _) =
-            box_between_the_fingers(&UNDER_THE_TABLE, &gripper, from, gripper.item_end());
+            box_between_the_fingers(&under_the_table(), &gripper, from, gripper.item_end());
         apply(&harness, vec![add("item", &pose, vec![shape])])
             .await
             .expect("the item is added");
         attach(&harness, "item", &gripper_links())
             .await
             .expect("the item is attached");
-        let held = standing(&harness, UNDER_THE_TABLE).await;
+        let held = standing(&harness, under_the_table()).await;
         if touching {
             assert!(
                 !held.clear
@@ -762,13 +758,13 @@ async fn a_held_item_keeps_out_of_contact_with_the_links_it_may_not_touch() -> p
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> peppygen::Result<()>
 {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let gripper = left_gripper(&UNDER_THE_TABLE);
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let gripper = left_gripper(&under_the_table());
     let from = gripper.tips - GRIP_M;
     gripper.assert_clear_of_the_wrist(from);
     let end = gripper.front + SHORT_M;
     assert!(end - SET_DOWN_M - gripper.front < world_clearance_m());
-    let (pose, shape, end) = box_between_the_fingers(&UNDER_THE_TABLE, &gripper, from, end);
+    let (pose, shape, end) = box_between_the_fingers(&under_the_table(), &gripper, from, end);
     apply(&harness, vec![add("item", &pose, vec![shape])])
         .await
         .expect("the item is added");
@@ -781,7 +777,7 @@ async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> 
     allow(&harness, "item", &["table".to_string()], true)
         .await
         .expect("the item may touch the table");
-    let near = standing(&harness, UNDER_THE_TABLE).await;
+    let near = standing(&harness, under_the_table()).await;
     assert!(
         !near.clear
             && near.reason.starts_with("the start keeps openarm_left_")
@@ -789,7 +785,7 @@ async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> 
             && near.reason.ends_with(CLEAR_OR_ALLOW_WAY_OUT),
         "the gripper near the table: {near:?}"
     );
-    let Err(Ended::Failed(refused)) = plan(&harness, &plan_to(&OVER_THE_TABLE)).await else {
+    let Err(Ended::Failed(refused)) = plan(&harness, &plan_to(&over_the_table())).await else {
         panic!("a plan from a start inside the clearance fails once taken");
     };
     assert_eq!(refused.kind, FailureKind::StartInCollision, "{refused}");
@@ -797,7 +793,7 @@ async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> 
     allow(&harness, "table", &gripper_links(), true)
         .await
         .expect("the table may touch the gripper");
-    let set_down = standing(&harness, UNDER_THE_TABLE).await;
+    let set_down = standing(&harness, under_the_table()).await;
     assert!(set_down.clear, "the short item set down: {set_down:?}");
     harness.shutdown().await
 }
@@ -807,10 +803,10 @@ async fn setting_a_short_item_down_needs_the_table_paired_with_the_gripper() -> 
 // open, and refused with rejected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_mesh_about_the_arm_collides_and_an_open_one_is_refused() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    let corners: Vec<Point3<f64>> = OPENARM_V2.arms[Side::Left]
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
+    let corners: Vec<Point3<f64>> = OPENARM_V2.arms[LEFT]
         .geometry
-        .place(&UNDER_THE_TABLE)
+        .place(&under_the_table())
         .pieces()
         .flat_map(|(_, piece)| piece.vertices().collect::<Vec<_>>())
         .collect();
@@ -829,7 +825,7 @@ async fn a_closed_mesh_about_the_arm_collides_and_an_open_one_is_refused() -> pe
     apply(&harness, vec![add("cube", &center, vec![cube_mesh(side)])])
         .await
         .expect("the cube is added");
-    let inside = standing(&harness, UNDER_THE_TABLE).await;
+    let inside = standing(&harness, under_the_table()).await;
     assert!(
         !inside.clear && inside.clear_waypoints == 0 && inside.reason.contains("touches cube"),
         "the arm inside the cube: {inside:?}"
@@ -855,7 +851,7 @@ async fn a_closed_mesh_about_the_arm_collides_and_an_open_one_is_refused() -> pe
 // it; a remove drops every pair that names the object.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_scene_gives_exactly_what_was_set() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
     let turned = UnitQuaternion::from_euler_angles(0.1, 0.2, 0.3);
     let pose = Isometry3::from_parts(Translation3::new(0.5, -0.3, 0.2), turned);
     let shapes = vec![
@@ -871,7 +867,7 @@ async fn the_scene_gives_exactly_what_was_set() -> peppygen::Result<()> {
         ),
     ];
     let sphere = vec![primitive("sphere", &[0.04], &Isometry3::identity())];
-    let held = grasp_pose(&UNDER_THE_TABLE) * Isometry3::translation(0.0, 0.0, 0.05);
+    let held = grasp_pose(&under_the_table()) * Isometry3::translation(0.0, 0.0, 0.05);
     apply(
         &harness,
         vec![
@@ -1192,8 +1188,8 @@ async fn every_refusal_comes_with_its_kind_and_changes_nothing() -> peppygen::Re
 /// Publishes the arms at Ready but the left one under the table of `table_across`, and
 /// waits until a check of the left arm standing still stops being refused.
 async fn measure_arms(harness: &Harness, mocks: &Mocks) -> peppygen::Result<()> {
-    publish_arms(mocks, at_ms(0), &arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
-    wait_for_the_arms(harness, UNDER_THE_TABLE).await;
+    publish_arms(mocks, at_ms(0), &arms(under_the_table(), right_ready())).await?;
+    wait_for_the_arms(harness, under_the_table()).await;
     Ok(())
 }
 
@@ -1202,7 +1198,7 @@ async fn measure_arms(harness: &Harness, mocks: &Mocks) -> peppygen::Result<()> 
 // at an orientation that is no unit quaternion each apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fields_an_operation_does_not_read_are_not_checked() -> peppygen::Result<()> {
-    let (harness, _mocks) = start_without_camera(&arms(UNDER_THE_TABLE, RIGHT_READY)).await?;
+    let (harness, _mocks) = start_without_camera(&arms(under_the_table(), right_ready())).await?;
     let here = Isometry3::translation(0.6, 0.0, 0.4);
     let block = vec![primitive("box", &[0.05; 3], &Isometry3::identity())];
     apply(&harness, vec![add("item", &here, block)])
@@ -1244,14 +1240,14 @@ async fn fields_an_operation_does_not_read_are_not_checked() -> peppygen::Result
 // item the left gripper holds marks nothing where the item is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn objects_clear_the_map_and_their_points_mark_nothing() -> peppygen::Result<()> {
-    let (table, _) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
+    let (table, _) = table_across(&under_the_table(), &over_the_table());
     let ([x0, y0, _], [x1, y1, top]) = table;
     let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let camera = looking_at(Vector3::new(x + 0.5, y, top + 0.7), Vector3::new(x, y, top));
     let (harness, mocks) = start_with_camera(&camera).await?;
-    let start = arms(UNDER_THE_TABLE, RIGHT_READY);
+    let start = arms(under_the_table(), right_ready());
     let seen = render(&camera, None, &[table]);
-    let straight = left_path(&[], &[OVER_THE_TABLE]);
+    let straight = left_path(&[], &[over_the_table()]);
     let blocked = |answer: check_joint_path::Response| {
         assert!(
             !answer.clear && answer.reason.contains(" from the map and the objects, "),
@@ -1267,7 +1263,7 @@ async fn objects_clear_the_map_and_their_points_mark_nothing() -> peppygen::Resu
     let take_three = async |from_ms: u64| -> peppygen::Result<()> {
         for at in [from_ms, from_ms + 200, from_ms + 400].map(at_ms) {
             publish_arms(&mocks, at, &start).await?;
-            take_frame(&harness, &mocks, at, &seen, UNDER_THE_TABLE).await?;
+            take_frame(&harness, &mocks, at, &seen, under_the_table()).await?;
         }
         Ok(())
     };
@@ -1317,7 +1313,7 @@ async fn objects_clear_the_map_and_their_points_mark_nothing() -> peppygen::Resu
     passes(check(&harness, &straight).await.expect("an answer"));
 
     // A cube 4 cm on a side, along the robot's axes, held about the grasp point.
-    let held = grasp_pose(&UNDER_THE_TABLE).translation.vector;
+    let held = grasp_pose(&under_the_table()).translation.vector;
     let item: Solid = (
         (held - Vector3::repeat(0.02)).into(),
         (held + Vector3::repeat(0.02)).into(),
@@ -1338,8 +1334,8 @@ async fn objects_clear_the_map_and_their_points_mark_nothing() -> peppygen::Resu
         .filter(|p| (0..3).all(|i| low[i] <= p[i] && p[i] <= high[i]))
         .count();
     assert!(on_the_item > 0, "the camera sees the item");
-    take_frame(&harness, &mocks, at_ms(3_000), &holding, UNDER_THE_TABLE).await?;
-    passes(standing(&harness, UNDER_THE_TABLE).await);
+    take_frame(&harness, &mocks, at_ms(3_000), &holding, under_the_table()).await?;
+    passes(standing(&harness, under_the_table()).await);
     harness.shutdown().await
 }
 
@@ -1352,14 +1348,14 @@ async fn objects_clear_the_map_and_their_points_mark_nothing() -> peppygen::Resu
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn depth_points_within_the_padding_of_an_object_mark_nothing() -> peppygen::Result<()> {
     let offset = parameters().padding_offset_m;
-    let (table, _) = table_across(&UNDER_THE_TABLE, &OVER_THE_TABLE);
+    let (table, _) = table_across(&under_the_table(), &over_the_table());
     let ([x0, y0, _], [x1, y1, top]) = table;
     let (x, y) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
     let camera = looking_at(Vector3::new(x, y, top + 0.7), Vector3::new(x, y, top));
     let (harness, mocks) = start_with_camera(&camera).await?;
-    let start = arms(UNDER_THE_TABLE, RIGHT_READY);
+    let start = arms(under_the_table(), right_ready());
     let seen = render(&camera, None, &[table]);
-    let straight = left_path(&[], &[OVER_THE_TABLE]);
+    let straight = left_path(&[], &[over_the_table()]);
     for (gap, from_ms, marked) in [(offset - 0.01, 0, false), (offset + 0.01, 1_000, true)] {
         apply(
             &harness,
@@ -1374,7 +1370,7 @@ async fn depth_points_within_the_padding_of_an_object_mark_nothing() -> peppygen
         // Three frames mark a voxel from the floor of its log-odds.
         for at in [from_ms, from_ms + 200, from_ms + 400].map(at_ms) {
             publish_arms(&mocks, at, &start).await?;
-            take_frame(&harness, &mocks, at, &seen, UNDER_THE_TABLE).await?;
+            take_frame(&harness, &mocks, at, &seen, under_the_table()).await?;
         }
         apply(&harness, vec![remove("lid")])
             .await

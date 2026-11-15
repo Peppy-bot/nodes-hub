@@ -5,7 +5,7 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
 use camera_core::encoding::DEPTH_ENCODING;
@@ -13,8 +13,9 @@ use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
 use camera_core::pose::Pose;
 use chain_kinematics::nalgebra::Isometry3;
 use collision_geometry::chain::BodyGeometry;
+use control_core::fault::Fault;
 use control_core::latched_log::LatchedLog;
-use control_core::{receiving, serving};
+use control_core::{asking, receiving, serving};
 use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
     Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathFault, PathOrientation, PlanFailure,
@@ -27,7 +28,7 @@ use ompl_bridge::PLANNING_THREADS;
 use peppygen::consumed_services::camera::depth_stream_info;
 use peppygen::consumed_services::camera_mounts::get_camera_poses;
 use peppygen::consumed_services::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
-use peppygen::consumed_services::identity::get_identity;
+use peppygen::consumed_services::identity::{get_description, get_identity};
 use peppygen::consumed_services::workspace::describe_workspace;
 use peppygen::consumed_topics::camera::depth_stream;
 use peppygen::consumed_topics::limb_state::limb_states;
@@ -41,10 +42,10 @@ use peppygen::exposed_services::motion_planning::{
     clear_occupancy_map, describe_arms, get_planning_scene, set_allowed_collision,
 };
 use peppygen::{NodeRunner, Parameters, ProducerRef, Result};
+use robot_description::{ArmId, OnShape, PerArm, RobotDescription, on_shape};
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::arm_set::{ArmId, PerArm};
 use crate::config::Config;
 use crate::fingers::{FingerFault, riders_of_the_arms, with_held_objects};
 use crate::history::{ArmJoints, History, Measured};
@@ -54,11 +55,14 @@ use crate::request::{
     ArmGoals, ArmStarts, CartesianQuery, CheckQuery, PlanQuery, listed, parse_cartesian,
     parse_check, parse_plan,
 };
-use crate::robot::{ArmModel, ModelError, Robot, RobotModel, openarm_v2, so101};
+use crate::robot::{ArmModel, ModelError, RobotModel, model};
 use crate::scene::{attach_request, object_requests, scene_response};
 
 /// Bounds every call to another node.
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the initializer may take to answer the robot's description, which carries
+/// every collision mesh of the model.
+const DESCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long after a check is asked a walk of a run or of an arc of its path may start: a
 /// check with a walk left then fails with timeout, under the 15 s the robot's MCP endpoint
 /// waits on check_joint_path. The map's copy, its distance field and the checks of the
@@ -202,7 +206,7 @@ struct Node<const N: usize, const D: usize, const K: usize> {
     /// The robot frame, the URDF's root link: the frame of the map, of each depth
     /// frame's sensor and of the robot cut out of it.
     frame: Frame,
-    arms: PerArm<ArmModel<N>>,
+    arms: PerArm<ArmModel<N>, K>,
     /// The robot's body around its arms, which the map cuts out of each frame.
     body: BodyGeometry,
     /// The robot's own body, its grippers at the openings it was built with.
@@ -213,7 +217,7 @@ struct Node<const N: usize, const D: usize, const K: usize> {
     map: Mutex<Map>,
     /// The measured joint positions and gripper openings, which a depth frame waits on
     /// until they reach its stamp.
-    history: watch::Sender<History<N>>,
+    history: watch::Sender<History<N, K>>,
     /// How many times the history has restarted on a clock that stepped back.
     restarts: AtomicU64,
     /// Whether the launcher bound a slot of the depth camera.
@@ -231,9 +235,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// # Panics
 ///
 /// When `link` is no arm's grasp link: the scene attaches objects to grasp links alone.
-fn grasp_pose<const N: usize>(
-    models: &PerArm<ArmModel<N>>,
-    arms: &ArmJoints<N>,
+fn grasp_pose<const N: usize, const K: usize>(
+    models: &PerArm<ArmModel<N>, K>,
+    arms: &ArmJoints<N, K>,
     link: &str,
 ) -> Isometry3<f64> {
     let arm = models
@@ -262,13 +266,13 @@ impl<const N: usize, const D: usize, const K: usize> Node<N, D, K> {
     }
 
     /// The newest measurement.
-    fn latest(&self) -> Option<Measured<N>> {
+    fn latest(&self) -> Option<Measured<N, K>> {
         self.history.borrow().latest()
     }
 
     /// The robot's own body with the grippers at the openings of `measured`, or at the
     /// openings it was built with when nothing is measured.
-    fn own_at(&self, measured: Option<&Measured<N>>) -> OwnBody<N, K> {
+    fn own_at(&self, measured: Option<&Measured<N, K>>) -> OwnBody<N, K> {
         let mut own = self.own.clone();
         if let Some(measured) = measured {
             own.set_openings(&measured.openings);
@@ -277,72 +281,101 @@ impl<const N: usize, const D: usize, const K: usize> Node<N, D, K> {
     }
 }
 
-/// The fault that ends the node after its setup: a model the robot's identity names that
-/// the planner holds no model of, or a model that fails to start. The first raise shuts
-/// the node down, and `main` exits with the fault as its error.
-#[derive(Clone, Debug, Default)]
-pub struct Fault(Arc<OnceLock<String>>);
-
-impl Fault {
-    /// Records `message`, unless a fault came first, and shuts the node down.
-    fn raise(&self, runner: &NodeRunner, message: &str) {
-        error!("{message}");
-        let _ = self.0.set(message.to_owned());
-        runner.cancellation_token().cancel();
-    }
-
-    /// The end of the node: the error of its fault, if one was raised.
-    pub fn end(&self) -> Result<()> {
-        self.0.get().map_or(Ok(()), |message| {
-            Err(peppygen::Error::Node(
-                std::io::Error::other(message.clone()).into(),
-            ))
-        })
-    }
-}
-
 /// Starts the node: its parameters parsed, then, once the robot's identity names its
 /// model, its state, the followers and the servers, each on its own task. The
 /// initializer that serves the identity may start after this node.
 pub async fn setup(params: Parameters, runner: Arc<NodeRunner>, fault: Fault) -> Result<()> {
     let config = Config::parse(&params).map_err(|e| peppygen::Error::Node(e.into()))?;
-    tokio::spawn(serve_once_identified(runner, config, fault));
+    let token = runner.cancellation_token().clone();
+    let serve = serve_once_identified(runner, config, fault.clone());
+    tokio::spawn(
+        fault.raise_on_panic("the start for the robot's model", serve, move || {
+            token.cancel()
+        }),
+    );
     Ok(())
 }
 
-/// Asks the robot's identity until it names the model, then starts the node for it. A
-/// model the planner holds no model of, or one that fails to start, raises `fault`.
+/// Asks the robot's identity until it names the model and describes it, then starts the
+/// node for the shape of its arms. A description the planner cannot read or plan for,
+/// meshes it cannot write, or a model that fails to start, raises `fault`.
 async fn serve_once_identified(runner: Arc<NodeRunner>, config: Config, fault: Fault) {
-    let Some(model) = identify(&runner).await else {
+    let Some(served) = identify(&runner).await else {
         return;
     };
-    let robot: Robot = match model.parse() {
-        Ok(robot) => robot,
-        Err(e) => return fault.raise(&runner, &format!("robot_identity: {e}")),
+    let Identified {
+        model_id,
+        description,
+        meshes,
+    } = match read(served) {
+        Ok(identified) => identified,
+        Err(e) => return fault.raise(e, || runner.cancellation_token().cancel()),
     };
-    match robot {
-        Robot::OpenArmV2 => serve_robot(runner, config, fault, robot, openarm_v2()),
-        Robot::So101 => serve_robot(runner, config, fault, robot, so101()),
+    let meshes_dir = match meshes.path().to_str() {
+        Some(dir) => dir,
+        None => {
+            return fault.raise(
+                "the robot's meshes are written to a directory whose path is not UTF-8",
+                || runner.cancellation_token().cancel(),
+            );
+        }
+    };
+    let serve = Serve {
+        runner: runner.clone(),
+        config,
+        fault: fault.clone(),
+        model_id: model_id.clone(),
+        description: &description,
+        meshes_dir,
+    };
+    if let Err(e) = on_shape(&description, serve) {
+        fault.raise(format!("the motion planner for {model_id}: {e}"), || {
+            runner.cancellation_token().cancel()
+        });
     }
 }
 
-/// Starts the node for `robot`, whose model is `model`, and its followers and servers. A
-/// model that fails to build, or to start, raises `fault`.
+/// The node's serving of the robot of model `model_id`, whose description is
+/// `description`, its collision meshes read from `meshes_dir`, at the shape of its arms.
+struct Serve<'d> {
+    runner: Arc<NodeRunner>,
+    config: Config,
+    fault: Fault,
+    model_id: String,
+    description: &'d RobotDescription,
+    meshes_dir: &'d str,
+}
+
+impl OnShape for Serve<'_> {
+    type Output = ();
+
+    fn on_shape<const N: usize, const D: usize, const K: usize>(self) {
+        let model = model::<N, D, K>(self.description, self.meshes_dir);
+        serve_robot(self.runner, self.config, self.fault, self.model_id, model);
+    }
+}
+
+/// Starts the node for the robot of model `model_id`, whose model is `model`, and its
+/// followers and servers. A model that fails to build, or to start, raises `fault`.
 fn serve_robot<const N: usize, const D: usize, const K: usize>(
     runner: Arc<NodeRunner>,
     config: Config,
     fault: Fault,
-    robot: Robot,
+    model_id: String,
     model: std::result::Result<RobotModel<N, D, K>, ModelError>,
 ) {
     let slots = camera_slots(&runner);
     let linked = !matches!(slots, CameraSlots::Vacant);
     let started = model
         .map_err(|e| e.to_string())
-        .and_then(|model| start(config, robot, model, linked).map_err(|e| e.to_string()));
+        .and_then(|model| start(config, &model_id, model, linked).map_err(|e| e.to_string()));
     let node = match started {
         Ok(node) => Arc::new(node),
-        Err(e) => return fault.raise(&runner, &format!("the motion planner for {robot}: {e}")),
+        Err(e) => {
+            return fault.raise(format!("the motion planner for {model_id}: {e}"), || {
+                runner.cancellation_token().cancel()
+            });
+        }
     };
     tokio::spawn(follow_limb_states(runner.clone(), node.clone()));
     match slots {
@@ -366,32 +399,89 @@ fn serve_robot<const N: usize, const D: usize, const K: usize>(
     tokio::spawn(serve_plans(runner, node));
 }
 
-/// The model the robot's identity names, or none once the node is cancelled: each ask
-/// waits up to `SERVICE_TIMEOUT` for the answer, and the next follows `RETRY` after.
-async fn identify(runner: &NodeRunner) -> Option<String> {
-    let token = runner.cancellation_token().clone();
-    let passing = LatchedLog::warn("robot_identity");
-    loop {
-        let producer = get_identity::bound_producer(runner);
-        match get_identity::poll(runner, producer, SERVICE_TIMEOUT).await {
-            Ok(answer) => {
-                passing.success();
-                return Some(answer.data.model);
-            }
-            Err(e) => passing.failure(format!("get_identity: {e}; asking again")),
-        }
-        tokio::select! {
-            _ = token.cancelled() => return None,
-            _ = tokio::time::sleep(RETRY) => {}
-        }
-    }
+/// The robot as its identity gives it: the id of its model, its description, and the
+/// collision meshes the description's URDF names, written to a directory of their own.
+struct Identified {
+    model_id: String,
+    description: RobotDescription,
+    meshes: tempfile::TempDir,
 }
 
-/// The node at start: the model of `robot`, an empty scene of the robot's links, and an
-/// empty map.
+/// What the robot's identity answers: the id of its model and the description it serves.
+struct Served {
+    model_id: String,
+    description: get_description::ResponseData,
+}
+
+/// What the robot's identity answers, or none once the node is cancelled: each ask waits
+/// up to `SERVICE_TIMEOUT` for the model's name and `DESCRIPTION_TIMEOUT` for its
+/// description, and the loop asks until the initializer answers.
+async fn identify(runner: &Arc<NodeRunner>) -> Option<Served> {
+    let asker = runner.clone();
+    asking::ask(
+        "robot_identity",
+        runner.cancellation_token().cancelled(),
+        async move || ask_identity(&asker).await,
+    )
+    .await
+}
+
+/// One ask of the robot's identity for its model's name and description.
+async fn ask_identity(runner: &NodeRunner) -> std::result::Result<Served, String> {
+    let model_id = get_identity::poll(
+        runner,
+        get_identity::bound_producer(runner),
+        SERVICE_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("get_identity: {e}"))?
+    .data
+    .model;
+    let description = get_description::poll(
+        runner,
+        get_description::bound_producer(runner),
+        DESCRIPTION_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("get_description: {e}"))?
+    .data;
+    Ok(Served {
+        model_id,
+        description,
+    })
+}
+
+/// The robot as its identity describes it: the description `served` read, and the
+/// collision meshes its URDF names written to a directory of their own. Refused naming
+/// the model when the description does not read or the meshes cannot be written.
+fn read(served: Served) -> std::result::Result<Identified, String> {
+    let Served {
+        model_id,
+        description: served,
+    } = served;
+    let description = RobotDescription::parse(&served.urdf, &served.srdf)
+        .map_err(|e| format!("the description of {model_id}: {e}"))?;
+    let meshes = tempfile::tempdir().map_err(|e| format!("a directory for the meshes: {e}"))?;
+    robot_description::write_meshes(
+        meshes.path(),
+        served
+            .meshes
+            .iter()
+            .map(|mesh| (mesh.name.as_str(), mesh.data.as_slice())),
+    )
+    .map_err(|e| format!("the meshes of {model_id}: {e}"))?;
+    Ok(Identified {
+        model_id,
+        description,
+        meshes,
+    })
+}
+
+/// The node at start: the model of the robot of model `model_id`, an empty scene of the
+/// robot's links, and an empty map.
 fn start<const N: usize, const D: usize, const K: usize>(
     config: Config,
-    robot: Robot,
+    model_id: &str,
     model: RobotModel<N, D, K>,
     camera_linked: bool,
 ) -> std::result::Result<Node<N, D, K>, Box<dyn std::error::Error + Send + Sync>> {
@@ -410,12 +500,12 @@ fn start<const N: usize, const D: usize, const K: usize>(
     let voxels = VoxelMap::new(frame.clone(), config.voxel_size, config.bounds)?;
     info!(
         "motion planner: {}, {} m voxels, clearance {} m, {} attempts",
-        robot,
+        model_id,
         config.voxel_size.get(),
         config.min_clearance_m,
         config.planning_attempts
     );
-    let history = History::new(&arms, HISTORY_SPAN);
+    let history = History::new(HISTORY_SPAN);
     Ok(Node {
         config,
         frame,
@@ -487,7 +577,7 @@ fn record<const N: usize, const D: usize, const K: usize>(
 fn push_measured<const N: usize, const D: usize, const K: usize>(
     node: &Node<N, D, K>,
     at: SystemTime,
-    measured: &Measured<N>,
+    measured: &Measured<N, K>,
 ) {
     let stepped_back = node
         .history
@@ -508,17 +598,17 @@ fn push_measured<const N: usize, const D: usize, const K: usize>(
 }
 
 /// Each arm of `models`' joint positions in a limb_states message, each finite.
-fn arms_of<const N: usize>(
-    models: &PerArm<ArmModel<N>>,
+fn arms_of<const N: usize, const K: usize>(
+    models: &PerArm<ArmModel<N>, K>,
     message: &limb_states::Message,
-) -> Option<ArmJoints<N>> {
+) -> Option<ArmJoints<N, K>> {
     let mut offset = 0;
-    let mut found: PerArm<Option<[f64; N]>> = models.each(|_, _| None);
+    let mut found: PerArm<Option<[f64; N]>, K> = PerArm::from_fn(|_| None);
     for (name, &count) in message.arm_names.iter().zip(&message.joints_per_arm) {
         let count = count as usize;
         let values = message.joint_positions.get(offset..offset + count)?;
         offset += count;
-        if let Some(arm) = models.ids().find(|arm| models[*arm].name == name) {
+        if let Some(arm) = PerArm::<(), K>::ids().find(|arm| models[*arm].name == *name) {
             found[arm] = <[f64; N]>::try_from(values)
                 .ok()
                 .filter(|q| q.iter().all(|v| v.is_finite()));
@@ -528,13 +618,13 @@ fn arms_of<const N: usize>(
 }
 
 /// Each gripper of `models`' opening in a limb_states message.
-fn openings_of<const N: usize>(
-    models: &PerArm<ArmModel<N>>,
+fn openings_of<const N: usize, const K: usize>(
+    models: &PerArm<ArmModel<N>, K>,
     message: &limb_states::Message,
-) -> Option<PerArm<f64>> {
-    let mut found: PerArm<Option<f64>> = models.each(|_, _| None);
+) -> Option<PerArm<f64, K>> {
+    let mut found: PerArm<Option<f64>, K> = PerArm::from_fn(|_| None);
     for (name, &opening) in message.gripper_names.iter().zip(&message.gripper_openings) {
-        if let Some(arm) = models.ids().find(|arm| models[*arm].gripper_name == name) {
+        if let Some(arm) = PerArm::<(), K>::ids().find(|arm| models[*arm].gripper_name == *name) {
             found[arm] = Some(opening);
         }
     }
@@ -793,7 +883,7 @@ async fn take_frames<const N: usize, const D: usize, const K: usize>(
 struct WaitingFrames<const N: usize, const D: usize, const K: usize> {
     node: Arc<Node<N, D, K>>,
     frames: watch::Receiver<Newest>,
-    history: watch::Receiver<History<N>>,
+    history: watch::Receiver<History<N, K>>,
     /// The history's restarts the waiting frames were stamped after.
     restarts: u64,
     oldest: Option<Arc<depth_stream::Message>>,
@@ -1123,21 +1213,21 @@ impl Group {
         }
     }
 
-    /// Its arms, of the arms of `all`, in the order of the robot's model.
-    fn arms<T>(self, all: &PerArm<T>) -> Vec<ArmId> {
+    /// Its arms, of a robot of `K` arms, in the order of the robot's model.
+    fn arms<const K: usize>(self) -> Vec<ArmId> {
         match self {
             Self::One(arm) => vec![arm],
-            Self::Every => all.ids().collect(),
+            Self::Every => PerArm::<(), K>::ids().collect(),
         }
     }
 
-    /// The state of its arms, of `G` joints in all, each at the joints `at` gives it.
-    fn state<T, const N: usize, const G: usize>(
+    /// The state of its arms, of a robot of `K` arms, `G` joints in all, each at the joints
+    /// `at` gives it.
+    fn state<const N: usize, const K: usize, const G: usize>(
         self,
-        all: &PerArm<T>,
         at: impl Fn(ArmId) -> [f64; N],
     ) -> [f64; G] {
-        let parts: Vec<[f64; N]> = self.arms(all).into_iter().map(at).collect();
+        let parts: Vec<[f64; N]> = self.arms::<K>().into_iter().map(at).collect();
         Arms::<N, G>::join(&parts)
     }
 }
@@ -1149,7 +1239,7 @@ struct Snapshot<const N: usize, const D: usize, const K: usize> {
     scene: PlanningScene,
     voxels: VoxelMap,
     stamp: Option<SystemTime>,
-    measured: ArmJoints<N>,
+    measured: ArmJoints<N, K>,
     own: OwnBody<N, K>,
 }
 
@@ -1159,7 +1249,7 @@ impl<const N: usize, const D: usize, const K: usize> Snapshot<N, D, K> {
     /// map no frame, and before the arms' joint positions are measured.
     fn of(
         node: &Node<N, D, K>,
-        latest: Option<Measured<N>>,
+        latest: Option<Measured<N, K>>,
         own: OwnBody<N, K>,
     ) -> std::result::Result<Self, Refusal> {
         let (scene, voxels, stamp) = {
@@ -1188,12 +1278,12 @@ impl<const N: usize, const D: usize, const K: usize> Snapshot<N, D, K> {
         &self,
         node: &Node<N, D, K>,
         group: Group,
-        standing: &ArmJoints<N>,
+        standing: &ArmJoints<N, K>,
         self_model: &dyn SelfModel<G>,
         run: impl FnOnce(&Arms<N, G>, &Scene) -> T,
     ) -> std::result::Result<T, FingerFault> {
         let models: Vec<&ArmModel<N>> = group
-            .arms(&node.arms)
+            .arms::<K>()
             .into_iter()
             .map(|arm| &node.arms[arm])
             .collect();
@@ -1208,10 +1298,13 @@ impl<const N: usize, const D: usize, const K: usize> Snapshot<N, D, K> {
         let arms = models
             .iter()
             .zip(&carried)
-            .map(|(model, riders)| Arm::new(model.name, &model.geometry).riding(riders))
+            .map(|(model, riders)| Arm::new(&model.name, &model.geometry).riding(riders))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let arms = Arms::new(arms, Some(self_model));
-        let grasp_links: Vec<&str> = models.iter().map(|model| model.grasp_link).collect();
+        let grasp_links: Vec<&str> = models
+            .iter()
+            .map(|model| model.grasp_link.as_str())
+            .collect();
         let objects = self
             .scene
             .for_arms(&grasp_links, |link| grasp_pose(&node.arms, standing, link));
@@ -1232,15 +1325,15 @@ impl<const N: usize, const D: usize, const K: usize> Snapshot<N, D, K> {
 
     /// Where each arm stands for a request whose arms start at `starts`: an arm's start,
     /// or where it was measured.
-    fn standing(&self, starts: &ArmStarts<N>) -> ArmJoints<N> {
+    fn standing(&self, starts: &ArmStarts<N, K>) -> ArmJoints<N, K> {
         standing_at(&self.measured, starts)
     }
 }
 
 /// The arms' joints `latest` measured; refused before they are measured.
-fn measured_arms<const N: usize>(
-    latest: Option<Measured<N>>,
-) -> std::result::Result<ArmJoints<N>, Refusal> {
+fn measured_arms<const N: usize, const K: usize>(
+    latest: Option<Measured<N, K>>,
+) -> std::result::Result<ArmJoints<N, K>, Refusal> {
     latest
         .map(|measured| measured.arms)
         .ok_or_else(|| Refusal::PreconditionFailed(NO_JOINTS.to_string()))
@@ -1248,8 +1341,11 @@ fn measured_arms<const N: usize>(
 
 /// Where each arm stands for a request: at its start in `starts`, or where `measured` has
 /// it.
-fn standing_at<const N: usize>(measured: &ArmJoints<N>, starts: &ArmStarts<N>) -> ArmJoints<N> {
-    measured.each(|arm, at| starts[arm].unwrap_or(*at))
+fn standing_at<const N: usize, const K: usize>(
+    measured: &ArmJoints<N, K>,
+    starts: &ArmStarts<N, K>,
+) -> ArmJoints<N, K> {
+    measured.map(|arm, at| starts[arm].unwrap_or(at))
 }
 
 /// The pieces of the robot, its own body `own` with the arms at `standing`, that a plan of
@@ -1257,7 +1353,7 @@ fn standing_at<const N: usize>(measured: &ArmJoints<N>, starts: &ArmStarts<N>) -
 /// each by the name of its link.
 fn unmoved_parts<'m, const N: usize, const K: usize>(
     own: &'m mut OwnBody<N, K>,
-    standing: &ArmJoints<N>,
+    standing: &ArmJoints<N, K>,
     moving: &[&ArmModel<N>],
 ) -> Vec<RobotPart<'m>> {
     own.standing_pieces(standing)
@@ -1283,9 +1379,9 @@ fn check_group<const N: usize, const D: usize, const K: usize, const G: usize>(
     node: &Node<N, D, K>,
     snapshot: &Snapshot<N, D, K>,
     group: Group,
-    standing: &ArmJoints<N>,
+    standing: &ArmJoints<N, K>,
     self_model: &dyn SelfModel<G>,
-    paths: &ArmPaths<N>,
+    paths: &ArmPaths<N, K>,
     deadline: Instant,
 ) -> std::result::Result<std::result::Result<PathCheck, CheckFailure>, FingerFault> {
     let path_of = |arm: ArmId| {
@@ -1293,10 +1389,10 @@ fn check_group<const N: usize, const D: usize, const K: usize, const G: usize>(
             .as_ref()
             .expect("an arm the check moves is named")
     };
-    let start = group.state(&node.arms, |arm| standing[arm]);
-    let count = path_of(group.arms(&node.arms)[0]).len();
+    let start = group.state::<N, K, G>(|arm| standing[arm]);
+    let count = path_of(group.arms::<K>()[0]).len();
     let waypoints: Vec<[f64; G]> = (0..count)
-        .map(|k| group.state(&node.arms, |arm| path_of(arm)[k]))
+        .map(|k| group.state::<N, K, G>(|arm| path_of(arm)[k]))
         .collect();
     snapshot.run(node, group, standing, self_model, |arms, scene| {
         check_path(
@@ -1532,7 +1628,7 @@ fn check<const N: usize, const D: usize, const K: usize>(
     let own = node.own_at(latest.as_ref());
     let snapshot = Snapshot::of(node, latest, own)?;
     let standing = snapshot.standing(&starts);
-    let paths: ArmPaths<N> = node.arms.each(|arm, _| waypoints.of(arm));
+    let paths: ArmPaths<N, K> = PerArm::from_fn(|arm| waypoints.of(arm));
     let still = |arm: ArmId| {
         let limits = node.arms[arm].geometry.chain().limits();
         paths[arm].as_ref().is_some_and(|path| {
@@ -1541,7 +1637,9 @@ fn check<const N: usize, const D: usize, const K: usize>(
             })
         })
     };
-    let named: Vec<ArmId> = paths.ids().filter(|arm| paths[*arm].is_some()).collect();
+    let named: Vec<ArmId> = PerArm::<(), K>::ids()
+        .filter(|arm| paths[*arm].is_some())
+        .collect();
     let moved: Vec<ArmId> = named.iter().copied().filter(|arm| !still(*arm)).collect();
     let group = Group::of(if moved.is_empty() { &named } else { &moved });
     let checked = match group {
@@ -1652,9 +1750,9 @@ serve_action!(
 /// for it, each arm the goal names at its start moved inside its joint limits, and the
 /// instant its plan ends by, its time limit after it is taken.
 struct Taken<const N: usize, const D: usize, const K: usize> {
-    query: PlanQuery<N>,
+    query: PlanQuery<N, K>,
     snapshot: Snapshot<N, D, K>,
-    standing: ArmJoints<N>,
+    standing: ArmJoints<N, K>,
     deadline: Instant,
 }
 
@@ -1685,9 +1783,9 @@ fn admit<const N: usize, const D: usize, const K: usize>(
 /// with precondition_failed when one lies outside a limit by more than the start tolerance.
 fn inside_limits<const N: usize, const D: usize, const K: usize>(
     node: &Node<N, D, K>,
-    standing: ArmJoints<N>,
+    standing: ArmJoints<N, K>,
     moving: &[ArmId],
-) -> std::result::Result<ArmJoints<N>, Refusal> {
+) -> std::result::Result<ArmJoints<N, K>, Refusal> {
     moving.iter().try_fold(standing, |mut standing, arm| {
         standing[*arm] = start_inside_limits(
             node.arms[*arm].geometry.chain(),
@@ -1899,21 +1997,23 @@ fn standing_arms_fault<const N: usize, const D: usize, const K: usize>(
     moving: ArmId,
 ) -> Option<String> {
     let paths = &taken.query.path_orientations;
-    paths.ids().filter(|arm| *arm != moving).find_map(|arm| {
-        let chain = node.arms[arm].geometry.chain();
-        paths[arm].iter().find_map(|held| {
-            let error = held.target.error_at(chain, &taken.standing[arm]);
-            let tolerance = held.target.tolerance_rad.get();
-            (error > tolerance).then(|| {
-                format!(
-                    "the start holds {} {error:.4} rad from its path orientation, past its \
+    PerArm::<(), K>::ids()
+        .filter(|arm| *arm != moving)
+        .find_map(|arm| {
+            let chain = node.arms[arm].geometry.chain();
+            paths[arm].iter().find_map(|held| {
+                let error = held.target.error_at(chain, &taken.standing[arm]);
+                let tolerance = held.target.tolerance_rad.get();
+                (error > tolerance).then(|| {
+                    format!(
+                        "the start holds {} {error:.4} rad from its path orientation, past its \
                      tolerance_rad {tolerance:.4}, and its arm stays where it starts; send a start \
                      within it or a wider tolerance_rad",
-                    held.link_name
-                )
+                        held.link_name
+                    )
+                })
             })
         })
-    })
 }
 
 /// The plan of the arms of `group`, `G` joints in all, which `taken` takes, each from its
@@ -1926,8 +2026,8 @@ fn plan_group<'g, const N: usize, const D: usize, const K: usize, const G: usize
     self_model: &dyn SelfModel<G>,
     goal_of: &dyn Fn(ArmId) -> &'g Goal,
     stop: &AtomicBool,
-) -> std::result::Result<std::result::Result<ArmPaths<N>, PlanFailure>, FingerFault> {
-    let moving = group.arms(&node.arms);
+) -> std::result::Result<std::result::Result<ArmPaths<N, K>, PlanFailure>, FingerFault> {
+    let moving = group.arms::<K>();
     let samplers: Vec<IkGoalSampler<N>> = moving
         .iter()
         .map(|arm| IkGoalSampler::new(node.arms[*arm].geometry.chain().clone()))
@@ -1953,7 +2053,7 @@ fn plan_group<'g, const N: usize, const D: usize, const K: usize, const G: usize
                 })
         })
         .collect();
-    let start = group.state(&node.arms, |arm| taken.standing[arm]);
+    let start = group.state::<N, K, G>(|arm| taken.standing[arm]);
     taken
         .snapshot
         .run(node, group, &taken.standing, self_model, |arms, scene| {
@@ -1966,16 +2066,16 @@ fn plan_group<'g, const N: usize, const D: usize, const K: usize, const G: usize
                 taken.deadline,
                 stop,
             );
-            plan_path(arms, scene, &request).map(|path| split(&path, group, &node.arms))
+            plan_path(arms, scene, &request).map(|path| split(&path, group))
         })
 }
 
 /// The request of a plan by the planner `query` names, its path refined by its refiner, of
 /// the arms of `goals` from `start`, holding `path_orientations`, by `deadline`, which `stop`
 /// ends.
-fn plan_request<'a, const N: usize, const G: usize>(
+fn plan_request<'a, const N: usize, const K: usize, const G: usize>(
     config: &Config,
-    query: &PlanQuery<N>,
+    query: &PlanQuery<N, K>,
     start: [f64; G],
     goals: Vec<ArmGoal<'a, N>>,
     path_orientations: &'a [PathOrientation<'a>],
@@ -2001,17 +2101,16 @@ fn plan_request<'a, const N: usize, const G: usize>(
 }
 
 /// Each arm's waypoints from its start, none for an arm a plan does not move.
-type ArmPaths<const N: usize> = PerArm<Option<Vec<[f64; N]>>>;
+type ArmPaths<const N: usize, const K: usize> = PerArm<Option<Vec<[f64; N]>>, K>;
 
-/// Each arm of `all`'s waypoints of `path`, a path of the arms of `group`, `G` joints in all;
+/// Each of `K` arms' waypoints of `path`, a path of the arms of `group`, `G` joints in all;
 /// none for an arm it does not move.
-fn split<T, const N: usize, const G: usize>(
+fn split<const N: usize, const K: usize, const G: usize>(
     path: &[[f64; G]],
     group: Group,
-    all: &PerArm<T>,
-) -> ArmPaths<N> {
-    let moving = group.arms(all);
-    all.each(|arm, _| {
+) -> ArmPaths<N, K> {
+    let moving = group.arms::<K>();
+    PerArm::from_fn(|arm| {
         let k = moving.iter().position(|named| *named == arm)?;
         Some(path.iter().map(|q| Arms::<N, G>::slice(q, k)).collect())
     })
@@ -2021,8 +2120,8 @@ fn split<T, const N: usize, const G: usize>(
 /// moves at its start moved inside its joint limits, and the snapshot its states keep clear
 /// of, where it checks collisions.
 struct TakenCartesian<const N: usize, const D: usize, const K: usize> {
-    query: CartesianQuery<N>,
-    standing: ArmJoints<N>,
+    query: CartesianQuery<N, K>,
+    standing: ArmJoints<N, K>,
     snapshot: Option<Snapshot<N, D, K>>,
 }
 
@@ -2118,7 +2217,7 @@ fn cartesian<const N: usize, const D: usize, const K: usize>(
                 .map_err(|fault| PlanEnd::Failed(Kind::AttemptFailed, fault.to_string()))?
         }
         None => {
-            let arms = Arms::new(vec![Arm::new(model.name, &model.geometry)], None);
+            let arms = Arms::new(vec![Arm::new(&model.name, &model.geometry)], None);
             let unchecked = cartesian_request(&node.config, taken, Collisions::Unchecked, stop);
             cartesian_path(&arms, &unchecked)
         }
@@ -2197,10 +2296,15 @@ fn result_arm<const N: usize>(
 mod tests {
     use super::{Node as ANode, *};
 
-    use openarm_description::{ARM_DOF, DUAL_DOF, Side};
+    use crate::robot::tests::{ARM_DOF, ARMS, BOTH, DUAL_DOF, Described, LEFT, RIGHT, ready};
 
     /// The node of OpenArm v2, which these tests run.
-    type Node = ANode<ARM_DOF, DUAL_DOF, 2>;
+    type Node = ANode<ARM_DOF, DUAL_DOF, ARMS>;
+
+    /// The limb name of `arm` of OpenArm v2, its arm group's in the description.
+    fn arm_name(arm: ArmId) -> String {
+        crate::robot::tests::OPENARM_V2.arms[arm].name.clone()
+    }
 
     use std::num::NonZeroU64;
     use std::task::{Context, Poll, Waker};
@@ -2210,7 +2314,6 @@ mod tests {
     use collision_geometry::chain::{Padding, RiderBody};
     use motion_planning_core::OCCUPANCY_MAP;
     use occupancy_map::Voxel;
-    use openarm_description::ready;
     use peppygen::exposed_actions::motion_planning::plan_joint_path::{
         GoalArmsItem, GoalGoalJointConstraintsItem,
     };
@@ -2226,15 +2329,17 @@ mod tests {
     /// The node for an OpenArm v2 from `params`, the camera linked or not.
     fn started(params: &Parameters, camera_linked: bool) -> Node {
         let config = Config::parse(params).expect("a config");
-        let model = openarm_v2().expect("OpenArm v2's model");
-        start(config, Robot::OpenArmV2, model, camera_linked).expect("the node starts")
+        let model = Described::bundled("openarm_v2")
+            .model()
+            .expect("OpenArm v2's model");
+        start(config, "openarm_v2", model, camera_linked).expect("the node starts")
     }
 
     /// Both arms at Ready, both grippers open.
-    fn still() -> Measured<ARM_DOF> {
+    fn still() -> Measured<ARM_DOF, ARMS> {
         Measured {
-            arms: PerArm::both(ready(Side::Left), ready(Side::Right)),
-            openings: PerArm::both(1.0, 1.0),
+            arms: PerArm::new([ready(LEFT), ready(RIGHT)]),
+            openings: PerArm::new([1.0, 1.0]),
         }
     }
 
@@ -2252,9 +2357,9 @@ mod tests {
         assert_eq!(check_deadline(asked_at) - asked_at, Duration::from_secs(10));
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let mut turned = ready(Side::Left);
+        let mut turned = ready(LEFT);
         turned[0] += 0.1;
-        let request = path_of(Side::Left, &[turned]);
+        let request = path_of(LEFT, &[turned]);
         let late = check_joint_path::Failure::from(
             check(&node, &request, Instant::now()).expect_err("a check with no time left"),
         );
@@ -2271,12 +2376,12 @@ mod tests {
         Instant::now() + Duration::from_secs(3600)
     }
 
-    /// The check of the path of the arm on `side` from where it stands through
+    /// The check of the path of the arm `arm` from where it stands through
     /// `waypoints`.
-    fn path_of(side: Side, waypoints: &[[f64; ARM_DOF]]) -> check_joint_path::RequestData {
+    fn path_of(arm: ArmId, waypoints: &[[f64; ARM_DOF]]) -> check_joint_path::RequestData {
         check_joint_path::RequestData {
             arms: vec![CheckJointPathArmsItem {
-                arm_name: side.arm_name().to_string(),
+                arm_name: arm_name(arm),
                 start_joint_positions: Vec::new(),
                 waypoints: waypoints
                     .iter()
@@ -2288,15 +2393,15 @@ mod tests {
         }
     }
 
-    /// A goal for the arm on `side` of `node`, from where it stands to every joint within
+    /// A goal for the arm `arm` of `node`, from where it stands to every joint within
     /// 0.01 of `q`, in the longest time a plan may take.
-    fn joint_goal(node: &Node, side: Side, q: &[f64; ARM_DOF]) -> GoalRequestData {
+    fn joint_goal(node: &Node, arm: ArmId, q: &[f64; ARM_DOF]) -> GoalRequestData {
         GoalRequestData {
             arms: vec![GoalArmsItem {
-                arm_name: side.arm_name().to_string(),
+                arm_name: arm_name(arm),
                 start_joint_positions: Vec::new(),
             }],
-            goal_joint_constraints: node.arms[side]
+            goal_joint_constraints: node.arms[arm]
                 .joint_names
                 .iter()
                 .zip(q)
@@ -2316,9 +2421,9 @@ mod tests {
         }
     }
 
-    /// The arm on `side` at Ready with its elbow at `angle`.
-    fn elbow_at(side: Side, angle: f64) -> [f64; ARM_DOF] {
-        let mut q = ready(side);
+    /// The arm on `arm` at Ready with its elbow at `angle`.
+    fn elbow_at(arm: ArmId, angle: f64) -> [f64; ARM_DOF] {
+        let mut q = ready(arm);
         q[3] = angle;
         q
     }
@@ -2330,22 +2435,20 @@ mod tests {
     fn the_right_arm_checks_and_plans_at_its_own_joint_positions() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let bent = elbow_at(Side::Right, 1.3);
-        let checked =
-            check(&node, &path_of(Side::Right, &[bent]), an_hour_on()).expect("an answer");
+        let bent = elbow_at(RIGHT, 1.3);
+        let checked = check(&node, &path_of(RIGHT, &[bent]), an_hour_on()).expect("an answer");
         assert!(
             checked.clear && checked.clear_waypoints == 1,
             "the right elbow's bend: {checked:?}"
         );
-        let taken =
-            admit(&node, &joint_goal(&node, Side::Right, &bent)).expect("the goal is taken");
+        let taken = admit(&node, &joint_goal(&node, RIGHT, &bent)).expect("the goal is taken");
         let (arms, _) =
             plan(&node, &taken, &AtomicBool::new(false)).expect("a path of the right arm");
         let [right] = arms.as_slice() else {
             panic!("the answer holds the one arm the goal names: {arms:?}");
         };
         assert_eq!(right.arm_name, "right_arm");
-        assert_eq!(right.start_joint_positions, ready(Side::Right).to_vec());
+        assert_eq!(right.start_joint_positions, ready(RIGHT).to_vec());
         let last = &right.waypoints.last().expect("a waypoint").joint_positions;
         assert!(
             (0..ARM_DOF).all(|j| (last[j] - bent[j]).abs() <= 0.01 + 1e-9),
@@ -2362,16 +2465,16 @@ mod tests {
     fn a_path_keeps_clear_of_the_other_arm_where_it_was_measured() {
         let node = started(&parameters(), false);
         measure_at(&node, after(0), still());
-        let across = path_of(Side::Left, &[[-0.35, -0.2, 1.38, 1.3, 0.0, 0.0, 0.0]]);
+        let across = path_of(LEFT, &[[-0.35, -0.2, 1.38, 1.3, 0.0, 0.0, 0.0]]);
         let passing = check(&node, &across, an_hour_on()).expect("an answer");
         assert!(
             passing.clear && passing.clear_waypoints == 1,
             "the reach across with the right arm at Ready: {passing:?}"
         );
-        let mut swung_in = ready(Side::Right);
+        let mut swung_in = ready(RIGHT);
         swung_in[1] = 0.1;
         let measured = Measured {
-            arms: PerArm::both(ready(Side::Left), swung_in),
+            arms: PerArm::new([ready(LEFT), swung_in]),
             ..still()
         };
         measure_at(&node, after(100), measured);
@@ -2389,27 +2492,27 @@ mod tests {
 
     /// A check of the arms of `paths`, in their order, each through its waypoints from
     /// where it stands.
-    fn paths_of(paths: &[(Side, &[[f64; ARM_DOF]])]) -> check_joint_path::RequestData {
+    fn paths_of(paths: &[(ArmId, &[[f64; ARM_DOF]])]) -> check_joint_path::RequestData {
         check_joint_path::RequestData {
             arms: paths
                 .iter()
-                .flat_map(|(side, waypoints)| path_of(*side, waypoints).arms)
+                .flat_map(|(arm, waypoints)| path_of(*arm, waypoints).arms)
                 .collect(),
         }
     }
 
     /// A goal of the arms of `goals`, in their order, each to its joints, and of every arm
     /// of `held` with no constraint.
-    fn goal_of(node: &Node, goals: &[(Side, [f64; ARM_DOF])], held: &[Side]) -> GoalRequestData {
+    fn goal_of(node: &Node, goals: &[(ArmId, [f64; ARM_DOF])], held: &[ArmId]) -> GoalRequestData {
         let mut goal = joint_goal(node, goals[0].0, &goals[0].1);
-        for (side, q) in &goals[1..] {
-            let other = joint_goal(node, *side, q);
+        for (arm, q) in &goals[1..] {
+            let other = joint_goal(node, *arm, q);
             goal.arms.extend(other.arms);
             goal.goal_joint_constraints
                 .extend(other.goal_joint_constraints);
         }
-        goal.arms.extend(held.iter().map(|side| GoalArmsItem {
-            arm_name: side.arm_name().to_string(),
+        goal.arms.extend(held.iter().map(|arm| GoalArmsItem {
+            arm_name: arm_name(*arm),
             start_joint_positions: Vec::new(),
         }));
         goal
@@ -2428,18 +2531,15 @@ mod tests {
     fn a_plan_of_both_arms_answers_them_in_the_goals_order() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let (left, right) = (elbow_at(Side::Left, 1.3), elbow_at(Side::Right, 1.3));
-        let taken = admit(
-            &node,
-            &goal_of(&node, &[(Side::Right, right), (Side::Left, left)], &[]),
-        )
-        .expect("the goal is taken");
+        let (left, right) = (elbow_at(LEFT, 1.3), elbow_at(RIGHT, 1.3));
+        let taken = admit(&node, &goal_of(&node, &[(RIGHT, right), (LEFT, left)], &[]))
+            .expect("the goal is taken");
         let (arms, _) = plan(&node, &taken, &AtomicBool::new(false)).expect("a path of both");
         let names: Vec<&str> = arms.iter().map(|arm| arm.arm_name.as_str()).collect();
         assert_eq!(names, ["right_arm", "left_arm"]);
         assert_eq!(arms[0].waypoints.len(), arms[1].waypoints.len());
-        assert_eq!(arms[0].start_joint_positions, ready(Side::Right).to_vec());
-        assert_eq!(arms[1].start_joint_positions, ready(Side::Left).to_vec());
+        assert_eq!(arms[0].start_joint_positions, ready(RIGHT).to_vec());
+        assert_eq!(arms[1].start_joint_positions, ready(LEFT).to_vec());
         assert!(
             ends_at(&arms[0], &right) && ends_at(&arms[1], &left),
             "{arms:?}"
@@ -2452,12 +2552,9 @@ mod tests {
     fn an_arm_with_no_constraint_holds_its_start_at_every_waypoint() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let right = elbow_at(Side::Right, 1.3);
-        let taken = admit(
-            &node,
-            &goal_of(&node, &[(Side::Right, right)], &[Side::Left]),
-        )
-        .expect("the goal is taken");
+        let right = elbow_at(RIGHT, 1.3);
+        let taken =
+            admit(&node, &goal_of(&node, &[(RIGHT, right)], &[LEFT])).expect("the goal is taken");
         let (arms, _) = plan(&node, &taken, &AtomicBool::new(false)).expect("a path");
         let [moving, held] = arms.as_slice() else {
             panic!("the answer holds both arms: {arms:?}");
@@ -2467,7 +2564,7 @@ mod tests {
         assert!(
             held.waypoints
                 .iter()
-                .all(|w| w.joint_positions == ready(Side::Left).to_vec()),
+                .all(|w| w.joint_positions == ready(LEFT).to_vec()),
             "{held:?}"
         );
         assert!(ends_at(moving, &right), "{moving:?}");
@@ -2481,27 +2578,24 @@ mod tests {
     fn a_check_of_both_arms_keeps_them_apart() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let (left, right) = (elbow_at(Side::Left, 1.3), elbow_at(Side::Right, 1.3));
+        let (left, right) = (elbow_at(LEFT, 1.3), elbow_at(RIGHT, 1.3));
         let beside = check(
             &node,
-            &paths_of(&[(Side::Left, &[ready(Side::Left)]), (Side::Right, &[right])]),
+            &paths_of(&[(LEFT, &[ready(LEFT)]), (RIGHT, &[right])]),
             an_hour_on(),
         )
         .expect("an answer");
         assert!(beside.clear && beside.clear_waypoints == 1, "{beside:?}");
         let both = check(
             &node,
-            &paths_of(&[(Side::Right, &[right]), (Side::Left, &[left])]),
+            &paths_of(&[(RIGHT, &[right]), (LEFT, &[left])]),
             an_hour_on(),
         )
         .expect("an answer");
         assert!(both.clear && both.clear_waypoints == 1, "{both:?}");
         let crossed = check(
             &node,
-            &paths_of(&[
-                (Side::Left, &[ready(Side::Right)]),
-                (Side::Right, &[ready(Side::Left)]),
-            ]),
+            &paths_of(&[(LEFT, &[ready(RIGHT)]), (RIGHT, &[ready(LEFT)])]),
             an_hour_on(),
         )
         .expect("an answer");
@@ -2525,21 +2619,21 @@ mod tests {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
         let mut model = node.own.model.clone();
-        let right = ready(Side::Right);
+        let right = ready(RIGHT);
         let raised = |turn: f64| {
-            let mut q = ready(Side::Left);
+            let mut q = ready(LEFT);
             q[2] = turn;
             q
         };
         let mut gripper_to_torso = |turn: f64| -> f64 {
             model
-                .min_distance_of_chain(Side::Left.index(), &[raised(turn), right])
+                .min_distance_of_chain(LEFT.place(), &[raised(turn), right])
                 .expect("a finite configuration")
                 .distance
         };
         let (mut apart, mut near) = (
-            ready(Side::Left)[2],
-            node.arms[Side::Left].geometry.chain().limits()[2].hi,
+            ready(LEFT)[2],
+            node.arms[LEFT].geometry.chain().limits()[2].hi,
         );
         for _ in 0..60 {
             let middle = (apart + near) / 2.0;
@@ -2551,15 +2645,15 @@ mod tests {
         }
         let left = raised(apart);
         let nearest = model
-            .min_distance_of_chain(Side::Left.index(), &[left, right])
+            .min_distance_of_chain(LEFT.place(), &[left, right])
             .expect("a finite configuration");
         assert_eq!(
             (nearest.link_a, nearest.link_b),
             ("openarm_body_link0", "openarm_left_ee_link1"),
             "the gripper meets the torso"
         );
-        let held_by = |side: Side, start: [f64; ARM_DOF], waypoint: [f64; ARM_DOF]| {
-            let mut path = path_of(side, &[waypoint]).arms;
+        let held_by = |arm: ArmId, start: [f64; ARM_DOF], waypoint: [f64; ARM_DOF]| {
+            let mut path = path_of(arm, &[waypoint]).arms;
             path[0].start_joint_positions = start.to_vec();
             path
         };
@@ -2567,8 +2661,8 @@ mod tests {
             &node,
             &check_joint_path::RequestData {
                 arms: [
-                    held_by(Side::Left, left, left),
-                    held_by(Side::Right, right, elbow_at(Side::Right, 1.3)),
+                    held_by(LEFT, left, left),
+                    held_by(RIGHT, right, elbow_at(RIGHT, 1.3)),
                 ]
                 .concat(),
             },
@@ -2579,7 +2673,7 @@ mod tests {
         let alone = check(
             &node,
             &check_joint_path::RequestData {
-                arms: held_by(Side::Left, left, left),
+                arms: held_by(LEFT, left, left),
             },
             an_hour_on(),
         )
@@ -2607,7 +2701,7 @@ mod tests {
     fn a_set_stop_ends_the_plan_stopped() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let goal = joint_goal(&node, Side::Left, &elbow_at(Side::Left, 1.3));
+        let goal = joint_goal(&node, LEFT, &elbow_at(LEFT, 1.3));
         let taken = admit(&node, &goal).expect("the goal is taken");
         assert!(matches!(
             plan(&node, &taken, &AtomicBool::new(true)),
@@ -2627,7 +2721,7 @@ mod tests {
             let goal = GoalRequestData {
                 planner: planner.name().to_string(),
                 refiner: refiner.name().to_string(),
-                ..joint_goal(&node, Side::Left, &elbow_at(Side::Left, 1.3))
+                ..joint_goal(&node, LEFT, &elbow_at(LEFT, 1.3))
             };
             let taken = admit(&node, &goal).expect("the goal is taken");
             let request = plan_request(
@@ -2664,9 +2758,9 @@ mod tests {
     fn a_set_stop_ends_the_cartesian_path_stopped() {
         let node = started(&parameters(), false);
         measure_at(&node, SystemTime::UNIX_EPOCH, still());
-        let grasp_link = node.arms[Side::Left].grasp_link;
-        let chain = node.arms[Side::Left].geometry.chain();
-        let (position, orientation) = pose_parts(&chain.world_ee_pose(&still().arms[Side::Left]));
+        let grasp_link = node.arms[LEFT].grasp_link.as_str();
+        let chain = node.arms[LEFT].geometry.chain();
+        let (position, orientation) = pose_parts(&chain.world_ee_pose(&still().arms[LEFT]));
         let goal = plan_cartesian_path::GoalRequestData {
             arm_name: "left_arm".to_string(),
             start_joint_positions: Vec::new(),
@@ -2781,7 +2875,7 @@ mod tests {
     }
 
     /// Records `measured` in the history of `node` at `at`.
-    fn measure_at(node: &Node, at: SystemTime, measured: Measured<ARM_DOF>) {
+    fn measure_at(node: &Node, at: SystemTime, measured: Measured<ARM_DOF, ARMS>) {
         push_measured(node, at, &measured);
     }
 
@@ -2793,7 +2887,7 @@ mod tests {
     }
 
     /// The intake of `node` from a camera of one pixel at the robot frame's origin.
-    fn intake(node: Arc<Node>) -> Intake<ARM_DOF, DUAL_DOF, 2> {
+    fn intake(node: Arc<Node>) -> Intake<ARM_DOF, DUAL_DOF, ARMS> {
         intake_at(node, &identity())
     }
 
@@ -2804,7 +2898,7 @@ mod tests {
 
     /// The intake of `node` from a camera of one pixel at `pose`, which sees along its
     /// optical axis.
-    fn intake_at(node: Arc<Node>, pose: &Pose) -> Intake<ARM_DOF, DUAL_DOF, 2> {
+    fn intake_at(node: Arc<Node>, pose: &Pose) -> Intake<ARM_DOF, DUAL_DOF, ARMS> {
         let lens = Pinhole::parse(&Intrinsics {
             width: 1,
             height: 1,
@@ -2878,7 +2972,10 @@ mod tests {
     /// joint positions.
     fn waiting_frames(
         node: &Arc<Node>,
-    ) -> (watch::Sender<Newest>, WaitingFrames<ARM_DOF, DUAL_DOF, 2>) {
+    ) -> (
+        watch::Sender<Newest>,
+        WaitingFrames<ARM_DOF, DUAL_DOF, ARMS>,
+    ) {
         let (newest, frames) = watch::channel::<Newest>(None);
         (newest, WaitingFrames::new(node.clone(), frames))
     }
@@ -2889,7 +2986,7 @@ mod tests {
     }
 
     /// The stamp of the frame `waiting` gives now; `None` while every frame waits.
-    fn given(waiting: &mut WaitingFrames<ARM_DOF, DUAL_DOF, 2>) -> Option<SystemTime> {
+    fn given(waiting: &mut WaitingFrames<ARM_DOF, DUAL_DOF, ARMS>) -> Option<SystemTime> {
         let mut context = Context::from_waker(Waker::noop());
         match std::pin::pin!(waiting.next()).poll(&mut context) {
             Poll::Ready(frame) => Some(frame.expect("the frames' follower runs").header.timestamp),
@@ -3013,12 +3110,7 @@ mod tests {
         let malformed = LatchedLog::warn("limb_states");
         record(
             &node,
-            &limb_states_at(
-                after(500),
-                ready(Side::Left),
-                ready(Side::Right),
-                &[1.0, 1.0],
-            ),
+            &limb_states_at(after(500), ready(LEFT), ready(RIGHT), &[1.0, 1.0]),
             &malformed,
         );
         assert_eq!(map_stamp(&node), None);
@@ -3090,7 +3182,7 @@ mod tests {
     }
 
     /// Where each finger of `model` hangs in its link's frame, on the arms of `node`.
-    fn finger_offsets(node: &Node, own: &OwnBody<ARM_DOF, 2>) -> Vec<Isometry3<f64>> {
+    fn finger_offsets(node: &Node, own: &OwnBody<ARM_DOF, ARMS>) -> Vec<Isometry3<f64>> {
         riders_of_the_arms(own, &node.arms)
             .expect("the arms' fingers")
             .into_iter()
@@ -3110,10 +3202,10 @@ mod tests {
         limb_states::Message {
             timestamp: at,
             arm_names: vec!["left_arm".to_string(), "right_arm".to_string()],
-            joints_per_arm: vec![ARM_DOF as u32; 2],
+            joints_per_arm: vec![ARM_DOF as u32; ARMS],
             joint_positions: [left, right].concat(),
-            positions: vec![0.0; 6],
-            orientations: [[0.0, 0.0, 0.0, 1.0]; 2].concat(),
+            positions: vec![0.0; 3 * ARMS],
+            orientations: [[0.0, 0.0, 0.0, 1.0]; ARMS].concat(),
             gripper_names: ["left_gripper", "right_gripper"][..openings.len()]
                 .iter()
                 .map(|name| name.to_string())
@@ -3137,12 +3229,12 @@ mod tests {
             &malformed,
         );
         let measured = Measured {
-            arms: PerArm::both(left, right),
-            openings: PerArm::both(0.25, 0.75),
+            arms: PerArm::new([left, right]),
+            openings: PerArm::new([0.25, 0.75]),
         };
         assert_eq!(node.latest().as_ref(), Some(&measured));
         let mut opened = node.own.clone();
-        opened.set_openings(&PerArm::both(0.25, 0.75));
+        opened.set_openings(&PerArm::new([0.25, 0.75]));
         assert_eq!(
             finger_offsets(&node, &node.own_at(node.latest().as_ref())),
             finger_offsets(&node, &opened)
@@ -3169,7 +3261,7 @@ mod tests {
     fn a_frame_cuts_the_fingers_out_at_its_openings() {
         let node = Arc::new(started(&parameters(), true));
         let opened = |left: f64| Measured {
-            openings: PerArm::both(left, 1.0 - left),
+            openings: PerArm::new([left, 1.0 - left]),
             ..still()
         };
         measure_at(&node, after(1_000), opened(0.0));
@@ -3178,7 +3270,7 @@ mod tests {
         intake.take(&frame_at(after(1_050)));
         assert_eq!(map_stamp(&node), Some(after(1_050)));
         let mut halfway = node.own.clone();
-        halfway.set_openings(&PerArm::both(0.5, 0.5));
+        halfway.set_openings(&PerArm::new([0.5, 0.5]));
         assert_eq!(
             finger_offsets(&node, &intake.own),
             finger_offsets(&node, &halfway)
@@ -3270,7 +3362,7 @@ mod tests {
         };
         let node = Arc::new(started(&params, true));
         let closed = Measured {
-            openings: PerArm::both(0.0, 0.0),
+            openings: PerArm::new([0.0, 0.0]),
             ..still()
         };
         measure_at(&node, after(1_000), closed.clone());
@@ -3278,7 +3370,7 @@ mod tests {
         let mut shut = node.own.clone();
         shut.set_openings(&closed.openings);
         let unpadded = Padding::new(1.0, 0.0).expect("the padding that grows nothing");
-        let robot_holds = |own: &OwnBody<ARM_DOF, 2>, point: &Point3<f64>| {
+        let robot_holds = |own: &OwnBody<ARM_DOF, ARMS>, point: &Point3<f64>| {
             let fingers = riders_of_the_arms(own, &node.arms).expect("the arms' fingers");
             let scene = lock(&node.scene);
             robot_mask(
@@ -3294,11 +3386,11 @@ mod tests {
             .any(|part| part.contains(point))
         };
         let shut_fingers = riders_of_the_arms(&shut, &node.arms).expect("the arms' fingers");
-        let point = Side::BOTH
+        let point = BOTH
             .into_iter()
-            .flat_map(|side| {
-                let posed = node.arms[side].geometry.chain().at(&closed.arms[side]);
-                shut_fingers[side]
+            .flat_map(|arm| {
+                let posed = node.arms[arm].geometry.chain().at(&closed.arms[arm]);
+                shut_fingers[arm]
                     .iter()
                     .flat_map(move |finger| {
                         let placed = posed.link_pose_world(finger.segment) * finger.offset;
@@ -3493,7 +3585,7 @@ mod tests {
     fn a_frame_marks_nothing_inside_an_object_where_it_stood_at_the_stamp() {
         let node = Arc::new(started(&parameters(), true));
         let mut intake = intake_at(node.clone(), &above(BESIDE));
-        let three_frames = |intake: &mut Intake<ARM_DOF, DUAL_DOF, 2>, from_ms: u64| {
+        let three_frames = |intake: &mut Intake<ARM_DOF, DUAL_DOF, ARMS>, from_ms: u64| {
             for ms in [from_ms, from_ms + 200, from_ms + 400] {
                 intake.take(&frame_seeing(after(ms), 300));
                 assert_eq!(map_stamp(&node), Some(after(ms)));
@@ -3505,7 +3597,7 @@ mod tests {
         assert!(!occupied_at(&node, BESIDE), "a point inside the box");
         apply_attachment(&node, &attach_to_the_left_hand("box")).expect("attached");
         let mut moved = still();
-        moved.arms[Side::Left][3] += 0.5;
+        moved.arms[LEFT][3] += 0.5;
         for ms in (2_300..=2_900).step_by(100) {
             measure_at(&node, after(ms), moved.clone());
         }

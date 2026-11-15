@@ -16,11 +16,12 @@ from ai_brain_vla.__main__ import setup
 WAIT = 10.0
 POSITION = (0.5, 0.1, 0.7)
 ORIENTATION = (0.0, 0.0, 0.0, 1.0)
-# The tolerances and settle timeout the moves below name.
+# The tolerances, the settle timeout and the contact gap the moves below name.
 BARS = {
     "settle_position_tolerance_m": 0.02,
     "settle_orientation_tolerance_rad": 0.15,
     "settle_timeout_s": 2.0,
+    "contact_gap_m": 0.0,
 }
 # The field a check names besides the pose.
 PLAN = {"duration_s": 0.0}
@@ -53,7 +54,9 @@ async def in_flight(robot: Robot) -> None:
 
 
 def arm_result() -> move_arm.ResultResponseData:
-    return move_arm.ResultResponseData(final_position=[0.51, 0.1, 0.69], final_orientation=[0.0, 0.0, 0.0, 1.0], action_time=0.4)
+    return move_arm.ResultResponseData(
+        final_position=[0.51, 0.1, 0.69], final_orientation=[0.0, 0.0, 0.0, 1.0], ended_on_contact=False, action_time=0.4
+    )
 
 
 async def test_a_completed_move_returns_where_the_limb_stands():

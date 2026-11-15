@@ -118,12 +118,16 @@ fails the goal with `attempt_failed`.
 
 ## Models
 
-What a robot of a model is made of is `sim_robot_core`'s entry of that model,
-shared with the MuJoCo node: its limbs under the names the robot answers to,
-the joints each limb moves, where each gripper's closed pose sits on its
-finger joints' range, its cameras with the links they hang from, and the
-posture it starts in. `sim_robot_core` is installed in the base image
-(`sim_base_images/requirements.isaac.txt`), pinned to one commit.
+What a robot of a model is made of comes from the description its attach
+goal carries, its URDF and SRDF, through `sim_robot_core`'s entry of that
+model, shared with the MuJoCo node: its limbs under the names the robot
+answers to, the joints each limb moves, where the gripper's closed and open
+states put each finger, its cameras at their optical frames, and the posture
+it starts in, every arm at its home state with its gripper closed.
+`sim_robot_core` and `robot_description_py` are installed in the base image
+(`sim_base_images/requirements.isaac.txt`), pinned to one commit. An attach
+whose description the engine's entry for the model does not fit is refused
+with `rejected`.
 
 What Isaac Sim alone knows about a model is `engine/models/<model>.json5`,
 parsed strictly at node setup by `engine/isaac_models.py`:
@@ -133,31 +137,42 @@ parsed strictly at node setup by `engine/isaac_models.py`:
 | `stage` | The model's USD, relative to `PEPPY_ROBOT_ASSETS_DIR` |
 | `articulation_root` | Where the stage keeps its articulation root, relative to the robot's prim; `"."` for a stage whose default prim carries it |
 | `link_prims` | URDF link name to the prim that is that link, where they differ |
-| `arm_gains` | `kp`, `kd` and `max_efforts`, one per joint of an arm, applied to every arm |
-| `gripper_gains` | `kp`, `kd` and `max_efforts`, one per finger of a gripper, applied to every gripper |
+| `arm_gains` | `kp` and `kd`, one per joint of an arm, applied to every arm. An OpenArm's `kp` and `kd` are the real arm's, the defaults of `openarm/arm/peppy.json5`, which the MuJoCo node and Waldo run too, and `tests/test_isaac_models.py` holds them equal. Each drive is capped at the effort limit the description gives its joint |
+| `gripper_gains` | `kp` and `kd`, one per finger of a gripper that moves of its own, applied to every gripper, each drive capped as an arm's is. A finger the description gives a mimic has no drive: it follows the finger it mimics |
 | `gravity_compensation` | Whether gravity is taken off the robot's own links |
 | `head_camera` | Whether the robot draws the OpenArm v2 head camera pack |
 
-An unknown key, a gain list of the wrong length or a stage outside the baked
-assets stops the node at setup. A model with no entry is refused at `attach`
+The engine's entries and `sim_robot_core`'s camera renders are read once at
+node setup: an entry that does not read, an unknown key, a gain that is
+negative or not finite, `kp` and `kd` of different lengths, or
+a stage outside the baked assets stops the node, naming the file and the key.
+What depends on the robot's description is checked at `attach`, which refuses
+with `rejected` gains whose length is not the number of joints of each arm or
+of fingers that move of their own of each gripper of the description, an
+effort limit of the description that is not positive on a joint whose drive it
+caps, and a camera the description has and no render names, or the reverse. A model with no entry is refused at `attach`
 naming the models the engine stands, and none falls back to another's entry.
 
 Everything downstream of `attach` takes the robot's own model:
 
 - the stage referenced under `/World/<robot>`;
 - the posture the robot starts in, authored on each joint's PhysX state and on
-  its drive's target as the robot joins, so the arm stands still until its
-  first setpoint. A model with no start posture starts where its stage puts
-  it;
+  the target of each joint's drive as the robot joins, so the arm stands still
+  until its first setpoint;
+- each finger the description gives a mimic, bound to the finger it follows
+  with PhysX's mimic joint as the robot joins: the mimic's position =
+  multiplier * followed position + offset is the joint's gearing, -multiplier,
+  and offset, -offset in the stage's unit, so one drive moves the pair;
 - gravity compensation, authored on the rigid-body links under the robot's own
   prim;
-- one actuator controller per limb, with the model's gains and effort
-  ceilings. Gains are what the articulation view takes: per radian on a
-  revolute joint, per metre on a prismatic one. A drive's damping is raised to
-  critical where `kd` falls short of it;
-- the gripper opening, mapped onto each finger's own span through
-  `sim_robot_core.models.finger_span`: an OpenArm's fingers close at their
-  joints' zero, the SO-101's jaw at its joint's lower limit;
+- one actuator controller per limb, with the model's gains, each drive capped
+  at its joint's effort limit in the description; a gripper's controller
+  drives its fingers that move of their own. Gains are what the articulation
+  view takes: per radian on a revolute joint, per metre on a prismatic one. A
+  drive's damping is raised to critical where `kd` falls short of it;
+- the gripper opening, mapped onto each driven finger's span from where the
+  description's `closed` state puts it to where its `open` state does, and
+  read back as the mean over every finger;
 - the camera rig, which is the cameras of the robot's own model, each defined
   under the prim its parent link is on that robot. With `cameras_enabled` a rig
   is mounted on each robot holding a camera pair, and a model with no camera
@@ -191,13 +206,20 @@ it through PhysX articulation views, so the USD:
 
 ### Adding a model
 
-1. Ship the model's entry in `sim_robot_core` (`models/<model>.json5`) and move
-   the pin in `sim_base_images/requirements.isaac.txt` and
-   `tests/pyproject.toml` to the commit that carries it.
-2. Bake the model's USD under `/opt/robot_assets/<robot>/` in
-   `sim_base_images/Dockerfile.isaac`.
+1. Ship the model's description in `robot_description`, and, when it carries
+   a camera, its camera renders in `sim_robot_core` (`models/<model>.json5`).
+   Move the pins in `sim_base_images/requirements.isaac.txt` and
+   `tests/pyproject.toml` to the commit that carries them.
+2. Publish the model's USD bundle, pin its key and SHA-256 in
+   `sim_base_images/isaac_assets.env`, and add it to the bundles
+   `sim_base_images/download_assets.sh` stages, which the image bakes under
+   `/opt/robot_assets/<robot>/`. Bump `ISAAC_IMAGE_REV` and run
+   `sim_base_images/build_base_images.sh`.
 3. Write `engine/models/<model>.json5`.
 4. Cover it in `tests/test_isaac_models.py`.
+
+[`sim_robot_core`'s README](https://github.com/Peppy-bot/public-peppy-libs/tree/main/sim_robot_core#adding-a-robot)
+lists the steps of both engines.
 
 `peppy.json5` stays as it is: a model changes no slot.
 
@@ -557,64 +579,65 @@ then restage the node with `peppy node add sim_isaac -sb --force`.
 
 ### The SO-101 stage
 
-`so101_description` carries a URDF of the arm's joints and its links' collision
-meshes, with no visual mesh and no inertia, so the SO-101's stage is built from
-its upstream geometry: MuJoCo Menagerie's `robotstudio_so101`
-(Apache-2.0) at the commit `sim_base_images/so101_model.lock.json` pins, the
-same files the MuJoCo node bakes and Waldo's catalogue names, so the three
-engines stand the same robot. `scripts/build_so101.py` compiles the upstream MJCF
+SO-101's description carries a URDF of the arm's joints and its links'
+collision meshes, with no visual mesh and no inertia, so the SO-101's stage is
+built from its MuJoCo model: the one in the release of Waldo's catalogue that
+`sim_base_images/waldo_catalogue.py` pins, MuJoCo Menagerie's
+`robotstudio_so101` (Apache-2.0) with the files Waldo lays over it. The MuJoCo
+node bakes the same model and Waldo loads it, so the three engines stand the
+same robot. `scripts/build_so101.py` compiles that MJCF
 with MuJoCo and writes the stage from the compiled model: one link prim per
 URDF link, with its mass, visual meshes and collision shapes, one revolute
 joint per hinge with a position drive, the base fixed to the world by the
 articulation's root joint, and the `gripper_frame_link` tool frame. Where
-upstream and the description differ the description wins: each joint's
+the model and the description differ the description wins: each joint's
 limits are the URDF's, and `tests/test_so101_stage.py` holds the stage to it,
 tool frame included. CPU only, no Isaac Sim. From the repository root, on
-Linux x86_64 (the platform of the Isaac image), with the upstream staged by
-`sim_base_images/so101_model.py fetch <directory>`:
+Linux x86_64 (the platform of the Isaac image), with the release staged by
+`python3 sim_base_images/waldo_catalogue.py fetch /tmp/so101-release --robot so101`:
 
 ```bash
 uv run --project sim_isaac/tests --locked --group dev \
   python sim_isaac/scripts/build_so101.py \
-  --model /tmp/so101-upstream/so101 \
-  --urdf <so101_description>/urdf/so101_kinematics.urdf \
-  --lock sim_base_images/so101_model.lock.json \
+  --release /tmp/so101-release \
   --output /tmp/so101-isaac-assets \
   --archive /tmp/so101-isaac-assets.tar.gz
 ```
 
-The command runs the builder on the `mujoco`, `usd-core` and `numpy` that
-`sim_isaac/tests/uv.lock` pins, the tools `tests/test_so101_stage.py` builds
-the stage with. `<so101_description>` is the package at the public-peppy-libs
-commit that `sim_isaac/tests/pyproject.toml` pins.
+The command runs the builder on the `mujoco`, `usd-core`, `numpy` and
+`robot_description_py` that `sim_isaac/tests/uv.lock` pins, the tools
+`tests/test_so101_stage.py` builds the stage with. The description is the
+SO-101's model that `robot_description_py` bundles, its URDF and its SRDF,
+whose arm's grasp link places the tool frame.
 
 The archive is published under its own SHA-256, as the OpenArm bundle is, at
 `so101/<version>/<sha256>.tar.gz`, and pinned as `SO101_ASSETS_KEY` and
 `SO101_ASSETS_SHA256` in `isaac_assets.env`, with the SHA-256 of its
 `so101.usd` as `SO101_STAGE_SHA256`; the image build then follows the OpenArm
-recipe above. The archive holds the stage and `bundle_manifest.json`, which
-records the digests of the builder, of the URDF and of the lock, and the
-versions of the tools. An archive built again thus differs from the pinned one
-when one of those differs, also when its stage is the same. The stage is what
-the tree is held to: on Linux x86_64 the same upstream, limits, tool frame,
-builder and tools give the same `so101.usd` byte for byte, and MuJoCo rounds
-what it compiles differently on another architecture.
+recipe above. The archive holds the stage, the model's `LICENSE` and
+`bundle_manifest.json`, which records the release and the tree the model came
+from, the digest of the builder, the digest `robot_description_py` gives the
+SO-101's model (its URDF, its SRDF and its collision meshes), and the versions
+of the tools. An archive built again thus differs from the pinned one when
+one of those differs, also when its stage is the same. The stage is what the
+tree is held to: on Linux x86_64 the same model, limits, tool frame, builder
+and tools give the same `so101.usd` byte for byte, and MuJoCo rounds what it
+compiles differently on another architecture.
 
-`tests/test_so101_stage.py` builds the stage from the pinned upstream and the
-pinned URDF, both of which it stages itself over the network, and on Linux
-x86_64 holds its SHA-256 to `SO101_STAGE_SHA256`. `download_assets.sh` refuses
-a bundle whose stage is another. So a change of the builder, of the lock, of
-the description or of the `mujoco` pin that moves the stage fails the suite
-until the bundle is built and pinned again:
+`tests/test_so101_stage.py` builds the stage from the pinned release, which
+it stages itself over the network, and the description `robot_description_py`
+bundles, and on Linux x86_64 holds its SHA-256 to `SO101_STAGE_SHA256`.
+`download_assets.sh` refuses a bundle whose stage is another. So a change of
+the builder, of the release, of the description or of the `mujoco` pin that
+moves the stage fails the suite until the bundle is built and pinned again:
 
 ```bash
 uv run --project sim_isaac/tests --locked --group dev pytest sim_isaac/tests/test_so101_stage.py
 ```
 
-`SO101_UPSTREAM_MODEL` names a directory the upstream is staged in, and
-`SO101_KINEMATICS_URDF` a URDF to hold the stage to in place of the pinned
-one. Inside the image the suite reads the baked stage from
-`PEPPY_ROBOT_ASSETS_DIR` instead of building it.
+`SO101_RELEASE` names a directory the release is staged in. Where
+`PEPPY_ROBOT_ASSETS_DIR` holds a baked stage, as in the image, the suite reads
+that stage.
 
 ## Tests
 

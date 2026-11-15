@@ -6,24 +6,25 @@
 
 use std::sync::Arc;
 
-use openarm_description::Side;
 use peppygen::NodeRunner;
 use peppygen::consumed_actions::limb_motion::move_gripper as limb_motion_move_gripper;
 use peppylib::runtime::CancellationToken;
+use robot_description::ArmId;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::owner::Feedback;
 use crate::result_wait::{GOAL_TIMEOUT, Waited, limb_goal_handle, summarize, wait_for_end};
+use crate::robot;
 
 limb_goal_handle!(move_gripper);
 
-/// One discrete gripper move, as fired at the backbone: the side, the opening
+/// One discrete gripper move, as fired at the backbone: the arm, the opening
 /// fraction, the effort cap in its wire encoding (0 = no preference), and the
 /// longest (s) the backbone waits after the planned end of the travel for the
 /// jaws to stand still.
 pub struct Goal {
-    pub side: Side,
+    pub arm: ArmId,
     pub opening: f64,
     pub max_effort: f64,
     pub settle_timeout_s: f64,
@@ -47,19 +48,16 @@ async fn run(
     goal: Goal,
 ) {
     let Goal {
-        side,
+        arm,
         opening,
         max_effort,
         settle_timeout_s,
     } = goal;
-    let label = side.to_string();
-    info!(
-        side = label.as_str(),
-        opening, max_effort, "fire move_gripper"
-    );
+    let label = robot::LIMBS.gripper_name(arm);
+    info!(gripper = label, opening, max_effort, "fire move_gripper");
 
     let goal = limb_motion_move_gripper::GoalRequest {
-        gripper_name: side.gripper_name().to_string(),
+        gripper_name: label.to_string(),
         opening,
         max_effort,
         settle_timeout_s,
@@ -79,7 +77,7 @@ async fn run(
             Some(refusal) => {
                 finalize(
                     &feedback,
-                    side,
+                    arm,
                     false,
                     format!("backbone refused the gripper goal: {refusal}"),
                 )
@@ -88,7 +86,7 @@ async fn run(
             }
         },
         Err(e) => {
-            finalize(&feedback, side, false, format!("fire_goal failed: {e}")).await;
+            finalize(&feedback, arm, false, format!("fire_goal failed: {e}")).await;
             return;
         }
     };
@@ -102,17 +100,17 @@ async fn run(
         &downstream,
         &token,
         None,
-        |trigger, e| warn!(side = label.as_str(), error = %e, "{}", trigger.failure_message()),
+        |trigger, e| warn!(gripper = label, error = %e, "{}", trigger.failure_message()),
     )
     .await
     {
         Waited::Shutdown => {
-            finalize(&feedback, side, false, "shutting down; move cancelled").await;
+            finalize(&feedback, arm, false, "shutting down; move cancelled").await;
             return;
         }
         Waited::Ended(ended) => ended,
     };
-    let (success, summary) = summarize("move_gripper", &label, ended, |data| {
+    let (success, summary) = summarize("move_gripper", label, ended, |data| {
         // The backbone reports where the jaws measured once they stood
         // still, or settle_timeout_s after the planned end of the travel:
         // on the target, or where an object or the effort cap stopped
@@ -127,25 +125,25 @@ async fn run(
             data.action_time, data.final_opening
         )
     });
-    finalize(&feedback, side, success, summary).await;
+    finalize(&feedback, arm, success, summary).await;
 }
 
 // Report the move outcome to the owner, which clears the in-flight slot and writes the
 // status line; a dropped channel means the owner is gone (shutdown), so ignore it.
 async fn finalize(
     feedback: &mpsc::Sender<Feedback>,
-    side: Side,
+    arm: ArmId,
     success: bool,
     summary: impl Into<String>,
 ) {
     let summary = summary.into();
-    let label = side.to_string();
+    let label = robot::LIMBS.gripper_name(arm);
     if success {
-        info!(side = label.as_str(), %summary, "move_gripper done");
+        info!(gripper = label, %summary, "move_gripper done");
     } else {
-        warn!(side = label.as_str(), %summary, "move_gripper done");
+        warn!(gripper = label, %summary, "move_gripper done");
     }
     let _ = feedback
-        .send(Feedback::GripperGoalDone { side, summary })
+        .send(Feedback::GripperGoalDone { arm, summary })
         .await;
 }

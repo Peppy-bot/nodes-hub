@@ -5,7 +5,8 @@
 //!
 //!   τ_fric[i] = Fo[i] + Fv[i]·ω[i] + Fc[i]·tanh(k[i]·ω[i])
 
-use openarm_description::{ARM_DOF, HardwareVersion};
+use openarm_can::ARM_DOF;
+use robot_description::DrivenModels;
 use srs_model::JointVec;
 
 /// Per-joint friction-model constants for the tanh model above.
@@ -54,13 +55,10 @@ const V2: Params = Params {
     k: [200.0; ARM_DOF],
 };
 
-/// The friction constants of one hardware generation.
-pub fn params(version: HardwareVersion) -> Params {
-    match version {
-        HardwareVersion::V1 => V1,
-        HardwareVersion::V2 => V2,
-    }
-}
+/// Each model whose arms this node drives, by its robot_identity model id, with the
+/// friction constants of its arms.
+pub(crate) const DRIVEN_MODELS: DrivenModels<Params, 2> =
+    DrivenModels::new([("openarm_v1", V1), ("openarm_v2", V2)]);
 
 /// Friction torque at velocity `dq` for the given constants.
 pub fn torques(p: &Params, dq: &JointVec) -> JointVec {
@@ -125,10 +123,28 @@ mod tests {
     }
 
     #[test]
-    fn each_generation_reads_its_own_constants() {
-        assert_eq!(params(HardwareVersion::V1), V1);
-        assert_eq!(params(HardwareVersion::V2), V2);
+    fn each_model_reads_its_own_constants() {
+        for (model, constants) in [("openarm_v1", V1), ("openarm_v2", V2)] {
+            let (bundled, friction) = DRIVEN_MODELS.model(model).expect("driven");
+            assert_eq!((bundled.id(), friction), (model, constants));
+        }
         assert_ne!(V1, V2);
+    }
+
+    #[test]
+    fn an_undriven_model_is_refused_naming_the_driven_ones() {
+        for model in ["so101", "openarm_v3"] {
+            assert_eq!(
+                DRIVEN_MODELS
+                    .model(model)
+                    .expect_err("undriven")
+                    .to_string(),
+                format!(
+                    "model {model} is no model this node drives; it drives \"openarm_v1\" and \
+                     \"openarm_v2\""
+                )
+            );
+        }
     }
 
     #[test]
@@ -149,8 +165,7 @@ mod tests {
 
     #[test]
     fn v2s_coulomb_term_is_near_full_at_a_median_start() {
-        let v2 = params(HardwareVersion::V2);
-        for (i, &k) in v2.k.iter().enumerate() {
+        for (i, &k) in V2.k.iter().enumerate() {
             let share = f64::tanh(k * MEDIAN_START_RAD_S);
             assert!(share >= COULOMB_SHARE_AT_MEDIAN_START, "joint {i}: {share}");
         }

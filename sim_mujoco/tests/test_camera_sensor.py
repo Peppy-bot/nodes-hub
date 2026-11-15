@@ -15,6 +15,7 @@ import mujoco
 import numpy as np
 import pytest
 
+from entries import known
 from sim_robot_core.cameras import CameraConfig, DepthSpec
 from sim_robot_core.models import ModelEntry
 
@@ -34,7 +35,6 @@ from camera_sensor import (
     add_light_rig,
     widen_offscreen,
 )
-from mujoco_models import MujocoModel
 
 _SCENE_OFFSCREEN = (320, 240)
 _WELDED_LINK = "openarm_body_link0"
@@ -95,24 +95,20 @@ def rgbd_camera(name="chest", parent=_WELDED_LINK, fps=_FPS):
     )
 
 
-def known_model(cameras, world_links=(_WELDED_LINK,), link_bodies=None, camera_lights=True):
-    """A model whose entry carries these cameras, with what this engine knows
-    about where they hang and how the scene is lit."""
+def known_model(cameras, link_bodies=None, camera_lights=True):
+    """A model whose entry carries these cameras, with the bodies the release
+    maps its links to (the welded pedestal to the world body, unless
+    `link_bodies` says otherwise) and how the scene is lit."""
     entry = ModelEntry(
         model="test", arms=(), grippers=(), cameras=tuple(cameras), start_posture={}
     )
-    return MujocoModel(
-        entry=entry,
-        scene="scene.xml",
-        world_links=frozenset(world_links),
-        link_bodies=link_bodies or {},
-        arm_gains=None,
-        gravity_compensation=False,
-        camera_lights=camera_lights,
-        floor=False,
-        head_camera=False,
-        joint_ranges={},
-        site_poses={},
+    return known(
+        "test",
+        entry,
+        Path("scene.xml"),
+        "world",
+        engine={"camera_lights": camera_lights},
+        link_bodies={_WELDED_LINK: "world"} if link_bodies is None else link_bodies,
     )
 
 
@@ -273,24 +269,18 @@ def test_compile_attaches_a_camera_to_the_body_its_parent_link_is_mapped_to(scen
     assert camera_body(model, "wrist") == body
 
 
-def test_compile_hangs_a_world_link_camera_from_the_world_body(scene):
-    model = compile_model_with_cameras(scene, [rgbd_camera()], world_links=[_WELDED_LINK])
+def test_compile_hangs_a_camera_from_the_world_body_its_link_is_mapped_to(scene):
+    """The compiler folds a link welded to the world into the world body, and
+    the release maps such a link to it."""
+    model = compile_model_with_cameras(scene, [rgbd_camera()])
     assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, _WELDED_LINK) == -1
     assert camera_body(model, "chest") == 0
 
 
-def test_compile_keeps_a_world_link_camera_on_the_body_a_scene_gives_that_link(scene):
-    model = compile_model_with_cameras(
-        scene, [color_camera(parent="link_a")], world_links=["link_a"]
-    )
-    body = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "link_a")
-    assert camera_body(model, "wrist") == body
-
-
 @pytest.mark.parametrize("parent", ["no_such_link", _WELDED_LINK])
-def test_compile_rejects_a_parent_link_that_is_neither_a_body_nor_a_world_link(scene, parent):
+def test_compile_rejects_a_parent_link_that_is_no_body_of_the_scene(scene, parent):
     with pytest.raises(RuntimeError) as excinfo:
-        compile_model_with_cameras(scene, [color_camera(parent=parent)], world_links=[])
+        compile_model_with_cameras(scene, [color_camera(parent=parent)], link_bodies={})
     message = str(excinfo.value)
     assert parent in message
     assert "link_a" in message

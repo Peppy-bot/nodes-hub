@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use control_core::fault::Fault;
 use control_core::motor_health::{NOT_DRIVING_ESCALATE_AFTER, STATE_STALE_AFTER};
 use control_core::sync::lock_ignoring_poison;
 use control_core::time;
@@ -26,9 +27,8 @@ use crate::drive::{self, Verdict};
 use crate::hardware::Gripper;
 use crate::stream::GripperSetpoint;
 
-/// Set when the loop stops on a hard fault, so main can exit non-zero after
-/// the shutdown hooks have run and the daemon records the instance as failed
-/// rather than finished.
+/// Set when the loop stops on a hard fault: is_ready answers not ready from then
+/// on, while the fault the loop raises ends the node.
 pub static HARD_FAULT: AtomicBool = AtomicBool::new(false);
 
 const CONTEXT: &str = "gripper follow";
@@ -43,6 +43,7 @@ pub async fn run(
     cfg: FollowConfig,
     token: CancellationToken,
     started_tx: oneshot::Sender<()>,
+    fault: Fault,
 ) {
     // Readiness gates on this: the loop is entered, not merely spawned.
     let _ = started_tx.send(());
@@ -88,9 +89,8 @@ pub async fn run(
                 // The motor is already limp or unaccounted for, so stop the
                 // node without commanding this tick. The shutdown hook
                 // disables the motor, and is_ready drops via the latch.
-                error!("{reason}; stopping node");
                 HARD_FAULT.store(true, Ordering::SeqCst);
-                token.cancel();
+                fault.raise(format!("{reason}; stopping node"), || token.cancel());
                 return;
             }
         }

@@ -9,7 +9,7 @@ from conftest import FakeHardware
 from peppygen.paired_topics.arm import joint_setpoints as arm_setpoints_topic
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
-from so101_description.units import GRIPPER_NAME, JOINT_NAMES
+from so101.units import GRIPPER_NAME, JOINT_NAMES
 
 from so101_leader.__main__ import make_setup
 

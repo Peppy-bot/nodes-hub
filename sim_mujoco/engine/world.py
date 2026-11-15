@@ -4,8 +4,10 @@
 The scene opens empty and every robot is attached into it under a prefix of
 its own name, so two robots of the same model keep their own joints,
 actuators and cameras, and taking one out is composing the scene again
-without it. What is attached is its model's own MJCF, corrected and fitted
-out as its entry asks; where it stands is its placement.
+without it. What is attached is the body of its model's MJCF that carries
+the whole robot, with its servos and weight compensation as the release of
+Waldo's catalogue gives them and the cameras of its description; where it
+stands is its placement.
 
 MuJoCo compiles a scene whole, so a robot joining or leaving makes a new
 model out of the robots standing then. The thread that steps the scene
@@ -15,7 +17,8 @@ else stands.
 
 A model's `<option>` and `<statistic>` stay behind when it is attached, and
 MuJoCo keeps the scene's own. The scene therefore takes the settings its
-models share, and a model that asks for others is refused.
+models share, and a model that asks for others is refused, as Waldo refuses
+it.
 """
 
 from __future__ import annotations
@@ -26,7 +29,6 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-import head_camera
 import numpy as np
 from exts.camera_sensor import add_cameras, add_light_rig, widen_offscreen
 from mujoco_models import MujocoModel
@@ -133,10 +135,7 @@ class World:
     composes it without that robot. Both leave the compiled model behind, so
     the engine builds its views on the new one."""
 
-    def __init__(self, head_camera_pack: Optional[head_camera.Pack], renders: bool) -> None:
-        # The pack a model that draws the head camera seats on its pedestal,
-        # or None when no model of this engine draws it.
-        self._head_camera_pack = head_camera_pack
+    def __init__(self, renders: bool) -> None:
         # Whether the robots' cameras are rendered: the rig is its model's.
         self._renders = renders
         self._robots: dict[str, Robot] = {}
@@ -258,7 +257,7 @@ class World:
             frame = stage.worldbody.add_frame()
             frame.pos = list(robot.placement.position)
             frame.quat = list(robot.placement.quat_wxyz())
-            stage.attach(child, prefix=robot.prefix, frame=frame)
+            frame.attach_body(child.body(robot.known.robot.mount_body), robot.prefix, "")
         return stage
 
     def _fit_out_rendering(self, stage, robots: list[Robot]) -> None:
@@ -270,21 +269,11 @@ class World:
             add_light_rig(stage)
 
     def _model_spec(self, robot: Robot):
-        """One robot's model as it is attached: its MJCF corrected to the
-        robot's description, weight compensated where its entry asks, with
-        the head camera it draws and the cameras of its own rig when the
-        engine renders."""
+        """One robot's model as it is attached: its MJCF with its servos and
+        its weight compensated as the release gives them, and the cameras of
+        its own rig when the engine renders."""
         known = robot.known
         spec = compile_spec(known)
-        if known.head_camera:
-            if self._head_camera_pack is None:
-                raise RuntimeError(f"{known.model} draws the head camera, and no pack was staged")
-            head_camera.attach(spec, self._head_camera_pack)
-            logger.info(
-                "robot '%s' draws its head camera from %s",
-                robot.instance,
-                self._head_camera_pack.directory,
-            )
         if self._renders and known.entry.cameras:
             add_cameras(spec, known, known.scene_path())
         return spec
@@ -319,21 +308,10 @@ def _lay_floor(stage) -> None:
 def _shared_settings(children: "list[tuple[Robot, object]]"):
     """The `<option>` and `<statistic>` every standing model asks for, or
     None while nothing stands. MuJoCo drops a model's settings when it is
-    attached and steps it under the scene's, so a scene runs one set of them.
-
-    A model stands under the settings its own MJCF asks for. Where two models
-    disagree, one whose entry names a `solver` takes those settings instead,
-    which is that model saying what it accepts in company, and the scene runs
-    what they then agree on. A model alone in a scene keeps its own settings
-    whatever its entry names, so sharing a scene is the only thing that costs
-    a model its own tuning."""
+    attached and steps it under the scene's, so a scene runs one set of them,
+    and two models that ask for different ones are refused."""
     if not children:
         return None
-    if not _disagreement(children):
-        return children[0][1].option, children[0][1].stat
-    for robot, spec in children:
-        if robot.known.solver is not None:
-            spec.option = robot.known.solver
     disagreement = _disagreement(children)
     if disagreement is None:
         return children[0][1].option, children[0][1].stat
@@ -390,43 +368,51 @@ def _settings_fields(settings) -> list[str]:
 
 
 def compile_spec(known: MujocoModel):
-    """The spec of a model's MJCF, with the joint ranges and site poses its
-    entry corrects, and the robot's weight compensated where its entry asks
-    for it. The model keeps the solver settings its own file asks for, which
-    a scene it shares can take off it. A correction
-    naming a joint or a site the file lacks is refused, so an upstream rename
-    is caught at the first stand."""
+    """The spec of a model's MJCF: each joint the release gives gains for
+    driven by a position servo at those gains, the robot's weight compensated
+    where the release asks for it, and no keyframe, as the robot starts in
+    the posture of its description. The model keeps the solver settings its
+    own file asks for."""
     import mujoco  # pylint: disable=C0415
 
     spec = mujoco.MjSpec.from_file(str(known.scene_path()))
-    for name, (lower, upper) in known.joint_ranges.items():
-        joint = spec.joint(name)
-        if joint is None:
-            raise RuntimeError(f"{known.model}: joint_ranges names '{name}', not in {known.scene}")
-        joint.range = [lower, upper]
-        for actuator in spec.actuators:
-            if actuator.target == name and _ctrl_limited(actuator):
-                actuator.ctrlrange = [lower, upper]
-    for name, pose in known.site_poses.items():
-        site = spec.site(name)
-        if site is None:
-            raise RuntimeError(f"{known.model}: site_poses names '{name}', not in {known.scene}")
-        site.pos = list(pose.pos)
-        site.quat = list(pose.quat_wxyz)
-    if known.gravity_compensation:
+    for key in list(spec.keys):
+        spec.delete(key)
+    _set_servos(spec, known)
+    if known.robot.gravity_compensation:
         _compensate_gravity(spec, known)
     return spec
 
 
-def _ctrl_limited(actuator) -> bool:
-    """Whether an actuator's control is clamped to its ctrlrange: its file
-    says so, or leaves it to the compiler, which clamps the ones that carry a
-    range."""
-    import mujoco  # pylint: disable=C0415
-
-    if actuator.ctrllimited == mujoco.mjtLimited.mjLIMITED_AUTO:
-        return actuator.ctrlrange[0] < actuator.ctrlrange[1]
-    return actuator.ctrllimited == mujoco.mjtLimited.mjLIMITED_TRUE
+def _set_servos(spec, known: MujocoModel) -> None:
+    """Makes the actuator of each joint the release gives gains for a
+    position servo at its stiffness and damping, whatever its MJCF made it.
+    The damping of an arm joint is raised to critical against the joint's
+    inertia once the scene is compiled (exts.actuator_ctrl). The servo is the
+    one actuator that drives the joint: a joint the gains name that no
+    actuator drives, or that several drive, is refused, so a renamed upstream
+    actuator is caught at the first stand."""
+    servos = known.servos()
+    drivers = {joint: [a for a in spec.actuators if a.target == joint] for joint in servos}
+    missing = sorted(joint for joint, actuators in drivers.items() if not actuators)
+    if missing:
+        raise RuntimeError(
+            f"{known.model}: the release gives gains for {missing}, which no actuator of "
+            f"{known.scene_path().name} drives"
+        )
+    shared = {
+        joint: sorted(a.name for a in actuators)
+        for joint, actuators in drivers.items()
+        if len(actuators) > 1
+    }
+    if shared:
+        raise RuntimeError(
+            f"{known.model}: the release gives gains for joints that several actuators of "
+            f"{known.scene_path().name} drive, {shared}, and a servo is one actuator"
+        )
+    for joint, (actuator,) in drivers.items():
+        servo = servos[joint]
+        actuator.set_to_position(kp=servo.gains.kp, kv=servo.gains.kd)
 
 
 def _compensate_gravity(spec, known: MujocoModel) -> None:
@@ -445,7 +431,8 @@ def _compensate_gravity(spec, known: MujocoModel) -> None:
         joint = spec.joint(name)
         if joint is None:
             raise RuntimeError(
-                f"{known.model}: gravity compensation names joint '{name}', not in {known.scene}"
+                f"{known.model}: gravity compensation names joint '{name}', not in "
+                f"{known.scene_path().name}"
             )
         moved = joint.parent
         for body in (moved, *moved.find_all(mujoco.mjtObj.mjOBJ_BODY)):

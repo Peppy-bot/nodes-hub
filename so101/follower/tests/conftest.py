@@ -7,7 +7,7 @@ import asyncio
 import time
 
 import pytest
-from so101_description.units import MOTOR_NAMES
+from so101.units import MOTOR_NAMES
 
 
 class FakeHardware:

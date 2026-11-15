@@ -15,15 +15,15 @@ from typing import Protocol
 
 from control_core_py.device import DeviceThread, LatestSlot
 from control_core_py.runtime import Latch, RateMeter
-from so101_description.device import (
+from so101.device import (
     PositionSample,
     connect_calibrated,
     motor_positions,
     position_channels,
     read_position_sample,
 )
-from so101_description.staleness import COMMAND_SILENCE_LIMIT_S
-from so101_description.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
+from so101.staleness import COMMAND_SILENCE_LIMIT_S
+from so101.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
 
 from so101_follower.health import HEALTH_RATE_HZ, describe_faults
 

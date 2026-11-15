@@ -9,13 +9,29 @@ pub mod params;
 
 use std::time::Duration;
 
-use peppygen::fixtures::harness::Harness;
+use control_core::fault::Fault;
+use peppygen::fixtures::harness::{Config, Harness, Mocks};
+
+/// The model of the tests' robot, as its initializer names it: v1 hardware.
+pub const MODEL: &str = "openarm_v1";
 
 /// How long a test waits for the node's `setup` to return.
 const SETUP_BUDGET: Duration = Duration::from_secs(30);
 
 /// How often a test checks whether the node's `setup` has returned.
 const SETUP_POLL: Duration = Duration::from_millis(50);
+
+/// Boots the node over the harness as `config` binds it, with the fault that
+/// ends it once its setup has returned.
+pub async fn start(config: Config) -> peppygen::Result<(Harness, Mocks, Fault)> {
+    let fault = Fault::default();
+    let raised = fault.clone();
+    let (harness, mocks) = Harness::start_with(config, move |params, runner| {
+        openarm_backbone::setup(params, runner, raised)
+    })
+    .await?;
+    Ok((harness, mocks, fault))
+}
 
 /// Waits for the node's `setup` to return, failing the test after
 /// `SETUP_BUDGET`.

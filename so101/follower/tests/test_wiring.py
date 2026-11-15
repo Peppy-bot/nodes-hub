@@ -10,14 +10,19 @@ from conftest import FakeHardware, wait_for_async
 from peppygen.paired_topics.arm import joint_states as arm_states_topic
 from peppygen.fixtures import harness
 from peppygen.fixtures.exposed_services.ready import is_ready as is_ready_fx
+from peppygen.fixtures.exposed_services.ready import set_model as set_model_fx
+from peppygen.exposed_services.ready.set_model import RequestData as ModelRequest
 from peppygen.paired_topics.arm import joint_setpoints as arm_setpoints_topic
 from peppygen.paired_topics.gripper import gripper_setpoints as gripper_setpoints_topic
 from peppygen.parameters import Parameters
-from so101_description.units import GRIPPER_NAME, JOINT_NAMES
+from so101.units import GRIPPER_NAME, JOINT_NAMES
 
-from so101_follower.__main__ import make_setup
+from so101_follower.__main__ import MODEL, end_on_refusal, make_setup
 
 TIMEOUT_S = 10.0
+
+# The robot's initializer tells the follower it is a part of an SO-101.
+SO101 = ModelRequest(model=MODEL)
 
 PARAMETERS = Parameters(
     device_path="/dev/so101_follower_test",
@@ -199,3 +204,25 @@ def test_the_wire_refuses_a_joint_vector_of_the_wrong_width():
         arm_states_topic.build_message(
             timestamp=0.0, positions=[0.0] * 4, velocities=[], efforts=[]
         )
+
+
+async def test_the_follower_takes_the_so101_and_refuses_another_model_naming_it():
+    fake = FakeHardware()
+    async with harness.start(make_setup(lambda _config: fake), parameters=PARAMETERS) as h:
+        await set_model_fx.poll(h, SO101, TIMEOUT_S)
+        with pytest.raises(set_model_fx.Failure) as refused:
+            await set_model_fx.poll(h, ModelRequest(model="openarm_v2"), TIMEOUT_S)
+        assert refused.value.kind == set_model_fx.FailureKind.REJECTED
+        assert refused.value.message == (
+            'model openarm_v2 is no model this node drives; it drives "so101"'
+        )
+
+
+async def test_a_refusal_ends_the_node_with_it():
+    refused = asyncio.get_running_loop().create_future()
+    ending = asyncio.ensure_future(end_on_refusal(refused))
+    await asyncio.sleep(0)
+    assert not ending.done()
+    refused.set_result(ValueError('model openarm_v2 is no model this node drives; it drives "so101"'))
+    with pytest.raises(ValueError, match="model openarm_v2 is no model this node drives"):
+        await asyncio.wait_for(ending, TIMEOUT_S)

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from robot_description_py import model as bundled
 from sim_robot_core.models import shipped_entry
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
@@ -25,11 +26,11 @@ from isaac_models import IsaacModels  # noqa: E402
 
 # The model whose entry asks for the head camera, and whose chest camera
 # renders from its left eye.
-_OPENARM_V2 = shipped_entry("openarm_v2")
+_OPENARM_V2 = shipped_entry("openarm_v2", bundled("openarm_v2").description())
 _LINK = "/openarm/openarm_body_link0"
 
 # The rig of the pinned pack, as tools/openarm_head_camera prints it: the
-# mount origin and the left lens front the checked-in chest camera sits at.
+# mount origin and the left lens front the description's chest camera sits at.
 _RIG = {
     "body": {"name": "openarm_head_camera", "pos": "0.0315 0 0.743"},
     "cameras": {
@@ -147,7 +148,7 @@ def pack(tmp_path, monkeypatch):
 @pytest.fixture
 def loaded(pack):
     """The staged pack as setup reads it."""
-    return head_camera.load(pack.directory, [_OPENARM_V2])
+    return head_camera.load(pack.directory)
 
 
 def _store(pack, served=None, requests=None):
@@ -322,15 +323,17 @@ class TestChestCamera:
 
     @pytest.mark.parametrize("model", ["openarm_v1", "so101"])
     def test_an_entry_without_a_chest_camera_is_refused(self, model):
-        with pytest.raises(RuntimeError, match=f"the {model} entry declares no 'chest' camera"):
-            head_camera.check_chest_camera(_RIG, shipped_entry(model))
+        entry = shipped_entry(model, bundled(model).description())
+        with pytest.raises(RuntimeError, match=f"the {model} description has no 'chest' camera"):
+            head_camera.check_chest_camera(_RIG, entry)
 
 
 class TestLoad:
-    def test_reads_the_mount_origin_and_every_mesh(self, pack):
-        loaded = head_camera.load(pack.directory, [_OPENARM_V2])
+    def test_reads_the_mount_origin_its_rig_and_every_mesh(self, pack):
+        loaded = head_camera.load(pack.directory)
         assert loaded.directory == pack.directory
         assert loaded.body_position == (0.0315, 0.0, 0.743)
+        assert loaded.rig == _RIG
         assert [name for name, _ in loaded.visuals] == list(head_camera.VISUAL_MESHES)
         for i, (_, (positions, normals, triangles)) in enumerate(loaded.visuals):
             assert positions == pytest.approx(_QUAD + i * 0.01)
@@ -341,20 +344,12 @@ class TestLoad:
 
     def test_refuses_an_unstaged_pack(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="fetch"):
-            head_camera.load(tmp_path / "head_camera", [_OPENARM_V2])
+            head_camera.load(tmp_path / "head_camera")
 
     def test_refuses_a_pack_that_is_not_the_pinned_one(self, pack):
         (pack.directory / "cover.obj").write_bytes(b"v 0 0 0\n")
         with pytest.raises(ValueError, match="does not match the pack index"):
-            head_camera.load(pack.directory, [_OPENARM_V2])
-
-    def test_refuses_a_pack_the_chest_camera_is_off(self, tmp_path, monkeypatch):
-        rig = copy.deepcopy(_RIG)
-        rig["cameras"]["left"]["position_m"] = [0.0794, 0.031497, 0.794103]
-        directory = tmp_path / "head_camera"
-        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
-        with pytest.raises(RuntimeError, match="left lens front"):
-            head_camera.load(directory, [_OPENARM_V2])
+            head_camera.load(pack.directory)
 
     def test_refuses_a_pack_framed_in_another_body(self, tmp_path, monkeypatch):
         rig = copy.deepcopy(_RIG)
@@ -362,7 +357,7 @@ class TestLoad:
         directory = tmp_path / "head_camera"
         monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
         with pytest.raises(ValueError, match="not 'openarm_head_camera'"):
-            head_camera.load(directory, [_OPENARM_V2])
+            head_camera.load(directory)
 
 
 @pytest.fixture
@@ -447,22 +442,3 @@ class TestLoadFor:
     def test_an_engine_with_a_model_that_draws_it_needs_the_pack_staged(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="fetch"):
             head_camera.load_for(IsaacModels.read(), tmp_path / "head_camera")
-
-    def test_the_chest_camera_of_every_model_that_draws_it_is_checked(self, tmp_path, monkeypatch):
-        rig = copy.deepcopy(_RIG)
-        rig["cameras"]["left"]["position_m"] = [0.0794, 0.031497, 0.794103]
-        directory = tmp_path / "head_camera"
-        monkeypatch.setattr(head_camera, "PACK_DIGEST", _stage(directory, _pack_files(rig)))
-        with pytest.raises(RuntimeError, match="left lens front"):
-            head_camera.load_for(IsaacModels.read(), directory)
-
-    def test_a_model_that_asks_for_the_head_camera_and_carries_no_chest_camera_is_refused(
-        self, tmp_path, pack
-    ):
-        """The pack is the OpenArm v2's: an SO-101 has no chest camera to
-        render from its left eye."""
-        (tmp_path / "so101.json5").write_text(
-            '{ stage: "so101/so101.usd", articulation_root: ".", head_camera: true }'
-        )
-        with pytest.raises(RuntimeError, match="the so101 entry declares no 'chest' camera"):
-            head_camera.load_for(IsaacModels.read(tmp_path), pack.directory)

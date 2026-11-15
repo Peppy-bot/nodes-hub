@@ -31,6 +31,10 @@ pub const RESULT_RETRY_DELAY: Duration = Duration::from_millis(250);
 /// needs to cover the decider, not a discovery probe.
 pub const GOAL_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The contact gap of the panel's arm moves (m), as limb_motion names no
+/// contact check: a panel move ends by its settle alone.
+pub const NO_CONTACT_CHECK_M: f64 = 0.0;
+
 /// After a preempted goal reports done, the backbone needs a beat to release its
 /// single-flight gate before it will accept the queued move; the queued goal task
 /// waits this long before firing.
@@ -200,7 +204,7 @@ async fn preempt_signal(preempt: Option<&GoalToken>) {
 }
 
 /// Whether the goal succeeded, and the status line naming `action` on the
-/// `label` side: every line opens with `{action} ({label})`, `completed`
+/// limb named `label`: every line opens with `{action} ({label})`, `completed`
 /// words a success after `: `, and the rest share one wording.
 pub fn summarize<D>(
     action: &str,

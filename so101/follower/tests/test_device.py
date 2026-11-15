@@ -3,7 +3,7 @@ import time
 
 import pytest
 from conftest import wait_for
-from so101_description.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
+from so101.units import GRIPPER_NAME, JOINT_NAMES, MOTOR_NAMES
 
 from so101_follower import __main__ as main_mod
 from so101_follower.device import DeviceLoop

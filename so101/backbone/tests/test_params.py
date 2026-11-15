@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
-from so101_description.device import BUS_MAX_RATE_HZ
+from so101.device import BUS_MAX_RATE_HZ
 
 from so101_backbone import params as params_mod
 from so101_backbone.params import UpstreamMode

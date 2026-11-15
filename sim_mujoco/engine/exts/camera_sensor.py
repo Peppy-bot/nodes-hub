@@ -131,14 +131,11 @@ def add_light_rig(spec) -> None:
 
 def _parent_body(spec, known, camera: CameraConfig, xml_path: Path):
     """The body a camera hangs from: the one its parent link is in this
-    model's MJCF, or the world body for a link the compiler folds into it.
-    Any other missing parent is an error of the model's entry."""
-    name = known.body_of(camera.parent_link)
-    body = spec.body(name)
+    model's MJCF, by the release's map of links to bodies. A parent the
+    MJCF lacks is an error of the release."""
+    body = spec.body(known.body_of(camera.parent_link))
     if body is not None:
         return body
-    if camera.parent_link in known.world_links:
-        return spec.worldbody
     raise RuntimeError(
         f"camera '{camera.name}' parent link '{camera.parent_link}' is not a "
         f"body of {xml_path.name}; bodies: {sorted(b.name for b in spec.bodies)}"

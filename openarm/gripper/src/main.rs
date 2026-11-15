@@ -1,16 +1,21 @@
 #![forbid(unsafe_code)]
 
+use control_core::fault::Fault;
+
 fn main() -> peppygen::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    peppygen::NodeBuilder::new().run(openarm_gripper::setup)?;
+    let fault = Fault::default();
+    let raised = fault.clone();
+    peppygen::NodeBuilder::new()
+        .run(move |params, runner| openarm_gripper::setup(params, runner, raised))?;
 
     // The runtime has returned, so the shutdown hooks (motor disable, lock
     // release) have already run; exiting non-zero here makes the daemon
-    // record a hard CAN fault as failed instead of finished.
-    if openarm_gripper::hard_fault_latched() {
-        return Err(openarm_gripper::NodeError::HardFault.into());
-    }
-    Ok(())
+    // record a node that a fault ended, a hard CAN fault among them, as
+    // failed instead of finished.
+    fault
+        .take()
+        .map_or(Ok(()), |reason| Err(peppygen::Error::Node(reason)))
 }

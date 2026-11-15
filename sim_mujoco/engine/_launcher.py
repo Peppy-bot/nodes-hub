@@ -9,8 +9,9 @@ onto the new one: their joint positions, their velocities and the targets
 their actuators hold. The engine's clock carries too, so the fleet's time
 never goes back.
 
-The scene is watched through a view: a browser one while the engine runs
-headless, a window where it does not, and none while no robot stands.
+The scene is watched in a browser, on the viewer's server. The server serves
+for as long as the node runs: each scene is drawn on it and wiped off it when
+the scene is composed again.
 """
 
 # pylint: disable=R0903
@@ -23,6 +24,7 @@ from typing import Callable, Optional
 
 from bridge_extension import MujocoBridgeExtension
 from edits import Edits
+from viewer_server import ViewerServer
 from world import PREFIX_SEPARATOR, World
 
 logger = logging.getLogger(__name__)
@@ -47,9 +49,7 @@ class SimLauncher:
         stop: threading.Event,
         io,
         state_rate_hz: int,
-        headless: bool,
-        viewer_host: str,
-        viewer_port: int,
+        viewer_server: ViewerServer,
     ) -> None:
         self._world = world
         # The stands and unstands waiting for this thread.
@@ -60,9 +60,9 @@ class SimLauncher:
         self._stop = stop
         self._io = io
         self._state_rate_hz = state_rate_hz
-        self._headless = headless
-        self._viewer_host = viewer_host
-        self._viewer_port = viewer_port
+        # The server every scene is drawn on. It is this launcher's from
+        # here on: the thread that draws on it stops it when it ends.
+        self._viewer_server = viewer_server
         self._model = None
         self._data = None
         self._extension: Optional[MujocoBridgeExtension] = None
@@ -95,6 +95,17 @@ class SimLauncher:
         finally:
             self._edits.cancel_all("the engine stopped")
             self.unbind()
+            self._stop_viewer_server()
+
+    def _stop_viewer_server(self) -> None:
+        """Stops the viewer's server once nothing draws on it any more: it
+        holds its address and threads of its own until it is stopped. A
+        server that will not stop is reported and nothing more, so what ended
+        the loop is what the node stops with."""
+        try:
+            self._viewer_server.stop()
+        except Exception:  # pylint: disable=W0718
+            logger.exception("the viewer's server did not stop")
 
     def _scene_is_changing(self) -> bool:
         """True once the engine stops or a change to the scene (a robot
@@ -200,19 +211,15 @@ class SimLauncher:
         return carried
 
     def _open_view(self, model, data, extension: MujocoBridgeExtension):
-        """How this scene is watched: a scene with no robot in it is stepped
-        and shown to nobody, so no viewer serves an empty stage and none is
-        left behind by the last robot to leave.
+        """How this scene is watched: in a browser, on the viewer's server,
+        whether or not a robot stands in it, so the address the node
+        announces always shows the scene as it is.
 
         A view that cannot open leaves the scene stepped and unwatched: the
         robots standing keep their physics, their state and the clock this
         engine publishes, and the operator is told why they have no picture."""
-        if not self._world.robots():
-            return _NoView(model, extension)
         try:
-            if self._headless:
-                return _BrowserView(model, data, extension, self._viewer_host, self._viewer_port)
-            return _WindowView(model, data, extension)
+            return _BrowserView(model, data, extension, self._viewer_server)
         except Exception as error:  # pylint: disable=W0718
             logger.error(
                 "the scene is stepped unwatched: its view could not open: %s", error
@@ -222,8 +229,8 @@ class SimLauncher:
 
 class _NoView:
     """A scene nobody watches: it steps against the wall clock and draws
-    nothing. The engine runs one while no robot stands, so its clock keeps
-    ticking for whoever reads it."""
+    nothing. The engine runs one for a scene whose view cannot open, so its
+    clock keeps ticking for whoever reads it."""
 
     def __init__(self, model=None, extension=None) -> None:
         self._extension = extension
@@ -259,80 +266,50 @@ class _StepPacer:
         return steps
 
 
-class _WindowView:
-    """The scene in a native MuJoCo window, for an engine that runs with a
-    display."""
-
-    def __init__(self, model, data, extension: MujocoBridgeExtension) -> None:
-        import mujoco.viewer  # pylint: disable=C0415
-
-        self._model = model
-        self._data = data
-        self._extension = extension
-        self._viewer = mujoco.viewer.launch_passive(model, data)
-        self._pacer = _StepPacer(model.opt.timestep)
-
-    def step(self, scene_is_changing: Callable[[], bool]) -> None:
-        if not self._viewer.is_running():
-            time.sleep(_IDLE_POLL_S)
-            return
-        _take_due_steps(
-            self._pacer.due(time.monotonic()), self._extension.step, scene_is_changing
-        )
-        self._viewer.sync()
-        time.sleep(_IDLE_POLL_S)
-
-    def close(self) -> None:
-        self._viewer.close()
-
-
 class _BrowserView:
-    """The scene in a browser, served by viser on the engine's viewer
-    address. One server per scene: a browser open on the scene before this
-    one reconnects to it."""
+    """The scene in a browser, drawn on the viewer's server. The server
+    outlives the view: closing the view wipes the scene off it, and a browser
+    open on the viewer sees the scene drawn next without connecting again."""
 
     def __init__(
         self,
         model,
         data,
         extension: MujocoBridgeExtension,
-        host: str,
-        port: int,
+        viewer_server: ViewerServer,
     ) -> None:
-        import viser  # pylint: disable=C0415
-
         self._model = model
         self._data = data
         self._extension = extension
         self._pacer = _StepPacer(model.opt.timestep)
         self._next_render_s = 0.0
-        self._server = viser.ViserServer(host=host, port=port)
+        self._viewer_server = viewer_server
         try:
-            self._show(host, port)
+            self._show()
         except Exception:
-            # The server holds the address and its own non-daemon threads from
-            # the moment it is built, so a view that cannot finish hands them
-            # back for whatever view comes after it. What went wrong with the
-            # view is what the operator is told, so a server that will not
-            # stop is reported under it.
+            # What the view drew before it failed stays on the server, which
+            # outlives it, so it is wiped off for whatever view comes after
+            # it. What went wrong with the view is what the operator is told,
+            # so a server that will not wipe is reported under it.
             try:
-                self._server.stop()
+                viewer_server.wipe()
             except Exception:  # pylint: disable=W0718
-                logger.exception("the viewer's server did not stop")
+                logger.exception("the viewer's server did not wipe")
             raise
 
-    def _show(self, host: str, port: int) -> None:
+    def _show(self) -> None:
         """Draws the scene for the browser: the viewer that renders it, the
         button that restages its props, and the first frame."""
         import mjviser  # pylint: disable=C0415
         import mujoco  # pylint: disable=C0415
 
         model, data, extension = self._model, self._data, self._extension
+        server = self._viewer_server.viser
 
         # Hand mjviser the bridge extension's step(): it owns mj_step plus the
         # plugin loop, so this single callback is the entire per-tick work.
         self._viewer = mjviser.Viewer(
-            model, data, server=self._server, step_fn=lambda _m, _d: extension.step()
+            model, data, server=server, step_fn=lambda _m, _d: extension.step()
         )
         # Free joints are the scene props (every robot joint is driven);
         # snapshot their spawn pose so the viewer button can restage the
@@ -345,7 +322,7 @@ class _BrowserView:
         self._spawn_qpos = [data.qpos[q : q + 7].copy() for q, _ in self._free_joints]
         self._reset_requested = threading.Event()
         if self._free_joints:
-            reset_button = self._server.gui.add_button("Reset scene objects")
+            reset_button = server.gui.add_button("Reset scene objects")
 
             @reset_button.on_click
             def _(_event) -> None:
@@ -353,20 +330,22 @@ class _BrowserView:
                 # the mj state, so only flag the request here.
                 self._reset_requested.set()
 
-        # viser sends batched position updates as delta messages only:
-        # new/refreshing clients receive initial zero positions unless we
-        # explicitly push current state on each connection.
-        @self._server.on_client_connect
-        def _(_client) -> None:
-            self._viewer._refresh_scene_from_gui()  # pylint: disable=W0212
-
         # viewer.run() installs a SIGINT handler which only works on the
         # main thread; we run inside run_in_executor, so drive the internals
         # by hand instead.
         self._viewer._setup_gui()  # pylint: disable=W0212
         mujoco.mj_forward(model, data)
         self._viewer._render()  # pylint: disable=W0212
-        logger.info(f"MuJoCo viewer available: open http://{host}:{port} in a browser")
+
+        # viser sends batched position updates as delta messages only:
+        # new/refreshing clients receive initial zero positions unless we
+        # explicitly push current state on each connection. viser runs the
+        # callback at once, on a thread of its own, for every browser already
+        # open on the viewer, so it is registered last: the scene it reads is
+        # then whole, and this thread writes it again only in step().
+        @server.on_client_connect
+        def _(_client) -> None:
+            self._viewer._refresh_scene_from_gui()  # pylint: disable=W0212
 
     def step(self, scene_is_changing: Callable[[], bool]) -> None:
         import mujoco  # pylint: disable=C0415
@@ -388,10 +367,7 @@ class _BrowserView:
         time.sleep(_IDLE_POLL_S)
 
     def close(self) -> None:
-        # ViserServer owns non-daemon HTTP/WebSocket threads; without an
-        # explicit stop the process can't exit after the sim loop ends, and
-        # the next scene's server takes the address back.
-        self._server.stop()
+        self._viewer_server.wipe()
 
 
 def _take_due_steps(

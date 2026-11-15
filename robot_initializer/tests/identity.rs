@@ -1,13 +1,14 @@
 //! Who the robot says it is, over the wire: `get_identity` answers the name
 //! the node runs under, the model the launcher wrote and the core node
-//! hosting it, which is the name and the model it joins a scene under. The
+//! hosting it, which is the name and the model it joins a scene under, and
+//! `get_description` the files of that model. The
 //! generated harness runs a node outside any copy, so the name it answers
 //! here is its instance id; the copy's name taking over inside a copy is
 //! covered by the identity module's own tests.
 
 use std::time::Duration;
 
-use peppygen::fixtures::exposed_services::robot_identity::get_identity;
+use peppygen::fixtures::exposed_services::robot_identity::{get_description, get_identity};
 use peppygen::fixtures::harness::Harness;
 use peppygen::mock::deps::simulation::attach;
 
@@ -46,6 +47,26 @@ async fn a_robot_of_any_model_says_the_model_it_was_launched_as() -> peppygen::R
     assert_eq!(identity.robot, harness.instance_id());
     assert_eq!(identity.model, "so101");
     assert_eq!(identity.core_node, core_node_of(&harness));
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_robot_gives_the_description_of_its_model() -> peppygen::Result<()> {
+    let (harness, _mocks) =
+        Harness::start_with(an_so101_on_its_own_hardware(), robot_initializer::setup).await?;
+    let model = robot_description::model("so101").expect("a bundled model");
+
+    let description = get_description::poll(&harness, WIRE).await?;
+    assert_eq!(description.urdf, model.urdf());
+    assert_eq!(description.srdf, model.srdf());
+    assert_eq!(description.digest, model.digest());
+    let meshes: Vec<(&str, &[u8])> = description
+        .meshes
+        .iter()
+        .map(|mesh| (mesh.name.as_str(), mesh.data.as_slice()))
+        .collect();
+    assert_eq!(meshes, model.meshes());
 
     harness.shutdown().await
 }

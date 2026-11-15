@@ -3,9 +3,9 @@
 The bimanual motion authority. One node sits between whatever leads (the
 commander panel or a leader arm rig) and the four followers (two arms, two
 grippers), and everything that reaches a follower has passed through one
-governed pipeline against one self-collision model, `self_collision_model`'s
-OpenArm model, which leaves out the pairs the joint limits keep apart (each upper
-arm against the torso and against its own arm's base). The same binary drives
+governed pipeline against one self-collision model, built by `self_collision_model`
+from the robot's description, which leaves out the pairs whose collisions the
+SRDF disables. The same binary drives
 hardware, MuJoCo, and Isaac, because the launcher decides what pairs into
 each slot.
 
@@ -36,7 +36,7 @@ fingers identically.
 
 `coordinator::run` owns the loop. Each tick, in order:
 
-1. **Consume the streams of busy sides** - a discrete move wipes its side's
+1. **Consume the streams of busy arms** - a discrete move wipes its arm's
    streamed command every tick, so a setpoint still in flight when the move
    was fired cannot re-target the arm (or snap the grippers) when the move ends.
 2. **Apply controls** - the commander's live `governor_control` stream retunes
@@ -55,7 +55,7 @@ fingers identically.
    planner takes that tick does. Each path that starts is handed to its
    judgment, and the shares of each path whose judgment came resume.
 5. **Advance the arms** - each planner turns its inputs (streamed command or an
-   in-flight move) into a rate-limited candidate, and hands out the side's
+   in-flight move) into a rate-limited candidate, and hands out the arm's
    end-effector Jacobian when the target came from the operator's stream. An
    arm on an `execute_joint_path` path holds its command until the path
    plays, then proposes the next point of its path, at one pace with the
@@ -105,7 +105,7 @@ stages, each contractive with respect to the last:
 
 1. **Parse.** A non-finite endpoint is a fault hold, not a step.
 2. **Limit (speed).** `DofSpeed` (per-DOF rate bound) and `EeSpeed` (the
-   operator's hand-speed cap, applied per side to stream-driven ticks via the
+   operator's hand-speed cap, applied per arm to stream-driven ticks via the
    Jacobian the planner handed out). These are motion shaping, not collision
    guards: they run in both modes, so the collision toggle gates collision
    avoidance and nothing else.
@@ -117,7 +117,7 @@ stages, each contractive with respect to the last:
    at a stale finger placement is unrepresentable, not merely avoided.
 4. **Limit (tripwire).** `MeasuredTripwire`, defense in depth against tracking
    error: latched with hysteresis on the *measured* clearance, it holds
-   closing motion per side until the real gap recovers. It alone feeds the
+   closing motion per arm until the real gap recovers. It alone feeds the
    collision readout, so a speed cap can never read as a collision event.
 5. **Project.** The closing-velocity barrier (a Faverjon-Tournassoud velocity
    damper): remove just enough of the gap-closing component that the clearance
@@ -126,7 +126,7 @@ stages, each contractive with respect to the last:
    limiter; it runs after them so its guarantee holds on the published step.
 6. **Clip.** The exact floor scan. Surface distance is not monotone along a
    joint-space segment, so this walks the realized segment and retracts to the
-   furthest point that stays at or above the step floor. A separating side can
+   furthest point that stays at or above the step floor. A separating arm can
    earn an exemption from a pushing partner's clip, and the exemption's result
    is re-scanned on the true prev-to-published line, so the point that goes
    out is always one proved on the path the arms actually travel.
@@ -156,30 +156,31 @@ field pose.
 
 ## Actions
 
-| Action | Goal | Refused when (`rejected`, `leader_streaming`, `precondition_failed` for a busy side) |
+| Action | Goal | Refused when (`rejected`, `leader_streaming`, `precondition_failed` for a busy arm) |
 |---|---|---|
-| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a leader streaming the arm, side busy |
-| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a leader streaming a named arm, a named arm busy |
-| `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a leader streaming the arm, side busy |
-| `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, side busy |
+| `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a negative contact gap, a leader streaming the arm, the arm busy |
+| `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a negative contact gap, a leader streaming a named arm, a named arm busy |
+| `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a negative contact gap, a leader streaming the arm, the arm busy |
+| `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, the gripper busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture, and no command to the grippers) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
 | `move_to_home` | `duration_s`, the time of the arm move alone (the postures contract; both grippers closed, then both arms to the Home rest) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm or either gripper, either arm or either gripper busy |
 
 A refusal for the joint limits names the joint, its position and its limits.
 A target or a waypoint up to 0.001 rad outside a limit runs at that limit: a
-measured pose sent back as a target lies that close, such as the elbow that
-Home holds at its floor and that settles a hair on either side of it.
+measured pose sent back as a target lies that close, such as the elbow of a
+straight arm, which settles a hair on either side of its lower limit.
 
 `arm_name`/`gripper_name`: `left_arm`/`right_arm` and `left_gripper`/`right_gripper`,
-an unknown name refused with `rejected`. Every pose here, commanded or
+the names the robot's description gives its arms and grippers, an unknown
+name refused with `rejected` naming the robot's arms or grippers. Every pose here, commanded or
 reported, is in the robot frame the contracts define, which for this robot
 is the root link of the URDF: the bottom of the pedestal's base plate on the
 column axis, `+x` to the robot's front, `+y` to its left, `+z` up. It is the
 gripper's **grasp point** (midway between the pads on the jaw closing axis,
-`+z` out of the gripper), not the wrist flange they mount on:
-`openarm_description` carries the offset per generation and its `arm_model` builds
-the model with it, so the pose solved for, the pose reported, and the point the
-EE speed cap applies to are one frame. One move per side at a time (a
+`+z` out of the gripper), not the wrist flange they mount on: the description
+names it as each arm's grasp link, and each arm's model mounts its tool there,
+so the pose solved for, the pose reported, and the point the EE speed cap
+applies to are one frame. One move per arm at a time (a
 single-flight move slot whose release rides a drop guard, held by the move,
 or by the coordinator for a goal it ends before the move starts, so every
 terminal frees it). `move_arm` plans a straight line (`srs_model::plan_line`): a
@@ -205,10 +206,46 @@ the measured grasp point stands within `settle_position_tolerance_m` and
 still stands outside its tolerance `settle_timeout_s` after the planned end
 fails with `timeout` and the remaining error, `still 0.031 rad from the target
 at joint 4, 2.0 s after the planned end` or `still 8.0 mm / 0.02 rad from the
-target, 2.0 s after the planned end`, and the arm holds where it stands: on
-the target, or where the governor held it short. A failed goal gives no result. A goal that completes or ends cancelled reports the
-measured state at that moment; a cancel of its caller ends it for the reason
-`cancelled by its caller`. A posture move completes once each arm stands
+target, 2.0 s after the planned end`. A failed goal gives no result. A goal
+that completes or ends cancelled reports the measured state at that moment; a
+cancel of its caller ends it for the reason `cancelled by its caller`.
+
+A `move_arm_joints`, `execute_joint_path` or `move_arm` goal with
+`contact_gap_m` above 0 also ends on contact. On each tick of the move the
+arm's planner compares two grasp points: the one of the joints the arm
+measures, and the one of the joints the arm was commanded to last
+(`Planner::stands_on_contact`, one check for the three moves). An arm that an
+object holds on its way falls behind its command. Once the two grasp points
+stand farther apart than the gap, the move completes with `ended_on_contact`
+true, and its result gives where the arm stands. The ends of a move come in
+the order of the limb_motion contract (`settle::verdict`): a cancel or the
+stop, a settle, which completes the move with `ended_on_contact` false, a
+contact, and the settle timeout. A gap of 0 is no contact check.
+
+What the arm is commanded to after a move depends on how the move ended
+(`Planner::end_move`):
+
+| End of the move | The arm's command from then on |
+|---|---|
+| Settled | the target of the move |
+| Ended on contact, failed with `timeout`, cancelled, or ended by `stop`, once the planner had started the move | it moves to the joints the arm measures on that tick, clamped into its joint limits, and holds them: an arm that an object holds short of its command stops pushing on it |
+| Ended with no fresh measurement of the arm (its follower stopped reporting) | the command it was last governed to |
+| Refused, failed before the planner started the move, or ended while a joint path waited for its judgment | the command as it was |
+
+The command moves to the measured joints as every command moves
+(`Planner::hold_where_it_stands`): a step of the joint velocity limits each
+tick, each step judged by the governor. The first step goes out on the tick
+the move ends, and for a share of a joint path, whose end is judged once its
+step is governed, on the tick after. The arm stands still where the command
+goes, so these steps are published with no velocity (`published_velocity`).
+Where the collision guard slows or holds those steps, the command stops
+where the guard leaves it once the steps the way takes at the velocity
+limits have run out, so a command the guard holds at the stop distance stays
+there, and no step toward that pose comes later. A move or a leader's stream
+that takes the command ends the hold; a joint path that waits for its
+judgment leaves it standing, and the hold goes on if the path never runs.
+
+A posture move completes once each arm stands
 within 0.1 rad of the posture in every joint, fails with `timeout` 2 s after
 the planned end otherwise, and reports where each arm stands. When the arm's follower stops reporting, the
 move fails with `resource_unavailable` and `the follower stopped reporting`,
@@ -226,7 +263,7 @@ command: the gripper motor's own position loop drives them at a speed in
 proportion to the distance still to go (measured on an openarm_v2, a time
 constant of about 0.18 s, so they stand still within about 1 s of any move).
 From the planned end on, the move keeps commanding the target and holding the
-side's move slot until the measured opening has stood still: every opening
+arm's move slot until the measured opening has stood still: every opening
 the follower delivered over 0.25 s lies within 0.01 of the travel of the
 others, the band and window the limb_motion contract states. Jaws an object
 or the effort cap stops short of the target stand still there too. At the latest `settle_timeout_s` after the planned end the move
@@ -363,7 +400,15 @@ its failure leads with its arm's name (`right_arm: the follower stopped
 reporting`), and the goal fails with the failure of the share that failed
 first. The goal completes once every named arm settles, and gives each
 arm's joints as its share measured them when it ended, in the order of
-`arms`, and the time since the path started.
+`arms`, and the time since the path started. A goal with `contact_gap_m`
+above 0 ends on contact for every named arm once one arm stands past the
+gap: both shares are judged on one reading of the contact of both arms
+(`planner::commit_both`), so on that tick that arm's share completes with
+`ended_on_contact` true, the other share with `ended_on_contact` false, and
+the goal completes. A contact of one arm comes before the settle timeout of
+the other. Each arm of a path that played and then ended on contact, failed,
+was cancelled or was stopped holds where it stands, as above; a goal that
+ends cancelled says `ended_on_contact` false for every arm.
 
 `move_to_ready` and `move_to_home` give each arm's planner a joint move to
 the posture. The goal completes once both arms settled at the posture: each
@@ -371,8 +416,9 @@ measured joint within 0.1 rad of it, by 2 s after the planned end. An arm
 that the governor holds short, or that stops against an object the backbone
 does not see, such as a bench in front of the robot, fails its move with
 `timeout`. The goal fails with the first failure of an arm's move, its
-message led by the side (`left: still 0.470 rad from the target at joint 6,
-2.0 s after the planned end`, `left: the follower stopped reporting`), and
+message led by the arm's name (`left_arm: still 0.470 rad from the target at
+joint 6, 2.0 s after the planned end`, `left_arm: the follower stopped
+reporting`), and
 with `attempt_failed` when an arm's planner does not take or answer its
 move.
 
@@ -409,13 +455,10 @@ state does not refuse it:
   name of the gripper (`left_gripper: the follower stopped reporting`). In
   both cases the arms do not move.
 
-On v2 with both grippers fully open, the jaws at Home sit closer to the
-torso than the validated stop distance (`d_stop_m`, 5 mm), and the governor
-holds both arms short of Home. The close of `move_to_home` takes the jaws
-out of that band before the arms move. Jaws that an item holds open in one
-gripper leave the band too, once the other gripper closed. An item in each
-gripper that holds both jaws fully open leaves them in the band: the arms
-then stop short of Home, and the goal fails with `timeout`.
+At Home, every pair of the robot's bodies stands farther apart than the
+governor's band reaches (`d_safe_m`), on v1 and v2, with the grippers at any
+opening. So the arms arrive at Home with whatever the grippers hold, an item
+that holds both jaws fully open included.
 
 A goal that completes or ends cancelled gives the pose of each arm:
 
@@ -426,8 +469,8 @@ A goal that completes or ends cancelled gives the pose of each arm:
 Each pose is the grasp point of the arm in the robot frame. The
 coordinator measures both arms when the posture goal completes, after the
 moves of both arms ended. limb_state gives the same pose for the same
-joints. After a cancel or a stop, the pose is where the arm stopped. A
-moving arm can then settle a little further, to the setpoint it holds.
+joints. After a cancel or a stop, the pose is where the arm stood on that
+tick, and the arm's command moves there and holds it.
 
 When an arm has no fresh measurement when the goal ends, the three arrays
 are empty, and the log says why: the follower of the arm stopped reporting,
@@ -445,9 +488,12 @@ takes it: the stop marks the move slot of the limb. This ends a goal on its
 way from its action to the coordinator, and a `move_to_home` goal between
 the end of its close and the moves of its arms. Each goal ends cancelled for
 the reason `stopped: <reason>` (`stopped` for an empty reason), a posture
-goal too. Each limb holds the setpoint it was last governed to, as after a
-cancel, and the answer's `stopped` names the limbs whose move was in flight,
-empty when none was. The stop does not latch: a goal admitted after it runs.
+goal too. Each arm whose move the stop ends holds where it stands, as after
+a cancel: its command moves to the joints it measures on the stop's tick. An
+arm with no fresh measurement, and an arm whose joint path had not started
+to play, keeps the command it was last governed to, and so does each gripper.
+The answer's `stopped` names the limbs whose move was in flight, empty when
+none was. The stop does not latch: a goal admitted after it runs.
 A leader's streamed setpoints are not stopped.
 A coordinator that does not answer cannot carry the stop out: the stop then
 gives an error reply with `attempt_failed`.
@@ -469,11 +515,11 @@ wait stops nothing and a check then gets an error reply with
 
 ### camera_mounts
 
-`get_camera_poses` answers where the generation's design carries each
+`get_camera_poses` answers where the robot's design carries each
 camera, in the robot frame, as the pose of the camera's colour optical frame
-(`+x` to the right of the image, `+y` down it, `+z` along the view): the
-numbers `openarm_description` lists, which are the simulation's, so they are
-exact in a simulation and nominal on hardware. A camera fixed to the base
+(`+x` to the right of the image, `+y` down it, `+z` along the view): each
+camera's optical frame in the description's URDF, which the simulation
+reads too, so they are exact in a simulation and nominal on hardware. A camera fixed to the base
 (v2's `chest`) has one pose; a camera an arm carries (v2's `wrist_left` and
 `wrist_right`, which hang off the link the grasp point hangs off) is composed
 with that arm's grasp pose from the last `limb_states` snapshot, and the
@@ -486,19 +532,26 @@ a link a moving joint carries, other than the grasp point's, stops bringup.
 
 `describe_workspace` and `check_positions` answer where the robot can work
 from its design alone, in the robot frame, knowing nothing of the room: a
-surface is a flat, level plane at the height asked, with nothing in the way.
-A point is reachable when an arm brings its grasp point within 1 cm of it
-in one of the 16 grasp orientations `workspace_core` lists (the gripper
-pointing straight down or straight forward, each at 8 rolls), solved by the
-arm's closed-form IK seeded at Ready: a grasp within 1 cm of an edge of
-the arm's reach, outside or inside it, is solved moved into that reach by
-less than 1 cm, in the same orientation.
+surface is a flat, level plane at the height asked, the top of a block under
+it that stands from the front of the robot's body to the far end of the
+measured grid, and reaches as far to each side of the robot as it reaches
+ahead (`workspace_core::surface_block`), with nothing else in the way; a
+point `check_positions` names stands on no surface.
+A point is reachable, by `workspace_core`'s reach rule
+(`workspace_core::reach`), when an arm brings its grasp point within 1 cm
+of it in one of the 16 grasp orientations `workspace_core` lists (the
+gripper pointing straight down or straight forward, each at 8 rolls),
+solved by the arm's closed-form IK seeded at Ready, in a pose of which no
+collision piece of the arm overlaps the block of the surface: a grasp
+within 1 cm of an edge of the arm's reach, outside or inside it, is solved
+moved into that reach by less than 1 cm, in the same orientation.
 The arm whose base stands nearer the point is tried first and named. A
 point out of reach carries how far the closest arm stops its grasp point
 short of it in any orientation, its joint limits aside: at most 0.01 when
-the grasp point gets within 1 cm of it, but in no grasp orientation, which
-the point's message words as `no arm reaches it with its gripper pointing
-down or forward`. A point is in view when it lies inside the perception camera's
+the grasp point gets within 1 cm of it, but in no grasp orientation, or on
+a surface only in poses that overlap its block, which the point's message
+words as `no arm reaches it with its gripper pointing down or forward`. A
+point is in view when it lies inside the perception camera's
 field of view, a pixel of its colour image showing it through the lens the
 camera gives, and its depth, by the depth model the camera gives (`z`, the
 depth along the optical axis, or `range`, the straight-line distance), lies
@@ -541,21 +594,22 @@ The robot's own body is not checked for hiding a point from the camera.
 
 | Module | Owns | Why it lives here |
 |---|---|---|
-| `main.rs` | tracing, then the node runtime running `setup` | all node logic lives in the library, so the integration tests boot the same entry point |
-| `node.rs` | bringup: params, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
+| `main.rs` | tracing, then the node runtime running `setup`, and the exit with the fault that ended the node | all node logic lives in the library, so the integration tests boot the same entry point |
+| `node.rs` | bringup: params in `setup`, then, once the robot's initializer names the model, models, channels, task supervision | first task exit is fatal; the daemon restarts a clean process |
+| `identity.rs` | the model the robot's initializer names, held to this backbone's arms, then the digest of the description it serves, held to the one this backbone was built with | the backbone runs only a model it drives, from the description it was built with |
 | `startup.rs` | the robot_initializer gate | nothing streams before the robot is ready |
 | `streams.rs` | every subscription + parse-at-the-boundary types (`GripperCommand`, `ArmState`, `GripperState`) | one receive policy (`subscribe_pair` + `accept`); a malformed message is dropped with a reason, never driven |
 | `upstream.rs` | `UpstreamMode` (which upstream slot kind is followed) + `Upstream` (the parsed joint or pose command) | one command authority per arm is unrepresentable, not checked per tick |
 | `publish.rs` | every publisher (`Publishers`), one stamp/build/publish/log path | peppy vocabulary: a publisher on a slot; "wire" means the transport encoding only |
 | `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern_along` call, which is why the governor is not folded into it |
-| `gripper_move.rs` | gripper move execution: a `move_gripper` goal, or the close of a gripper for a `move_to_home` goal, admitted into a free side, the effort cap it relays, the terminal it gets once the jaws stand still, its settle timeout passes or its travel timeout runs out, and the end of its goal or the report to its posture goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
+| `gripper_move.rs` | gripper move execution: a `move_gripper` goal, or the close of a gripper for a `move_to_home` goal, admitted into a free arm, the effort cap it relays, the terminal it gets once the jaws stand still, its settle timeout passes or its travel timeout runs out, and the end of its goal or the report to its posture goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
 | `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, the `SlotRelease` a move holds, and the mark a stop leaves on a slot whose goal the coordinator has not taken), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move / share of an `execute_joint_path` path) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only, but for the path its share follows; never the collision model |
 | `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
 | `planner/stream_smoothing.rs` | the smoothing of a streamed pose's steps: one Butterworth per joint at MoveIt Servo's default cutoff for the control period | a smoother can overshoot its input, so the planner holds its output to the velocity limit |
 | `path_checks.rs` | the judgments of `execute_joint_path` paths on a blocking thread, and the resumption of their shares on the tick each judgment comes | the loop never waits on a judgment |
-| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move settles within), the verdict an arm move gets from its planned end on, and how far a joint target or a grasp point still stands from its target | one rule for the joint and the Cartesian move |
+| `settle.rs` | `Settle`, `PoseTolerance` (the slack a Cartesian move settles within), `ContactGap` (the gap a goal names for a contact), the verdict an arm move gets on each tick, and how far a joint target or a grasp point still stands from its target | one rule for the joint move, the joint path and the Cartesian move |
 | `governor/mod.rs` | `GovState`, the pipeline, the runtime controls, disposition and readout | the only mutable resource is the collision model |
 | `governor/sense.rs` | the pre-projection model read (`Sensed`) | limiters and the projection decide on one snapshot |
 | `governor/model.rs` | `ConfiguredModel`, the only door to the collision model | every query takes the whole configuration; stale-placement reads are unrepresentable |
@@ -564,12 +618,22 @@ The robot's own body is not checked for hiding a point from the camera.
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
 | `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal |
-| `workspace.rs` | the OpenArm's part of the workspace answer from the design: reach per grasp orientation, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
+| `workspace.rs` | the OpenArm's part of the workspace answer from the design: its arms as `workspace_core`'s reach rule asks them, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `camera_mounts.rs` | the camera_mounts contract: each camera resolved once at bringup into the frame that carries it, then composed with the grasp poses measured last | a mount the backbone cannot place stops bringup |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
-| `types.rs` | the limb tables, the world-pose wire codec, both arms' joints in one vector | shared primitives; `ARM_DOF`, `Side` and `ArmPair` come from `openarm_description`, `JointVec` from `srs_model` |
+| `types.rs` | the limb tables, the world-pose wire codec, every arm's joints in one vector | shared primitives; `ArmId` and `PerArm` come from `robot_description`, `ARM_DOF` and `JointVec` from `srs_model` |
+| `robot.rs` | the robot this node is built for (`ARMS` arms of `ARM_DOF` joints, each arm's and gripper's name, `LIMBS`), a request's arm or gripper by name, the postures of a named state | a model of another shape ends the node, naming the models of this shape |
+| `arm_order.rs` | `ArmOrder`, the arms a request names in its order, on `control_core::requested_arms` | one reading of a request's `arms` for `execute_joint_path` |
 
 ## Parameters and links
+
+The backbone reads the robot's model from the robot's initializer on its
+`robot_identity` link: it asks once its setup has returned, since the
+initializer may start after it, and asks again each second until the
+initializer answers. A model whose arms are not `left_arm` and `right_arm` of
+seven joints, each with its gripper, ends the node with an error that names the
+served model and the models of this shape, as does an initializer that serves
+another build of the model's description.
 
 See `peppy.json5` for the full commented list. The operational governor
 parameters (`d_stop_m`, `d_safe_m`, `collision_governor_enabled`,

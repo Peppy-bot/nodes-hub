@@ -1,25 +1,32 @@
-//! Node composition: parses every parameter up front, takes the per-gripper
-//! instance lock, brings the motor up over CAN in its generation's control
-//! mode, then wires the setpoint stream to the follow loop and the state/health
-//! publishers. All device and stream logic lives in the sibling modules; this
-//! is only the assembly.
+//! Node composition: setup parses every parameter, takes the per-gripper
+//! instance lock, opens the CAN interface and serves readiness; the first
+//! `set_model` call of the robot's initializer names the robot's model, and the
+//! node then brings the motor up in the control mode of that model's mechanism
+//! and wires the setpoint stream to the follow loop and the state/health
+//! publishers. All
+//! device and stream logic lives in the sibling modules; this is only the
+//! assembly.
 
 use crate::follow::{self, FollowConfig};
-use crate::hardware::{Gripper, PosForceLimits, gripper_motor_type};
+use crate::geometry::driven_finger;
+use crate::hardware::{DRIVEN_MODELS, Gripper, Mechanism, PosForceLimits};
 use crate::{health, stream};
+use control_core::component_model::ComponentModel;
+use control_core::fault::Fault;
+use control_core::requested_arms::limb_at;
 use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 use control_core::time::{RateOutOfRange, period_from_hz};
-use openarm_can::ReceivePass;
-use openarm_description::{HardwareVersion, Side};
-use peppygen::exposed_services::ready::is_ready;
+use openarm_can::{CanInterface, ReceivePass};
+use peppygen::exposed_services::ready::{is_ready, set_model};
 use peppygen::{NodeRunner, Parameters, Result};
 use peppylib::runtime::CancellationToken;
+use robot_description::{Finger, RobotDescription, UndrivenModel};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
 // Mirrors the ROS2 reference hardware's on_activate / on_deactivate sleep durations.
@@ -34,31 +41,20 @@ const ENABLE_FD: bool = true;
 /// minimum 1 s grace window so the disable hook keeps most of the budget.
 const HEALTH_FLUSH_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// `gripper_id` values (0 = left, 1 = right), selecting the side whose
-/// opening geometry this instance drives.
-const GRIPPER_ID_LEFT: u8 = 0;
-const GRIPPER_ID_RIGHT: u8 = 1;
-
-/// The gripper side for the given `gripper_id`, refused on an unknown value
-/// so a misconfigured run fails at startup with the value in the message.
-fn side_for(gripper_id: u8) -> NodeResult<Side> {
-    match gripper_id {
-        GRIPPER_ID_LEFT => Ok(Side::Left),
-        GRIPPER_ID_RIGHT => Ok(Side::Right),
-        other => Err(NodeError::GripperId(other)),
-    }
-}
-
 /// The fastest this node drives the gripper. The motor shares the arm's
 /// CAN FD bus and is paced the same way.
 const MAX_RATE_HZ: u32 = 1_000;
 
-/// Everything this node refuses to run on, or stops for.
+/// Everything this node refuses to run on, or stops for: a parameter, the
+/// instance lock or the CAN interface, which `setup` refuses, and the model the
+/// robot's initializer names, the parameters that model's mechanism reads, or a
+/// step of the bring-up, which end the node with a [`Fault`] after `setup` has
+/// returned.
 ///
 /// Named rather than stringly typed so each refusal keeps its source, and so
 /// this list is the one place to read what a launch can be rejected for. It
 /// exists because returning a refusal, rather than panicking it, is what runs
-/// the shutdown hooks: a panic in `setup` unwinds past them, leaving the motor
+/// the shutdown hooks: a panic unwinds past them, leaving the motor
 /// energised.
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -68,17 +64,23 @@ pub enum NodeError {
     #[error("parameter state_rate_hz")]
     StateRate(#[source] RateOutOfRange),
 
-    #[error("gripper_id must be {GRIPPER_ID_LEFT} (left) or {GRIPPER_ID_RIGHT} (right), got {0}")]
-    GripperId(u8),
-
     #[error(transparent)]
-    HardwareVersion(#[from] openarm_description::UnknownHardwareVersion),
+    Model(UndrivenModel),
+
+    #[error("{0}")]
+    GripperId(String),
+
+    #[error("model {model}'s {gripper} moves no finger for the motor to drive")]
+    NoFinger { model: String, gripper: String },
 
     #[error(transparent)]
     Limits(#[from] crate::hardware::PosForceLimitsError),
 
     #[error(transparent)]
     Claim(#[from] instance_lock::Error),
+
+    #[error("cancelled before bring-up")]
+    CancelledDuringBringUp,
 
     #[error("enable the gripper motor")]
     Enable(#[from] openarm_can::EnableFailure),
@@ -88,9 +90,6 @@ pub enum NodeError {
 
     #[error("the follow loop never started")]
     FollowLoopNeverStarted,
-
-    #[error("hard fault stopped this node; the log names the failing component")]
-    HardFault,
 
     /// The runtime's own failures pass through unchanged rather than being
     /// re-wrapped, so a messaging or config error keeps the variant it was
@@ -117,63 +116,109 @@ impl From<NodeError> for peppygen::Error {
     }
 }
 
-/// Names this gripper's motor on the alert wire.
-fn alert_source(side: Side) -> String {
-    format!("{side} gripper")
-}
-
-/// What the launch parameters resolve to, parsed once before any device
-/// contact.
+/// What the launch parameters resolve to, parsed in `setup`, before any device
+/// contact and before the robot's model is known.
 #[derive(Debug)]
-struct Config {
-    side: Side,
-    hardware_version: HardwareVersion,
+struct Launch {
     cycle_period: Duration,
     state_period: Duration,
+}
+
+/// What the robot's model resolves to for this gripper, built on the first
+/// `set_model` call that names a model this node drives.
+#[derive(Debug)]
+struct Config {
+    /// The robot's model id.
+    model: &'static str,
+    /// The mechanism of the model's gripper: the control mode the motor is
+    /// opened in and its travel.
+    mechanism: Mechanism,
+    /// The gripper's name in the description, which names its motor on the
+    /// alert wire.
+    gripper_name: String,
+    /// The finger the motor drives, whose opening direction signs the motor's.
+    finger: Finger,
     limits: PosForceLimits,
 }
 
-/// Parse every launch parameter, refusing the first that cannot drive a
-/// gripper.
-fn parse_config(params: &Parameters) -> NodeResult<Config> {
-    let side = side_for(params.gripper_id)?;
-    // Which OpenArm generation this gripper drives; selects the control
-    // mode the motor is opened in and this side's opening geometry.
-    let hardware_version: HardwareVersion = params.hardware_version.parse()?;
-    let cycle_period =
-        period_from_hz(params.control_rate_hz, MAX_RATE_HZ).map_err(NodeError::ControlRate)?;
-    let state_period =
-        period_from_hz(params.state_rate_hz, MAX_RATE_HZ).map_err(NodeError::StateRate)?;
-    // Checked whatever the generation: the ranges are properties of the
-    // parameters, not of the gripper that reads them. Only the v2
-    // POS_FORCE command path puts them on the wire.
+/// The gripper of the arm at `gripper_id` among the arms of `description`,
+/// refused naming each place with its gripper.
+fn gripper_at(
+    description: &RobotDescription,
+    gripper_id: u8,
+) -> NodeResult<&robot_description::Gripper> {
+    limb_at(
+        "gripper",
+        "gripper_id",
+        gripper_id,
+        description.arms(),
+        |arm| arm.gripper.name.as_str(),
+    )
+    .map(|arm| &arm.gripper)
+    .map_err(NodeError::GripperId)
+}
+
+/// Parse every launch parameter the model leaves alone, refusing the first that
+/// cannot drive a gripper.
+fn parse_launch(params: &Parameters) -> NodeResult<Launch> {
+    Ok(Launch {
+        cycle_period: period_from_hz(params.control_rate_hz, MAX_RATE_HZ)
+            .map_err(NodeError::ControlRate)?,
+        state_period: period_from_hz(params.state_rate_hz, MAX_RATE_HZ)
+            .map_err(NodeError::StateRate)?,
+    })
+}
+
+/// The configuration of the gripper at `params.gripper_id` of a robot of
+/// `model`: refused when this node drives no gripper of the model, naming the
+/// models it drives, when the model has no gripper at `gripper_id` or none whose
+/// motor turns a finger, or when the POS_FORCE limits do not fit the model's
+/// motor.
+fn configure(model: &str, params: &Parameters) -> NodeResult<Config> {
+    let (model, mechanism) = DRIVEN_MODELS.model(model).map_err(NodeError::Model)?;
+    let description = model.description();
+    let gripper = gripper_at(&description, params.gripper_id)?;
+    let finger = driven_finger(gripper)
+        .ok_or_else(|| NodeError::NoFinger {
+            model: model.id().to_owned(),
+            gripper: gripper.name.clone(),
+        })?
+        .clone();
+    // Checked whatever the mechanism: the ranges are properties of the
+    // parameters, not of the gripper that reads them. Only the pinch
+    // fingers' POS_FORCE command path puts them on the wire.
     let limits = PosForceLimits::new(
-        gripper_motor_type(hardware_version),
+        mechanism.motor_type(),
         params.speed_rad_s,
         params.max_effort_nm,
     )?;
     Ok(Config {
-        side,
-        hardware_version,
-        cycle_period,
-        state_period,
+        model: model.id(),
+        mechanism,
+        gripper_name: gripper.name.clone(),
+        finger,
         limits,
     })
 }
 
 /// Cancel the node when a supervised task exits while it should still be
-/// running. An unsupervised dead loop leaves the node reachable but inert;
-/// a dead follow loop is worse, because the health task would keep judging
-/// a frozen state cache. Watching the JoinHandle means a panic lands here
-/// too, not only a clean return.
-fn supervise(task: tokio::task::JoinHandle<()>, what: &'static str, token: CancellationToken) {
+/// running, raising `fault`. An unsupervised dead loop leaves the node
+/// reachable but inert; a dead follow loop is worse, because the health task
+/// would keep judging a frozen state cache. Watching the JoinHandle means a
+/// panic lands here too, not only a clean return.
+fn supervise(
+    task: tokio::task::JoinHandle<()>,
+    what: &'static str,
+    token: CancellationToken,
+    fault: Fault,
+) {
     tokio::spawn(async move {
         let _ = task.await;
-        if !token.is_cancelled() {
-            error!("{what} exited unexpectedly");
-            follow::HARD_FAULT.store(true, Ordering::SeqCst);
+        if token.is_cancelled() {
+            return;
         }
-        token.cancel();
+        follow::HARD_FAULT.store(true, Ordering::SeqCst);
+        fault.raise(format!("the {what} exited unexpectedly"), || token.cancel());
     });
 }
 
@@ -185,52 +230,31 @@ fn reports_ready(brought_up: bool, hard_faulted: bool, shutting_down: bool) -> b
     brought_up && !hard_faulted && !shutting_down
 }
 
-/// True once the follow loop has latched a hard CAN fault; read by `main`
-/// after the runtime returns (the `follow` module stays private to this
-/// crate).
-pub fn hard_fault_latched() -> bool {
-    follow::HARD_FAULT.load(Ordering::SeqCst)
+/// The runtime's entry point, in the shape `NodeBuilder::run` takes once `fault`
+/// is bound: the setup runs as [`NodeError`] and is converted once, here, so every
+/// step inside can use `?` on its own failures. The robot's initializer, which
+/// names the model with its first `set_model` call, may start after this node, so
+/// `setup` returns before the motor is brought up, and a refusal after it raises
+/// `fault`.
+pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>, fault: Fault) -> Result<()> {
+    assemble(params, node_runner, fault)
+        .await
+        .map_err(Into::into)
 }
 
-/// The runtime's entry point: the whole bring-up runs as [`NodeError`] and is
-/// converted once, here, so every step inside can use `?` on its own failures.
-pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
-    assemble(params, node_runner).await.map_err(Into::into)
-}
-
-async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResult {
+async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>, fault: Fault) -> NodeResult {
     // Pairing timestamps read this instance's bound clock, so state
     // consumers age samples on one timeline.
     peppygen::clock::init(&node_runner).await?;
 
     // Parse every parameter up front (parse, don't validate): a bad launch
     // fails here with the reason, before touching the CAN bus.
-    let Config {
-        side,
-        hardware_version,
-        cycle_period,
-        state_period,
-        limits,
-    } = parse_config(&params)?;
+    let launch = parse_launch(&params)?;
     let gripper_id = params.gripper_id;
-    let can_interface = params.can_interface.clone();
-    let alert_source = alert_source(side);
-
-    // The resolved configuration, so a parameter that this generation
-    // does not read is visibly absent rather than silently ignored.
     info!(
-        "config: {alert_source} ({hardware_version}) rate={}Hz state_rate={}Hz",
+        "config: gripper_id={gripper_id} rate={}Hz state_rate={}Hz",
         params.control_rate_hz, params.state_rate_hz
     );
-    if hardware_version == HardwareVersion::V2 {
-        info!(
-            "config: POS_FORCE speed={} rad/s grip-force ceiling={} N*m at the shaft",
-            params.speed_rad_s, params.max_effort_nm
-        );
-    }
-
-    let cfg = FollowConfig { cycle_period };
-    let receive = ReceivePass::new(cycle_period);
 
     // One instance per gripper: two instances sharing a `gripper_id` command one
     // motor id on one bus, each decoding the other's replies. The claim is an
@@ -245,17 +269,164 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
     .inspect_err(|e| error!("{e}"))?;
 
     // Claim-release hook, registered first so it runs last, after the
-    // motor-disable hook below: the next start of this gripper finds its motor
-    // already disabled.
+    // motor-disable hook the bring-up registers: the next start of this
+    // gripper finds its motor already disabled.
     node_runner.on_shutdown(async move {
         drop(gripper_claim);
     });
 
-    // Hardware bringup, mirroring the ROS2 reference's on_init / on_configure
-    // / on_activate: opening writes this generation's control mode into the
-    // motor and consumes the reply, so the bus is quiet on return.
+    // The interface is the same whatever the robot's model, so a missing or
+    // down interface refuses the launch here; the bring-up writes the control
+    // mode of the model's mechanism into the motor on it.
+    let can_interface = &params.can_interface;
     info!("opening CAN interface {can_interface} (FD={ENABLE_FD})");
-    let gripper = Gripper::open(hardware_version, side, &can_interface, ENABLE_FD, limits)?;
+    let interface = CanInterface::open(can_interface, ENABLE_FD)?;
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let (configured_tx, configured_rx) = mpsc::unbounded_channel();
+    serve_readiness(
+        &node_runner,
+        &params,
+        ready.clone(),
+        configured_tx,
+        fault.clone(),
+    );
+    let token = node_runner.cancellation_token().clone();
+    let bring_up = bring_up_once_configured(
+        node_runner,
+        params,
+        launch,
+        configured_rx,
+        interface,
+        ready,
+        fault.clone(),
+    );
+    tokio::spawn(fault.raise_on_panic("the bring-up", bring_up, move || token.cancel()));
+    Ok(())
+}
+
+/// Serves component_ready for as long as the node runs. `set_model` names the robot's
+/// model, and the first one configures the gripper for it, which `configured` hands to
+/// the bring-up; `is_ready` answers not ready until the bring-up and control wiring
+/// complete, then ready. A model this node does not drive, or one other than the first
+/// `set_model`'s, gets an error reply naming it and raises `fault`.
+fn serve_readiness(
+    node_runner: &Arc<NodeRunner>,
+    params: &Parameters,
+    ready: Arc<AtomicBool>,
+    configured: mpsc::UnboundedSender<Config>,
+    fault: Fault,
+) {
+    let runner = node_runner.clone();
+    let params = params.clone();
+    let token = node_runner.cancellation_token().clone();
+    tokio::spawn(async move {
+        let model = ComponentModel::default();
+        let set = serving::serve("set_model", token.cancelled(), || {
+            set_model::handle_requests(&runner, |request| {
+                model
+                    .set(
+                        &request.data.model,
+                        |named| configure(named, &params),
+                        |config| {
+                            let _ = configured.send(config);
+                        },
+                        &fault,
+                        || token.cancel(),
+                    )
+                    .map_err(|reply| {
+                        set_model::Failure::new(set_model::FailureKind::Rejected, reply)
+                    })
+            })
+        });
+        let answer = serving::serve("is_ready", token.cancelled(), || {
+            is_ready::handle_requests(&runner, |_request| {
+                Ok(is_ready::Response::new(reports_ready(
+                    ready.load(Ordering::SeqCst),
+                    follow::HARD_FAULT.load(Ordering::SeqCst),
+                    token.is_cancelled(),
+                )))
+            })
+        });
+        tokio::join!(set, answer);
+    });
+}
+
+/// Waits for the configuration the first `set_model` call names, then brings the
+/// gripper up for it on `interface`. A bring-up that fails raises `fault`.
+async fn bring_up_once_configured(
+    node_runner: Arc<NodeRunner>,
+    params: Parameters,
+    launch: Launch,
+    mut configured: mpsc::UnboundedReceiver<Config>,
+    interface: CanInterface,
+    ready: Arc<AtomicBool>,
+    fault: Fault,
+) {
+    let token = node_runner.cancellation_token().clone();
+    let config = tokio::select! {
+        _ = token.cancelled() => return,
+        config = configured.recv() => match config {
+            Some(config) => config,
+            None => return,
+        },
+    };
+    if let Err(refusal) = bring_up(
+        &node_runner,
+        &params,
+        launch,
+        config,
+        interface,
+        &ready,
+        &fault,
+    )
+    .await
+    {
+        fault.raise(refusal, || token.cancel());
+    }
+}
+
+/// Brings the motor on `interface` up in the control mode of the model's mechanism
+/// and wires the setpoint stream to the follow loop and the state/health
+/// publishers; marks the gripper ready once the follow loop runs.
+async fn bring_up(
+    node_runner: &Arc<NodeRunner>,
+    params: &Parameters,
+    launch: Launch,
+    config: Config,
+    interface: CanInterface,
+    ready: &AtomicBool,
+    fault: &Fault,
+) -> NodeResult {
+    let Launch {
+        cycle_period,
+        state_period,
+    } = launch;
+    let Config {
+        model,
+        mechanism,
+        gripper_name,
+        finger,
+        limits,
+    } = config;
+
+    // The resolved configuration, so a parameter that this mechanism
+    // does not read is visibly absent rather than silently ignored.
+    info!("config: {gripper_name} of {model} ({mechanism:?})");
+    if mechanism == Mechanism::PinchFingers {
+        info!(
+            "config: POS_FORCE speed={} rad/s grip-force ceiling={} N*m at the shaft",
+            params.speed_rad_s, params.max_effort_nm
+        );
+    }
+
+    let cfg = FollowConfig { cycle_period };
+    let receive = ReceivePass::new(cycle_period);
+
+    // Hardware bringup, mirroring the ROS2 reference's on_init / on_configure
+    // / on_activate: opening writes this mechanism's control mode into the
+    // motor and consumes the reply, so the bus is quiet on return.
+    let gripper = Gripper::open(mechanism, &finger, interface, limits)?;
     let gripper = Arc::new(Mutex::new(gripper));
 
     // Motor-disable hook, registered before the motor is ever enabled and
@@ -290,13 +461,23 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
 
     // Enable and verify the motor acknowledges torque authority, then
     // return to closed (motor angle = 0.0 rad) before serving requests.
-    // Errors return through the runtime so the hooks above disable the
-    // motor and release the lock.
-    lock_ignoring_poison(&gripper).enable_and_confirm(
-        openarm_can::ENABLE_ATTEMPTS,
-        POST_ENABLE_SLEEP,
-        BRINGUP_RECV_US,
-    )?;
+    // Errors raise the node's fault, whose stop runs the hooks above: they
+    // disable the motor and release the lock. Cancellation precedes the
+    // shutdown hooks and the disable hook, registered above, takes this same
+    // lock, so checking under the lock closes both orders: a bring-up after
+    // shutdown began bails here before enabling, and a shutdown during the
+    // enable disables after it completes.
+    {
+        let mut g = lock_ignoring_poison(&gripper);
+        if node_runner.cancellation_token().is_cancelled() {
+            return Err(NodeError::CancelledDuringBringUp);
+        }
+        g.enable_and_confirm(
+            openarm_can::ENABLE_ATTEMPTS,
+            POST_ENABLE_SLEEP,
+            BRINGUP_RECV_US,
+        )?;
+    }
     {
         let mut g = lock_ignoring_poison(&gripper);
         info!("returning to zero");
@@ -319,6 +500,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         publisher,
         "state publisher",
         node_runner.cancellation_token().clone(),
+        fault.clone(),
     );
 
     // Motor condition telemetry and operator alerts, off the same cached
@@ -334,7 +516,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         let token = node_runner.cancellation_token().clone();
         async move {
             let _done = health_done_tx;
-            health::run(runner, alert_source, gripper, ratings, cycle_period, token).await;
+            health::run(runner, gripper_name, gripper, ratings, cycle_period, token).await;
         }
     });
     node_runner.on_shutdown(async move {
@@ -349,29 +531,8 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         health_task,
         "health publisher",
         node_runner.cancellation_token().clone(),
+        fault.clone(),
     );
-
-    // is_ready service: false until bringup and control wiring complete, then
-    // true. A real robot's robot_initializer polls this (component_ready)
-    // to gate the whole robot.
-    let ready = Arc::new(AtomicBool::new(false));
-    {
-        let runner = node_runner.clone();
-        let ready = ready.clone();
-        let token = node_runner.cancellation_token().clone();
-        tokio::spawn(async move {
-            serving::serve("is_ready", token.cancelled(), || {
-                is_ready::handle_requests(&runner, |_req| {
-                    Ok(is_ready::Response::new(reports_ready(
-                        ready.load(Ordering::SeqCst),
-                        follow::HARD_FAULT.load(Ordering::SeqCst),
-                        token.is_cancelled(),
-                    )))
-                })
-            })
-            .await;
-        });
-    }
 
     // Stream listener -> follow loop: the listener keeps the latest streamed
     // opening addressed to this gripper, the follow loop drives the motor
@@ -386,6 +547,7 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         setpoints,
         "command stream",
         node_runner.cancellation_token().clone(),
+        fault.clone(),
     );
     let (follow_started_tx, follow_started_rx) = oneshot::channel::<()>();
     let follower = tokio::spawn(follow::run(
@@ -394,11 +556,13 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
         cfg,
         node_runner.cancellation_token().clone(),
         follow_started_tx,
+        fault.clone(),
     ));
     supervise(
         follower,
         "follow loop",
         node_runner.cancellation_token().clone(),
+        fault.clone(),
     );
 
     // The ack arrives once the follow loop is actually running; a task
@@ -417,24 +581,23 @@ async fn assemble(params: Parameters, node_runner: Arc<NodeRunner>) -> NodeResul
 mod tests {
     use super::*;
 
+    /// The model the tests' robot is.
+    const MODEL: &str = "openarm_v2";
+
     /// A launch the node accepts, one field per parameter the manifest names.
     fn params() -> Parameters {
         Parameters {
             can_interface: "can0".to_string(),
             control_rate_hz: 100,
-            gripper_id: GRIPPER_ID_LEFT,
-            hardware_version: "v2".to_string(),
+            gripper_id: 0,
             max_effort_nm: 3.0,
             speed_rad_s: 25.0,
             state_rate_hz: 100,
         }
     }
 
-    /// A parameter's name and the edit that makes it acceptable.
-    type ParameterFix = (&'static str, fn(&mut Parameters));
-
-    fn refusal(params: Parameters) -> String {
-        let error = parse_config(&params).expect_err("refused");
+    /// A refusal as an operator reads it: the error and its source.
+    fn reading(error: NodeError) -> String {
         // The source carries the reason; the variant names the parameter.
         match std::error::Error::source(&error) {
             Some(source) => format!("{error}: {source}"),
@@ -442,32 +605,62 @@ mod tests {
         }
     }
 
+    /// The refusal of `params` at setup, or at the first `set_model` call naming
+    /// [`MODEL`] when setup takes it.
+    fn refusal(params: Parameters) -> String {
+        let refused = parse_launch(&params)
+            .err()
+            .or_else(|| configure(MODEL, &params).err())
+            .expect("refused");
+        reading(refused)
+    }
+
+    /// The bundled description of `model`.
+    fn description_of(model: &str) -> RobotDescription {
+        robot_description::model(model)
+            .expect("a bundled model")
+            .description()
+    }
+
     #[test]
-    fn a_launch_with_every_parameter_set_parses() {
-        let config = parse_config(&params()).expect("parses");
-        assert_eq!(config.side, Side::Left);
-        assert_eq!(config.hardware_version, HardwareVersion::V2);
-        assert_eq!(config.cycle_period, Duration::from_millis(10));
-        assert_eq!(config.state_period, Duration::from_millis(10));
+    fn a_launch_with_every_parameter_set_parses_and_configures() {
+        let launch = parse_launch(&params()).expect("parses");
+        assert_eq!(launch.cycle_period, Duration::from_millis(10));
+        assert_eq!(launch.state_period, Duration::from_millis(10));
+        let config = configure(MODEL, &params()).expect("configures");
+        assert_eq!(config.model, MODEL);
+        assert_eq!(config.mechanism, Mechanism::PinchFingers);
+        assert_eq!(
+            config.gripper_name,
+            description_of(MODEL).arms()[0].gripper.name
+        );
+    }
+
+    /// Every gripper of every model this node drives configures: its mechanism,
+    /// its name on the alert wire, and the finger its motor drives, each read
+    /// from the model's description.
+    #[test]
+    fn every_gripper_of_every_driven_model_configures_under_its_name() {
+        for (model, mechanism) in DRIVEN_MODELS {
+            for (place, arm) in description_of(model).arms().iter().enumerate() {
+                let config = configure(
+                    model,
+                    &Parameters {
+                        gripper_id: u8::try_from(place).expect("a place a u8 holds"),
+                        ..params()
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{model} {}: {e}", arm.gripper.name));
+                assert_eq!(config.mechanism, mechanism, "{model}");
+                assert_eq!(config.gripper_name, arm.gripper.name, "{model}");
+                assert_eq!(Some(&config.finger), driven_finger(&arm.gripper), "{model}");
+            }
+        }
     }
 
     #[test]
     fn every_refusal_names_its_parameter() {
         let cases = [
-            (
-                "gripper_id",
-                Parameters {
-                    gripper_id: 2,
-                    ..params()
-                },
-            ),
-            (
-                "hardware_version",
-                Parameters {
-                    hardware_version: "v3".into(),
-                    ..params()
-                },
-            ),
             (
                 "control_rate_hz",
                 Parameters {
@@ -486,6 +679,13 @@ mod tests {
                 "state_rate_hz",
                 Parameters {
                     state_rate_hz: 0,
+                    ..params()
+                },
+            ),
+            (
+                "gripper_id",
+                Parameters {
+                    gripper_id: 2,
                     ..params()
                 },
             ),
@@ -513,50 +713,45 @@ mod tests {
         }
     }
 
+    /// A gripper_id past the model's arms is refused naming the value and
+    /// each place the model has, with its gripper.
     #[test]
-    fn a_launch_wrong_in_every_parameter_is_refused_in_parameter_order() {
-        let fixes: [ParameterFix; 5] = [
-            ("gripper_id", |p| p.gripper_id = GRIPPER_ID_LEFT),
-            ("hardware_version", |p| p.hardware_version = "v2".into()),
-            ("control_rate_hz", |p| p.control_rate_hz = 100),
-            ("state_rate_hz", |p| p.state_rate_hz = 100),
-            ("speed_rad_s", |p| p.speed_rad_s = 25.0),
-        ];
-        let mut launch = Parameters {
-            gripper_id: 2,
-            hardware_version: "v3".into(),
-            control_rate_hz: 0,
-            state_rate_hz: 0,
-            speed_rad_s: 0.0,
-            ..params()
-        };
-        for (parameter, fix) in fixes {
-            let refused = refusal(launch.clone());
-            assert!(
-                refused.contains(parameter),
-                "the next refusal must name {parameter}: {refused}"
-            );
-            fix(&mut launch);
-        }
-        parse_config(&launch).expect("every parameter fixed");
-    }
-
-    #[test]
-    fn an_unknown_gripper_id_is_named_not_panicked() {
-        assert!(matches!(side_for(GRIPPER_ID_LEFT), Ok(Side::Left)));
-        assert!(matches!(side_for(GRIPPER_ID_RIGHT), Ok(Side::Right)));
-        let refusal = side_for(7).expect_err("an id outside the convention must be refused");
-        assert!(matches!(refusal, NodeError::GripperId(7)), "got {refusal}");
+    fn an_unknown_gripper_id_names_the_grippers_of_the_model() {
+        let refusal = configure(
+            MODEL,
+            &Parameters {
+                gripper_id: 7,
+                ..params()
+            },
+        )
+        .expect_err("a place with no arm must be refused")
+        .to_string();
         assert!(
-            refusal.to_string().ends_with("got 7"),
-            "the message must name the offending value, got {refusal}"
+            refusal.starts_with("gripper_id names 7, no gripper of this robot: "),
+            "{refusal}"
         );
+        for (place, arm) in description_of(MODEL).arms().iter().enumerate() {
+            let named = format!("{place} (\"{}\")", arm.gripper.name);
+            assert!(refusal.contains(&named), "{named} in {refusal}");
+        }
     }
 
+    /// A model this node drives no gripper of is refused naming the models it
+    /// drives, whether robot_description bundles it or not.
     #[test]
-    fn the_alert_source_names_the_side() {
-        assert_eq!(alert_source(Side::Left), "left gripper");
-        assert_eq!(alert_source(Side::Right), "right gripper");
+    fn an_undriven_model_is_refused_naming_the_driven_ones() {
+        for model in ["so101", "openarm_v3"] {
+            let refused = configure(model, &params())
+                .expect_err("this node drives no gripper of it")
+                .to_string();
+            assert!(
+                refused.contains(&format!("model {model} is no model this node drives")),
+                "{refused}"
+            );
+            for (driven, _) in DRIVEN_MODELS {
+                assert!(refused.contains(&format!("{driven:?}")), "{refused}");
+            }
+        }
     }
 
     #[test]

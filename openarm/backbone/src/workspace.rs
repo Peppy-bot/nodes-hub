@@ -1,8 +1,10 @@
 //! The OpenArm's part of the workspace contract's answer, from the robot's
 //! design alone: whether an arm reaches a point, and where the perception
-//! camera stands, in the robot frame. Reach is the arms' closed-form inverse
-//! kinematics, the grasp point at the target, to within the reach tolerance,
-//! in each grasp orientation `workspace_core` lists; the view is
+//! camera stands, in the robot frame. Reach is `workspace_core`'s rule
+//! ([`workspace_core::reach::reach`]) over the arms' closed-form inverse
+//! kinematics, each arm seeded at its Ready posture; on a surface, an arm
+//! reaches a point only in a pose clear of the block under the surface
+//! ([`workspace_core::surface_block`]); the view is
 //! `workspace_core`'s field-of-view and depth test of the perception camera,
 //! placed where the design fixes it and seen through the pinhole model of the
 //! colour stream and the depth model its camera gives, each parsed by
@@ -16,18 +18,21 @@ use std::sync::{Mutex, MutexGuard};
 
 use camera_core::geometry::depth_range_is_valid;
 use camera_core::pinhole::{DepthModel, Pinhole, UnknownDepthModel};
-use openarm_description::{ArmPair, Side};
+use robot_description::{ArmId, PerArm};
 use srs_model::nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion, Vector3};
-use srs_model::{Arm, ArmAnglePolicy};
+use srs_model::{Arm, ArmAnglePolicy, JointVec};
 use workspace_core::design::{
     self, Positions, PositionsAnswer, PositionsReach, ReachMemo, SurfaceAnswer, SurfaceHeight,
     SurfaceReach, ViewCheck,
 };
+use workspace_core::reach::{self as rule, ArmSolver, Attempt, Solves, Unobstructed};
+use workspace_core::surface_block::ArmBodies;
 use workspace_core::{
-    Camera, CameraFacts, Depth, GraspOrientation, PerceptionCameraError, REACH_TOLERANCE, Reach,
+    Camera, CameraFacts, Depth, Limits, PerceptionCameraError, REACH_TOLERANCE, Reach,
 };
 
 use crate::camera_mounts::{CameraMounts, DesignCamera};
+use crate::robot::{ARMS, LIMBS};
 
 /// Why the perception camera's view cannot be checked now, from what the
 /// camera linked as perception_geometry answered.
@@ -140,39 +145,44 @@ impl PerceptionCamera {
     }
 }
 
-/// The pose the grasp point takes to reach `target` in `orientation`, in the
-/// robot frame. The tool frame `HardwareVersion::arm_model` mounts is the grasp frame of
-/// `workspace_core`: +Z the approach out of the gripper, +Y the jaw closing
-/// axis.
-fn grasp_pose(orientation: GraspOrientation, target: [f64; 3]) -> Isometry3<f64> {
-    let rotation =
-        Rotation3::from_matrix_unchecked(Matrix3::from_row_slice(&orientation.rotation()));
+/// The pose the grasp point takes at `target`, turned as `rotation` (row-major),
+/// in the robot frame. The tool frame each arm model mounts at its arm's grasp
+/// link is the grasp frame of `workspace_core`: +Z the approach out of the
+/// gripper, +Y the jaw closing axis.
+fn grasp_pose(target: [f64; 3], rotation: [f64; 9]) -> Isometry3<f64> {
+    let rotation = Rotation3::from_matrix_unchecked(Matrix3::from_row_slice(&rotation));
     Isometry3::from_parts(
         Translation3::new(target[0], target[1], target[2]),
         UnitQuaternion::from_rotation_matrix(&rotation),
     )
 }
 
-/// The grasps at `target`, in the robot frame, in the 16 grasp orientations.
-fn grasp_poses(target: [f64; 3]) -> impl Iterator<Item = Isometry3<f64>> {
-    GraspOrientation::all().map(move |orientation| grasp_pose(orientation, target))
-}
-
-/// The robot's workspace from its design: its two arms, its perception
-/// camera if it has one, and the reach of the surfaces measured last.
+/// The robot's workspace from its design: its arms, the Ready posture each
+/// solves from, the bodies a surface holds them clear of, its perception camera
+/// if it has one, and the reach of the surfaces measured last.
 pub struct Workspace {
-    arms: ArmPair<Arm>,
+    arms: PerArm<Arm, ARMS>,
+    ready: PerArm<JointVec, ARMS>,
+    bodies: Mutex<ArmBodies>,
     perception_camera: Option<PerceptionCamera>,
     reach_memo: Mutex<ReachMemo>,
 }
 
 impl Workspace {
-    /// The workspace of the robot whose arms are `arms`, built by
-    /// `HardwareVersion::arm_model`, and whose cameras are `mounts`. A design with more than
-    /// one camera that could be its perception camera is refused.
-    pub fn new(arms: ArmPair<Arm>, mounts: &CameraMounts) -> Result<Self, PerceptionCameraError> {
+    /// The workspace of the robot whose arms are `arms`, each built from its
+    /// arm of the description, whose Ready posture is `ready`, whose arm bodies
+    /// are `bodies` and whose cameras are `mounts`. A design with more than one
+    /// camera that could be its perception camera is refused.
+    pub fn new(
+        arms: PerArm<Arm, ARMS>,
+        ready: &PerArm<JointVec, ARMS>,
+        bodies: ArmBodies,
+        mounts: &CameraMounts,
+    ) -> Result<Self, PerceptionCameraError> {
         Ok(Self {
             arms,
+            ready: *ready,
+            bodies: Mutex::new(bodies),
             perception_camera: PerceptionCamera::of(&mounts.design_cameras())?,
             reach_memo: Mutex::new(ReachMemo::new()),
         })
@@ -195,25 +205,16 @@ impl Workspace {
         }
     }
 
-    /// Whether an arm brings its grasp point to `target`, in the robot frame,
-    /// to within [`REACH_TOLERANCE`], in one of the grasp orientations: the
-    /// arm nearest the target is tried first, so it names the arm when both
-    /// reach. When none does, how far the closest stops its grasp point
-    /// short of the target in any orientation.
+    /// Whether an arm reaches `target`, in the robot frame, by
+    /// `workspace_core`'s rule, with nothing in the way: a point that names no
+    /// surface stands in a room the design knows nothing of.
     pub fn reach(&self, target: [f64; 3]) -> Reach {
-        let grasps: Vec<Isometry3<f64>> = grasp_poses(target).collect();
-        match self
-            .sides_nearest_first(target)
-            .into_iter()
-            .find(|&side| self.reaches(side, &grasps))
-        {
-            Some(side) => Reach::Reached {
-                arm: side.arm_name().to_owned(),
-            },
-            None => Reach::Short {
-                by: self.shortfall(target),
-            },
-        }
+        rule::reach(
+            &mut self.solver(),
+            &mut Unobstructed,
+            target,
+            &Limits::STANDARD,
+        )
     }
 
     /// Where on a flat, level surface at `height` the robot can work, the
@@ -230,12 +231,22 @@ impl Workspace {
     }
 
     /// The reach of the surface at `height`: from the memo when the height
-    /// was measured last, else measured now and stored.
+    /// was measured last, else measured now, each grid target by
+    /// `workspace_core`'s rule in poses clear of the block under the surface,
+    /// and stored.
     fn surface_reach(&self, height: SurfaceHeight) -> SurfaceReach {
         if let Some(stored) = self.reach_memo().get(height) {
             return stored;
         }
-        let measured = SurfaceReach::measure(height, |target| self.reach(target));
+        let mut bodies = self
+            .bodies
+            .lock()
+            .expect("no panic while the arm bodies are held");
+        let mut block = bodies.over(height);
+        let mut solver = self.solver();
+        let measured = SurfaceReach::measure(height, |target| {
+            rule::reach(&mut solver, &mut block, target, &Limits::STANDARD)
+        });
         self.reach_memo().insert(measured)
     }
 
@@ -245,49 +256,69 @@ impl Workspace {
             .expect("no panic while the reach memo is held")
     }
 
-    /// Both sides, the one whose arm base stands nearer `target` first; left
-    /// first when they stand as near.
-    fn sides_nearest_first(&self, target: [f64; 3]) -> [Side; 2] {
-        let target = Vector3::new(target[0], target[1], target[2]);
-        let distance = |side: Side| {
-            let base = self.arms[side].world_pose(&Isometry3::identity());
-            (base.translation.vector - target).norm()
-        };
-        let mut sides = Side::BOTH;
-        sides.sort_by(|a, b| distance(*a).total_cmp(&distance(*b)));
-        sides
+    fn solver(&self) -> DesignSolver<'_> {
+        DesignSolver {
+            arms: &self.arms,
+            ready: &self.ready,
+        }
+    }
+}
+
+/// The arms of a workspace as `workspace_core`'s rule asks them: the
+/// closed-form inverse kinematics of each arm, seeded at its Ready posture.
+struct DesignSolver<'w> {
+    arms: &'w PerArm<Arm, ARMS>,
+    ready: &'w PerArm<JointVec, ARMS>,
+}
+
+impl ArmSolver for DesignSolver<'_> {
+    fn solves(&self) -> Solves {
+        Solves::FullPoses
     }
 
-    /// Whether the arm of `side` reaches one of `grasps` to within
-    /// [`REACH_TOLERANCE`]: the exact solver, seeded at the Ready posture,
-    /// finds an in-limit solution at some arm angle for the grasp or, when the
-    /// grasp lies within the tolerance of an edge of the arm's reach, outside
-    /// or inside it, for the grasp moved into that reach by less than the
-    /// tolerance, in the same orientation ([`Arm::solve_ik_within`]).
-    fn reaches(&self, side: Side, grasps: &[Isometry3<f64>]) -> bool {
-        let arm = &self.arms[side];
-        let seed = openarm_description::ready(side);
-        grasps.iter().any(|grasp| {
-            arm.solve_ik_within(
-                &arm.base_pose(grasp),
-                REACH_TOLERANCE,
-                ArmAnglePolicy::FromSeed,
-                &seed,
-            )
-            .is_some()
-        })
+    fn arm_names(&self) -> Vec<String> {
+        PerArm::<(), ARMS>::ids()
+            .map(|arm| LIMBS.arm_name(arm).to_owned())
+            .collect()
     }
 
-    /// How far short of `target`, in the robot frame, the closest arm stops
-    /// its grasp point in any orientation, its joint limits aside
-    /// ([`Arm::position_shortfall`]): the least over the arms. 0 when the
-    /// target lies within an arm's reach in some orientation.
-    fn shortfall(&self, target: [f64; 3]) -> f64 {
+    fn arm_base(&self, arm: usize) -> [f64; 3] {
+        let base = self.arms[ArmId::new(arm)].world_pose(&Isometry3::identity());
+        base.translation.vector.into()
+    }
+
+    /// How far short of `target` the arm stops its grasp point in any
+    /// orientation, its joint limits aside, which only add to it: a bound that
+    /// is never more than the true distance.
+    fn reach_bound(&mut self, arm: usize, target: [f64; 3]) -> f64 {
+        self.position_shortfall(arm, target)
+    }
+
+    /// How far short of `target` the arm stops its grasp point in any
+    /// orientation, its joint limits aside ([`Arm::position_shortfall`]).
+    fn position_shortfall(&mut self, arm: usize, target: [f64; 3]) -> f64 {
+        let model = &self.arms[ArmId::new(arm)];
         let point = Isometry3::translation(target[0], target[1], target[2]);
-        self.arms
-            .iter()
-            .map(|arm| arm.position_shortfall(&arm.base_pose(&point).translation.vector))
-            .fold(f64::INFINITY, f64::min)
+        model.position_shortfall(&model.base_pose(&point).translation.vector)
+    }
+
+    /// The exact solver, seeded at the Ready posture, finds an in-limit
+    /// solution at some arm angle for the grasp or, when the grasp lies within
+    /// the tolerance of an edge of the arm's reach, outside or inside it, for
+    /// the grasp moved into that reach by less than the tolerance, in the same
+    /// orientation ([`Arm::solve_ik_within`]).
+    fn reach_pose(&mut self, arm: usize, target: [f64; 3], rotation: [f64; 9]) -> Option<Attempt> {
+        let id = ArmId::new(arm);
+        let (model, seed) = (&self.arms[id], &self.ready[id]);
+        let grasp = model.base_pose(&grasp_pose(target, rotation));
+        let solution =
+            model.solve_ik_within(&grasp, REACH_TOLERANCE, ArmAnglePolicy::FromSeed, seed)?;
+        let reached = model.world_ee_pose(&solution.q);
+        Some(Attempt {
+            joints: solution.q.to_vec(),
+            grasp_point: reached.translation.vector.into(),
+            approach: (reached.rotation * Vector3::z()).into(),
+        })
     }
 }
 
@@ -295,16 +326,24 @@ impl Workspace {
 mod tests {
     use super::*;
 
-    use openarm_description::HardwareVersion;
     use srs_model::Solution;
     use workspace_core::design::MAX_COORDINATE;
     use workspace_core::messages::robot_frame_placement;
-    use workspace_core::{GraspDirection, View};
+    use workspace_core::{GraspDirection, GraspOrientation, View};
 
-    use crate::test_support::bundled_arm;
+    use robot_description::states;
 
-    fn arms(version: HardwareVersion) -> ArmPair<Arm> {
-        ArmPair::from_fn(|side| bundled_arm(version, side))
+    use crate::test_support::{
+        LEFT, RIGHT, V1, V2, arm_bodies, bundled_arm, description, postures,
+    };
+
+    fn arms(model: &str) -> PerArm<Arm, ARMS> {
+        PerArm::from_fn(|arm| bundled_arm(model, arm))
+    }
+
+    /// The grasps at `target`, in the robot frame, in the 16 grasp orientations.
+    fn grasp_poses(target: [f64; 3]) -> impl Iterator<Item = Isometry3<f64>> {
+        GraspOrientation::all().map(move |orientation| grasp_pose(target, orientation.rotation()))
     }
 
     /// Poses at `target`, in the robot frame, in orientations spread over
@@ -338,7 +377,7 @@ mod tests {
     /// robot frame, its joint limits aside: the least
     /// [`Arm::reach_shortfall`] over the poses and both arms.
     fn least_shortfall(
-        arms: &ArmPair<Arm>,
+        arms: &PerArm<Arm, ARMS>,
         poses: impl IntoIterator<Item = Isometry3<f64>>,
     ) -> f64 {
         poses
@@ -352,42 +391,46 @@ mod tests {
 
     /// [`least_shortfall`] of the grasps at `target` in the 16 grasp
     /// orientations.
-    fn least_grasp_shortfall(arms: &ArmPair<Arm>, target: [f64; 3]) -> f64 {
+    fn least_grasp_shortfall(arms: &PerArm<Arm, ARMS>, target: [f64; 3]) -> f64 {
         least_shortfall(arms, grasp_poses(target))
     }
 
-    /// The exact solver's in-limit solution for the arm of `side` at `pose`,
-    /// in the robot frame, seeded at the Ready posture as [`Workspace::reaches`]
+    /// The exact solver's in-limit solution for the arm `arm` at `pose`,
+    /// in the robot frame, seeded at the Ready posture as [`DesignSolver`]
     /// seeds it, without the reach tolerance.
     fn solve_from_ready(
-        arms: &ArmPair<Arm>,
-        side: Side,
+        arms: &PerArm<Arm, ARMS>,
+        arm: ArmId,
         pose: &Isometry3<f64>,
     ) -> Option<Solution> {
-        let arm = &arms[side];
-        arm.solve_ik(
-            &arm.base_pose(pose),
+        let model = &arms[arm];
+        model.solve_ik(
+            &model.base_pose(pose),
             ArmAnglePolicy::FromSeed,
-            &openarm_description::ready(side),
+            &postures(V2, states::READY)[arm],
         )
     }
 
     /// Whether an arm's exact solver takes one of `poses`, from the Ready
     /// posture ([`solve_from_ready`]).
     fn an_arm_solves_exactly(
-        arms: &ArmPair<Arm>,
+        arms: &PerArm<Arm, ARMS>,
         poses: impl IntoIterator<Item = Isometry3<f64>>,
     ) -> bool {
         poses.into_iter().any(|pose| {
-            Side::BOTH
-                .into_iter()
-                .any(|side| solve_from_ready(arms, side, &pose).is_some())
+            PerArm::<(), ARMS>::ids().any(|arm| solve_from_ready(arms, arm, &pose).is_some())
         })
     }
 
-    fn workspace(version: HardwareVersion) -> Workspace {
-        let mounts = CameraMounts::resolve(version).expect("the mounts resolve");
-        Workspace::new(arms(version), &mounts).expect("one perception camera at most")
+    fn workspace(model: &str) -> Workspace {
+        let mounts = CameraMounts::resolve(description(model)).expect("the mounts resolve");
+        Workspace::new(
+            arms(model),
+            &postures(model, states::READY),
+            arm_bodies(model),
+            &mounts,
+        )
+        .expect("one perception camera at most")
     }
 
     /// The simulated chest camera: 1280 by 720 pixels over a 52° vertical
@@ -427,21 +470,21 @@ mod tests {
     #[test]
     fn a_grasp_orientation_is_the_tool_pose_the_solved_gripper_takes() {
         let target = [0.30, 0.0, 0.45];
-        let arms = arms(HardwareVersion::V2);
-        for side in Side::BOTH {
-            let arm = &arms[side];
+        let arms = arms(V2);
+        for arm in PerArm::<(), ARMS>::ids() {
+            let (model, name) = (&arms[arm], LIMBS.arm_name(arm));
             let mut solved_directions = Vec::new();
             for orientation in GraspOrientation::all() {
                 let Some(solution) =
-                    solve_from_ready(&arms, side, &grasp_pose(orientation, target))
+                    solve_from_ready(&arms, arm, &grasp_pose(target, orientation.rotation()))
                 else {
                     continue;
                 };
-                let reached = arm.world_pose(&arm.at(&solution.q).ee_pose());
+                let reached = model.world_pose(&model.at(&solution.q).ee_pose());
                 let position = reached.translation.vector;
                 assert!(
                     (position - Vector3::from(target)).norm() < 1e-6,
-                    "{side:?} {orientation:?}: the grasp point stands at {position}"
+                    "{name} {orientation:?}: the grasp point stands at {position}"
                 );
                 let rotation = orientation.rotation();
                 let asked = |column: usize| {
@@ -450,20 +493,20 @@ mod tests {
                 let approach = reached.rotation * Vector3::z();
                 assert!(
                     (approach - Vector3::from(orientation.direction.approach())).norm() < 1e-6,
-                    "{side:?} {orientation:?}: the gripper points along {approach}"
+                    "{name} {orientation:?}: the gripper points along {approach}"
                 );
                 assert!((approach - asked(2)).norm() < 1e-6);
                 let jaws = reached.rotation * Vector3::y();
                 assert!(
                     (jaws - asked(1)).norm() < 1e-6,
-                    "{side:?} {orientation:?}: the jaws close along {jaws}"
+                    "{name} {orientation:?}: the jaws close along {jaws}"
                 );
                 solved_directions.push(orientation.direction);
             }
             for direction in GraspDirection::ALL {
                 assert!(
                     solved_directions.contains(&direction),
-                    "{side:?} reaches the target pointing {}",
+                    "{name} reaches the target pointing {}",
                     direction.name()
                 );
             }
@@ -471,21 +514,31 @@ mod tests {
     }
 
     #[test]
-    fn the_perception_camera_of_v2_is_the_chest_camera_and_v1_has_none() {
-        let v2 = workspace(HardwareVersion::V2);
+    fn the_perception_camera_of_v2_is_its_base_camera_and_v1_has_none() {
+        let v2 = workspace(V2);
         let perception = v2.perception_camera().expect("v2 has one");
-        assert_eq!(perception.name, "chest");
+        let mounts = CameraMounts::resolve(description(V2)).expect("the mounts resolve");
+        let base_cameras: Vec<DesignCamera> = mounts
+            .design_cameras()
+            .into_iter()
+            .filter(|camera| camera.fixed_pose.is_some())
+            .collect();
+        let [base] = base_cameras.as_slice() else {
+            panic!("v2's design fixes one camera to the base: {base_cameras:?}");
+        };
+        assert_eq!(perception.name, base.name);
         let camera = chest(&v2);
-        assert_eq!(camera.position, [0.0792, 0.0315, 0.7941]);
+        let at = base.fixed_pose.expect("fixed").translation.vector;
+        assert_eq!(camera.position, [at.x, at.y, at.z]);
         // The optical axis, the third column, looks forward and down.
         let (view_x, view_z) = (camera.rotation[2], camera.rotation[8]);
         assert!(view_x > 0.4 && view_z < -0.8, "({view_x}, {view_z})");
-        assert_eq!(workspace(HardwareVersion::V1).perception_camera(), None);
+        assert_eq!(workspace(V1).perception_camera(), None);
     }
 
     #[test]
     fn a_point_in_front_at_table_height_is_reached_and_seen() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let answer = v2.check(&positions(&[0.30, 0.0, 0.45]), &chest_view(&v2));
         let [point] = answer.points.as_slice() else {
             panic!("one point answered: {answer:?}");
@@ -506,7 +559,7 @@ mod tests {
 
     #[test]
     fn a_point_a_metre_in_front_is_out_of_reach_by_how_far_the_closest_arm_stops() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let target = [1.0, 0.0, 0.45];
         let answer = v2.check(&positions(&target), &chest_view(&v2));
         let point = &answer.points[0];
@@ -517,7 +570,7 @@ mod tests {
         // The closest arm stops `by` short in its best orientation, whichever
         // it is: no orientation of the sphere stops it shorter, and the best
         // of them comes within a few millimetres of `by`.
-        let arms = arms(HardwareVersion::V2);
+        let arms = arms(V2);
         let least_sampled = least_shortfall(&arms, poses_all_around(target));
         assert!(by <= least_sampled + 1e-9, "{by} > {least_sampled}");
         assert!(least_sampled - by < 0.003, "{by} vs {least_sampled}");
@@ -539,7 +592,7 @@ mod tests {
 
     #[test]
     fn a_point_the_grasp_point_gets_to_tilted_falls_short_by_nothing_in_a_grasp_orientation() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let target = [0.40, 0.0, 0.30];
         let answer = v2.check(&positions(&target), &chest_view(&v2));
         let point = &answer.points[0];
@@ -549,7 +602,7 @@ mod tests {
             "Not workable: no arm reaches it with its gripper pointing down or forward; \
              the chest camera sees it."
         );
-        let arms = arms(HardwareVersion::V2);
+        let arms = arms(V2);
         assert!(
             an_arm_solves_exactly(&arms, poses_all_around(target)),
             "an arm gets its grasp point there, tilted"
@@ -558,9 +611,8 @@ mod tests {
 
     #[test]
     fn a_point_beyond_an_arms_reach_by_less_than_the_reach_tolerance_is_reached() {
-        let version = HardwareVersion::V2;
-        let mounts = CameraMounts::resolve(version).expect("the mounts resolve");
-        let arms = arms(version);
+        let mounts = CameraMounts::resolve(description(V2)).expect("the mounts resolve");
+        let arms = arms(V2);
         // How far the arms' wrist centres stand outside their reach for the
         // best grasp orientation at `x` ahead, 0.2 m to the left and 0.2 m
         // up.
@@ -581,27 +633,35 @@ mod tests {
             !an_arm_solves_exactly(&arms, grasp_poses(target)),
             "no arm takes a grasp exactly"
         );
-        let workspace = Workspace::new(arms, &mounts).expect("one perception camera at most");
+        let workspace = Workspace::new(arms, &postures(V2, states::READY), arm_bodies(V2), &mounts)
+            .expect("one perception camera at most");
         assert_eq!(
             workspace.reach(target),
             Reach::Reached {
-                arm: "left_arm".to_owned()
+                arm: LIMBS.arm_name(LEFT).to_owned()
             }
         );
     }
 
     #[test]
     fn the_arm_on_the_side_of_a_point_names_its_reach_and_the_left_one_a_point_between() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let reaches =
             [[0.30, 0.2, 0.45], [0.30, -0.2, 0.45], [0.30, 0.0, 0.45]].map(|point| v2.reach(point));
         let arms = reaches.each_ref().map(Reach::arm);
-        assert_eq!(arms, ["left_arm", "right_arm", "left_arm"]);
+        assert_eq!(
+            arms,
+            [
+                LIMBS.arm_name(LEFT),
+                LIMBS.arm_name(RIGHT),
+                LIMBS.arm_name(LEFT)
+            ]
+        );
     }
 
     #[test]
     fn a_surface_at_table_height_is_workable_inside_both_the_reach_and_the_view() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let answer = v2.describe(height(0.45), &chest_view(&v2));
         assert!(answer.workable, "{}", answer.message);
         let [x_min, x_max, y_min, y_max] = answer.rectangle.expect("a rectangle");
@@ -626,7 +686,7 @@ mod tests {
 
     #[test]
     fn a_surface_above_the_chest_camera_is_not_visible_and_says_how_far_above_it_is() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let answer = v2.describe(height(0.96), &chest_view(&v2));
         assert!(!answer.workable);
         assert!(answer.reach.is_some(), "the arms reach part of it");
@@ -640,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_surface_just_below_the_chest_camera_says_how_far_ahead_the_arms_reach_it() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let answer = v2.describe(height(0.75), &chest_view(&v2));
         assert!(!answer.workable);
         assert_eq!((answer.view, answer.rectangle), (None, None));
@@ -656,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_robot_without_a_perception_camera_is_judged_on_reach_alone_and_says_so() {
-        let v1 = workspace(HardwareVersion::V1);
+        let v1 = workspace(V1);
         let view_check = v1.unlinked_view_check();
         assert_eq!(view_check, ViewCheck::NoPerceptionCamera);
         let unchecked = "The view is not checked: the robot has no perception camera.";
@@ -678,16 +738,18 @@ mod tests {
         let surface = v1.describe(height(0.45), &view_check);
         assert!(surface.workable, "{}", surface.message);
         assert_eq!(surface.view, None);
-        assert!(surface.message.ends_with(unchecked), "{}", surface.message);
+        assert!(surface.message.ends_with(&unchecked), "{}", surface.message);
     }
 
     #[test]
     fn a_perception_camera_with_no_linked_geometry_leaves_the_view_unchecked_and_names_it() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let view_check = v2.unlinked_view_check();
-        assert_eq!(view_check, ViewCheck::NoCameraGeometry { camera: "chest" });
-        let unchecked =
-            "The view is not checked: no camera geometry is linked for the chest camera.";
+        let camera = v2.perception_camera().expect("v2 has one").name;
+        assert_eq!(view_check, ViewCheck::NoCameraGeometry { camera });
+        let unchecked = format!(
+            "The view is not checked: no camera geometry is linked for the {camera} camera."
+        );
         let checked = v2.check(&positions(&[0.30, 0.0, 0.45]), &view_check);
         let [point] = checked.points.as_slice() else {
             panic!("one point answered: {checked:?}");
@@ -701,12 +763,37 @@ mod tests {
         let surface = v2.describe(height(0.45), &view_check);
         assert!(surface.workable, "{}", surface.message);
         assert_eq!(surface.view, None);
-        assert!(surface.message.ends_with(unchecked), "{}", surface.message);
+        assert!(surface.message.ends_with(&unchecked), "{}", surface.message);
+    }
+
+    // A surface 0.70 m up stands at the height of the shoulders, so some of
+    // the targets over it are reached only with an elbow or a forearm under
+    // its top.
+    #[test]
+    fn an_arm_reaches_a_point_of_a_surface_only_in_a_pose_clear_of_the_block_under_it() {
+        let v2 = workspace(V2);
+        let high = height(0.70);
+        let free = SurfaceReach::measure(high, |target| v2.reach(target));
+        let clear = v2.surface_reach(high);
+        let pairs = || free.reaches().iter().zip(clear.reaches());
+        let sunk: Vec<&Reach> = pairs()
+            .filter(|(free, clear)| free.reached() && !clear.reached())
+            .map(|(_, clear)| clear)
+            .collect();
+        assert!(!sunk.is_empty(), "the block rules out no reached target");
+        for reach in sunk {
+            let by = reach.short_by();
+            assert!(by <= REACH_TOLERANCE, "an arm comes within {by} m");
+        }
+        assert!(
+            pairs().all(|(free, clear)| free.reached() || !clear.reached()),
+            "a target is reached over the surface alone"
+        );
     }
 
     #[test]
     fn a_measured_surface_is_stored_and_its_height_answers_from_the_stored_reach() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let view = chest_view(&v2);
         let table = height(0.45);
         assert!(v2.describe(table, &view).workable);
@@ -733,7 +820,7 @@ mod tests {
 
     #[test]
     fn a_point_at_the_coordinate_bound_falls_short_by_a_finite_distance() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let Reach::Short { by } = v2.reach([MAX_COORDINATE, 0.0, 0.0]) else {
             panic!("a kilometre ahead is out of reach");
         };
@@ -778,7 +865,7 @@ mod tests {
 
     #[test]
     fn a_range_camera_does_not_see_a_point_whose_distance_passes_its_farthest_depth() {
-        let v2 = workspace(HardwareVersion::V2);
+        let v2 = workspace(V2);
         let perception = v2.perception_camera().expect("v2 has one");
         let pinhole = Pinhole::from_vertical_fov(52f64.to_radians(), 1280, 720).expect("a model");
         let camera = |model: &str| {

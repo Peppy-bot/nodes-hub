@@ -1,5 +1,6 @@
 // What this engine alone knows about an OpenArm v2. Its limbs, joints and
-// cameras are sim_robot_core's entry of the same name.
+// cameras come from the robot's description, through sim_robot_core's entry of
+// the same name.
 {
   // The robot's USD, under PEPPY_ROBOT_ASSETS_DIR. The engine references it
   // under a prim of the robot's own name, so the stage's default prim is the
@@ -12,22 +13,24 @@
   // of the shared entry, which is how PhysX names their dofs.
   articulation_root: ".",
 
-  // MIT servo gains (j1..j7) applied to every arm's PhysX joint drives: the openarm
-  // teleop config's. The real arm's are in openarm/arm/peppy.json5. Plus the motor
-  // torque caps (DM8009/4340/4310) applied as max_efforts.
+  // MIT servo gains (j1..j7) applied to every arm's PhysX joint drives: the
+  // real arm's, the defaults of openarm/arm/peppy.json5, which
+  // tests/test_isaac_models.py holds them to. Each drive is capped at the
+  // effort limit the description gives its joint, its motor's peak torque.
   arm_gains: {
-    kp: [240.0, 240.0, 240.0, 240.0, 24.0, 31.0, 25.0],
-    kd: [3.0, 3.0, 3.0, 3.0, 0.2, 0.2, 0.2],
-    max_efforts: [40.0, 40.0, 27.0, 27.0, 7.0, 7.0, 7.0],
+    kp: [360.0, 360.0, 360.0, 360.0, 48.0, 62.0, 50.0],
+    kd: [5.0, 5.0, 5.0, 5.0, 1.5, 1.5, 1.5],
   },
 
-  // Explicit PhysX finger drives, one per finger of a gripper. Without these
-  // the fingers can free-float when the arm moves if the imported USD has
-  // weak/default drive gains.
+  // Explicit PhysX finger drive, one per finger of a gripper that moves of
+  // its own: the other finger follows it through the mimic coupling the
+  // description gives, one motor for the pair. Without it the fingers can
+  // free-float when the arm moves if the imported USD has weak/default drive
+  // gains. The drive is capped at the effort limit the description gives its
+  // joint.
   gripper_gains: {
-    kp: [80.0, 80.0],
-    kd: [2.0, 2.0],
-    max_efforts: [5.0, 5.0],
+    kp: [80.0],
+    kd: [2.0],
   },
 
   // Mirrors the real driver's in-process gravity feedforward by disabling

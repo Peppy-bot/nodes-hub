@@ -1,6 +1,6 @@
 //! Joining a simulation: this robot attaches as the copy it runs as, naming
-//! the model to stand and where, and holds that goal for as long as it is in
-//! the scene.
+//! the model to stand and where and giving the model's URDF and SRDF, and
+//! holds that goal for as long as it is in the scene.
 //!
 //! Its limbs pair to the engine through the backbone, and the copy the engine
 //! reads on each pair is the one this goal named, so a setpoint reaches the
@@ -47,6 +47,7 @@ use peppygen::consumed_actions::simulation::attach;
 use peppygen::parameters::placement::Placement;
 use peppygen::{DEFAULT_FEEDBACK_BOUND, NodeRunner, ProducerRef, Result};
 use peppylib::runtime::CancellationToken;
+use robot_description::RobotDescription;
 use tokio::sync::oneshot;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::{info, warn};
@@ -230,12 +231,14 @@ fn spot_of(
 }
 
 /// Joins the simulation that the launcher bound this robot to, standing the
-/// model `identity` names under the name it gives the robot, and resolves
-/// once the robot stands, with the wait on the clock that `clock` starts on
-/// the stand budget. A robot with no simulation bound drives its own
-/// hardware and returns at once.
+/// model `identity` names under the name it gives the robot, with the URDF,
+/// the SRDF and the limbs of its `description`, and resolves once the robot
+/// stands, with the wait on the clock that `clock` starts on the stand
+/// budget. A robot with no simulation bound drives its own hardware and
+/// returns at once.
 pub async fn scene<C: StandClock>(
     identity: &Identity,
+    description: &RobotDescription,
     placement: &Placement,
     runner: &Arc<NodeRunner>,
     clock: impl FnOnce(Duration) -> C + Send,
@@ -261,7 +264,10 @@ pub async fn scene<C: StandClock>(
             robot: identity.robot.clone(),
             model: identity.model.clone(),
             placement,
+            urdf: description.urdf().to_owned(),
+            srdf: description.srdf().to_owned(),
         },
+        limbs: Limbs::of(description),
         wire: setup_budget,
         budget,
         token: token.clone(),
@@ -299,6 +305,8 @@ struct Join {
     runner: Arc<NodeRunner>,
     simulation: ProducerRef,
     request: attach::GoalRequest,
+    /// The limbs the simulation stands, for the line that says it stands them.
+    limbs: Limbs,
     /// How long the wire waits for the engine's answer to the goal: the
     /// setup budget, so the stand budget, which is shorter, ends that wait
     /// first.
@@ -306,6 +314,22 @@ struct Join {
     /// The time the robot has to stand, the acceptance included.
     budget: Duration,
     token: CancellationToken,
+}
+
+/// The names of a robot's arms and grippers, in its description's arm order.
+struct Limbs {
+    arms: Vec<String>,
+    grippers: Vec<String>,
+}
+
+impl Limbs {
+    fn of(description: &RobotDescription) -> Self {
+        let arms = description.arms();
+        Self {
+            arms: arms.iter().map(|arm| arm.name.clone()).collect(),
+            grippers: arms.iter().map(|arm| arm.gripper.name.clone()).collect(),
+        }
+    }
 }
 
 impl Join {
@@ -403,13 +427,6 @@ async fn wait_to_stand<C: StandClock>(
         leave(&goal, robot, false).await;
         return None;
     }
-    let Some(limbs) = goal.data.clone() else {
-        leave(&goal, robot, false).await;
-        verdict.give(Err(did_not_stand(
-            "it admitted the robot without naming its limbs",
-        )));
-        return None;
-    };
     info!(
         "'{robot}' was admitted to the simulation as {}; it starts once the simulation stands it, within {}",
         join.request.model,
@@ -427,8 +444,8 @@ async fn wait_to_stand<C: StandClock>(
             Event::Feedback(Heard::Standing) => {
                 info!(
                     "'{robot}' stands in the simulation, with arms [{}] and grippers [{}]",
-                    limbs.arm_names.join(", "),
-                    limbs.gripper_names.join(", ")
+                    join.limbs.arms.join(", "),
+                    join.limbs.grippers.join(", ")
                 );
                 verdict.give(Ok(()));
                 return Some(goal);

@@ -15,13 +15,14 @@ from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.alerts import alerts as alerts_topic
 from peppygen.emitted_topics.motor_health import motor_health as motor_health_topic
 from peppygen.exposed_services.ready import is_ready as is_ready_svc
+from peppygen.exposed_services.ready import set_model as set_model_svc
 from peppygen.paired_topics.arm import joint_setpoints, joint_states
 from peppygen.paired_topics.gripper import gripper_setpoints, gripper_states
 from peppygen.parameters import Parameters
-from so101_description import units
-from so101_description.device import PositionSample
-from so101_description.setpoints import parse_gripper_setpoint, parse_joint_setpoints
-from so101_description.staleness import WIRE_AGE_LIMIT_S
+from so101 import units
+from so101.device import PositionSample
+from so101.setpoints import parse_gripper_setpoint, parse_joint_setpoints
+from so101.staleness import WIRE_AGE_LIMIT_S
 
 from so101_follower import params as params_mod
 from so101_follower.device import DeviceLoop, LerobotFollower
@@ -50,6 +51,29 @@ _HEALTH_FRESH_PERIODS = 2.0
 _BUS_SILENT_READY_S = 2.0
 _BUS_DEAD_EXIT_S = 10.0
 _BUS_WATCH_PERIOD_S = 1.0
+
+# The model this follower drives, as robot_identity names it: the robot's
+# initializer tells it the robot's model (component_ready's set_model).
+MODEL = "so101"
+
+
+class UndrivenModel(ValueError):
+    """The robot's initializer names a model this follower does not drive."""
+
+
+def _undriven(model: str) -> UndrivenModel | None:
+    """The refusal of `model`, in robot_description's words, or None for the
+    model this follower drives."""
+    if model == MODEL:
+        return None
+    return UndrivenModel(f'model {model} is no model this node drives; it drives "{MODEL}"')
+
+
+async def end_on_refusal(refused: asyncio.Future) -> None:
+    """Ends the node with the refusal `refused` holds, once a `set_model`
+    call names a model this follower does not drive: a returned task that
+    raises records its error and cancels the node."""
+    raise await refused
 
 
 def _now_s() -> float:
@@ -287,7 +311,19 @@ def make_setup(hardware_factory=_lerobot_hardware):
 
         token = node_runner.cancellation_token()
 
-        async def ready_handler(_request):
+        refused = asyncio.get_running_loop().create_future()
+
+        async def model_handler(request):
+            # The model the robot's initializer names: one this follower
+            # does not drive gets an error reply naming it, and ends the node.
+            refusal = _undriven(request.data.model)
+            if refusal is not None:
+                if not refused.done():
+                    refused.set_result(refusal)
+                return set_model_svc.Failure(set_model_svc.FailureKind.REJECTED, str(refusal))
+            return None
+
+        async def ready_handler(request):
             # Readiness is live, not a bringup latch: a bus that stopped
             # serving reads is not ready however healthy the process looks,
             # and a node mid-shutdown is already releasing torque.
@@ -327,9 +363,13 @@ def make_setup(hardware_factory=_lerobot_hardware):
                 _stream_health(node_runner, device, config, alert_bus, token)
             ),
             asyncio.create_task(
+                runtime.serve(node_runner, set_model_svc, model_handler, "set_model")
+            ),
+            asyncio.create_task(
                 runtime.serve(node_runner, is_ready_svc, ready_handler, "is_ready")
             ),
             asyncio.create_task(_watch_bus(device, token, token.cancel)),
+            asyncio.create_task(end_on_refusal(refused)),
         ]
 
     return setup

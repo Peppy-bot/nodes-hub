@@ -1,5 +1,5 @@
 //! The panel's state: [`UiState`], which the owner task holds outright (see
-//! [`crate::owner`]), with the per-side targets, the governor and jog
+//! [`crate::owner`]), with the per-arm targets, the governor and jog
 //! settings, gesture playback and the recorder panel, and the parsed reports
 //! the feeds hand the owner (motor health, alerts, proximity).
 
@@ -8,14 +8,15 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use robot_description::{ArmId, PerArm};
 use serde::Serialize;
-use srs_model::JointVec;
+use srs_model::{ARM_DOF, JointVec};
 
 use crate::gestures::BakedGesture;
 use crate::pose::{JogCaps, JointJog};
+use crate::robot::{self, ARMS};
 
 pub use control_core::motor_health::{AlertSeverity, HealthLevel};
-use openarm_description::{ARM_DOF, ArmPair, Side};
 use peppylib::messaging::ProducerRef;
 // The gripper axis is the unitless opening fraction (0 = closed, 1 = open);
 // this is only the startup default for the gripper target.
@@ -27,7 +28,7 @@ pub struct ArmTarget {
     pub last_feedback: Option<JointVec>,
     // Whether `joints` has been initialized from a real measured pose yet. Set once,
     // from the first joint_states feedback, so the target starts where the arm is
-    // instead of at the home default; thereafter only streaming and discrete moves
+    // instead of at every joint 0; thereafter only streaming and discrete moves
     // move it. Prevents re-seeding the gravity-sagged measured every disable, which
     // ratcheted the arm down across enable/disable cycles.
     pub established: bool,
@@ -35,14 +36,15 @@ pub struct ArmTarget {
     // Cancels the in-flight goal so a new move preempts instead of being
     // rejected by the arm's single-flight gate.
     pub preempt: Option<tokio_util::sync::CancellationToken>,
-    // The joint target the operator is driving this side toward: the setpoint ramps
-    // toward it under the jog's velocity and acceleration caps. None when the side is
+    // The joint target the operator is driving this arm toward: the setpoint ramps
+    // toward it under the jog's velocity and acceleration caps. None when the arm is
     // idle; it clears on enable/disable.
     pub jog: Option<JointJog>,
 }
 
 impl ArmTarget {
-    pub fn home() -> Self {
+    /// A target no measured pose has established yet: every joint at 0.
+    pub fn unmeasured() -> Self {
         Self {
             joints: [0.0; ARM_DOF],
             last_feedback: None,
@@ -84,11 +86,21 @@ impl GripperTarget {
     }
 }
 
-/// A limb of one side: its arm or its gripper.
+/// A limb of one arm: the arm itself or its gripper.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Limb {
     Arm,
     Gripper,
+}
+
+impl Limb {
+    /// The name of this limb of `arm`, the one the wire carries.
+    pub fn name_of(self, arm: ArmId) -> &'static str {
+        match self {
+            Self::Arm => robot::LIMBS.arm_name(arm),
+            Self::Gripper => robot::LIMBS.gripper_name(arm),
+        }
+    }
 }
 
 impl fmt::Display for Limb {
@@ -148,8 +160,8 @@ pub struct GesturePlayback {
 #[derive(Clone, Copy, Debug)]
 pub enum GesturePhase {
     LeadIn {
-        from: ArmPair<Option<JointVec>>,
-        gripper_from: ArmPair<Option<f64>>,
+        from: PerArm<Option<JointVec>, ARMS>,
+        gripper_from: PerArm<Option<f64>, ARMS>,
         t: f64,
         duration_s: f64,
     },
@@ -160,16 +172,16 @@ pub enum GesturePhase {
 
 #[derive(Clone, Debug)]
 pub struct UiState {
-    pub arms: ArmPair<ArmTarget>,
-    pub grippers: ArmPair<GripperTarget>,
-    // The gesture being played, if any. Playback owns its involved sides: their
+    pub arms: PerArm<ArmTarget, ARMS>,
+    pub grippers: PerArm<GripperTarget, ARMS>,
+    // The gesture being played, if any. Playback owns its involved arms: their
     // deadmen stay off, discrete fires are refused, and the player writes their
     // arm/gripper targets each tick.
     pub gesture: Option<GesturePlayback>,
-    // Streaming deadman, one per side: while false the commander emits no
-    // commands for that side's arm or gripper. The arm and gripper share the
-    // deadman because the operator enables a whole side at once.
-    pub enabled: ArmPair<bool>,
+    // Streaming deadman, one per arm: while false the commander emits no
+    // commands for that arm or its gripper. The arm and its gripper share the
+    // deadman because the operator enables both at once.
+    pub enabled: PerArm<bool, ARMS>,
     // Operator controls for the backbone's self-collision governor, streamed to the
     // backbone on governor_control; the backbone holds its own defaults until the first
     // message. All five launch defaults are node parameters, kept in step with the
@@ -192,13 +204,13 @@ pub struct UiState {
     // The dataset recorder panel; hidden entirely when the deployment binds no
     // recorder instance.
     pub recorder: RecorderState,
-    // Latest per-arm motor health: `None` until that side's first report and
+    // Latest per-arm motor health: `None` until that arm's first report and
     // retained thereafter. The retained entry doubles as the has-ever-reported
     // bit: one aged past its validity renders as not reporting, never as a
     // fresh launch still inside its grace.
-    pub arm_health: ArmPair<Option<ArmHealth>>,
+    pub arm_health: PerArm<Option<ArmHealth>, ARMS>,
     // Latest per-gripper motor health, keyed, retained, and aged the same way.
-    pub gripper_health: ArmPair<Option<GripperHealth>>,
+    pub gripper_health: PerArm<Option<GripperHealth>, ARMS>,
     // When this state was created; the startup grace for components that have
     // never reported counts from here.
     pub created_at: Instant,
@@ -384,17 +396,17 @@ impl Disposition {
 impl UiState {
     pub fn new(governor: GovernorSettings, jog_caps: JogCaps) -> Self {
         Self {
-            arms: ArmPair::from_fn(|_| ArmTarget::home()),
-            grippers: ArmPair::from_fn(|_| GripperTarget::closed()),
+            arms: PerArm::from_fn(|_| ArmTarget::unmeasured()),
+            grippers: PerArm::from_fn(|_| GripperTarget::closed()),
             gesture: None,
-            enabled: ArmPair::new(false, false),
+            enabled: PerArm::from_fn(|_| false),
             governor,
             collision_enabled_default: governor.collision_enabled,
             jog_caps,
             proximity: None,
             recorder: RecorderState::unavailable(),
-            arm_health: ArmPair::new(None, None),
-            gripper_health: ArmPair::new(None, None),
+            arm_health: PerArm::from_fn(|_| None),
+            gripper_health: PerArm::from_fn(|_| None),
             created_at: Instant::now(),
             health_bound: false,
             alerts_bound: false,
@@ -420,17 +432,17 @@ impl UiState {
         self.status = message.into();
     }
 
-    /// Whether a playing gesture owns this side's targets.
-    pub fn gesture_holds(&self, side: Side) -> bool {
+    /// Whether a playing gesture owns this arm's targets.
+    pub fn gesture_holds(&self, arm: ArmId) -> bool {
         self.gesture
             .as_ref()
-            .is_some_and(|p| p.gesture.involves(side))
+            .is_some_and(|p| p.gesture.involves(arm))
     }
 
-    /// Whether this side's setpoints should stream: the operator's deadman is on,
+    /// Whether this arm's setpoints should stream: the operator's deadman is on,
     /// or a gesture is driving it.
-    pub fn side_active(&self, side: Side) -> bool {
-        self.enabled[side] || self.gesture_holds(side)
+    pub fn arm_active(&self, arm: ArmId) -> bool {
+        self.enabled[arm] || self.gesture_holds(arm)
     }
 }
 

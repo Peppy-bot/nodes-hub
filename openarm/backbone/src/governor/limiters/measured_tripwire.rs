@@ -11,9 +11,10 @@
 
 use tracing::{info, warn};
 
-use openarm_description::{ArmPair, Side};
+use crate::robot::ARMS;
+use robot_description::{ArmId, PerArm};
 
-use super::super::{GovState, Governor, Step, concat, dof_side};
+use super::super::{GovState, Governor, Step, concat, dof_arm};
 use super::Limiter;
 use super::allowance::Allowance;
 
@@ -29,7 +30,7 @@ pub(in crate::governor) const MONITOR_TRIP_FRACTION: f64 = 0.5;
 const _: () = assert!(MONITOR_TRIP_FRACTION > 0.0 && MONITOR_TRIP_FRACTION < 1.0);
 
 /// Commanded-space clearances the measured-state tripwire needs to decide which
-/// side is making the real breach worse. Sampled only while the latch is armed,
+/// arm is making the real breach worse. Sampled only while the latch is armed,
 /// so an untripped tick costs one measured query and nothing else.
 ///
 /// Judging in the commanded space (against `Sensed::d_prev`, the held
@@ -39,10 +40,10 @@ const _: () = assert!(MONITOR_TRIP_FRACTION > 0.0 && MONITOR_TRIP_FRACTION < 1.0
 pub(in crate::governor) struct Tripwire {
     /// Clearance at the full candidate.
     pub d_cand: f64,
-    /// Per side, the clearance of that side moving alone with the other held,
-    /// and `None` when the side does not move or its query failed. A failed
+    /// Per arm, the clearance of that arm moving alone with the other held,
+    /// and `None` when the arm does not move or its query failed. A failed
     /// query reads as "does not open", which holds rather than frees.
-    pub d_solo: ArmPair<Option<f64>>,
+    pub d_solo: PerArm<Option<f64>, ARMS>,
 }
 
 impl Governor {
@@ -81,22 +82,22 @@ impl Governor {
         }
 
         let d_cand = self.distance_at(&concat(cand))?;
-        let solo = |side: Side| {
-            let state_of = |each: Side| if each == side { cand } else { prev };
+        let solo = |arm: ArmId| {
+            let state_of = |each: ArmId| if each == arm { cand } else { prev };
             GovState::new(
-                ArmPair::from_fn(|each| state_of(each).arms[each]),
-                ArmPair::from_fn(|each| state_of(each).grippers[each]),
+                PerArm::from_fn(|each| state_of(each).arms[each]),
+                PerArm::from_fn(|each| state_of(each).grippers[each]),
             )
         };
-        let moves = |side: Side| {
-            cand.arms[side] != prev.arms[side] || cand.grippers[side] != prev.grippers[side]
+        let moves = |arm: ArmId| {
+            cand.arms[arm] != prev.arms[arm] || cand.grippers[arm] != prev.grippers[arm]
         };
-        let sample = |g: &mut Self, side: Side| -> Option<f64> {
-            moves(side)
-                .then(|| g.distance_at(&concat(&solo(side))))
+        let sample = |g: &mut Self, arm: ArmId| -> Option<f64> {
+            moves(arm)
+                .then(|| g.distance_at(&concat(&solo(arm))))
                 .flatten()
         };
-        let d_solo = ArmPair::from_fn(|side| sample(self, side));
+        let d_solo = PerArm::from_fn(|arm| sample(self, arm));
         Some(Tripwire { d_cand, d_solo })
     }
 }
@@ -106,9 +107,9 @@ impl Governor {
 /// closing motion whenever the *real* clearance has closed past the tripwire
 /// floor, until it recovers.
 ///
-/// The gate is per side (an arm and its gripper opening together): one
-/// operator's closing push must not trap the other side's escape. When the
-/// joint candidate closes, each side is re-judged with the other held, and any
+/// The gate is per arm (an arm and its gripper opening together): one
+/// operator's closing push must not trap the other arm's escape. When the
+/// joint candidate closes, each arm is re-judged with the other held, and any
 /// sub-motion that does not worsen the commanded clearance stays free.
 ///
 /// Whether the tripwire is armed at all, and the clearances this reads, are
@@ -138,22 +139,16 @@ impl Limiter for MeasuredTripwire<'_> {
         if tripwire.d_cand >= self.d_prev {
             return Allowance::FULL;
         }
-        // The joint candidate closes, so free at most one side, the one that
-        // opens more and the left one on a tie: the two can each open alone
-        // yet still converge on the same gap together.
-        let freed = match (opens(tripwire.d_solo.left), opens(tripwire.d_solo.right)) {
-            (Some(left), Some(right)) => {
-                if left >= right {
-                    Side::Left
-                } else {
-                    Side::Right
-                }
-            }
-            (Some(_), None) => Side::Left,
-            (None, Some(_)) => Side::Right,
-            (None, None) => return Allowance::FREEZE,
+        // The joint candidate closes, so free at most one arm, the one that
+        // opens more and the first in place order on a tie: the arms can each
+        // open alone yet still converge on the same gap together.
+        let freed = PerArm::<(), ARMS>::ids()
+            .filter_map(|arm| opens(tripwire.d_solo[arm]).map(|d| (arm, d)))
+            .reduce(|best, next| if next.1 > best.1 { next } else { best });
+        let Some((freed, _)) = freed else {
+            return Allowance::FREEZE;
         };
-        Allowance::gate(|i| dof_side(i) == freed)
+        Allowance::gate(|i| dof_arm(i) == freed)
     }
 }
 
@@ -164,7 +159,7 @@ mod tests {
 
     const D_PREV: f64 = 0.004;
 
-    fn allowance_for(d_solo: ArmPair<Option<f64>>, d_cand: f64) -> Allowance {
+    fn allowance_for(d_solo: PerArm<Option<f64>, ARMS>, d_cand: f64) -> Allowance {
         let tripwire = Tripwire { d_cand, d_solo };
         let limiter = MeasuredTripwire {
             d_prev: D_PREV,
@@ -177,49 +172,49 @@ mod tests {
         })
     }
 
-    /// Whether `a` frees each side: its first joint and its opening take the
+    /// Whether `a` frees each arm: its first joint and its opening take the
     /// whole of a unit step.
-    fn freed(a: &Allowance) -> ArmPair<bool> {
+    fn freed(a: &Allowance) -> PerArm<bool, ARMS> {
         let step = Step {
             prev: [0.0; GOV_DOF],
             target: [1.0; GOV_DOF],
         };
         let governed = split(&a.apply(&step));
-        ArmPair::from_fn(|side| governed.arms[side][0] == 1.0 && governed.grippers[side] == 1.0)
+        PerArm::from_fn(|arm| governed.arms[arm][0] == 1.0 && governed.grippers[arm] == 1.0)
     }
 
-    /// The four-way side-freeing decision, pinned as a table without any
-    /// geometry: which side stays free while the real clearance is breached is
+    /// The four-way arm-freeing decision, pinned as a table without any
+    /// geometry: which arm stays free while the real clearance is breached is
     /// the sharpest call the limiter set makes.
     #[test]
-    fn the_side_freeing_match_pins_all_four_arms_and_the_tie() {
+    fn the_arm_freeing_choice_pins_all_four_cases_and_the_tie() {
         let closing = Some(D_PREV - 0.001);
         let opens_a_little = Some(D_PREV + 0.001);
         let opens_more = Some(D_PREV + 0.002);
 
-        // Both sides open alone: the one opening more is freed, the other held.
-        let a = allowance_for(ArmPair::new(opens_a_little, opens_more), 0.0);
-        assert_eq!(freed(&a), ArmPair::new(false, true));
-        let a = allowance_for(ArmPair::new(opens_more, opens_a_little), 0.0);
-        assert_eq!(freed(&a), ArmPair::new(true, false));
+        // Both arms open alone: the one opening more is freed, the other held.
+        let a = allowance_for(PerArm::new([opens_a_little, opens_more]), 0.0);
+        assert_eq!(freed(&a), PerArm::new([false, true]));
+        let a = allowance_for(PerArm::new([opens_more, opens_a_little]), 0.0);
+        assert_eq!(freed(&a), PerArm::new([true, false]));
 
-        // A tie frees the left side (the match's documented >= choice).
-        let a = allowance_for(ArmPair::new(opens_more, opens_more), 0.0);
-        assert_eq!(freed(&a), ArmPair::new(true, false));
+        // A tie frees the first arm in place order.
+        let a = allowance_for(PerArm::new([opens_more, opens_more]), 0.0);
+        assert_eq!(freed(&a), PerArm::new([true, false]));
 
-        // Exactly one side opens alone: that side and only that side is free.
-        let a = allowance_for(ArmPair::new(opens_more, closing), 0.0);
-        assert_eq!(freed(&a), ArmPair::new(true, false));
-        let a = allowance_for(ArmPair::new(closing, opens_more), 0.0);
-        assert_eq!(freed(&a), ArmPair::new(false, true));
+        // Exactly one arm opens alone: that arm and only that arm is free.
+        let a = allowance_for(PerArm::new([opens_more, closing]), 0.0);
+        assert_eq!(freed(&a), PerArm::new([true, false]));
+        let a = allowance_for(PerArm::new([closing, opens_more]), 0.0);
+        assert_eq!(freed(&a), PerArm::new([false, true]));
 
-        // A side that does not move (or whose query failed) reads None and is
+        // An arm that does not move (or whose query failed) reads None and is
         // held, exactly like a closing one.
-        let a = allowance_for(ArmPair::new(None, opens_more), 0.0);
-        assert_eq!(freed(&a), ArmPair::new(false, true));
+        let a = allowance_for(PerArm::new([None, opens_more]), 0.0);
+        assert_eq!(freed(&a), PerArm::new([false, true]));
 
         // Neither opens alone: everything freezes.
-        let a = allowance_for(ArmPair::new(closing, None), 0.0);
+        let a = allowance_for(PerArm::new([closing, None]), 0.0);
         assert_eq!(a, Allowance::FREEZE);
     }
 
@@ -227,7 +222,7 @@ mod tests {
     /// on the held setpoint, and when the latch is not armed at all.
     #[test]
     fn a_non_closing_candidate_and_an_unarmed_latch_pass_in_full() {
-        let a = allowance_for(ArmPair::new(None, None), D_PREV);
+        let a = allowance_for(PerArm::new([None, None]), D_PREV);
         assert_eq!(a, Allowance::FULL, "candidate at d_prev is not closing");
 
         let unarmed = MeasuredTripwire {

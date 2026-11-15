@@ -81,28 +81,26 @@
       // run and rendering falls back to the same path as before.
       apptainer_run_extra_args: ["--nv"],
     },
+    // The socket the viewer binds during setup. The label is announced with
+    // the address the viewer took; the daemon reports the URLs.
+    endpoints: {
+      viewer: { kind: "page", description: "The viser viewer of the scene, HTTP and WebSocket." },
+    },
     parameters: {
       // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
       // Where the deployment names this simulation its clock domain's
       // publisher, the same rate is how often that domain advances, so it
       // also sets how finely every instance bound to it can read time.
       state_rate_hz: "u32",
-      // Run without a native viewer window (the deployment default). "Headless"
-      // here means no local GUI window, not no viewer: this mode serves the
-      // viser viewer to a browser on viewer_host:viewer_port, which is how the
-      // sim is watched in a deployment and the only viewer that works inside a
-      // container.
-      //
-      // Set false to open a native MuJoCo GLFW window instead. That mode
-      // serves no viser viewer, so nothing is reachable over the network.
-      // It also needs a display socket bound into the container and MUJOCO_GL
-      // overridden off the apptainer.def default of egl. Neither applies on macOS, where peppy runs apptainer inside a Lima
-      // VM with no display: keep headless true there and use the browser.
-      headless: { $type: "bool", $default: true },
-      // Viser viewer bind address + port, used when headless is true. All
-      // interfaces by default so the viewer is reachable from other machines.
+      // Where the viser viewer is served, which shows the scene whether or
+      // not a robot stands in it. viewer_host is a literal IP address, not a
+      // hostname: all interfaces by default, so the viewer is reachable from
+      // other machines. viewer_port is the port the viewer prefers: an engine
+      // whose port another process already holds serves on one the operating
+      // system picks and logs the address it took, so two engines on a host
+      // both come up.
       viewer_host: { $type: "string", $default: "0.0.0.0" },
-      viewer_port: { $type: "u32", $default: 8080 },
+      viewer_port: { $type: "u16", $default: 8080 },
       // Render and stream the cameras of the standing robot's model on the
       // camera slots, each on the pair of its own relay. Required: the
       // launcher states whether cameras are rendered.
