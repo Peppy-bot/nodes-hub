@@ -157,7 +157,7 @@ pub fn held_lime() -> get_planning_scene::ResponseDataAttachedObjectsItem {
 }
 
 /// True when the canvas drew anything at `path`.
-pub fn drew_at(drawn: &[rerun_viewer::testing::Drawn], path: &str) -> bool {
+pub fn drew_at(drawn: &[rerun_viewer::drawn::Drawn], path: &str) -> bool {
     drawn.iter().any(|call| call.path() == Some(path))
 }
 

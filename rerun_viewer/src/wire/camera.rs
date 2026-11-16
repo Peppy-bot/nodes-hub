@@ -31,6 +31,8 @@ use crate::wire::{SERVICE_TIMEOUT, sendable, stopped};
 #[derive(Debug, Clone)]
 pub struct DepthSettings {
     pub image_interval: Duration,
+    /// Whether the depth image is drawn; the points are drawn either way.
+    pub depth_image: bool,
     pub cloud_interval: Duration,
     pub cloud_stride: NonZeroU32,
     /// The camera of camera_mounts that the camera link is.
@@ -160,11 +162,13 @@ pub fn parse_camera_mount(
     })
 }
 
-/// Draws the color frames, at most one each image interval, until the node stops.
+/// Draws the color frames, at most one each image interval, each shrunk to at most
+/// `max_width` pixels wide (`ColorImage::shrunk_to`), until the node stops.
 pub async fn follow_color(
     runner: Arc<NodeRunner>,
     canvas: Arc<dyn Canvas>,
     image_interval: Duration,
+    max_width: NonZeroU32,
 ) {
     let cancelled = stopped(&runner);
     let mut subscription = match sendable(video_stream::subscribe(&runner)).await {
@@ -177,6 +181,7 @@ pub async fn follow_color(
     let mut follower = ColorFollower {
         canvas,
         throttle: Throttle::new(image_interval),
+        max_width,
         unreadable: LatchedLog::warn("reading video_stream"),
     };
     receiving::receive(
@@ -195,6 +200,7 @@ pub async fn follow_color(
 struct ColorFollower {
     canvas: Arc<dyn Canvas>,
     throttle: Throttle,
+    max_width: NonZeroU32,
     unreadable: LatchedLog,
 }
 
@@ -212,6 +218,7 @@ impl ColorFollower {
         ) {
             Ok(image) => {
                 self.unreadable.success();
+                let image = image.shrunk_to(self.max_width);
                 draw_color_image(self.canvas.as_ref(), at, &image);
             }
             Err(e) => self.unreadable.failure(e),
@@ -286,7 +293,7 @@ struct DepthFollower {
 impl DepthFollower {
     async fn on_frame(&mut self, message: depth_stream::Message) {
         let now = Instant::now();
-        let draw_image = self.image_throttle.admit_at(now);
+        let draw_image = self.settings.depth_image && self.image_throttle.admit_at(now);
         let make_cloud = self.cloud_linked && self.cloud_throttle.admit_at(now);
         if !draw_image && !make_cloud {
             return;

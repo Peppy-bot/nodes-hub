@@ -1,6 +1,6 @@
-//! The planning scene: each object as its shapes, each carried object at its arm's grasp
-//! point, a shell of the clearance around each shape, the allowed pairs, and the log of
-//! the changes.
+//! The planning scene: each object as its shapes with its id as a label, each carried
+//! object at its arm's grasp point, a shell of the clearance around each shape, the
+//! allowed pairs, and the log of the changes.
 
 use std::collections::BTreeSet;
 use std::time::SystemTime;
@@ -15,14 +15,18 @@ use crate::model::scene::{PlacedShape, PlanningScene, attached_shapes, object_sh
 pub const CHANGES_PATH: &str = "scene/changes";
 pub const ALLOWED_PAIRS_PATH: &str = "scene/allowed_pairs";
 
+/// An object that stands in the scene: green.
 const OBJECT_LOOK: Look = Look {
     color: [60, 180, 75, 255],
     wireframe: false,
 };
+/// An object that an arm carries: magenta. It stands between the fingers of the arm, so
+/// its color is far from the color of each part of the robot (`draw::robot::part_look`).
 const ATTACHED_LOOK: Look = Look {
-    color: [245, 130, 48, 255],
+    color: [240, 50, 230, 255],
     wireframe: false,
 };
+/// The clearance around a shape: a red wireframe.
 const SHELL_LOOK: Look = Look {
     color: [230, 25, 75, 255],
     wireframe: true,
@@ -41,8 +45,9 @@ pub fn attached_path(arm: &str) -> String {
 /// Draws `scene` at `at`, which `changes` took it to, and clears each entity of
 /// `previous`, the entities of the scene drawn before, that this scene does not draw.
 /// Each carried object is drawn under the grasp point of the arm whose grasp link
-/// carries it, as `description` names it; one carried by another link is only logged.
-/// Gives the entities it drew.
+/// carries it, as `description` names it; one carried by another link is not drawn.
+/// The log gets each change and, with changes, each carried object not drawn: a scene
+/// drawn again unchanged logs nothing. Gives the entities it drew.
 pub fn draw_scene(
     canvas: &dyn Canvas,
     at: SystemTime,
@@ -65,6 +70,13 @@ pub fn draw_scene(
             &object_shapes(object),
             OBJECT_LOOK,
         );
+        drawing.label(
+            OBJECTS_PATH,
+            &object.id,
+            object.placement.position,
+            &object.id,
+            OBJECT_LOOK,
+        );
     }
     let mut not_drawn = Vec::new();
     for attached in &scene.attached {
@@ -83,12 +95,23 @@ pub fn draw_scene(
             &attached_shapes(attached),
             ATTACHED_LOOK,
         );
+        // The planner holds the object as carried, whatever became of the real one.
+        drawing.label(
+            &parent,
+            &attached.id,
+            attached.placement.position,
+            &format!("{} (carried)", attached.id),
+            ATTACHED_LOOK,
+        );
     }
     let drawn = drawing.drawn;
     for gone in previous.difference(&drawn) {
         canvas.clear(gone);
     }
     canvas.text(ALLOWED_PAIRS_PATH, &allowed_pairs_text(scene));
+    if changes.is_empty() {
+        return drawn;
+    }
     for change in changes {
         canvas.log_line(CHANGES_PATH, &change.to_string());
     }
@@ -137,6 +160,14 @@ impl SceneDrawing<'_> {
         self.canvas.shape(&path, shape, look);
         self.drawn.insert(path);
     }
+
+    /// Draws `text` at `position` of the frame that the object `id` under `parent` is
+    /// placed in, in the color of `look`.
+    fn label(&mut self, parent: &str, id: &str, position: [f64; 3], text: &str, look: Look) {
+        let path = format!("{parent}/{id}/label");
+        self.canvas.label(&path, position, text, look.color);
+        self.drawn.insert(path);
+    }
 }
 
 /// The allowed pairs of `scene` as a markdown list.
@@ -155,11 +186,15 @@ fn allowed_pairs_text(scene: &PlanningScene) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canvas::Rgba;
+    use crate::draw::robot::part_look;
+    use crate::drawn::Drawn;
     use crate::model::arms::tests::openarm;
     use crate::model::changes::scene_changes;
+    use crate::model::robot::LinkPart;
     use crate::model::scene::tests::{at, boxed, held};
     use crate::model::scene::{AttachedObject, SceneObject, Shape, ShapeKind};
-    use crate::testing::{Drawn, FakeCanvas};
+    use crate::testing::FakeCanvas;
 
     fn scene_with(objects: Vec<SceneObject>, attached: Vec<AttachedObject>) -> PlanningScene {
         PlanningScene {
@@ -207,6 +242,37 @@ mod tests {
             .collect()
     }
 
+    /// The least difference, in one channel of the two colors, that sets a shape of the
+    /// scene apart from a link of the robot that it touches.
+    const APART: u8 = 64;
+
+    #[test]
+    fn an_object_of_the_scene_has_a_color_far_from_the_color_of_each_part_of_the_robot() {
+        let parts = [
+            LinkPart::Body,
+            LinkPart::Arm { segment: 1 },
+            LinkPart::Arm { segment: 2 },
+            LinkPart::Finger,
+        ];
+        let looks = [
+            ("an object", OBJECT_LOOK),
+            ("a carried object", ATTACHED_LOOK),
+        ];
+        for (name, look) in looks {
+            for part in parts {
+                let apart = widest_difference(look.color, part_look(part).color);
+                assert!(apart >= APART, "{name} against {part:?}: {apart}");
+            }
+        }
+    }
+
+    /// The largest difference between two colors in one channel.
+    fn widest_difference(one: Rgba, other: Rgba) -> u8 {
+        let channels = one.into_iter().zip(other);
+        let differences = channels.map(|(a, b)| a.abs_diff(b));
+        differences.max().expect("a color has channels")
+    }
+
     #[test]
     fn each_object_is_drawn_with_its_shell_and_the_changes_are_logged() {
         let scene = scene_with(vec![boxed("brain/lime_1", [0.4, -0.2, 0.1])], vec![]);
@@ -227,7 +293,12 @@ mod tests {
                 "world/scene/shells/brain/lime_1/shell_0_box"
             ]
         );
-        assert_eq!(drawn.len(), 2);
+        assert_eq!(drawn.len(), 3, "the shape, its shell and the label");
+        assert!(matches!(
+            &canvas.at("world/scene/objects/brain/lime_1/label")[..],
+            [Drawn::Label { position, text, .. }]
+                if *position == [0.4, -0.2, 0.1] && text == "brain/lime_1"
+        ));
         let shell = canvas.at("world/scene/shells/brain/lime_1/shell_0_box");
         let Drawn::Shape { shape, look, .. } = &shell[0] else {
             panic!("a shape")
@@ -266,6 +337,11 @@ mod tests {
         let Drawn::Shape { shape, .. } = &shape[0] else {
             panic!("a shape")
         };
+        assert!(matches!(
+            &canvas.at("world/arms/right_arm/grasp/attached/brain/lime_1/label")[..],
+            [Drawn::Label { position, text, .. }]
+                if *position == [0.0, 0.0, 0.05] && text == "brain/lime_1 (carried)"
+        ));
         assert_eq!(
             shape.pose.origin(),
             [0.0, 0.0, 0.05],
@@ -274,23 +350,37 @@ mod tests {
     }
 
     #[test]
-    fn an_object_carried_by_another_link_is_logged_and_not_drawn() {
+    fn an_object_carried_by_another_link_is_logged_with_the_changes_and_not_drawn() {
         let scene = scene_with(vec![], vec![held("brain/lime_1", "openarm_right_link7")]);
+        let changes = scene_changes(&PlanningScene::empty_like(&scene), &scene);
         let canvas = FakeCanvas::default();
         let drawn = draw_scene(
             &canvas,
             SystemTime::UNIX_EPOCH,
             &scene,
-            &[],
+            &changes,
             &openarm(),
             &BTreeSet::new(),
         );
         assert!(drawn.is_empty());
+        let not_drawn = "brain/lime_1 is attached to openarm_right_link7, which is no arm's grasp link: not drawn";
         assert_eq!(
-            canvas.log_lines(CHANGES_PATH),
-            [
-                "brain/lime_1 is attached to openarm_right_link7, which is no arm's grasp link: not drawn"
-            ]
+            canvas.log_lines(CHANGES_PATH).last().map(String::as_str),
+            Some(not_drawn)
+        );
+        let lines = canvas.log_lines(CHANGES_PATH).len();
+        draw_scene(
+            &canvas,
+            SystemTime::UNIX_EPOCH,
+            &scene,
+            &[],
+            &openarm(),
+            &drawn,
+        );
+        assert_eq!(
+            canvas.log_lines(CHANGES_PATH).len(),
+            lines,
+            "the same scene drawn again logs nothing"
         );
     }
 
@@ -303,6 +393,7 @@ mod tests {
         assert_eq!(
             cleared_paths(&canvas),
             [
+                "world/scene/objects/brain/lime_1/label",
                 "world/scene/objects/brain/lime_1/shape_0_box",
                 "world/scene/shells/brain/lime_1/shell_0_box"
             ]

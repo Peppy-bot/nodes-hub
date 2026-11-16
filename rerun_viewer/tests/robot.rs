@@ -9,8 +9,8 @@ use common::{
     TIMEOUT, bound, drew_at, mini_description, mini_snapshot, publish_once_subscribed, start,
 };
 use rerun_viewer::config::default_parameters;
+use rerun_viewer::drawn::Drawn;
 use rerun_viewer::model::scene::ShapeKind;
-use rerun_viewer::testing::Drawn;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_description_draws_the_links_and_each_snapshot_places_them() -> Result<(), String> {

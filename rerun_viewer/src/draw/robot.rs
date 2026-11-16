@@ -31,7 +31,7 @@ const fn solid(color: Rgba) -> Look {
 }
 
 /// How the shapes of a link of `part` are drawn.
-fn part_look(part: LinkPart) -> Look {
+pub(crate) fn part_look(part: LinkPart) -> Look {
     match part {
         LinkPart::Body => BODY_LOOK,
         LinkPart::Arm { segment } if segment % 2 == 1 => ODD_SEGMENT_LOOK,
@@ -68,8 +68,9 @@ pub fn draw_link_poses(canvas: &dyn Canvas, at: SystemTime, poses: &[(&BodyLink,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drawn::Drawn;
     use crate::model::scene::ShapeKind;
-    use crate::testing::{Drawn, FakeCanvas, mini};
+    use crate::testing::{FakeCanvas, mini};
 
     #[test]
     fn each_shape_is_drawn_once_for_the_whole_recording_under_its_link() {

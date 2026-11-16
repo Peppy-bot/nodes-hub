@@ -1,6 +1,8 @@
 //! What the drawers draw on: the `Canvas` trait, in the words of this node, and
 //! `RerunCanvas`, the Rerun viewer that implements it. This file is the only code that
-//! calls Rerun; tests draw on the `FakeCanvas` of `testing.rs`.
+//! calls Rerun. The node draws on the `LiveCanvas` of `live.rs`, which hands the newest
+//! draws on to `RerunCanvas`; tests draw on the `FakeCanvas` of `testing.rs`. A call to
+//! a canvas as a value is `Drawn`, in `drawn.rs`.
 //!
 //! Rerun keeps the time of a recording for each thread, so a drawer sets the time and
 //! draws in one synchronous call, with no `.await` between, which keeps the task on one
@@ -12,6 +14,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use camera_core::pose::Pose;
 use control_core::latched_log::LatchedLog;
+use rerun::blueprint::components::PanelState;
+use rerun::blueprint::{
+    Blueprint, BlueprintActivation, BlueprintPanel, ContainerLike, Horizontal, SelectionPanel,
+    Spatial2DView, Spatial3DView, Tabs, TextDocumentView, TextLogView, TimePanel, TimeSeriesView,
+    Vertical,
+};
 use rerun::external::image::ExtendedColorType;
 use rerun::external::image::codecs::jpeg::JpegEncoder;
 use rerun::grpc_server::GrpcServerSink;
@@ -19,9 +27,9 @@ use rerun::sink::FileSink;
 use rerun::web_viewer::WebViewerConfig;
 use rerun::{
     AsComponents, Boxes3D, Clear, Color, Cylinders3D, DepthImage as RerunDepthImage, Ellipsoids3D,
-    EncodedImage, FillMode, LineStrips3D, MemoryLimit, Mesh3D, Points3D, RecordingStream,
-    RecordingStreamBuilder, Scalars, ServerOptions, TextDocument, TextLog, Transform3D,
-    TransformAxes3D, ViewCoordinates,
+    EncodedImage, FillMode, LineStrips3D, MemoryLimit, Mesh3D, PlaybackBehavior, Points3D,
+    RecordingStream, RecordingStreamBuilder, Scalars, SeriesLines, ServerOptions, TextDocument,
+    TextLog, Transform3D, TransformAxes3D, ViewCoordinates,
 };
 use tracing::info;
 
@@ -32,6 +40,9 @@ use crate::model::scene::{PlacedShape, ShapeKind, vertex_normals};
 
 /// The timeline every entry of the viewer is on.
 pub const TIMELINE: &str = "time";
+
+/// The radius (m) of the point that carries a label.
+const LABEL_POINT_RADIUS_M: f32 = 0.003;
 
 /// The quality (1 to 100) of the JPEG a raw color image is sent as.
 const JPEG_QUALITY: u8 = 80;
@@ -68,15 +79,22 @@ pub trait Canvas: Send + Sync {
     /// part of the robot that moves only with the entity above it.
     fn static_shape(&self, path: &str, shape: &PlacedShape, look: Look);
     fn points(&self, path: &str, points: &[[f32; 3]], color: Rgba, radius: f32);
+    /// A text in the 3D view, at `position` in the frame of the entity above `path`.
+    fn label(&self, path: &str, position: [f64; 3], text: &str, color: Rgba);
     /// Cubes of side `side` around `centers`.
     fn cubes(&self, path: &str, centers: &[[f32; 3]], side: f32, color: Rgba);
     fn line_strip(&self, path: &str, points: &[[f64; 3]], color: Rgba);
-    /// One value of a plot.
-    fn scalar(&self, path: &str, value: f64);
+    /// One value for each line of the plot at `path`, in the order of the lines' names.
+    fn scalars(&self, path: &str, values: &[f64]);
+    /// The names of the lines of the plot at `path`, for the whole recording.
+    fn series_names(&self, path: &str, names: &[String]);
     fn color_image(&self, path: &str, image: &ColorImage);
     fn depth_image(&self, path: &str, image: &DepthImage);
     /// Removes the entity and every entity under it from now on.
     fn clear(&self, path: &str);
+    /// Waits until the draws so far reach where the canvas sends them: for the Rerun
+    /// viewer, until its data server took them.
+    fn flush(&self);
 }
 
 /// Where and how the viewer serves, parsed from the node's parameters.
@@ -158,6 +176,76 @@ pub fn host_of(ip: IpAddr) -> String {
     }
 }
 
+/// The entities that the page lays out, each in a view of its own kind: the 3D view of
+/// `world` on the left; on the right the camera's images, the plots and the texts.
+#[derive(Debug, Clone)]
+pub struct PageLayout {
+    /// The root of what the 3D view shows: the robot frame.
+    pub world: &'static str,
+    pub color_image: &'static str,
+    /// The depth image, when the node draws it.
+    pub depth_image: Option<&'static str>,
+    /// The root of the plots of the arms' joints.
+    pub joint_plots: &'static str,
+    pub gripper_plot: &'static str,
+    pub scene_changes: &'static str,
+    pub map_state: &'static str,
+    pub allowed_pairs: &'static str,
+    pub note: &'static str,
+}
+
+impl PageLayout {
+    /// The blueprint of the page. Its side panels start collapsed: the page is a live
+    /// view first, and each panel opens with its button.
+    fn blueprint(&self) -> Blueprint {
+        let mut images: Vec<ContainerLike> = vec![
+            Spatial2DView::new("Camera")
+                .with_origin(self.color_image)
+                .into(),
+        ];
+        if let Some(depth_image) = self.depth_image {
+            images.push(Spatial2DView::new("Depth").with_origin(depth_image).into());
+        }
+        let plots: [ContainerLike; 2] = [
+            TimeSeriesView::new("Joints")
+                .with_origin(self.joint_plots)
+                .into(),
+            TimeSeriesView::new("Grippers")
+                .with_origin(self.gripper_plot)
+                .into(),
+        ];
+        let texts: [ContainerLike; 4] = [
+            TextLogView::new("Scene changes")
+                .with_origin(self.scene_changes)
+                .into(),
+            TextDocumentView::new("Planner map")
+                .with_origin(self.map_state)
+                .into(),
+            TextDocumentView::new("Allowed pairs")
+                .with_origin(self.allowed_pairs)
+                .into(),
+            TextDocumentView::new("Notes").with_origin(self.note).into(),
+        ];
+        let side: [ContainerLike; 3] = [
+            Tabs::new(images).into(),
+            Tabs::new(plots).into(),
+            Tabs::new(texts).into(),
+        ];
+        let page: [ContainerLike; 2] = [
+            Spatial3DView::new("Robot").with_origin(self.world).into(),
+            Vertical::new(side).with_row_shares([3.0, 3.0, 2.0]).into(),
+        ];
+        Blueprint::new(Horizontal::new(page).with_column_shares([3.0, 2.0]))
+            .with_blueprint_panel(BlueprintPanel::from_state(PanelState::Collapsed))
+            .with_selection_panel(SelectionPanel::from_state(PanelState::Collapsed))
+            .with_time_panel(
+                TimePanel::new()
+                    .with_state(PanelState::Collapsed)
+                    .with_timeline(TIMELINE),
+            )
+    }
+}
+
 /// Why the viewer did not start.
 #[derive(Debug, thiserror::Error)]
 pub enum CanvasError {
@@ -177,14 +265,16 @@ pub struct RerunCanvas {
 }
 
 impl RerunCanvas {
-    /// Starts the data server and the web page that `config` describes.
-    pub fn serve(config: &ViewerConfig) -> Result<Self, CanvasError> {
+    /// Starts the data server and the web page that `config` describes, with the page
+    /// laid out as `layout` says.
+    pub fn serve(config: &ViewerConfig, layout: &PageLayout) -> Result<Self, CanvasError> {
         let bind_ip = config.bind_ip.to_string();
         let options = ServerOptions {
             memory_limit: config.memory_limit,
+            // A page that opens late gets the newest data first: the stack as it is now.
+            playback_behavior: PlaybackBehavior::NewestFirst,
             // The browser sends the page's origin with each read of the data.
             cors_allowed_origins: vec![config.page_origin()],
-            ..ServerOptions::default()
         };
         // The data server binds its port on a thread of its own and only logs a failure,
         // so the port is tried here first: a port in use stops the node.
@@ -212,8 +302,13 @@ impl RerunCanvas {
         })
         .map_err(|e| CanvasError::Page(e.to_string()))?
         .detach();
+        // The data server keeps the layout for each page that opens.
+        layout
+            .blueprint()
+            .send(&recording, BlueprintActivation::default())
+            .map_err(|e| CanvasError::Data(format!("the page's layout: {e}")))?;
         recording
-            .log_static("world", &ViewCoordinates::FLU())
+            .log_static(layout.world, &ViewCoordinates::FLU())
             .map_err(|e| CanvasError::Data(e.to_string()))?;
         let host = if config.bind_ip.is_unspecified() {
             "<an address of this machine>".to_string()
@@ -247,7 +342,8 @@ impl RerunCanvas {
         }
     }
 
-    /// Logs `shape` at `path`, placed at its pose, with `log`.
+    /// Logs `shape` at `path`, placed at its pose, with `log`: its pose and its geometry
+    /// in one row, half the messages of two.
     fn log_shape(
         &self,
         path: &str,
@@ -255,37 +351,28 @@ impl RerunCanvas {
         look: Look,
         log: fn(&Self, &str, &dyn AsComponents),
     ) {
-        log(self, path, &transform_of(&shape.pose));
         let color = rerun_color(look.color);
-        match &shape.kind {
-            ShapeKind::Box { size } => log(
-                self,
-                path,
-                &Boxes3D::from_sizes([size.map(|side| side as f32)])
+        let geometry: Box<dyn AsComponents> = match &shape.kind {
+            ShapeKind::Box { size } => Box::new(
+                Boxes3D::from_sizes([size.map(|side| side as f32)])
                     .with_colors([color])
                     .with_fill_mode(fill_mode(look)),
             ),
-            ShapeKind::Sphere { radius } => log(
-                self,
-                path,
-                &Ellipsoids3D::from_radii([*radius as f32])
+            ShapeKind::Sphere { radius } => Box::new(
+                Ellipsoids3D::from_radii([*radius as f32])
                     .with_colors([color])
                     .with_fill_mode(fill_mode(look)),
             ),
-            ShapeKind::Cylinder { height, radius } => log(
-                self,
-                path,
-                &Cylinders3D::from_lengths_and_radii([*height as f32], [*radius as f32])
+            ShapeKind::Cylinder { height, radius } => Box::new(
+                Cylinders3D::from_lengths_and_radii([*height as f32], [*radius as f32])
                     .with_colors([color])
                     .with_fill_mode(fill_mode(look)),
             ),
             ShapeKind::Mesh {
                 vertices,
                 triangles,
-            } => log(
-                self,
-                path,
-                &Mesh3D::new(vertices.iter().map(|vertex| vertex.map(|c| c as f32)))
+            } => Box::new(
+                Mesh3D::new(vertices.iter().map(|vertex| vertex.map(|c| c as f32)))
                     .with_triangle_indices(triangles.iter().copied())
                     .with_vertex_normals(
                         vertex_normals(vertices, triangles)
@@ -294,7 +381,9 @@ impl RerunCanvas {
                     )
                     .with_albedo_factor(color.0),
             ),
-        }
+        };
+        let placed: [&dyn AsComponents; 2] = [&transform_of(&shape.pose), geometry.as_ref()];
+        log(self, path, &placed);
     }
 }
 
@@ -358,8 +447,10 @@ impl Canvas for RerunCanvas {
     }
 
     fn frame(&self, path: &str, pose: &Pose, axis_length: f32) {
-        self.place(path, pose);
-        self.log(path, &TransformAxes3D::new(axis_length));
+        // One row for both: half the messages of two.
+        let placed: [&dyn AsComponents; 2] =
+            [&transform_of(pose), &TransformAxes3D::new(axis_length)];
+        self.log(path, &placed);
     }
 
     fn place(&self, path: &str, pose: &Pose) {
@@ -380,6 +471,17 @@ impl Canvas for RerunCanvas {
             &Points3D::new(points.iter().copied())
                 .with_colors([rerun_color(color)])
                 .with_radii([radius]),
+        );
+    }
+
+    fn label(&self, path: &str, position: [f64; 3], text: &str, color: Rgba) {
+        // Rerun shows a text at a point: a small point carries it.
+        self.log(
+            path,
+            &Points3D::new([position.map(|c| c as f32)])
+                .with_labels([text])
+                .with_colors([rerun_color(color)])
+                .with_radii([LABEL_POINT_RADIUS_M]),
         );
     }
 
@@ -404,8 +506,15 @@ impl Canvas for RerunCanvas {
         );
     }
 
-    fn scalar(&self, path: &str, value: f64) {
-        self.log(path, &Scalars::single(value));
+    fn scalars(&self, path: &str, values: &[f64]) {
+        self.log(path, &Scalars::new(values.iter().copied()));
+    }
+
+    fn series_names(&self, path: &str, names: &[String]) {
+        self.log_static(
+            path,
+            &SeriesLines::new().with_names(names.iter().map(String::as_str)),
+        );
     }
 
     fn color_image(&self, path: &str, image: &ColorImage) {
@@ -429,12 +538,18 @@ impl Canvas for RerunCanvas {
     fn clear(&self, path: &str) {
         self.log(path, &Clear::recursive());
     }
+
+    fn flush(&self) {
+        if let Err(e) = self.recording.flush_blocking() {
+            self.failures
+                .failure(format!("flushing the recording: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn parse(
         bind_ip: &str,
         web: u16,

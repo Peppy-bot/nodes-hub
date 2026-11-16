@@ -10,7 +10,7 @@ use common::{TIMEOUT, bound, publish_once_subscribed, start};
 use peppygen::consumed_topics::motion_planning::occupancy_map::Message;
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::planner_map::{MAP_PATH, MAP_STATE_PATH};
-use rerun_viewer::testing::Drawn;
+use rerun_viewer::drawn::Drawn;
 
 /// A map read at second `second` of the planner's clock, of cubes of 2 cm.
 fn map(second: u64, centers: Vec<f64>, waiting: &str) -> Message {

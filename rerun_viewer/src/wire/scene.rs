@@ -193,8 +193,9 @@ fn parse_mesh(vertices: &[f64], triangles: &[u32]) -> Result<ShapeKind, String> 
 }
 
 /// Asks the planner for its arms until it answers, then reads the scene every
-/// `poll_interval` and draws each scene that differs from the one before, until the
-/// node stops.
+/// `poll_interval` and draws it at each read, until the node stops: a page that opens
+/// late shows the scene as it is within one read. The changes from the scene before are
+/// logged only when there are some.
 pub async fn follow_scene(
     runner: Arc<NodeRunner>,
     canvas: Arc<dyn Canvas>,
@@ -237,10 +238,6 @@ pub async fn follow_scene(
                 continue;
             }
         };
-        if last.as_ref() == Some(&scene) {
-            failures.success();
-            continue;
-        }
         // A scene is drawn at its time on the node's clock; until that clock is ready,
         // the scene waits for the next read.
         let at = match node_now() {
@@ -254,6 +251,7 @@ pub async fn follow_scene(
         let before = last
             .take()
             .unwrap_or_else(|| PlanningScene::empty_like(&scene));
+        // An unchanged scene gives no changes.
         let changes = scene_changes(&before, &scene);
         let description = shared.arms.borrow().clone().unwrap_or_default();
         drawn = draw_scene(canvas.as_ref(), at, &scene, &changes, &description, &drawn);

@@ -6,7 +6,7 @@ mod common;
 use common::{TIMEOUT, bound, drew_at, free_lime, held_lime, right_arm, scene, start};
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::scene::CHANGES_PATH;
-use rerun_viewer::testing::Drawn;
+use rerun_viewer::drawn::Drawn;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lime_is_added_then_attached_to_the_right_arm() -> Result<(), String> {
@@ -85,7 +85,7 @@ async fn a_lime_is_added_then_attached_to_the_right_arm() -> Result<(), String> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_that_changes_nothing_draws_nothing() -> Result<(), String> {
+async fn an_unchanged_scene_is_drawn_again_and_logs_nothing() -> Result<(), String> {
     let (harness, mocks, canvas) = start(bound(&["motion_planning"], default_parameters())).await?;
     let planner = mocks
         .deps
@@ -128,8 +128,14 @@ async fn a_read_that_changes_nothing_draws_nothing() -> Result<(), String> {
     );
     assert_eq!(
         canvas.at("scene/allowed_pairs").len(),
-        2,
-        "the first read and the move are drawn, the read between them is not"
+        3,
+        "each read is drawn, the one that changes nothing too"
+    );
+    assert_eq!(
+        canvas
+            .at("world/scene/objects/brain/lime_1/shape_0_sphere")
+            .len(),
+        3
     );
     harness.shutdown().await.map_err(|e| e.to_string())
 }

@@ -39,7 +39,8 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::testing::{Drawn, FakeCanvas};
+    use crate::drawn::Drawn;
+    use crate::testing::FakeCanvas;
 
     fn map(centers: &[f64], waiting: &str) -> PlannerMap {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(4);

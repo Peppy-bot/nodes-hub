@@ -1,5 +1,6 @@
 //! The arms: each grasp point with its axes and its trail, and the joints and the
-//! grippers as plots.
+//! grippers as plots, one plot for each arm with a line for each joint, and one plot
+//! with a line for each gripper.
 
 use crate::canvas::{Canvas, Rgba};
 use crate::model::arms::{ArmsDescription, ArmsSnapshot, Trails};
@@ -18,16 +19,20 @@ pub fn trail_path(arm: &str) -> String {
     format!("world/arms/{arm}/trail")
 }
 
-pub fn joint_path(arm: &str, joint: &str) -> String {
-    format!("plots/joints/{arm}/{joint}")
+/// The root of the plots of the arms' joints.
+pub const JOINT_PLOTS_PATH: &str = "plots/joints";
+
+/// The plot of the joints of the arm `arm`: one line for each joint.
+pub fn joints_path(arm: &str) -> String {
+    format!("{JOINT_PLOTS_PATH}/{arm}")
 }
 
-pub fn gripper_path(gripper: &str) -> String {
-    format!("plots/grippers/{gripper}")
-}
+/// The plot of the grippers' openings: one line for each gripper.
+pub const GRIPPERS_PATH: &str = "plots/grippers";
 
 /// Draws `snapshot` at its time: each arm's grasp point, its trail in `trails`, and,
-/// when `joint_names` is known, its joints by those names, then each gripper's opening.
+/// when `joint_names` is known, its joints as the lines of its plot, by those names,
+/// then the grippers' openings as the lines of theirs.
 pub fn draw_arms(
     canvas: &dyn Canvas,
     snapshot: &ArmsSnapshot,
@@ -41,23 +46,33 @@ pub fn draw_arms(
         let Some(description) = joint_names else {
             continue;
         };
-        for (index, position) in arm.joint_positions.iter().enumerate() {
-            let joint = description.joint_label(&arm.name, index);
-            canvas.scalar(&joint_path(&arm.name, &joint), *position);
-        }
+        let names: Vec<String> = (0..arm.joint_positions.len())
+            .map(|index| description.joint_label(&arm.name, index))
+            .collect();
+        let plot = joints_path(&arm.name);
+        canvas.series_names(&plot, &names);
+        canvas.scalars(&plot, &arm.joint_positions);
     }
-    for gripper in &snapshot.grippers {
-        canvas.scalar(&gripper_path(&gripper.name), gripper.opening);
+    if snapshot.grippers.is_empty() {
+        return;
     }
+    let (names, openings): (Vec<String>, Vec<f64>) = snapshot
+        .grippers
+        .iter()
+        .map(|gripper| (gripper.name.clone(), gripper.opening))
+        .unzip();
+    canvas.series_names(GRIPPERS_PATH, &names);
+    canvas.scalars(GRIPPERS_PATH, &openings);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drawn::Drawn;
     use crate::model::arms::tests::openarm;
     use crate::model::arms::{ArmState, GripperState};
     use crate::model::placement::Placement;
-    use crate::testing::{Drawn, FakeCanvas};
+    use crate::testing::FakeCanvas;
     use std::num::NonZeroUsize;
     use std::time::{Duration, SystemTime};
 
@@ -92,24 +107,28 @@ mod tests {
             Drawn::LineStrip { path, points, .. }
                 if path == "world/arms/right_arm/trail" && points == &[[0.3, -0.2, 0.4]]
         ));
-        let scalars: Vec<(String, f64)> = drawn
-            .iter()
-            .filter_map(|drawn| match drawn {
-                Drawn::Scalar { path, value } => Some((path.clone(), *value)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            scalars,
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(matches!(
+            &drawn[3..],
             [
-                (
-                    "plots/joints/right_arm/openarm_right_joint1".to_string(),
-                    0.5
-                ),
-                ("plots/joints/right_arm/joint_1".to_string(), -0.25),
-                ("plots/grippers/right_gripper".to_string(), 0.75),
-            ]
-        );
+                Drawn::SeriesNames { path: joints, names: joint_names },
+                Drawn::Scalars { path: joint_values_at, values: joint_values },
+                Drawn::SeriesNames { path: grippers, names: gripper_names },
+                Drawn::Scalars { path: gripper_values_at, values: gripper_values },
+            ] if joints == "plots/joints/right_arm"
+                && joint_names == &names(&["openarm_right_joint1", "joint_1"])
+                && joint_values_at == "plots/joints/right_arm"
+                && joint_values == &[0.5, -0.25]
+                && grippers == "plots/grippers"
+                && gripper_names == &names(&["right_gripper"])
+                && gripper_values_at == "plots/grippers"
+                && gripper_values == &[0.75]
+        ));
     }
 
     #[test]
@@ -130,7 +149,7 @@ mod tests {
             !canvas
                 .drawn()
                 .iter()
-                .any(|drawn| matches!(drawn, Drawn::Scalar { .. }))
+                .any(|drawn| matches!(drawn, Drawn::Scalars { .. }))
         );
         assert_eq!(canvas.at("world/arms/right_arm/grasp").len(), 1);
     }

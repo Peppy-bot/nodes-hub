@@ -14,7 +14,8 @@
 //!   `planner/map` what the map holds.
 //! - `world/scene/objects/<id>` and `world/scene/shells/<id>`: the planning scene.
 //! - `camera/color` and `camera/depth`: the camera's images.
-//! - `plots/joints/<arm>/<joint>` and `plots/grippers/<gripper>`: the plots.
+//! - `plots/joints/<arm>`: the positions of the arm's joints, one line for each joint; and
+//!   `plots/grippers`: the grippers' openings, one line for each gripper.
 //! - `scene/changes` and `scene/allowed_pairs`: the log of the scene and its pairs.
 //! - `notes/cubes`: what the cubes and the points are.
 
@@ -24,8 +25,27 @@ pub mod planner_map;
 pub mod robot;
 pub mod scene;
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, PageLayout};
 use crate::model::scene::PlacedShape;
+
+/// The robot frame: the root of everything drawn in 3D.
+pub const WORLD_PATH: &str = "world";
+
+/// The page's layout over the entities of the drawers; the depth image has a view only
+/// when the node draws it.
+pub fn page_layout(depth_image: bool) -> PageLayout {
+    PageLayout {
+        world: WORLD_PATH,
+        color_image: camera::COLOR_PATH,
+        depth_image: depth_image.then_some(camera::DEPTH_PATH),
+        joint_plots: arms::JOINT_PLOTS_PATH,
+        gripper_plot: arms::GRIPPERS_PATH,
+        scene_changes: scene::CHANGES_PATH,
+        map_state: planner_map::MAP_STATE_PATH,
+        allowed_pairs: scene::ALLOWED_PAIRS_PATH,
+        note: CUBES_NOTE_PATH,
+    }
+}
 
 /// The path of the note on the cubes.
 pub const CUBES_NOTE_PATH: &str = "notes/cubes";
@@ -47,4 +67,15 @@ pub fn part_path(parent: &str, id: &str, part: &str, index: usize, shape: &Place
 /// Draws the notes that hold for the whole recording.
 pub fn draw_notes(canvas: &dyn Canvas) {
     canvas.note(CUBES_NOTE_PATH, CUBES_NOTE);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_depth_image_has_a_view_only_when_the_node_draws_it() {
+        assert_eq!(page_layout(false).depth_image, None);
+        assert_eq!(page_layout(true).depth_image, Some(camera::DEPTH_PATH));
+    }
 }

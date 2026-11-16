@@ -73,6 +73,50 @@ impl ColorImage {
             }
         }
     }
+
+    /// The image at most `max_width` pixels wide. Raw pixels wider than that are shrunk
+    /// by the smallest whole factor that fits: each pixel is the mean of the block of
+    /// factor by factor pixels it stands for, and the columns and the rows past the last
+    /// whole block are left out. A JPEG, an image that fits and an image lower than the
+    /// factor stay as they are.
+    pub fn shrunk_to(self, max_width: NonZeroU32) -> Self {
+        let (width, height, pixels) = match self {
+            Self::Rgb {
+                width,
+                height,
+                pixels,
+            } if width > max_width.get() && height >= width.div_ceil(max_width.get()) => {
+                (width, height, pixels)
+            }
+            as_it_is => return as_it_is,
+        };
+        let factor = width.div_ceil(max_width.get());
+        let (small_width, small_height) = (width / factor, height / factor);
+        let block = factor as usize;
+        let row_bytes = 3 * width as usize;
+        let count = factor * factor;
+        let mut small = Vec::with_capacity(3 * small_width as usize * small_height as usize);
+        for row in 0..small_height as usize {
+            for column in 0..small_width as usize {
+                let mut sums = [0_u32; 3];
+                for line in 0..block {
+                    let start = (row * block + line) * row_bytes + 3 * column * block;
+                    for pixel in pixels[start..start + 3 * block].as_chunks::<3>().0 {
+                        for (sum, channel) in sums.iter_mut().zip(pixel) {
+                            *sum += u32::from(*channel);
+                        }
+                    }
+                }
+                // The mean, rounded to the nearest.
+                small.extend(sums.map(|sum| ((sum + count / 2) / count) as u8));
+            }
+        }
+        Self::Rgb {
+            width: small_width,
+            height: small_height,
+            pixels: small,
+        }
+    }
 }
 
 /// Whether a frame of `got` bytes is `width` by `height` pixels of `bytes_per_pixel`.
@@ -466,6 +510,70 @@ mod tests {
     fn an_mjpeg_frame_stays_a_jpeg() {
         let jpeg = ColorImage::parse("mjpeg", 640, 480, vec![0xFF, 0xD8]).unwrap();
         assert_eq!(jpeg, ColorImage::Jpeg(vec![0xFF, 0xD8]));
+    }
+
+    #[test]
+    fn a_wide_image_shrinks_to_the_mean_of_each_block() {
+        // 4 by 2 pixels, to at most 2 wide: a factor of 2, one row of two pixels.
+        #[rustfmt::skip]
+        let pixels = vec![
+            10, 0, 0,   20, 0, 0,   100, 100, 100,   100, 100, 100,
+            30, 0, 0,   40, 0, 2,   100, 100, 100,   104, 100, 100,
+        ];
+        let wide = ColorImage::Rgb {
+            width: 4,
+            height: 2,
+            pixels,
+        };
+        assert_eq!(
+            wide.shrunk_to(NonZeroU32::new(2).unwrap()),
+            ColorImage::Rgb {
+                width: 2,
+                height: 1,
+                // Left: red (10 + 20 + 30 + 40) / 4 = 25, blue 2 / 4 rounds to 1.
+                pixels: vec![25, 0, 1, 101, 100, 100],
+            }
+        );
+    }
+
+    #[test]
+    fn the_pixels_past_the_last_whole_block_are_left_out() {
+        // 5 by 3 pixels, each row 9, 9, 9, 200, 200, to at most 2 wide: a factor of 3,
+        // one pixel, the mean of the first 3 by 3 block.
+        let row = [9, 9, 9, 9, 9, 9, 9, 9, 9, 200, 200, 200, 200, 200, 200];
+        let wide = ColorImage::Rgb {
+            width: 5,
+            height: 3,
+            pixels: row.repeat(3),
+        };
+        assert_eq!(
+            wide.shrunk_to(NonZeroU32::new(2).unwrap()),
+            ColorImage::Rgb {
+                width: 1,
+                height: 1,
+                pixels: vec![9, 9, 9],
+            }
+        );
+    }
+
+    #[test]
+    fn an_image_that_fits_a_jpeg_and_an_image_lower_than_the_factor_stay_as_they_are() {
+        let two = NonZeroU32::new(2).unwrap();
+        let fits = ColorImage::Rgb {
+            width: 2,
+            height: 1,
+            pixels: vec![1, 2, 3, 4, 5, 6],
+        };
+        assert_eq!(fits.clone().shrunk_to(two), fits);
+        let jpeg = ColorImage::Jpeg(vec![0xFF, 0xD8]);
+        assert_eq!(jpeg.clone().shrunk_to(two), jpeg);
+        // 4 by 1 pixels: a factor of 2 leaves no row.
+        let low = ColorImage::Rgb {
+            width: 4,
+            height: 1,
+            pixels: vec![7; 12],
+        };
+        assert_eq!(low.clone().shrunk_to(two), low);
     }
 
     #[test]

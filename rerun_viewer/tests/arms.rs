@@ -9,7 +9,7 @@ use common::{
 };
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::CUBES_NOTE_PATH;
-use rerun_viewer::testing::Drawn;
+use rerun_viewer::drawn::Drawn;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_note_on_the_cubes_is_drawn_at_the_start() -> Result<(), String> {
@@ -34,21 +34,27 @@ async fn a_snapshot_draws_the_arms_with_every_optional_link_vacant() -> Result<(
     )
     .await?;
     canvas
-        .wait_until(TIMEOUT, "the gripper's opening", |drawn| {
-            drew_at(drawn, "plots/grippers/right_gripper")
+        .wait_until(TIMEOUT, "the grippers' openings", |drawn| {
+            drawn
+                .iter()
+                .any(|call| matches!(call, Drawn::Scalars { path, .. } if path == "plots/grippers"))
         })
         .await?;
     let Drawn::Frame { pose, .. } = &canvas.at("world/arms/right_arm/grasp")[0] else {
         panic!("the grasp point is a frame")
     };
     assert_eq!(pose.origin(), [0.3, -0.2, 0.4]);
+    // Each plot takes the names of its lines, then a value for each.
+    let names = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
     assert!(matches!(
-        &canvas.at("plots/joints/left_arm/joint_1")[0],
-        Drawn::Scalar { value, .. } if *value == 0.2
+        &canvas.at("plots/joints/left_arm")[..],
+        [Drawn::SeriesNames { names: lines, .. }, Drawn::Scalars { values, .. }]
+            if lines == &names(&["joint_0", "joint_1"]) && values == &[0.1, 0.2]
     ));
     assert!(matches!(
-        &canvas.at("plots/grippers/right_gripper")[0],
-        Drawn::Scalar { value, .. } if *value == 0.5
+        &canvas.at("plots/grippers")[..],
+        [Drawn::SeriesNames { names: lines, .. }, Drawn::Scalars { values, .. }]
+            if lines == &names(&["right_gripper"]) && values == &[0.5]
     ));
     harness.shutdown().await.map_err(|e| e.to_string())
 }
@@ -94,7 +100,13 @@ async fn the_joints_take_the_planners_names() -> Result<(), String> {
     .await?;
     canvas
         .wait_until(TIMEOUT, "the named joint", |drawn| {
-            drew_at(drawn, "plots/joints/right_arm/openarm_right_joint1")
+            drawn.iter().any(|call| {
+                matches!(
+                    call,
+                    Drawn::SeriesNames { path, names }
+                        if path == "plots/joints/right_arm" && names == &["openarm_right_joint1"]
+                )
+            })
         })
         .await?;
     harness.shutdown().await.map_err(|e| e.to_string())

@@ -34,6 +34,7 @@ pub async fn setup(
         runner.clone(),
         canvas.clone(),
         config.trail_length,
+        config.arms_interval,
         shared.clone(),
     ));
     if get_description::bound_producer(&runner).is_some() {
@@ -46,9 +47,11 @@ pub async fn setup(
             runner.clone(),
             canvas.clone(),
             config.image_interval,
+            config.image_max_width,
         ));
         let settings = DepthSettings {
             image_interval: config.image_interval,
+            depth_image: config.depth_image,
             cloud_interval: config.cloud_interval,
             cloud_stride: config.cloud_stride,
             camera_name: config.camera_name.clone(),

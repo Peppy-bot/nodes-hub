@@ -18,8 +18,8 @@ use peppygen::mock::deps::camera_mounts::get_camera_poses;
 use peppygen::mock::deps::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::camera::{COLOR_PATH, DEPTH_PATH, POINTS_PATH};
+use rerun_viewer::drawn::Drawn;
 use rerun_viewer::model::camera::ColorImage;
-use rerun_viewer::testing::Drawn;
 
 const ALIGN: &str = "depth_to_color";
 
@@ -120,6 +120,7 @@ fn depth_frame() -> DepthFrame {
 async fn a_depth_frame_becomes_an_image_and_points_in_the_robot_frame() -> Result<(), String> {
     let mut parameters = default_parameters();
     parameters.cloud_stride = 2;
+    parameters.depth_image = true;
     let links = ["camera", "geometry", "camera_mounts"];
     let (harness, mocks, canvas) = start(bound(&links, parameters)).await?;
     script_the_camera(&mocks, "", 1)?;
@@ -157,6 +158,25 @@ async fn a_depth_frame_becomes_an_image_and_points_in_the_robot_frame() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn by_default_a_depth_frame_becomes_points_and_no_depth_image() -> Result<(), String> {
+    let links = ["camera", "geometry", "camera_mounts"];
+    let (harness, mocks, canvas) = start(bound(&links, default_parameters())).await?;
+    script_the_camera(&mocks, "", 1)?;
+    let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
+    publish_once_subscribed(
+        camera.depth_stream.wait_for_subscriber(TIMEOUT),
+        camera.depth_stream.publish(&depth_frame()),
+    )
+    .await?;
+    canvas
+        .wait_until(TIMEOUT, "the points", |drawn| drew_at(drawn, POINTS_PATH))
+        .await?;
+    // A frame's depth image is drawn before its points, when it is drawn.
+    assert!(canvas.at(DEPTH_PATH).is_empty());
+    harness.shutdown().await.map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fixed_camera_is_placed_once_and_a_carried_one_for_each_cloud() -> Result<(), String> {
     for (carried_by, asks) in [("", 1), ("left_arm", 2)] {
         let mut parameters = default_parameters();
@@ -190,6 +210,48 @@ async fn a_fixed_camera_is_placed_once_and_a_carried_one_for_each_cloud() -> Res
         harness.shutdown().await.map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_wider_than_image_max_width_is_drawn_shrunk() -> Result<(), String> {
+    let mut parameters = default_parameters();
+    parameters.image_max_width = 2;
+    let links = ["camera", "geometry", "camera_mounts"];
+    let (harness, mocks, canvas) = start(bound(&links, parameters)).await?;
+    let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
+    publish_once_subscribed(
+        camera.video_stream.wait_for_subscriber(TIMEOUT),
+        camera.video_stream.publish(&ColorFrame {
+            header: ColorHeader {
+                timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+                frame_id: 1,
+                align_mode: ALIGN.to_string(),
+            },
+            encoding: "rgb8".to_string(),
+            // 4 by 2 pixels: the left half 10, the right half 200.
+            width: 4,
+            height: 2,
+            frame: [[10_u8; 6], [200; 6], [10; 6], [200; 6]].concat(),
+        }),
+    )
+    .await?;
+    canvas
+        .wait_until(TIMEOUT, "the color image", |drawn| {
+            drew_at(drawn, COLOR_PATH)
+        })
+        .await?;
+    let Drawn::ColorImage { image, .. } = &canvas.at(COLOR_PATH)[0] else {
+        panic!("a color image")
+    };
+    assert_eq!(
+        image,
+        &ColorImage::Rgb {
+            width: 2,
+            height: 1,
+            pixels: vec![10, 10, 10, 200, 200, 200]
+        }
+    );
+    harness.shutdown().await.map_err(|e| e.to_string())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -234,8 +296,9 @@ async fn a_bgr8_frame_becomes_an_rgb_image() -> Result<(), String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_the_camera_mounts_link_the_depth_image_is_drawn_and_no_points()
 -> Result<(), String> {
-    let (harness, mocks, canvas) =
-        start(bound(&["camera", "geometry"], default_parameters())).await?;
+    let mut parameters = default_parameters();
+    parameters.depth_image = true;
+    let (harness, mocks, canvas) = start(bound(&["camera", "geometry"], parameters)).await?;
     script_camera_unit(&mocks)?;
     let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
     publish_once_subscribed(

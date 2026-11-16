@@ -3,14 +3,16 @@
 `rerun_viewer` draws, live in one 3D view in a browser, what a robot stack already has on
 the wire. It serves the [Rerun](https://rerun.io) web viewer (Rerun 0.41.0) and draws:
 
-- the color and depth images of one camera;
+- the color image of one camera, and its depth image when `depth_image` is set;
 - the depth samples of that camera as points in the robot frame;
 - the motion planner's voxel map: the occupied cubes that its plans keep their clearance
   from, as the planner publishes them;
 - each arm's grasp point with its axes and a trail of its past positions;
 - each link of the robot as its collision shapes, where the joints put it;
-- each joint's position and each gripper's opening, as plots;
-- the planning scene of `motion_planning:v1`: each object as its shapes, each attached
+- each joint's position and each gripper's opening, as plots: one plot for each arm with a
+  line for each joint, and one plot with a line for each gripper;
+- the planning scene of `motion_planning:v1`: each object as its shapes, with its id as a
+  label ("(carried)" after the id of an object that an arm carries), each attached
   object at the grasp point of the arm that carries it, a see-through shell of the
   scene's clearance around each shape, and the pairs allowed to touch;
 - a log of each change of the planning scene between two reads ("added brain/lime_1",
@@ -22,22 +24,107 @@ It draws only the contracts that its `peppy.json5` lists: `limb_state:v1`,
 `robot_identity:v1`, `rgbd_camera:v1`, `camera_geometry:v1`, `camera_mounts:v1` and
 `motion_planning:v1`.
 
-## The cubes are the planner's map
+## Start it beside a running stack
 
-The cubes under `world/planner/map` are the motion planner's voxel map, as the planner
-publishes it on `occupancy_map` of `motion_planning:v1`, by default once a second
-(`occupancy_map_rate_hz` of motion_planner). They are the cubes that its plans, Cartesian
-paths and checks keep their clearance from: the robot and the scene's objects are cut out
-of them, and they hold the cubes that the camera cannot see now. Each map is drawn at the
-time the planner read it. The text entity `planner/map` says how many cubes the map holds
-or, when it holds no depth frame, why (before the first frame, and after
-`clear_occupancy_map`). The points under `world/camera/points` are the camera's depth now.
-The text entity `notes/cubes` says this too.
+No launcher deploys the viewer. Start it beside a running stack and link it to the
+instances of one robot copy (`peppy stack list` names them). For the copy `alpha` of a
+simulated OpenArm:
+
+```bash
+peppy node add ./rerun_viewer -sb
+peppy node run rerun_viewer:v1 --instance-id alpha_viewer --clock simulation \
+  --link limb_state@alpha_backbone_inst --link identity@alpha_init_inst \
+  --link camera@alpha_chest --link geometry@alpha_chest \
+  --link camera_mounts@alpha_backbone_inst --link motion_planning@alpha_planner_inst \
+  bind_ip=<address>
+```
+
+`<address>` is the address of this machine that the browser reaches, such as its
+Tailscale address. Without `bind_ip`, the viewer serves this machine only.
+`--clock simulation` puts the viewer on the simulation's clock, as the other instances of
+a simulated stack are. On a physical robot, leave `--clock` out. To leave a link out, give
+`--vacant-link <link>=<why>` in place of its `--link`.
+
+Then open the page from the browser, with the address the viewer serves on:
+
+```text
+http://<address>:9090/?url=rerun%2Bhttp%3A%2F%2F<address>%3A9876%2Fproxy
+```
+
+The node logs this address at its start. The page reads its data from the second port
+(`grpc_port`); the `url` part of the address tells it where.
+
+To replay a saved recording (`recording_path`), run the Rerun viewer of the same version
+on any machine:
+
+```bash
+uvx --from rerun-sdk==0.41.0 rerun recording.rrd
+```
+
+## The page
+
+The viewer lays the page out (a Rerun blueprint, kept by the data server for each page):
+
+- left, the 3D view `Robot`: the robot frame `world` with the links, the arms' grasp
+  points and trails, the camera's points, the planner's cubes and the planning scene;
+- right, from the top: the camera's image (and the depth image in a second tab with
+  `depth_image`); the plots `Joints`, one line for each joint of each arm, and
+  `Grippers`, one line for each gripper; and the texts `Scene changes`, `Planner map`,
+  `Allowed pairs` and `Notes`.
+
+The side panels and the time panel start collapsed; each opens with its button at the
+top right. The page shows the newest data while its time cursor follows the stream.
+
+In the 3D view, each kind of thing has its own look:
+
+| Look | What it is |
+| --- | --- |
+| grey shapes, with orange fingers | the robot's links |
+| green shape, with its id | an object of the planning scene |
+| magenta shape, with its id and "(carried)" | an object that an arm carries, at that arm's grasp point |
+| red wireframe | the scene's clearance around a shape of the planning scene |
+| see-through blue cubes | the planner's voxel map |
+| light blue points | the camera's depth samples |
+| three axes and a yellow line | an arm's grasp point and the trail of its past positions |
+
+To hide a kind, open the left panel and click the eye of its entity under the view
+`Robot`: `world/planner/map` for the cubes, `world/camera/points` for the points,
+`world/robot` for the links, `world/scene` for the objects that stand in the scene and
+their shells.
+
+## Arguments
+
+| Argument | Default | What it does |
+| --- | --- | --- |
+| `bind_ip` | `127.0.0.1` | the address the viewer serves on: this machine only by default; give the Tailscale address to open it from another machine |
+| `web_port` | 9090 | the port of the web page |
+| `grpc_port` | 9876 | the port the page reads the data from |
+| `memory_limit` | `8MB` | how much data the viewer keeps for a page that opens late, newest first, as `8MB` or `1%`; past it, the oldest data goes first, the robot's link shapes (about 2.5 MB for an OpenArm) last |
+| `recording_path` | empty | a file to save the run to (`.rrd`), as the data server takes it; empty saves none |
+| `arms_rate_hz` | 10.0 | the most snapshots of the arms a second it draws |
+| `image_rate_hz` | 2.0 | the most color images, and the most depth images, a second it draws |
+| `image_max_width` | 640 | the widest color image it draws, in pixels; a wider raw frame is shrunk by a whole factor, a JPEG frame goes as it came |
+| `depth_image` | false | whether it draws the depth image; the points show the depth without it |
+| `cloud_rate_hz` | 2.0 | the most depth frames a second it turns into points |
+| `cloud_stride` | 4 | the points come from every n-th pixel across and down |
+| `scene_poll_hz` | 2.0 | how many times a second it reads the planning scene |
+| `trail_length` | 100 | how many past grasp-point positions each trail holds |
+| `camera_name` | `chest` | the camera of `camera_mounts` that the `camera` link is |
+
+The color images go to the page as JPEG. The rates bound the work of the node and the
+data on the link: a color frame of the simulated OpenArm chest camera is 1280x720 (2.8 MB
+raw), drawn at 640x360 (about 34 kB as JPEG), and the camera sends up to 15 a second. A
+raw depth image of that camera is about 1.8 MB, which is why the viewer draws it only
+with `depth_image`.
+
+The data server answers the page served from `bind_ip` and `web_port` only
+(`http://<bind_ip>:<web_port>`). With `bind_ip=0.0.0.0` it answers the page under any
+address on `web_port`.
 
 ## What it needs
 
 | Link | Contract | Cardinality | Without it |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `limb_state` | `limb_state:v1` | one | the node does not start |
 | `identity` | `robot_identity:v1` | zero_or_one | no robot links |
 | `camera` | `rgbd_camera:v1` | zero_or_one | no images, no points |
@@ -51,14 +138,50 @@ asks the geometry again when the frames change their size or their alignment. Fo
 camera that an arm carries, it asks the pose again for each cloud: the points take the
 pose of that ask, which can be some tens of milliseconds after the frame, so the points
 of a camera on a moving arm stand that much off. It reads the planning scene at
-`scene_poll_hz` and draws it each time it differs from the read before, at its time on
-the node's clock.
+`scene_poll_hz` and draws it at each read, at its time on the node's clock, and logs the
+changes from the read before.
 
-With the `motion_planning` link bound, the joints are plotted once the planner has named
-them; without it, each joint is named by its index (`joint_0`, `joint_1`, ...).
+The arms are drawn at most `arms_rate_hz` times a second: the grasp points, the links and
+the plots. Each snapshot still adds its point to the trails. With the `motion_planning`
+link bound, the joints are plotted once the planner has named them; without it, each
+joint is named by its index (`joint_0`, `joint_1`, ...).
 
 An attached object is drawn at the grasp point of the arm whose `grasp_link`
 (`describe_arms`) carries it. An object that another link carries is logged and not drawn.
+
+## Live: the stack as it is now
+
+The viewer shows the stack as it is now, as RViz does, not a history:
+
+- The node keeps only the newest draw of each entity until Rerun's data server takes it
+  (`src/live.rs`). When the server takes the draws slower than they come, a newer draw of
+  an entity replaces the one that waits, and the node logs once that it keeps up by
+  dropping draws. The lines of `scene/changes` are events: each waits in order, at most
+  256.
+- The node sends only what changes the view. A draw that is the same as the last one sent
+  for its entity is left out: a pose within 0.1 mm, a value of a plot within 1e-4, the
+  same points, the same image. Each entity is sent again once its data is 2 s newer, so a
+  page that opens late has everything within 2 s. A stack at rest sends about 18 messages
+  and 80 kB a second, and one with an arm in motion about 90 messages and 190 kB a
+  second (measured on the simulated OpenArm): a link of 1.5 MB a second carries it with
+  room, and the page stays within half a second of the stack.
+- The data server keeps `memory_limit` of data for a page that opens late, 8 MB by
+  default: the robot's link shapes and some seconds of the rest. It sends that page the
+  newest data first.
+- The viewer draws the planning scene at each read (`scene_poll_hz`), so a page that opens
+  late shows the scene as it is within one read.
+
+## The cubes are the planner's map
+
+The cubes under `world/planner/map` are the motion planner's voxel map, as the planner
+publishes it on `occupancy_map` of `motion_planning:v1`, by default once a second
+(`occupancy_map_rate_hz` of motion_planner). They are the cubes that its plans, Cartesian
+paths and checks keep their clearance from: the robot and the scene's objects are cut out
+of them, and they hold the cubes that the camera cannot see now. Each map is drawn at the
+time the planner read it. The text entity `planner/map` says how many cubes the map holds
+or, when it holds no depth frame, why (before the first frame, and after
+`clear_occupancy_map`). The points under `world/camera/points` are the camera's depth now.
+The text entity `notes/cubes` says this too.
 
 ## The robot's links
 
@@ -88,76 +211,19 @@ viewer draws no links.
 The shapes go to the viewer once, for the whole recording; each snapshot sends only the
 pose of each link. Before the first snapshot, the shapes stand at the robot frame's origin.
 
-## Attach it to a running stack
+## The cost
 
-No launcher deploys the viewer. Start it beside a running stack and link it to the
-instances of one robot copy (`peppy stack list` names them). For the copy `alpha` of a
-simulated OpenArm:
-
-```bash
-peppy node add ./rerun_viewer -sb
-peppy node run rerun_viewer:v1 --instance-id alpha_viewer --clock simulation \
-  --link limb_state@alpha_backbone_inst --link identity@alpha_init_inst \
-  --link camera@alpha_chest --link geometry@alpha_chest \
-  --link camera_mounts@alpha_backbone_inst --link motion_planning@alpha_planner_inst \
-  bind_ip=<address>
-```
-
-`--clock simulation` puts the viewer on the simulation's clock, as the other instances of
-a simulated stack are. On a physical robot, leave `--clock` out. To leave a link out, give
-`--vacant-link <link>=<why>` in place of its `--link`.
-
-Then open the page from the browser, with the address the viewer serves on:
-
-```
-http://<address>:9090/?url=rerun%2Bhttp%3A%2F%2F<address>%3A9876%2Fproxy
-```
-
-The node logs this address at its start. The page reads its data from the second port
-(`grpc_port`); the `url` part of the address tells it where.
-
-To replay a saved recording, run the Rerun viewer of the same version on any machine:
-
-```bash
-uvx --from rerun-sdk==0.41.0 rerun recording.rrd
-```
-
-## Arguments
-
-| Argument | Default | What it does |
-|---|---|---|
-| `bind_ip` | `127.0.0.1` | the address the viewer serves on: this machine only by default; give the Tailscale address to open it from another machine |
-| `web_port` | 9090 | the port of the web page |
-| `grpc_port` | 9876 | the port the page reads the data from |
-| `memory_limit` | `1GB` | how much data the viewer keeps for a page that opens late, as `1GB` or `25%`; past it, the oldest data goes first |
-| `recording_path` | empty | a file to save the whole run to (`.rrd`); empty saves none |
-| `image_rate_hz` | 2.0 | the most color images, and the most depth images, a second it draws |
-| `cloud_rate_hz` | 2.0 | the most depth frames a second it turns into points |
-| `cloud_stride` | 4 | the points come from every n-th pixel across and down |
-| `scene_poll_hz` | 2.0 | how many times a second it reads the planning scene |
-| `trail_length` | 100 | how many past grasp-point positions each trail holds |
-| `camera_name` | `chest` | the camera of `camera_mounts` that the `camera` link is |
-
-The color images go to the page as JPEG. The rates bound the work of the node: a color
-frame of the simulated OpenArm chest camera is 1280x720 (2.8 MB raw), and the camera sends
-up to 15 a second.
-
-The cost at the defaults, measured on a machine of 30 cores against the simulated OpenArm
-`alpha`, with limb_states at 20 Hz and the planner's map at 1 Hz, the viewer running for
-16 minutes:
+The cost at the defaults, measured on a machine of 30 cores against the simulated OpenArm,
+with limb_states at 20 Hz and the planner's map at 1 Hz, the viewer running for 10
+minutes:
 
 | Chest camera | CPU | Resident memory |
-|---|---|---|
-| idle, 1 frame a second | 7.2 % of one core | 1016 MB |
-| held, 15 frames a second | 12.4 % of one core | 1131 MB |
+| --- | --- | --- |
+| idle, 1 frame a second | 3.7 % of one core | 78 MB |
+| held, 15 frames a second | 8.2 % of one core | 82 MB |
 
-The memory is mostly the history that the data server keeps for a page that opens late. It
-grows to `memory_limit` within minutes, since the raw depth image alone is about 3.7 MB a
-second at 2 images a second, and stays there: past the limit, the oldest data goes first.
-
-The data server answers the page served from `bind_ip` and `web_port` only
-(`http://<bind_ip>:<web_port>`). With `bind_ip=0.0.0.0` it answers the page under any
-address on `web_port`.
+The memory stays there: the data server keeps at most `memory_limit` of data, and the node
+keeps the newest draw of each entity and the last one it sent.
 
 ## The code
 
@@ -169,8 +235,14 @@ Each part of the node knows only what its comment says:
   points, a scene to shapes and shells, the change log, the planner's voxel map, and the
   robot's body (its description and STL meshes to shapes, joints to link poses).
 - `src/draw/`: the canvas only. How each value is drawn, and the paths of the entities.
-- `src/canvas.rs`: Rerun. The `Canvas` trait that the drawers use, and `RerunCanvas`, the
-  only code that calls Rerun. The tests draw on `FakeCanvas` (`src/testing.rs`).
+- `src/canvas.rs`: Rerun. The `Canvas` trait that the drawers use, the page's layout, and
+  `RerunCanvas`, the only code that calls Rerun. The tests draw on `FakeCanvas`
+  (`src/testing.rs`).
+- `src/drawn.rs`: a call to a canvas as a value (`Drawn`), and when two draws are the same
+  for the eye.
+- `src/live.rs`: the canvas the node draws on. It keeps the newest draw of each entity and
+  hands on what changes the view to `RerunCanvas`, on a thread of its own, so only that
+  thread waits on Rerun.
 - `src/config.rs`: the node's parameters, parsed once at start.
 - `src/node.rs`: the start: one follower for each link that is bound.
 
