@@ -28,7 +28,7 @@ use tracing::info;
 use crate::config::ConfigError;
 use crate::model::camera::{ColorImage, DepthImage};
 use crate::model::placement::rotation_columns;
-use crate::model::scene::{PlacedShape, ShapeKind};
+use crate::model::scene::{PlacedShape, ShapeKind, vertex_normals};
 
 /// The timeline every entry of the viewer is on.
 pub const TIMELINE: &str = "time";
@@ -287,6 +287,11 @@ impl RerunCanvas {
                 path,
                 &Mesh3D::new(vertices.iter().map(|vertex| vertex.map(|c| c as f32)))
                     .with_triangle_indices(triangles.iter().copied())
+                    .with_vertex_normals(
+                        vertex_normals(vertices, triangles)
+                            .into_iter()
+                            .map(|normal| normal.map(|c| c as f32)),
+                    )
                     .with_albedo_factor(color.0),
             ),
         }

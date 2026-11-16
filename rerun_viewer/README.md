@@ -71,6 +71,11 @@ meshes that RViz shows, which `robot_identity` does not give. The planner checks
 pieces that it fits around these shapes, a little larger than them, and keeps its
 clearance from those pieces; the viewer does not draw the pieces.
 
+Each link takes the color of its part: mid grey for the body and the base of each arm,
+dark and light grey in turn for the segments of each arm from the first, and orange for
+the fingers. Each mesh, of a link or of the planning scene, goes to the viewer with a
+normal for each vertex, so that the viewer's light shades it.
+
 For each `limb_states` snapshot, the viewer places each link by forward kinematics over
 the URDF: each arm's joints, in the order of the arm's chain in the SRDF, at the
 snapshot's positions, and each finger joint in proportion to its gripper's opening,

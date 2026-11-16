@@ -1,36 +1,58 @@
 //! The robot's body: the collision shapes of each link, drawn once for the whole
-//! recording, and each link placed where the joints of each snapshot put it.
+//! recording in the color of the link's part, and each link placed where the joints of
+//! each snapshot put it.
 
 use std::time::SystemTime;
 
 use camera_core::pose::Pose;
 
-use crate::canvas::{Canvas, Look};
+use crate::canvas::{Canvas, Look, Rgba};
 use crate::draw::part_path;
-use crate::model::robot::{BodyLink, RobotBody};
+use crate::model::robot::{BodyLink, LinkPart, RobotBody};
 
 /// Where the links are drawn: the robot frame.
 pub const ROBOT_PATH: &str = "world/robot";
 
-/// Light grey, a little see-through, so that the points and the cubes behind a link
-/// show where the viewer draws see-through meshes.
-const BODY_LOOK: Look = Look {
-    color: [200, 205, 215, 200],
-    wireframe: false,
-};
+/// The body and the base of each arm: mid grey.
+const BODY_LOOK: Look = solid([150, 154, 162, 255]);
+/// The odd segments of an arm, from the first: dark grey.
+const ODD_SEGMENT_LOOK: Look = solid([62, 66, 76, 255]);
+/// The even segments of an arm: light grey, so that each segment stands apart from the
+/// next.
+const EVEN_SEGMENT_LOOK: Look = solid([214, 217, 224, 255]);
+/// The fingers: orange.
+const FINGER_LOOK: Look = solid([235, 140, 52, 255]);
+
+const fn solid(color: Rgba) -> Look {
+    Look {
+        color,
+        wireframe: false,
+    }
+}
+
+/// How the shapes of a link of `part` are drawn.
+fn part_look(part: LinkPart) -> Look {
+    match part {
+        LinkPart::Body => BODY_LOOK,
+        LinkPart::Arm { segment } if segment % 2 == 1 => ODD_SEGMENT_LOOK,
+        LinkPart::Arm { .. } => EVEN_SEGMENT_LOOK,
+        LinkPart::Finger => FINGER_LOOK,
+    }
+}
 
 /// The entity of the link `link`, which its shapes are drawn under.
 pub fn link_path(link: &str) -> String {
     format!("{ROBOT_PATH}/{link}")
 }
 
-/// Draws the collision shapes of each link of `body`, under the link's entity, for the
-/// whole recording: they move with the link and never change.
+/// Draws the collision shapes of each link of `body`, under the link's entity, in the
+/// look of the link's part, for the whole recording: they move with the link and never
+/// change.
 pub fn draw_body(canvas: &dyn Canvas, body: &RobotBody) {
     for link in body.links() {
         for (index, shape) in link.shapes.iter().enumerate() {
             let path = part_path(ROBOT_PATH, &link.name, "collision", index, shape);
-            canvas.static_shape(&path, shape, BODY_LOOK);
+            canvas.static_shape(&path, shape, part_look(link.part));
         }
     }
 }
@@ -53,26 +75,24 @@ mod tests {
     fn each_shape_is_drawn_once_for_the_whole_recording_under_its_link() {
         let canvas = FakeCanvas::default();
         draw_body(&canvas, &mini());
-        let paths: Vec<String> = canvas
+        let drawn: Vec<(String, Look)> = canvas
             .drawn()
             .iter()
-            .map(|drawn| {
-                assert!(matches!(drawn, Drawn::StaticShape { look, .. } if *look == BODY_LOOK));
-                drawn.path().expect("a shape's entity").to_string()
+            .map(|drawn| match drawn {
+                Drawn::StaticShape { path, look, .. } => (path.clone(), *look),
+                other => panic!("a static shape, not {other:?}"),
             })
             .collect();
-        assert_eq!(
-            paths,
-            [
-                "world/robot/base/collision_0_box",
-                "world/robot/base/collision_1_cylinder",
-                "world/robot/base/collision_2_sphere",
-                "world/robot/base/collision_3_sphere",
-                "world/robot/upper/collision_0_cylinder",
-                "world/robot/hand/collision_0_mesh",
-                "world/robot/finger/collision_0_sphere",
-            ]
-        );
+        let expected = [
+            ("world/robot/base/collision_0_box", BODY_LOOK),
+            ("world/robot/base/collision_1_cylinder", BODY_LOOK),
+            ("world/robot/base/collision_2_sphere", BODY_LOOK),
+            ("world/robot/base/collision_3_sphere", BODY_LOOK),
+            ("world/robot/upper/collision_0_cylinder", ODD_SEGMENT_LOOK),
+            ("world/robot/hand/collision_0_mesh", EVEN_SEGMENT_LOOK),
+            ("world/robot/finger/collision_0_sphere", FINGER_LOOK),
+        ];
+        assert_eq!(drawn, expected.map(|(path, look)| (path.to_string(), look)));
         let Drawn::StaticShape { shape, .. } =
             &canvas.at("world/robot/upper/collision_0_cylinder")[0]
         else {

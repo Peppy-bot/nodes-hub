@@ -174,6 +174,55 @@ fn bounding_box(vertices: &[[f64; 3]]) -> ([f64; 3], [f64; 3]) {
     (center, size)
 }
 
+/// The normal of each vertex of a mesh, for the light to shade it: the sum of the
+/// normals of the triangles that hold the vertex, each as long as twice its triangle's
+/// area, scaled to length 1. A triangle faces the side that its vertices turn
+/// counterclockwise on. A triangle with an index past the vertices adds nothing. A
+/// vertex whose triangles add up to no normal (none has an area, or they face opposite
+/// ways) takes +z.
+pub fn vertex_normals(vertices: &[[f64; 3]], triangles: &[[u32; 3]]) -> Vec<[f64; 3]> {
+    let mut sums = vec![[0.0; 3]; vertices.len()];
+    let corner = |index: u32| vertices.get(index as usize).copied();
+    for triangle in triangles {
+        let (Some(a), Some(b), Some(c)) = (
+            corner(triangle[0]),
+            corner(triangle[1]),
+            corner(triangle[2]),
+        ) else {
+            continue;
+        };
+        let normal = cross(difference(b, a), difference(c, a));
+        for &index in triangle {
+            let sum = &mut sums[index as usize];
+            for axis in 0..3 {
+                sum[axis] += normal[axis];
+            }
+        }
+    }
+    sums.into_iter()
+        .map(|sum| {
+            let length = sum.iter().map(|c| c * c).sum::<f64>().sqrt();
+            if length > 0.0 {
+                sum.map(|c| c / length)
+            } else {
+                [0.0, 0.0, 1.0]
+            }
+        })
+        .collect()
+}
+
+fn difference(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -333,5 +382,66 @@ pub(crate) mod tests {
             }
         );
         assert!(close(grown.pose.origin(), [2.5, 0.5, 0.5], 1e-12));
+    }
+
+    /// The corner of a cube at the origin, and the ends of its three edges from there.
+    const CORNER: [[f64; 3]; 4] = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ];
+
+    #[test]
+    fn a_triangle_faces_the_side_its_vertices_turn_counterclockwise_on() {
+        let up = vertex_normals(&CORNER, &[[0, 1, 2]]);
+        assert_eq!(up[..3], [[0.0, 0.0, 1.0]; 3]);
+        let down = vertex_normals(&CORNER, &[[0, 2, 1]]);
+        assert_eq!(down[..3], [[0.0, 0.0, -1.0]; 3]);
+    }
+
+    #[test]
+    fn a_vertex_of_two_triangles_takes_the_normal_between_theirs() {
+        // The floor of the corner faces +z, its wall in the xz plane faces -y; both
+        // have the same area, and they share the edge from vertex 0 to vertex 1.
+        let normals = vertex_normals(&CORNER, &[[0, 1, 2], [0, 1, 3]]);
+        let between = [
+            0.0,
+            -std::f64::consts::FRAC_1_SQRT_2,
+            std::f64::consts::FRAC_1_SQRT_2,
+        ];
+        assert!(close(normals[0], between, 1e-12));
+        assert!(close(normals[1], between, 1e-12));
+        assert_eq!(normals[2], [0.0, 0.0, 1.0]);
+        assert_eq!(normals[3], [0.0, -1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_larger_triangle_weighs_more_in_the_normal_of_a_shared_vertex() {
+        // The floor reaches 3 m along y: three times the area of the wall.
+        let vertices = [CORNER[0], CORNER[1], [0.0, 3.0, 0.0], CORNER[3]];
+        let normals = vertex_normals(&vertices, &[[0, 1, 2], [0, 1, 3]]);
+        let length = 10.0_f64.sqrt();
+        assert!(close(normals[0], [0.0, -1.0 / length, 3.0 / length], 1e-12));
+    }
+
+    #[test]
+    fn a_vertex_with_no_normal_takes_up_and_a_triangle_past_the_vertices_adds_nothing() {
+        let normals = vertex_normals(
+            &CORNER,
+            // A triangle with no area, one past the vertices, and the floor.
+            &[[3, 3, 0], [0, 1, 9], [0, 1, 2]],
+        );
+        assert_eq!(
+            normals[3],
+            [0.0, 0.0, 1.0],
+            "only in the triangle with no area"
+        );
+        assert_eq!(normals[1], [0.0, 0.0, 1.0], "the floor alone");
+        assert_eq!(
+            vertex_normals(&CORNER, &[[0, 1, 2], [0, 2, 1]])[0],
+            [0.0, 0.0, 1.0],
+            "two triangles that face opposite ways add up to no normal"
+        );
     }
 }

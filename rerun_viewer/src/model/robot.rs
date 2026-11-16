@@ -3,7 +3,7 @@
 //! link stands for a snapshot of limb_state, by forward kinematics over the
 //! description's tree of joints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use camera_core::pose::{Pose, PoseError};
 use chain_kinematics::nalgebra::{Isometry3, Translation3, UnitQuaternion};
@@ -70,8 +70,21 @@ pub struct BodyLink {
     pub name: String,
     /// Its collision shapes, each in the link's frame.
     pub shapes: Vec<PlacedShape>,
+    pub part: LinkPart,
     /// Its index in the tree.
     index: usize,
+}
+
+/// Which part of the robot a link is, by the joints between it and the tree's root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkPart {
+    /// No joint of an arm or a finger moves it: the body, and the base of each arm.
+    Body,
+    /// `segment` joints of an arm's chain move it: 1 for the link after the arm's first
+    /// joint.
+    Arm { segment: usize },
+    /// A finger joint moves it.
+    Finger,
 }
 
 /// An arm of the description: its name, and the tree's index of each joint of its chain
@@ -124,24 +137,6 @@ impl RobotBody {
                 return Err(BodyError::MeshTwice(name.to_string()));
             }
         }
-        let mut links = Vec::new();
-        for link in &description.robot().links {
-            if link.collision.is_empty() {
-                continue;
-            }
-            let mut shapes = Vec::new();
-            for collision in &link.collision {
-                shapes.extend(collision_shapes(&link.name, collision, &by_name)?);
-            }
-            let index = tree
-                .link_index(&link.name)
-                .expect("the tree holds each link of the URDF it is read from");
-            links.push(BodyLink {
-                name: link.name.clone(),
-                shapes,
-                index,
-            });
-        }
         let joints: HashMap<&str, usize> = tree
             .joints()
             .iter()
@@ -178,6 +173,33 @@ impl RobotBody {
                     fingers,
                 });
             }
+        }
+        let arm_joints: HashSet<usize> = arms
+            .iter()
+            .flat_map(|arm| arm.joints.iter().copied())
+            .collect();
+        let finger_joints: HashSet<usize> = grippers
+            .iter()
+            .flat_map(|gripper| gripper.fingers.iter().map(|finger| finger.joint))
+            .collect();
+        let mut links = Vec::new();
+        for link in &description.robot().links {
+            if link.collision.is_empty() {
+                continue;
+            }
+            let mut shapes = Vec::new();
+            for collision in &link.collision {
+                shapes.extend(collision_shapes(&link.name, collision, &by_name)?);
+            }
+            let index = tree
+                .link_index(&link.name)
+                .expect("the tree holds each link of the URDF it is read from");
+            links.push(BodyLink {
+                name: link.name.clone(),
+                shapes,
+                part: link_part(&tree.path_to(index), &arm_joints, &finger_joints),
+                index,
+            });
         }
         Ok(Self {
             tree,
@@ -254,6 +276,27 @@ impl RobotBody {
                     })
             })
             .collect()
+    }
+}
+
+/// The part of the link that the joints `path`, root to link, lead to: a finger when a
+/// finger joint is among them, else the arm's segment of as many arm joints as they hold,
+/// else the body.
+fn link_part(
+    path: &[usize],
+    arm_joints: &HashSet<usize>,
+    finger_joints: &HashSet<usize>,
+) -> LinkPart {
+    if path.iter().any(|joint| finger_joints.contains(joint)) {
+        return LinkPart::Finger;
+    }
+    match path
+        .iter()
+        .filter(|joint| arm_joints.contains(joint))
+        .count()
+    {
+        0 => LinkPart::Body,
+        segment => LinkPart::Arm { segment },
     }
 }
 
@@ -415,6 +458,25 @@ mod tests {
                 vertices: vec![[0.0, 0.0, 0.0], [tenth, 0.0, 0.0], [0.0, -tenth, 0.0]],
                 triangles: vec![[0, 2, 1]],
             }
+        );
+    }
+
+    #[test]
+    fn each_link_is_a_part_by_the_joints_that_move_it() {
+        let body = mini();
+        let parts: Vec<(&str, LinkPart)> = body
+            .links()
+            .iter()
+            .map(|link| (link.name.as_str(), link.part))
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                ("base", LinkPart::Body),
+                ("upper", LinkPart::Arm { segment: 1 }),
+                ("hand", LinkPart::Arm { segment: 2 }),
+                ("finger", LinkPart::Finger),
+            ]
         );
     }
 
@@ -592,6 +654,23 @@ mod tests {
             arms: vec![arm("left_arm", &left), arm("right_arm", &right)],
             grippers: vec![gripper("left_gripper"), gripper("right_gripper")],
         };
+        let part = |name: &str| {
+            body.links()
+                .iter()
+                .find(|link| link.name == name)
+                .expect("a link with shapes")
+                .part
+        };
+        assert_eq!(part("openarm_body_link0"), LinkPart::Body);
+        assert_eq!(part("openarm_head_camera"), LinkPart::Body);
+        assert_eq!(part("openarm_left_base_link"), LinkPart::Body);
+        assert_eq!(part("openarm_left_link1"), LinkPart::Arm { segment: 1 });
+        assert_eq!(part("openarm_right_link6"), LinkPart::Arm { segment: 6 });
+        assert_eq!(
+            part("openarm_left_ee_base_link"),
+            LinkPart::Arm { segment: 7 }
+        );
+        assert_eq!(part("openarm_right_ee_link2"), LinkPart::Finger);
         let poses = body.link_poses(&snapshot).expect("openarm_v2's arms");
         let robot = urdf_rs::read_from_string(model.urdf()).unwrap();
         for (tcp, joints) in [("openarm_left_tcp", left), ("openarm_right_tcp", right)] {
