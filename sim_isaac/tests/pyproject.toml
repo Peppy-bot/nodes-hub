@@ -11,7 +11,7 @@ name = "sim-isaac-tests"
 version = "0.1.0"
 description = "GPU-free tests for the sim_isaac node: its model entries, pair routing, robot stays, stage, visuals, startup, loop pacing, cameras and clock"
 # One minor, so every run resolves the same interpreter: the 3.12 that Isaac
-# Sim 6.1's python.sh runs.
+# Sim 6.2's python.sh runs.
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # What the engine's modules reach for: pyjson5 to read the model entries,
@@ -37,7 +37,7 @@ dev = [
     # the mujoco the MuJoCo node's base image installs
     # (sim_base_images/requirements.mujoco.txt). test_so101_stage.py holds
     # the stage this mujoco builds to the stage the Isaac base image bakes.
-    "mujoco==4.0.0",
+    "mujoco==4.0.1",
     # PyPI provides no USD wheel or source distribution for Linux ARM64.
     # That platform runs the runtime suites without the USD-specific tests.
     "usd-core==26.11; platform_machine == 'x86_64' or platform_machine == 'AMD64' or sys_platform == 'darwin'",

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import logging
 from dataclasses import dataclass
@@ -33,7 +34,9 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from typing import Optional
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -44,6 +47,16 @@ STORE_URL = "https://waldo-assets.peppy.bot"
 # The store sits behind Cloudflare, which answers urllib's default agent with
 # 403; a named one gets through.
 USER_AGENT = "sim_isaac/head_camera.py"
+# The store sometimes breaks off an answer before its last byte, which urllib
+# raises as http.client.IncompleteRead. A file is read again after a fault
+# that another attempt can clear, up to READ_ATTEMPTS attempts in all, with a
+# pause of FIRST_PAUSE_S after the first failed attempt that doubles after
+# each next one.
+READ_ATTEMPTS = 4
+FIRST_PAUSE_S = 1.0
+# The HTTP statuses that ask the client to come back: a request timeout and
+# too many requests. A server error (5xx) asks the same.
+COME_BACK_STATUSES = (408, 429)
 PACK_PREFIX = "sources/openarm_v2_head_camera"
 # The derivation of 2026-09-17 from the STEP at openarm_hardware eefc9fa: the
 # pack Waldo's openarm_v2 robot names as the overlay of its head_camera/
@@ -130,17 +143,31 @@ def verify(pack: Path, digest: Optional[str] = None) -> dict[str, tuple[int, str
     return inventory
 
 
+def another_attempt_can_clear(error: Exception) -> bool:
+    """Whether a read that raised `error` can succeed when made again: a
+    connection that breaks, times out or ends the answer early, a server
+    error, or a status that asks to come back. A missing file, or another
+    refusal of the store, stays as it is."""
+    if isinstance(error, HTTPError):
+        return error.code in COME_BACK_STATUSES or error.code >= 500
+    return isinstance(error, (OSError, http.client.HTTPException))
+
+
 def fetch(
     destination: Path,
     digest: Optional[str] = None,
     store_url: str = STORE_URL,
     open_url=urlopen,
+    pause=time.sleep,
 ) -> None:
     """Stages the pack at `destination` from the store: the index first,
     checked against the digest, then each file it lists, checked against
-    the index. Files land in a scratch directory beside `destination` and
-    move into place together, so a failed fetch leaves nothing behind. A
-    pack already staged there is verified and kept."""
+    the index. Each file is read in up to READ_ATTEMPTS attempts: a failed
+    attempt that another attempt can clear is followed by a pause and the
+    next attempt, and the last attempt raises its fault. Files land in a
+    scratch directory beside `destination` and move into place together, so
+    a failed fetch leaves nothing behind. A pack already staged there is
+    verified and kept."""
     digest = digest or PACK_DIGEST
     if destination.exists():
         verify(destination, digest)
@@ -148,10 +175,25 @@ def fetch(
         return
     base = f"{store_url}/{PACK_PREFIX}/{digest}/"
 
-    def get(name: str) -> bytes:
+    def get_once(name: str) -> bytes:
         request = Request(base + name, headers={"User-Agent": USER_AGENT})
         with open_url(request, timeout=120) as response:
             return response.read()
+
+    def get(name: str) -> bytes:
+        for attempt in range(1, READ_ATTEMPTS):
+            try:
+                return get_once(name)
+            except (OSError, http.client.HTTPException) as error:
+                if not another_attempt_can_clear(error):
+                    raise
+                wait_s = FIRST_PAUSE_S * 2 ** (attempt - 1)
+                logger.warning(
+                    "%s%s: attempt %d of %d failed (%r), the next one in %.0f s",
+                    base, name, attempt, READ_ATTEMPTS, error, wait_s,
+                )
+                pause(wait_s)
+        return get_once(name)
 
     index_data = get(INDEX_FILE)
     inventory = read_index(index_data, digest)

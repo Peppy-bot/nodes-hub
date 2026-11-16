@@ -1,13 +1,13 @@
-ARG ISAAC_VERSION=6.1.0
+ARG ISAAC_VERSION=6.2.0.1
 
 # DLSS runs on the NGX core library, libnvidia-ngx.so.1, which ships with the
 # NVIDIA driver and which Peppy's Apptainer `--nv` binding does not carry into
-# the container. Isaac Sim 6.1 renders with RTX Real-Time 2.0, whose only
+# the container. Isaac Sim 6.2 renders with RTX Real-Time 2.0, whose only
 # denoiser is DLSS Ray Reconstruction, so without the core the stream is raw
 # path-tracing noise. The core is not tied to the driver it shipped with: it
 # reads the running driver's version through NVML and each DLSS snippet checks
 # that against its own minimum. The image therefore carries the core from the
-# driver Isaac Sim 6.1 was tested with, 595.58.03, and every supported host
+# driver Isaac Sim 6.2 was tested with, 595.58.03, and every supported host
 # driver is at least that new. NVIDIA's apt repository for Ubuntu 24.04 stops
 # at the 580 series, so the package comes from the Ubuntu 26.04 repository;
 # only the core library is taken from it, and that file depends on glibc alone.

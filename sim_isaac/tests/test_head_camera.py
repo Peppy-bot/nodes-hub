@@ -6,12 +6,14 @@ published index is checked verbatim against the pinned digest."""
 import copy
 import dataclasses
 import hashlib
+import http.client
 import io
 import json
 import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 import numpy as np
 import pytest
@@ -151,11 +153,27 @@ def loaded(pack):
     return head_camera.load(pack.directory)
 
 
-def _store(pack, served=None, requests=None):
+class _BrokenOff(io.BytesIO):
+    """An answer that the store breaks off: urllib reads half of its body and
+    raises IncompleteRead for the rest."""
+
+    def read(self, *args):
+        data = super().read(*args)
+        raise http.client.IncompleteRead(data[: len(data) // 2], len(data) - len(data) // 2)
+
+
+def _http_error(code):
+    return HTTPError(head_camera.STORE_URL, code, "status", hdrs=None, fp=None)
+
+
+def _store(pack, served=None, requests=None, faults=None):
     """An opener serving the pack's files from the store's URL layout, to a
     request that names its agent (the store's Cloudflare front refuses
-    urllib's default one)."""
+    urllib's default one). For a file that `faults` lists, each attempt
+    first takes the next fault of its list: the class _BrokenOff, for an
+    answer that breaks off, or an exception that the opening raises."""
     served = pack.served if served is None else served
+    faults = {} if faults is None else faults
     base = f"{head_camera.STORE_URL}/{head_camera.PACK_PREFIX}/{pack.digest}/"
 
     def open_url(request, timeout):
@@ -165,7 +183,13 @@ def _store(pack, served=None, requests=None):
         name = url[len(base):]
         if requests is not None:
             requests.append(name)
-        return io.BytesIO(served[name])
+        pending = faults.get(name, [])
+        if not pending:
+            return io.BytesIO(served[name])
+        fault = pending.pop(0)
+        if fault is _BrokenOff:
+            return _BrokenOff(served[name])
+        raise fault
 
     return open_url
 
@@ -239,6 +263,58 @@ class TestFetch:
         with pytest.raises(ValueError, match="zed_mini.obj does not match"):
             head_camera.fetch(pack.directory, open_url=_store(pack, requests=[]))
         assert (pack.directory / "zed_mini.obj").read_bytes() == b"edited by hand"
+
+    def test_a_pack_whose_every_file_breaks_off_once_is_staged(self, tmp_path, pack):
+        requests, pauses = [], []
+        destination = tmp_path / "node" / "head_camera"
+        faults = {name: [_BrokenOff] for name in pack.served}
+        head_camera.fetch(destination, open_url=_store(pack, requests=requests, faults=faults), pause=pauses.append)
+        assert {path.name: path.read_bytes() for path in destination.iterdir()} == pack.served
+        assert sorted(requests) == sorted([*pack.served, *pack.served])
+        assert pauses == [head_camera.FIRST_PAUSE_S] * len(pack.served)
+
+    @pytest.mark.parametrize(
+        "fault",
+        [
+            _BrokenOff,
+            ConnectionResetError(104, "Connection reset by peer"),
+            TimeoutError("The read operation timed out"),
+            _http_error(429),
+            _http_error(503),
+        ],
+        ids=lambda fault: getattr(fault, "__name__", None) or repr(fault),
+    )
+    def test_a_read_that_another_attempt_can_clear_is_made_again(self, tmp_path, pack, fault):
+        requests, pauses = [], []
+        destination = tmp_path / "node" / "head_camera"
+        faults = {"cover.obj": [fault]}
+        head_camera.fetch(destination, open_url=_store(pack, requests=requests, faults=faults), pause=pauses.append)
+        assert (destination / "cover.obj").read_bytes() == pack.served["cover.obj"]
+        assert requests.count("cover.obj") == 2
+        assert pauses == [head_camera.FIRST_PAUSE_S]
+
+    def test_a_fault_that_stays_ends_the_fetch_with_the_fault_of_the_last_attempt(self, tmp_path, pack):
+        requests, pauses = [], []
+        destination = tmp_path / "node" / "head_camera"
+        faults = {"index.json": [_BrokenOff] * (head_camera.READ_ATTEMPTS - 1) + [_http_error(503)]}
+        with pytest.raises(HTTPError) as raised:
+            head_camera.fetch(destination, open_url=_store(pack, requests=requests, faults=faults), pause=pauses.append)
+        assert raised.value.code == 503
+        assert requests == ["index.json"] * head_camera.READ_ATTEMPTS
+        assert pauses == [head_camera.FIRST_PAUSE_S * 2**attempt for attempt in range(head_camera.READ_ATTEMPTS - 1)]
+        assert not destination.parent.exists()
+
+    @pytest.mark.parametrize("code", [403, 404])
+    def test_a_refusal_of_the_store_is_not_read_again_and_stages_nothing(self, tmp_path, pack, code):
+        requests, pauses = [], []
+        destination = tmp_path / "node" / "head_camera"
+        faults = {"mount.obj": [_http_error(code)]}
+        with pytest.raises(HTTPError) as raised:
+            head_camera.fetch(destination, open_url=_store(pack, requests=requests, faults=faults), pause=pauses.append)
+        assert raised.value.code == code
+        assert requests.count("mount.obj") == 1
+        assert pauses == []
+        assert list(destination.parent.iterdir()) == []
 
     def test_the_command_line_stages_the_pinned_pack(self, tmp_path, pack, monkeypatch):
         monkeypatch.setattr(head_camera, "urlopen", _store(pack))

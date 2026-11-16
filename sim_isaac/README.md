@@ -1,6 +1,6 @@
 # sim_isaac
 
-The Isaac Sim 6.1.0 simulation node. It opens an empty stage and stands every
+The Isaac Sim 6.2.0 simulation node. It opens an empty stage and stands every
 robot that attaches to it, of any model it has an entry for, side by side: an
 OpenArm v1, an OpenArm v2 and an SO-101 share one stage, one physics scene and
 the same four pairing slots. It runs headless with WebRTC streaming, renders
@@ -8,7 +8,7 @@ each robot's own cameras, and serves runtime scene and object editing.
 
 ## Features
 
-- Isaac Sim 6.1.0
+- Isaac Sim 6.2.0, from the container image `6.2.0.1`
 - Any number of robots on one stage, each of its own model: `openarm_v1`,
   `openarm_v2`, `so101`
 - One entry per model under `engine/models/`, beside the entry
@@ -34,7 +34,7 @@ Recommended host setup:
 Isaac Sim base image:
 
 ```text
-nvcr.io/nvidia/isaac-sim:6.1.0
+nvcr.io/nvidia/isaac-sim:6.2.0.1
 ```
 
 The node builds on `peppybot/sim-isaac`, which
@@ -288,7 +288,7 @@ and viewport controls. Headless mode enables WebRTC; a robot that pairs a
 camera has its model's rig rendered for it through Replicator. Extensions
 resolve from the Isaac Sim installation, with settings persistence and
 extension-registry lookup disabled. Runtime scenes and props use
-`isaacsim.storage.native`'s default Isaac 6.1 asset root;
+`isaacsim.storage.native`'s default Isaac 6.2 asset root;
 `PEPPY_ROBOT_ASSETS_DIR` selects the directory the robots' USDs are baked
 under.
 
@@ -310,7 +310,7 @@ renderer denoises only through DLSS Ray Reconstruction, which runs on the NGX
 core library shipped with the NVIDIA driver, and Peppy's `--nv` GPU binding does
 not carry the host's copy into the container. The base image therefore carries
 the core itself: `sim_base_images/Dockerfile.isaac` takes
-`libnvidia-ngx.so.1` from the driver Isaac Sim 6.1 was tested with, 595.58.03,
+`libnvidia-ngx.so.1` from the driver Isaac Sim 6.2 was tested with, 595.58.03,
 pinned by version and checksum. The core reads the running driver through NVML
 and the DLSS snippets check that version against their own minimum, so the host
 needs a driver at least that new, not that exact version. Kit falls back to TAA

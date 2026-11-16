@@ -3,7 +3,7 @@
 # Run whenever assets or base image versions change, then rebuild the SIF.
 #
 # The MuJoCo image is published as a multi-arch manifest (linux/amd64 +
-# linux/arm64) so the node runs on both x86_64 and aarch64 hosts. Isaac Sim 6.1
+# linux/arm64) so the node runs on both x86_64 and aarch64 hosts. Isaac Sim 6.2
 # publishes an arm64 image too, but the Isaac node is validated on x86_64 only,
 # so its image stays amd64. One of the MuJoCo image's dependencies,
 # PyOpenGL-accelerate, is x86_64 only and is left out on arm64. It is an
@@ -33,9 +33,9 @@ IMAGES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
 
 # ── Version manifest ──────────────────────────────────────────────────────────
-ISAAC_VERSION="6.1.0"    # mirrors nvcr.io/nvidia/isaac-sim upstream version
-ISAAC_IMAGE_REV="12"     # bump when Isaac image content changes without an upstream version bump
-MUJOCO_IMAGE_REV="7"     # bump when MuJoCo image content changes without an upstream version bump
+ISAAC_VERSION="6.2.0.1"  # mirrors nvcr.io/nvidia/isaac-sim upstream version
+ISAAC_IMAGE_REV="1"      # bump when Isaac image content changes without an upstream version bump
+MUJOCO_IMAGE_REV="2"     # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
 # The mujoco PyPI version that the MuJoCo image installs: the pin of
 # requirements.mujoco.txt, read here so that the tag of the image cannot name
