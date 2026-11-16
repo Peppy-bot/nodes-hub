@@ -19,7 +19,7 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _RUNTIME_COMMAND = Path(__file__).resolve().parents[1] / "scripts" / "runtime_command.py"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
-_ASSET_ROOT = "https://assets.example/Isaac/6.1"
+_ASSET_ROOT = "https://assets.example/Isaac/6.2"
 _PROPS = {
     "props/blocks/red_block": {
         "asset_id": "props/blocks/red_block", "display_name": "red block", "kind": "object",
