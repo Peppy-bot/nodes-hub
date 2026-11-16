@@ -6,7 +6,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use camera_core::encoding::DEPTH_ENCODING;
 use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
@@ -32,6 +32,8 @@ use peppygen::consumed_services::identity::{get_description, get_identity};
 use peppygen::consumed_services::workspace::describe_workspace;
 use peppygen::consumed_topics::camera::depth_stream;
 use peppygen::consumed_topics::limb_state::limb_states;
+// Named apart from the occupancy_map crate, which holds the map itself.
+use peppygen::emitted_topics::motion_planning::occupancy_map as occupancy_map_topic;
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     self, FailureKind, GoalRequestData, PlanJointPathResultArmsItem,
@@ -42,8 +44,10 @@ use peppygen::exposed_services::motion_planning::{
     clear_occupancy_map, describe_arms, get_planning_scene, set_allowed_collision,
 };
 use peppygen::{NodeRunner, Parameters, ProducerRef, Result};
+use peppylib::TopicPublisher;
 use robot_description::{ArmId, OnShape, PerArm, RobotDescription, on_shape};
 use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
 use crate::config::Config;
@@ -394,6 +398,7 @@ fn serve_robot<const N: usize, const D: usize, const K: usize>(
     tokio::spawn(serve_attachments(runner.clone(), node.clone()));
     tokio::spawn(serve_allowed_pairs(runner.clone(), node.clone()));
     tokio::spawn(serve_scene(runner.clone(), node.clone()));
+    tokio::spawn(publish_map(runner.clone(), node.clone()));
     tokio::spawn(serve_checks(runner.clone(), node.clone()));
     tokio::spawn(serve_cartesian_paths(runner.clone(), node.clone()));
     tokio::spawn(serve_plans(runner, node));
@@ -1589,6 +1594,93 @@ async fn serve_scene<const N: usize, const D: usize, const K: usize>(
     .await;
 }
 
+/// The map as occupancy_map publishes it.
+#[derive(Debug, PartialEq)]
+struct MapSnapshot {
+    voxel_size_m: f64,
+    /// The center of each occupied voxel in the robot frame, three coordinates a voxel,
+    /// in the order of the map's grid.
+    centers: Vec<f64>,
+    /// Why the map holds no depth frame; empty while it holds one or the planner reads
+    /// no camera.
+    waiting: String,
+}
+
+/// `map` as occupancy_map publishes it, for a planner that reads a camera when
+/// `camera_linked`.
+fn map_snapshot(map: &Map, camera_linked: bool) -> MapSnapshot {
+    let waiting = if camera_linked && map.stamp.is_none() {
+        map.waiting.reason().to_string()
+    } else {
+        String::new()
+    };
+    MapSnapshot {
+        voxel_size_m: map.voxels.voxel_size(),
+        centers: map
+            .voxels
+            .occupied()
+            .flat_map(|key| map.voxels.center(key))
+            .collect(),
+        waiting,
+    }
+}
+
+/// Publishes the map on occupancy_map once every `map_interval` of the config, as it
+/// stands, until the node stops. A read waits on a frame's intake, which holds the map,
+/// in place on its thread.
+async fn publish_map<const N: usize, const D: usize, const K: usize>(
+    runner: Arc<NodeRunner>,
+    node: Arc<Node<N, D, K>>,
+) {
+    if let Err(e) = peppygen::clock::init(&runner).await {
+        error!("occupancy_map: the node's clock: {e}; the map is not published");
+        return;
+    }
+    let publisher = match occupancy_map_topic::declare_publisher(&runner).await {
+        Ok(publisher) => publisher,
+        Err(e) => {
+            error!("occupancy_map: no publisher: {e}; the map is not published");
+            return;
+        }
+    };
+    let token = runner.cancellation_token().clone();
+    let mut ticks = tokio::time::interval(node.config.map_interval);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let failures = LatchedLog::warn("occupancy_map");
+    loop {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        let snapshot =
+            tokio::task::block_in_place(|| map_snapshot(&lock(&node.map), node.camera_linked));
+        match publish_snapshot(&publisher, snapshot).await {
+            Ok(()) => failures.success(),
+            Err(reason) => failures.failure(reason),
+        }
+    }
+}
+
+/// Publishes `snapshot` on `publisher`, stamped now on the node's clock.
+async fn publish_snapshot(
+    publisher: &TopicPublisher,
+    snapshot: MapSnapshot,
+) -> std::result::Result<(), String> {
+    let now = peppygen::clock::now_ns().map_err(|e| format!("the node's clock: {e}"))?;
+    let message = occupancy_map_topic::build_message(
+        UNIX_EPOCH + Duration::from_nanos(now),
+        snapshot.voxel_size_m,
+        snapshot.centers,
+        snapshot.waiting,
+    )
+    .map_err(|e| format!("the message: {e}"))?;
+    publisher
+        .publish(message)
+        .await
+        .map_err(|e| format!("publish: {e}"))
+}
+
 /// The instant a check asked at `asked_at` ends by.
 fn check_deadline(asked_at: Instant) -> Instant {
     asked_at + CHECK_TIME
@@ -2333,6 +2425,50 @@ mod tests {
             .model()
             .expect("OpenArm v2's model");
         start(config, "openarm_v2", model, camera_linked).expect("the node starts")
+    }
+
+    /// Marks occupied the voxels of the map that a cube of side 4 mm touches at
+    /// `center`: one voxel of 2 cm, when `center` is a voxel's center.
+    fn occupy(node: &Node, center: [f64; 3]) {
+        let cube = collision_geometry::shapes::Shape::cuboid([0.004; 3]).unwrap();
+        let at = Isometry3::translation(center[0], center[1], center[2]);
+        lock(&node.map)
+            .voxels
+            .occupy_intersecting(&collision_geometry::shapes::PlacedShape::new(&cube, at));
+    }
+
+    #[test]
+    fn the_snapshot_holds_the_center_of_each_occupied_voxel() {
+        let node = started(&parameters(), true);
+        // Voxels of 2 cm counted from the robot frame's origin: (0.31, 0.01, 0.51) is the
+        // center of the voxel from (0.30, 0.00, 0.50) to (0.32, 0.02, 0.52).
+        occupy(&node, [0.31, 0.01, 0.51]);
+        let snapshot = map_snapshot(&lock(&node.map), node.camera_linked);
+        assert_eq!(snapshot.voxel_size_m, 0.02);
+        let [x, y, z] = snapshot.centers[..] else {
+            panic!("one voxel, not {:?}", snapshot.centers)
+        };
+        for (got, expected) in [x, y, z].into_iter().zip([0.31, 0.01, 0.51]) {
+            assert!((got - expected).abs() < 1e-12, "{got} is not {expected}");
+        }
+        assert_eq!(snapshot.waiting, AWAITING_FRAME);
+    }
+
+    #[test]
+    fn a_map_with_a_frame_or_without_a_camera_waits_on_nothing() {
+        let node = started(&parameters(), true);
+        lock(&node.map).stamp = Some(SystemTime::UNIX_EPOCH);
+        assert_eq!(map_snapshot(&lock(&node.map), true).waiting, "");
+        let without = started(&parameters(), false);
+        let snapshot = map_snapshot(&lock(&without.map), without.camera_linked);
+        assert_eq!(
+            snapshot,
+            MapSnapshot {
+                voxel_size_m: 0.02,
+                centers: vec![],
+                waiting: String::new(),
+            }
+        );
     }
 
     /// Both arms at Ready, both grippers open.
