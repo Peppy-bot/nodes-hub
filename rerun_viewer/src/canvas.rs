@@ -8,9 +8,9 @@
 //! draws in one synchronous call, with no `.await` between, which keeps the task on one
 //! thread.
 
-use std::net::{IpAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use camera_core::pose::Pose;
 use control_core::latched_log::LatchedLog;
@@ -37,6 +37,7 @@ use crate::config::ConfigError;
 use crate::model::camera::{ColorImage, DepthImage};
 use crate::model::placement::rotation_columns;
 use crate::model::scene::{PlacedShape, ShapeKind, vertex_normals};
+use crate::relay::relay_pages;
 
 /// The timeline every entry of the viewer is on.
 pub const TIMELINE: &str = "time";
@@ -105,6 +106,9 @@ pub struct ViewerConfig {
     pub grpc_port: u16,
     pub memory_limit: MemoryLimit,
     pub recording_path: Option<PathBuf>,
+    /// How long a page may take no data, while data waits for it, before its connection
+    /// is closed (`relay.rs`); none keeps every page, however long it stalls.
+    pub page_stall_timeout: Option<Duration>,
 }
 
 impl ViewerConfig {
@@ -114,6 +118,7 @@ impl ViewerConfig {
         grpc_port: u16,
         memory_limit: &str,
         recording_path: &str,
+        page_stall_timeout_s: f64,
     ) -> Result<Self, ConfigError> {
         let bind_ip = bind_ip.parse::<IpAddr>().map_err(|_| {
             ConfigError::new("bind_ip", bind_ip, "it is an IP address, such as 127.0.0.1")
@@ -140,12 +145,28 @@ impl ViewerConfig {
             )
         })?;
         let recording_path = (!recording_path.is_empty()).then(|| PathBuf::from(recording_path));
+        let page_stall_timeout = if page_stall_timeout_s == 0.0 {
+            None
+        } else {
+            let timeout = Duration::try_from_secs_f64(page_stall_timeout_s)
+                .ok()
+                .filter(|timeout| !timeout.is_zero())
+                .ok_or_else(|| {
+                    ConfigError::new(
+                        "page_stall_timeout_s",
+                        page_stall_timeout_s,
+                        "it is 0, which keeps every page, or a time above 0 that fits the clock",
+                    )
+                })?;
+            Some(timeout)
+        };
         Ok(Self {
             bind_ip,
             web_port,
             grpc_port,
             memory_limit,
             recording_path,
+            page_stall_timeout,
         })
     }
 
@@ -166,6 +187,13 @@ impl ViewerConfig {
         }
         format!("http://{}:{}", host_of(self.bind_ip), self.web_port)
     }
+}
+
+/// An address of this machine alone with a port that is free now.
+fn free_local_address() -> Result<SocketAddr, String> {
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|listener| listener.local_addr())
+        .map_err(|e| format!("no free port for the data server on this machine: {e}"))
 }
 
 /// `ip` as the host part of an address: an IPv6 address in brackets.
@@ -277,14 +305,31 @@ impl RerunCanvas {
             cors_allowed_origins: vec![config.page_origin()],
         };
         // The data server binds its port on a thread of its own and only logs a failure,
-        // so the port is tried here first: a port in use stops the node.
-        drop(
-            TcpListener::bind((config.bind_ip, config.grpc_port))
-                .map_err(|e| CanvasError::Data(format!("{bind_ip}:{}: {e}", config.grpc_port)))?,
-        );
-        // The data server reads `<host>:<port>`, so an IPv6 address takes brackets there.
-        let data = GrpcServerSink::new(&host_of(config.bind_ip), config.grpc_port, options)
-            .map_err(|e| CanvasError::Data(e.to_string()))?;
+        // so the port is taken here first: a port in use stops the node.
+        let data_port = TcpListener::bind((config.bind_ip, config.grpc_port))
+            .map_err(|e| CanvasError::Data(format!("{bind_ip}:{}: {e}", config.grpc_port)))?;
+        let data = match config.page_stall_timeout {
+            // The pages connect to the relay on the data port, and Rerun's data server
+            // serves the relay alone, on a free port of this machine.
+            Some(stall_timeout) => {
+                let server = free_local_address().map_err(CanvasError::Data)?;
+                let data = GrpcServerSink::new(&server.ip().to_string(), server.port(), options)
+                    .map_err(|e| CanvasError::Data(e.to_string()))?;
+                data_port
+                    .set_nonblocking(true)
+                    .and_then(|()| tokio::net::TcpListener::from_std(data_port))
+                    .map(|listener| tokio::spawn(relay_pages(listener, server, stall_timeout)))
+                    .map_err(|e| CanvasError::Data(format!("the relay of the data port: {e}")))?;
+                data
+            }
+            None => {
+                drop(data_port);
+                // The data server reads `<host>:<port>`, so an IPv6 address takes
+                // brackets there.
+                GrpcServerSink::new(&host_of(config.bind_ip), config.grpc_port, options)
+                    .map_err(|e| CanvasError::Data(e.to_string()))?
+            }
+        };
         let builder = RecordingStreamBuilder::new("rerun_viewer");
         let recording = match &config.recording_path {
             Some(path) => {
@@ -556,7 +601,7 @@ mod tests {
         grpc: u16,
         memory: &str,
     ) -> Result<ViewerConfig, ConfigError> {
-        ViewerConfig::parse(bind_ip, web, grpc, memory, "")
+        ViewerConfig::parse(bind_ip, web, grpc, memory, "", 15.0)
     }
 
     #[test]
@@ -590,7 +635,8 @@ mod tests {
 
     #[test]
     fn a_recording_path_is_kept() {
-        let config = ViewerConfig::parse("0.0.0.0", 9090, 9876, "25%", "/tmp/run.rrd").unwrap();
+        let config =
+            ViewerConfig::parse("0.0.0.0", 9090, 9876, "25%", "/tmp/run.rrd", 15.0).unwrap();
         assert_eq!(config.recording_path, Some(PathBuf::from("/tmp/run.rrd")));
     }
 
@@ -616,6 +662,23 @@ mod tests {
             parse("127.0.0.1", 9090, 9876, "lots").unwrap_err().name,
             "memory_limit"
         );
+    }
+
+    #[test]
+    fn a_stall_timeout_of_zero_keeps_every_page_and_one_below_zero_is_refused() {
+        let timeout = |seconds: f64| {
+            ViewerConfig::parse("127.0.0.1", 9090, 9876, "8MB", "", seconds)
+                .map(|config| config.page_stall_timeout)
+        };
+        assert_eq!(timeout(0.0).unwrap(), None);
+        assert_eq!(timeout(2.5).unwrap(), Some(Duration::from_millis(2500)));
+        for refused in [-1.0, f64::NAN, f64::INFINITY, 1e-12] {
+            assert_eq!(
+                timeout(refused).unwrap_err().name,
+                "page_stall_timeout_s",
+                "{refused}"
+            );
+        }
     }
 
     #[test]

@@ -100,6 +100,7 @@ their shells.
 | `web_port` | 9090 | the port of the web page |
 | `grpc_port` | 9876 | the port the page reads the data from |
 | `memory_limit` | `8MB` | how much data the viewer keeps for a page that opens late, newest first, as `8MB` or `1%`; past it, the oldest data goes first, the robot's link shapes (about 2.5 MB for an OpenArm) last |
+| `page_stall_timeout_s` | 15.0 | how long a page may take no data, while data waits for it, before its connection is closed; 0 keeps every page |
 | `recording_path` | empty | a file to save the run to (`.rrd`), as the data server takes it; empty saves none |
 | `arms_rate_hz` | 10.0 | the most snapshots of the arms a second it draws |
 | `image_rate_hz` | 2.0 | the most color images, and the most depth images, a second it draws |
@@ -170,6 +171,16 @@ The viewer shows the stack as it is now, as RViz does, not a history:
   newest data first.
 - The viewer draws the planning scene at each read (`scene_poll_hz`), so a page that opens
   late shows the scene as it is within one read.
+
+Rerun's data server sends each message to each page and waits for the slowest: a page
+that stops reading, as a browser tab left in the background does after some time, would
+hold the data back from every page. So each page's connection passes through a relay of
+the node (`src/relay.rs`), which closes the connection of a page that takes no data for
+`page_stall_timeout_s` (15 s by default) while data waits for it. The other pages go on.
+The page that was closed shows what it last read: load it again to follow the stack.
+With the stack at rest, a page that stops reading is closed after about 2 minutes, since
+the connection's buffers take that long to fill. `page_stall_timeout_s=0` keeps every
+page, however long it stalls.
 
 ## The cubes are the planner's map
 
@@ -243,6 +254,8 @@ Each part of the node knows only what its comment says:
 - `src/live.rs`: the canvas the node draws on. It keeps the newest draw of each entity and
   hands on what changes the view to `RerunCanvas`, on a thread of its own, so only that
   thread waits on Rerun.
+- `src/relay.rs`: the relay in front of Rerun's data server, which closes the connection
+  of a page that stopped reading.
 - `src/config.rs`: the node's parameters, parsed once at start.
 - `src/node.rs`: the start: one follower for each link that is bound.
 

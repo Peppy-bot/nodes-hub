@@ -23,5 +23,7 @@ peppylib = { path = ".peppy/libs/peppylib" }
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+# The paused clock of tokio, for the tests of the relay's stall timeout.
+tokio = { version = "1", features = ["full", "test-util"] }
 # The collision meshes of the bundled robot models, for a test on a real robot.
 robot_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "robot_description", features = ["meshes"] }

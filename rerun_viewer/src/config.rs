@@ -61,6 +61,7 @@ impl Config {
             params.grpc_port,
             &params.memory_limit,
             &params.recording_path,
+            params.page_stall_timeout_s,
         )?;
         let cloud_stride = NonZeroU32::new(params.cloud_stride).ok_or_else(|| {
             ConfigError::new("cloud_stride", params.cloud_stride, "it is 1 or more")
@@ -119,6 +120,7 @@ pub fn default_parameters() -> Parameters {
         image_max_width: 640,
         image_rate_hz: 2.0,
         memory_limit: "8MB".to_string(),
+        page_stall_timeout_s: 15.0,
         recording_path: String::new(),
         scene_poll_hz: 2.0,
         trail_length: 100,
@@ -143,6 +145,10 @@ mod tests {
         assert!(!config.depth_image);
         assert_eq!(config.image_max_width.get(), 640);
         assert_eq!(config.arms_interval, Duration::from_millis(100));
+        assert_eq!(
+            config.viewer.page_stall_timeout,
+            Some(Duration::from_secs(15))
+        );
         assert_eq!(
             config.viewer.memory_limit,
             MemoryLimit::parse("8MB").unwrap()

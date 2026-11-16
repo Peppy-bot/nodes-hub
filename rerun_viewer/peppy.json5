@@ -78,6 +78,11 @@
       // seconds of the rest: the viewer shows the stack as it is now, not a
       // history, and a page that opens reads all of it first.
       memory_limit: { $type: "string", $default: "8MB" },
+      // How long (s) a page may take no data, while data waits for it,
+      // before the viewer closes its connection, so that a page that
+      // stopped reading, as a browser tab left in the background does, does
+      // not hold the data back from the other pages. 0 keeps every page.
+      page_stall_timeout_s: { $type: "f64", $default: 15.0 },
       // A file to save the recording to (.rrd), for a replay; empty saves
       // none. The file holds the whole run.
       recording_path: { $type: "string", $default: "" },
