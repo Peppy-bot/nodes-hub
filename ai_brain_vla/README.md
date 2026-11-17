@@ -205,8 +205,12 @@ sequenceDiagram
 - `perception_gallery`: the shipped enrolment of `sam3_siglip`, above: empty
   is none, `waldo_catalogue` the one the node ships.
 - `camera_name`: the camera the brain looks through, by the name the robot's
-  `camera_mounts` lists it under; the camera model, below. Required; the
+  `sensor_mounts` lists it under; the camera model, below. Required; the
   OpenArm launchers set `chest`.
+- `lookup_timeout_s`: how long a lookup of the camera's place waits for the
+  robot's transforms of a picture's time (s), from 0 to 1, the longest wait
+  `transform_lookup` takes; the camera model, below. Required: the launcher
+  sets it for the robot.
 
 ## The camera model
 
@@ -241,19 +245,23 @@ read a region against the same frame.
   be aligned, as the relays and the ZED publish them and as `realsense_d4xx`
   does under `depth_to_color`: a pair whose frames say `align_mode` "none",
   or two different alignments, is refused with the reason.
-- **The pose comes from the robot.** The `camera_mounts` slot consumes
-  `camera_mounts:v1`, served by the robot's backbone: `get_camera_poses`
-  lists where the robot's design carries each camera, in the robot frame, as
-  the pose of its optical frame (+X to the right of the image, +Y down it, +Z
-  along the view). The brain asks every 2 s until the robot gives its
-  response and names the camera `camera_name` names (the OpenArm launchers
-  name `chest`, the v2 head camera); until then both searches are refused
-  with `resource_unavailable`, naming the reason (slot vacant, not answered
-  yet, the robot's error reply before it has measured its joints, a robot
-  that carries no camera by that name). The pose is read
-  once: the brain looks through a camera fixed to the robot's base, and a
-  camera an arm carries would have moved between the answer and a scan. The
-  values are the design's, exact in a simulation and nominal on hardware.
+- **The pose comes from the robot's tree of frames.** The `sensor_mounts`
+  slot consumes `sensor_mounts:v1`, served by the robot's initializer:
+  `describe_sensors` names the robot frame and the frame of each camera the
+  robot's design carries, its optical frame (+X to the right of the image, +Y
+  down it, +Z along the view). The brain asks every 2 s until the robot gives
+  its response and names the camera `camera_name` names (the OpenArm
+  launchers name `chest`, the v2 head camera); until then both searches are
+  refused with `resource_unavailable`, naming the reason (slot vacant, not
+  answered yet, the robot's error reply, a robot that carries no camera by
+  that name). The `transform_lookup` slot consumes `transform_lookup:v1`:
+  each search asks `lookup_transform` where the camera's frame stood in the
+  robot frame when the picture it reads was taken, waiting up to
+  `lookup_timeout_s` for the transforms of that time, and a lookup that
+  fails refuses the search with `resource_unavailable` and the lookup's
+  words. A camera an arm carries is placed where the arm held it. The
+  transforms of the robot's fixed joints are the design's, exact in a
+  simulation and nominal on hardware.
 
 ## Item ids
 
@@ -398,11 +406,14 @@ peppy stack launch openarm_simulation --with robot_control,alpha.cameras_sim
 peppy node run ai_brain_vla:v1 -i brain -b --clock simulation \
   --link limb_motion@alpha_backbone_inst --link limb_state@alpha_backbone_inst \
   --link camera@alpha_chest --link geometry@alpha_chest \
-  --link camera_mounts@alpha_backbone_inst \
-  limbs=left_arm:left_gripper,right_arm:right_gripper camera_name=chest
+  --link sensor_mounts@alpha_init_inst --link transform_lookup@alpha_transforms_inst \
+  limbs=left_arm:left_gripper,right_arm:right_gripper camera_name=chest \
+  lookup_timeout_s=<seconds>
 ```
 
-A brain run this way is not on the MCP endpoint, so ask it through an
+`<seconds>` is how long a search waits for the robot's transforms of its
+picture's time: give the value the stack's launcher gives its own brain. A
+brain run this way is not on the MCP endpoint, so ask it through an
 `item_perception:v1` consumer node.
 
 ### 5. What to expect
