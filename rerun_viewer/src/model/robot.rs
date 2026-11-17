@@ -9,7 +9,7 @@ use camera_core::pose::{Pose, PoseError};
 use chain_kinematics::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use chain_kinematics::{Tree, TreeError};
 use robot_description::urdf_rs::{self, Geometry};
-use robot_description::{DescriptionError, RobotDescription, mesh_name};
+use robot_description::{DescriptionError, FingerSpan, RobotDescription, mesh_name};
 
 use crate::model::arms::ArmsSnapshot;
 use crate::model::placement::translation;
@@ -102,13 +102,12 @@ struct DrivenGripper {
     fingers: Vec<DrivenFinger>,
 }
 
-/// A finger joint: the tree's index of the joint, and its positions with the gripper
-/// closed and open. It moves in proportion to the gripper's opening.
+/// A finger joint: the tree's index of the joint, and where the gripper's opening puts
+/// it.
 #[derive(Debug)]
 struct DrivenFinger {
     joint: usize,
-    closed: f64,
-    open: f64,
+    span: FingerSpan,
 }
 
 /// The robot's body: each link with collision shapes, and the joints that limb_state
@@ -163,8 +162,7 @@ impl RobotBody {
                 .iter()
                 .map(|finger| DrivenFinger {
                     joint: joint_index(&finger.joint),
-                    closed: finger.closed,
-                    open: finger.open,
+                    span: finger.span,
                 })
                 .collect();
             if !fingers.is_empty() {
@@ -255,7 +253,7 @@ impl RobotBody {
             }
             let opening = state.opening.clamp(0.0, 1.0);
             for finger in &gripper.fingers {
-                positions[finger.joint] = finger.closed + opening * (finger.open - finger.closed);
+                positions[finger.joint] = finger.span.position_at(opening);
             }
         }
         let mut in_robot = vec![Isometry3::identity(); self.tree.link_count()];
