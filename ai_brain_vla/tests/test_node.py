@@ -132,9 +132,11 @@ async def test_the_node_answers_every_member_with_the_none_models():
         assert grabbed.message == "no manipulation model: manipulation_model is 'none'"
         assert grabbed.gripper_name == "" and grabbed.item_id == ""
 
-        dropped = await result_of(drop_fx, h, drop_action.GoalRequestData(gripper_name=""))
+        dropped = await result_of(drop_fx, h, drop_action.GoalRequestData(gripper_name="", target_item_id=None))
         assert dropped.success is False and dropped.message == "no gripper holds an item"
-        placed = await result_of(place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.5, 0.1, 0.7], orientation=QUAT))
+        placed = await result_of(
+            place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.5, 0.1, 0.7], orientation=QUAT, target_item_id=None)
+        )
         assert placed.success is False and placed.message == "no gripper holds an item"
         assert placed.final_position == [0.0, 0.0, 0.0]
 
@@ -228,16 +230,24 @@ async def test_every_member_completes_over_the_wire_with_models():
         state = await get_state_fx.poll(h, 5.0)
         assert state.holding == [True, False] and state.held_item_ids == [cup, ""]
 
-        placed = await result_of(place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.6, 0.2, 0.75], orientation=QUAT))
+        unknown = await result_of(
+            place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.0, 0.0, 0.0], orientation=None, target_item_id="bowl_9-zz")
+        )
+        assert (unknown.success, unknown.message) == (False, "unknown item 'bowl_9-zz': scan or identify it again")
+        placed = await result_of(
+            place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.6, 0.2, 0.75], orientation=QUAT, target_item_id=None)
+        )
         assert placed.success is True, placed.message
         assert (placed.gripper_name, placed.item_id) == ("left_gripper", cup)
         assert placed.final_position == [0.6, 0.2, 0.76]
 
         by_pose = await result_of(grab_fx, h, grab_request("right_gripper", position=(0.5, -0.1, 0.7)))
         assert by_pose.success is True and by_pose.item_id.startswith("item_1-")
-        dropped = await result_of(drop_fx, h, drop_action.GoalRequestData(gripper_name=""))
+        # A drop above the cup that the left gripper put down.
+        dropped = await result_of(drop_fx, h, drop_action.GoalRequestData(gripper_name="", target_item_id=cup))
         assert dropped.success is True, dropped.message
         assert (dropped.gripper_name, dropped.item_id) == ("right_gripper", by_pose.item_id)
+        assert manipulator.calls[-1] == ("drop", "right_gripper", cup)
         state = await get_state_fx.poll(h, 5.0)
         assert state.holding == [False, False] and state.current_action == ""
         assert [call[0] for call in manipulator.calls] == ["grab", "place", "grab", "drop"]
