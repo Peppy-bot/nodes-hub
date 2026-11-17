@@ -903,12 +903,15 @@ impl<'a, H: Host> Lane<'a, H> {
             Ok(result) => result,
             Err(end) => return end,
         };
-        if let Some(name) = &call.result {
-            scope.insert(name.clone(), result);
-        }
         let Some(done_when) = &call.done_when else {
+            if let Some(name) = &call.result {
+                scope.insert(name.clone(), result);
+            }
             return StepEnd::Done;
         };
+        if let Some(name) = &call.result {
+            scope.insert(name.clone(), result.clone());
+        }
         match self
             .read_or_fail(
                 &within.cancel,
@@ -917,10 +920,13 @@ impl<'a, H: Host> Lane<'a, H> {
             .await
         {
             Ok(true) => self.monitored(name, &within.cancel).await,
-            Ok(false) => StepEnd::Failed(Failure::new(
-                ATTEMPT_FAILED,
-                format!("`done_when` of `{}` is false", step.id),
-            )),
+            Ok(false) => StepEnd::Failed(
+                Failure::new(
+                    ATTEMPT_FAILED,
+                    format!("`done_when` of `{}` is false", step.id),
+                )
+                .with_result(result),
+            ),
             Err(end) => end,
         }
     }

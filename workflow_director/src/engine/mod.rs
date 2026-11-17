@@ -22,8 +22,8 @@ use tokio_util::sync::CancellationToken;
 use workflow_documents::expression::{Expression, Type, Value};
 use workflow_documents::result::{
     AssumptionKind, AssumptionOutcome, CheckToJudge, Duration, Ending, FailedStep, IncidentRecord,
-    LaneOutcome, LaneState, RUN_SUSPENDED, RefusalCause, RunRefusal, RunResult, RunState,
-    RunStatus, SafeStateResult, SuspendedLane, Suspension, ToConfirm,
+    IncidentResult, LaneOutcome, LaneState, RUN_SUSPENDED, RefusalCause, RunRefusal, RunResult,
+    RunState, RunStatus, SafeStateResult, SuspendedLane, Suspension, ToConfirm,
 };
 use workflow_documents::run::Attendance;
 use workflow_documents::work_cell::Uncovered;
@@ -334,6 +334,10 @@ impl<H: Host> RunCtx<'_, H> {
                 Some(Cause::Alert(alert)) => Some(alert.clone()),
                 _ => None,
             },
+            result: failure
+                .result
+                .as_deref()
+                .map(|result| IncidentResult::of(result.clone())),
             affected_lanes: vec![role.clone()],
             safe_state: safe_state.to_vec(),
         };

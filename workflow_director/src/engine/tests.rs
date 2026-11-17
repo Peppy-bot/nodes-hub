@@ -8,7 +8,8 @@ use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use workflow_documents::EventKind;
 use workflow_documents::result::{
-    AlertCause, Anomaly, Ending, LaneState, RunResult, SafeStateOutcome,
+    AlertCause, Anomaly, Ending, IncidentRecord, IncidentResult, LaneState, RunResult,
+    SafeStateOutcome,
 };
 use workflow_documents::run::{Attendance, Severity};
 
@@ -139,6 +140,125 @@ async fn a_result_that_fails_done_when_takes_the_retries() {
     let (result, _) = run(&plan, &host, Vec::new()).await;
     assert_eq!(result.ending, Ending::Completed, "{result:#?}");
     assert_eq!(host.calls_of("grab").len(), 2);
+}
+
+/// The answer of a grab that did not grab, with the words of the robot
+/// `why`.
+fn missed_grab(why: &str) -> Json {
+    json!({ "success": false, "item_id": "b1", "message": why })
+}
+
+/// The result of the call that the incident `incident` holds.
+fn incident_result(incident: &IncidentRecord) -> Option<&IncidentResult> {
+    incident.result.as_ref()
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_incident_of_a_false_done_when_holds_the_result_of_the_call() {
+    let plan = plan(
+        &one_arm("alpha", find_then_grab(grab(0, "grabbed.success")), home()),
+        Attendance::Unattended,
+    );
+    let missed = missed_grab("start_in_collision: the start is too near the map");
+    let host = arm().answer("grab", vec![Answer::now(missed.clone())]);
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let [incident] = &result.incidents[..] else {
+        panic!("one incident: {:#?}", result.incidents);
+    };
+    assert_eq!(incident.message, "`done_when` of `grab` is false");
+    assert_eq!(
+        incident_result(incident),
+        Some(&IncidentResult::Value(missed))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_incident_of_a_call_that_names_no_result_holds_its_result() {
+    let mut unnamed = grab(0, "!seen.found");
+    unnamed["call"].as_object_mut().unwrap().remove("as");
+    let plan = plan(
+        &one_arm("alpha", find_then_grab(unnamed), home()),
+        Attendance::Unattended,
+    );
+    let answer = json!({ "success": true, "item_id": "b1" });
+    let host = arm().answer("grab", vec![Answer::now(answer.clone())]);
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let [incident] = &result.incidents[..] else {
+        panic!("one incident: {:#?}", result.incidents);
+    };
+    assert_eq!(
+        incident_result(incident),
+        Some(&IncidentResult::Value(answer))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_incident_of_a_step_with_retries_holds_the_result_of_its_last_attempt() {
+    let plan = plan(
+        &one_arm("alpha", find_then_grab(grab(1, "grabbed.success")), home()),
+        Attendance::Unattended,
+    );
+    let last = missed_grab("the second attempt");
+    let host = arm().answer(
+        "grab",
+        vec![
+            Answer::now(missed_grab("the first attempt")),
+            Answer::now(last.clone()),
+        ],
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(host.calls_of("grab").len(), 2);
+    let [incident] = &result.incidents[..] else {
+        panic!("one incident: {:#?}", result.incidents);
+    };
+    assert_eq!(
+        incident_result(incident),
+        Some(&IncidentResult::Value(last))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_suspension_and_the_event_of_an_incident_hold_the_result_of_the_call() {
+    let plan = plan(
+        &one_arm("alpha", find_then_grab(grab(0, "grabbed.success")), home()),
+        Attendance::Attended,
+    );
+    let missed = missed_grab("the hand is too near the plate");
+    let host = arm().answer("grab", vec![Answer::now(missed.clone())]);
+    let (result, phases) = run(&plan, &host, vec![(60, RunCommand::Abort)]).await;
+    assert_eq!(result.ending, Ending::Aborted, "{result:#?}");
+    let held = Some(IncidentResult::Value(missed));
+    let suspension = phases
+        .iter()
+        .find_map(|phase| match phase {
+            Phase::Suspended(suspension) => Some(suspension),
+            _ => None,
+        })
+        .expect("the run suspends");
+    assert_eq!(suspension.incidents[0].result, held);
+    let incident_details = host.event_details(EventKind::Incident);
+    let [details] = &incident_details[..] else {
+        panic!("one incident event: {incident_details:#?}");
+    };
+    let recorded: IncidentRecord = serde_json::from_value(details.clone()).unwrap();
+    assert_eq!(recorded.result, held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_incident_of_another_failure_holds_no_result() {
+    let plan = plan(
+        &one_arm("alpha", find_then_grab(grab(0, "grabbed.success")), home()),
+        Attendance::Unattended,
+    );
+    let host = arm().answer("grab", vec![Answer::failing("unreachable")]);
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    let [incident] = &result.incidents[..] else {
+        panic!("one incident: {:#?}", result.incidents);
+    };
+    assert_eq!(incident.failure_kind, "unreachable");
+    assert_eq!(incident.result, None);
 }
 
 #[tokio::test(start_paused = true)]

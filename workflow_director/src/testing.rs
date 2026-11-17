@@ -442,6 +442,17 @@ impl ScriptedHost {
             .collect()
     }
 
+    /// The details of each event of `kind`, in the order of the events.
+    pub fn event_details(&self, kind: EventKind) -> Vec<Json> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == kind)
+            .map(|event| event.details.clone())
+            .collect()
+    }
+
     fn next_answer(&self, member: &str) -> Answer {
         let mut answers = self.answers.lock().unwrap();
         let queue = answers
