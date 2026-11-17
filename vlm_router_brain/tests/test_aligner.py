@@ -477,3 +477,48 @@ async def test_a_drop_above_a_bowl_checks_the_pre_point_alone_and_says_the_jaws_
     assert "The jaws then open at this height, with no descent: the item falls into the wooden bowl." in turn.goal
     assert "; the jaws open at this height." in turn.state
     assert turn.tools[1].description.startswith("the held item is centred above a free spot of the wooden bowl: the jaws open at this height")
+
+
+# The alignment of a place: two answers, the whole move in the first, no
+# limit of a step, and Aligned when the answers run out after a move.
+
+async def test_a_place_has_two_answers_and_its_goal_asks_for_the_whole_move_in_the_first():
+    a, model = aligner('{"action": "ready"}')
+    await a.align(place_request(), FakeMoves(), CancelToken())
+    (turn,) = model.turns
+    assert turn.max_steps == 2
+    assert "and opens. You have 2 answers: make the whole move in the first, then answer ready." in turn.goal
+    assert turn.tools[0].description.startswith(
+        "moves the gripper sideways by dx and dy and turns it by roll_deg, at the same height. One move goes anywhere at once"
+    )
+
+
+async def test_one_move_of_a_place_goes_anywhere_inside_the_limit_beyond_3_cm():
+    a, model = aligner('{"action": "move", "dx": 8.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    moves = FakeMoves()
+    end = await a.align(place_request(), moves, CancelToken())
+    assert moves.moves[0][0] == (0.58, 0.10, PRE[2]) and isinstance(end, Aligned) and end.steps == 2
+
+
+async def test_a_place_whose_answers_run_out_after_a_move_that_completed_ends_aligned_there():
+    a, model = aligner(
+        '{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}',
+        '{"action": "ready"}',
+    )
+    moves = FakeMoves()
+    end = await a.align(place_request(), moves, CancelToken())
+    assert len(model.turns) == 2
+    assert end == Aligned((0.52, 0.10, PRE[2]), (0.52, 0.10, TARGET[2]), lifted((0.52, 0.10, TARGET[2]), LIFT_M), DOWN_0, steps=2)
+
+
+async def test_a_place_whose_last_answer_moved_nothing_runs_out_of_steps():
+    a, model = aligner('{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "move", "dx": 0, "dy": 20.0, "roll_deg": 0}')
+    end = await a.align(place_request(), FakeMoves(), CancelToken())
+    assert end == OutOfSteps(2)
+
+
+async def test_a_grab_keeps_five_steps_of_3_cm_at_most():
+    a, model = aligner('{"action": "move", "dx": 4.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    moves = FakeMoves()
+    await a.align(request(), moves, CancelToken())
+    assert moves.moves == [] and model.turns[0].max_steps == 5

@@ -33,9 +33,15 @@ are checked before each move, so the descent that follows a `ready` has a
 plan; above a target item with no descent after it, a drop, the pre point
 alone.
 
+A place, at a pose or into a target item, has `place_max_steps` answers,
+and its goal text says so and asks for the whole move in the first: one
+move may go anywhere inside the limit, with no limit of a step. A grab has
+`max_steps`, each step within `step_max_m`.
+
 The alignment ends `Aligned` with the new points and orientation, `GaveUp`,
-`OutOfSteps` after `max_steps`, or `Stopped` when a stop ended a move; a
-cancel raises `Cancelled` from the loop. `AlignmentFailed` names what the
+`OutOfSteps` after the last step, or `Stopped` when a stop ended a move; a
+place whose last step was a move that completed ends `Aligned` there, with
+no `ready` after it. A cancel raises `Cancelled` from the loop. `AlignmentFailed` names what the
 step could not get: a wrist frame after the move, the chest frame, a
 camera's pose, the limbs.
 
@@ -69,6 +75,8 @@ from .directions import axes_in_picture
 from .loop import Observation, Picture, StepModel, ToolLoop, ToolResult
 
 MAX_STEPS = 5
+# The answers of the alignment of a place: the whole move, then ready.
+PLACE_MAX_STEPS = 2
 STEP_MAX_M = 0.03
 RADIUS_M = 0.10
 # How far inside the rim of a target item the held item's centre stays: the
@@ -106,6 +114,7 @@ PLACE_GOAL = (
     "spot: the item may rest on them, so aim at a gap between them or at the lowest of them. The gripper then goes "
     "straight down until the item rests, and opens.\n\n" + FRAME_WORDS
 )
+PLACE_ANSWERS = " You have {answers} answers: make the whole move in the first, then answer ready."
 INTO_GOAL = (
     "You guide a robot gripper that holds an item to a free spot of the {target}{width}. Goal: the held item straight "
     "above a free spot inside the {target}, clear of its rim. Items already in the {target} do not make it full: the "
@@ -130,6 +139,7 @@ class ModelAligner:
         model: StepModel,
         *,
         max_steps: int = MAX_STEPS,
+        place_max_steps: int = PLACE_MAX_STEPS,
         step_max_m: float = STEP_MAX_M,
         radius_m: float = RADIUS_M,
         roll_max_deg: float = ROLL_MAX_DEG,
@@ -139,6 +149,7 @@ class ModelAligner:
     ) -> None:
         self.model = model
         self.max_steps = max_steps
+        self.place_max_steps = place_max_steps
         self.step_max_m = step_max_m
         self.radius_m = radius_m
         self.roll_max_deg = roll_max_deg
@@ -170,9 +181,14 @@ class ModelAligner:
         if self._senses is None:
             raise AlignmentFailed(NOT_STARTED)
         run = _Run(self, self._senses, request, moves)
+        steps = self.place_max_steps if request.is_place else self.max_steps
         goal = _goal(request)
-        loop = ToolLoop(self.model, run.tools, goal, self.max_steps, run.observe)
+        if request.is_place:
+            goal = goal.replace("\n\n", PLACE_ANSWERS.format(answers=steps) + "\n\n", 1)
+        loop = ToolLoop(self.model, run.tools, goal, steps, run.observe)
         end = await loop.run(cancel)
+        if end.out_of_steps and request.is_place and run.moved_in_step:
+            return Aligned(run.pre, run.point, run.lift, run.orientation, steps=end.steps)
         if end.out_of_steps:
             return OutOfSteps(end.steps)
         return replace(end.value, steps=end.steps)
@@ -216,6 +232,8 @@ class _Run:
         self.orientation = request.orientation
         self.centre = request.centre
         self.radius_m = radius_of(aligner, request)
+        # Whether the step that runs now moved the gripper to a new place.
+        self.moved_in_step = False
         self.tools = (_MoveTool(self), _ReadyTool(self), _GiveUpTool(request))
 
     @property
@@ -223,6 +241,7 @@ class _Run:
         return self.request.gripper.arm
 
     async def observe(self) -> Observation:
+        self.moved_in_step = False
         try:
             return await self._observe()
         except Refusal as refusal:
@@ -303,10 +322,13 @@ class _MoveTool:
     def __init__(self, run: _Run) -> None:
         self.alignment = run
         a = run.aligner
+        if run.request.is_place:
+            reach = f"One move goes anywhere at once and turns at most {a.roll_max_deg:.0f} degrees"
+        else:
+            reach = f"One step moves at most {100 * a.step_max_m:.0f} cm and turns at most {a.roll_max_deg:.0f} degrees"
         self.description = (
-            f"moves the gripper sideways by dx and dy and turns it by roll_deg, at the same height. One step moves at "
-            f"most {100 * a.step_max_m:.0f} cm and turns at most {a.roll_max_deg:.0f} degrees; the gripper stays within "
-            f"{100 * run.radius_m:.0f} cm of {run.request.centre_words}."
+            f"moves the gripper sideways by dx and dy and turns it by roll_deg, at the same height. {reach}; the gripper "
+            f"stays within {100 * run.radius_m:.0f} cm of {run.request.centre_words}."
         )
 
     def parse(self, fields: Mapping[str, object]) -> Move:
@@ -321,7 +343,7 @@ class _MoveTool:
     async def run(self, move: Move, cancel: CancelToken) -> ToolResult:
         run, a = self.alignment, self.alignment.aligner
         step_cm = 100 * math.hypot(move.dx_m, move.dy_m)
-        if step_cm > 100 * a.step_max_m + 1e-9:
+        if not run.request.is_place and step_cm > 100 * a.step_max_m + 1e-9:
             return ToolResult(f"moved nothing: a step moves at most {100 * a.step_max_m:.0f} cm, this one is {step_cm:.1f} cm")
         if abs(move.roll_deg) > a.roll_max_deg + 1e-9:
             return ToolResult(f"moved nothing: one step turns at most {a.roll_max_deg:.0f} degrees")
@@ -349,6 +371,7 @@ class _MoveTool:
         if not moved.completed:
             return ToolResult(f"the move failed: {moved.message}; {run.where(now=True)}")
         run.pre, run.point, run.lift, run.orientation = pre, point, lift, orientation
+        run.moved_in_step = True
         return ToolResult(f"moved: {run.where(now=True)}")
 
 
