@@ -13,9 +13,10 @@ import numpy as np
 
 from peppygen.consumed_actions.limb_motion import move_arm, move_gripper
 from peppygen.consumed_services.camera import depth_stream_info
-from peppygen.consumed_services.camera_mounts import get_camera_poses
 from peppygen.consumed_services.geometry import get_color_intrinsics, get_depth_intrinsics
 from peppygen.consumed_services.limb_motion import check_arm_move
+from peppygen.consumed_services.sensor_mounts import describe_sensors
+from peppygen.consumed_services.transform_lookup import lookup_transform
 from peppygen.consumed_topics.camera import depth_stream, video_stream
 from peppygen.consumed_topics.limb_state import limb_states
 from peppygen.consumed_topics.wrist_cameras import video_stream as wrist_video_stream
@@ -36,8 +37,24 @@ PARAMS = {
     "perception_model": "gemini-robotics-er-2-preview",
     "manipulation_model": "scripted",
     "camera_name": "chest",
+    "lookup_timeout_s": 0.5,
     "wrist_cameras": "left_arm:wrist_left,right_arm:wrist_right",
 }
+
+# The robot's cameras, each with its frame and its place in the robot frame
+# at every time: the chest at the robot's origin looking along +Z, and
+# `wrist_left` 0.5 m up looking straight down with its picture's right along
+# the robot's +Y.
+ROBOT_FRAME = "base_link"
+CAMERAS = {
+    "chest": ("chest_color_optical_frame", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
+    "wrist_left": ("wrist_left_color_optical_frame", [0.2, 0.2, 0.5], [0.7071, 0.7071, 0.0, 0.0]),
+}
+# How long the answerer of the lookups waits for the next one: longer than a
+# test runs, so it stops when the harness stops its mocks.
+LOOKUP_WAIT_S = 3600.0
+# The answerer of each harness's lookups, kept while it runs.
+_ANSWERERS: WeakKeyDictionary = WeakKeyDictionary()
 
 
 def params(**overrides) -> Parameters:
@@ -46,7 +63,8 @@ def params(**overrides) -> Parameters:
 
 def answer_the_camera(h) -> None:
     """The depth unit, the 16 x 12 camera's intrinsics with a 90 degree
-    lens, and the chest camera at the robot's origin looking along +Z."""
+    lens, the robot's cameras of CAMERAS, and the place of each in the
+    robot frame for every lookup the brain makes."""
     h.mocks.deps.camera.depth_stream_info.enqueue_response(
         depth_stream_info.ResponseData(width=16, height=12, frames_per_second=15, encoding="z16", depth_unit=0.001)
     )
@@ -59,11 +77,36 @@ def answer_the_camera(h) -> None:
             depth_model="z", min_depth_m=0.1, max_depth_m=10.0, align_mode="depth_to_color",
         )
     )
-    h.mocks.deps.camera_mounts.get_camera_poses.enqueue_response(
-        get_camera_poses.ResponseData(
-            timestamp=7.0, camera_names=["chest"], positions=[0.0, 0.0, 0.0], orientations=[0.0, 0.0, 0.0, 1.0], carried_by=[""],
+    h.mocks.deps.sensor_mounts.describe_sensors.enqueue_response(
+        describe_sensors.ResponseData(
+            robot_frame=ROBOT_FRAME,
+            sensor_names=list(CAMERAS),
+            sensor_kinds=["rgbd_camera", "rgb_camera"],
+            sensor_frames=[frame for frame, _, _ in CAMERAS.values()],
+            carried_by=["", "left_arm"],
         )
     )
+    _ANSWERERS[h] = asyncio.get_running_loop().create_task(_answer_lookups(h.mocks.deps.transform_lookup.lookup_transform))
+
+
+async def _answer_lookups(service) -> None:
+    """Answers each lookup of a camera's frame in the robot frame with its
+    place of CAMERAS, and any other with the failure `unknown_frame`, until
+    the harness stops its mocks."""
+    places = {frame: (position, orientation) for frame, position, orientation in CAMERAS.values()}
+    while True:
+        try:
+            request, responder = await service.next_request(LOOKUP_WAIT_S)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # The harness stopped its mocks.
+            return
+        if request.target_frame != ROBOT_FRAME or request.source_frame not in places:
+            await responder.respond_failure(
+                lookup_transform.FailureKind.UNKNOWN_FRAME, f"no transform names {request.source_frame}"
+            )
+            continue
+        position, orientation = places[request.source_frame]
+        await responder.respond(lookup_transform.ResponseData(position=position, orientation=orientation, timestamp=request.time))
 
 
 async def publish_a_capture(h, frame_id: int = 1) -> None:
@@ -243,25 +286,6 @@ async def publish_limbs_until(h, done: asyncio.Event, left_opening: float) -> No
         limbs.stamp += 1.0
         await publish_limbs(h)
         await asyncio.sleep(0.01)
-
-
-def answer_the_cameras(h, mounts_answers: int = 1) -> None:
-    """The camera answers of `answer_the_camera`, with the robot carrying a
-    wrist camera beside the chest one: the chest at the robot's origin
-    looking along +Z, `wrist_left` looking straight down with its picture's
-    right along the robot's +Y, 0.5 m up. `mounts_answers` is how many
-    get_camera_poses answers to queue: one for the brain's learner at its
-    start, one for each alignment step."""
-    answer_the_camera(h)
-    mounts = h.mocks.deps.camera_mounts.get_camera_poses
-    for _ in range(mounts_answers - 1):
-        mounts.enqueue_response(
-            get_camera_poses.ResponseData(
-                timestamp=7.0, camera_names=["chest", "wrist_left"],
-                positions=[0.0, 0.0, 0.0, 0.2, 0.2, 0.5], orientations=[0.0, 0.0, 0.0, 1.0, 0.7071, 0.7071, 0.0, 0.0],
-                carried_by=["", "left_arm"],
-            )
-        )
 
 
 async def publish_wrist_until(h, done: asyncio.Event) -> None:
