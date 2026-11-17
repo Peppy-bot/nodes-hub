@@ -334,10 +334,7 @@ impl<H: Host> RunCtx<'_, H> {
                 Some(Cause::Alert(alert)) => Some(alert.clone()),
                 _ => None,
             },
-            result: failure
-                .result
-                .as_deref()
-                .map(|result| IncidentResult::of(result.clone())),
+            result: failure.result.as_deref().map(IncidentResult::of),
             affected_lanes: vec![role.clone()],
             safe_state: safe_state.to_vec(),
         };
