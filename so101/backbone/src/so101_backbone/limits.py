@@ -3,13 +3,13 @@
 The backbone enforces them: goals more than LIMIT_SLACK_RAD beyond a limit
 are rejected and closer ones run at the limit, and streamed targets and IK
 solutions are clamped or refused.
-Parse, don't validate: a joint of the arm whose limits are no finite range
-fails the launch.
+Parse, don't validate: the description refuses a joint whose limits are not
+finite or whose lower limit lies above its upper one, and a joint of the arm
+whose limits are one position fails the launch here.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 from robot_description_py import RobotDescription
@@ -73,11 +73,11 @@ class JointLimits:
 def from_description(description: RobotDescription) -> JointLimits:
     """The position limits (rad) the URDF of `description` gives each joint
     of its one arm, in the arm's order. Raises ValueError for a joint whose
-    limits are not a finite range."""
+    limits are one position."""
     (arm,) = description.arms
     ranges = [(bound.lower, bound.upper) for bound in map(description.joint_limits, arm.joints)]
     for joint, (lo, hi) in zip(arm.joints, ranges, strict=True):
-        if not (math.isfinite(lo) and math.isfinite(hi) and lo < hi):
+        if not lo < hi:
             raise ValueError(f"URDF joint {joint} has unusable limits [{lo}, {hi}]")
     lower, upper = zip(*ranges, strict=True)
     return JointLimits(lower=lower, upper=upper)

@@ -39,15 +39,16 @@ def test_the_limits_are_the_urdfs_of_the_arms_joints_in_the_arms_order():
     assert parsed.upper == (0.5, 1.5, 2.5, 3.5, 4.5)
 
 
-@pytest.mark.parametrize(
-    "lower, upper",
-    [(0.5, 0.5), (-math.inf, 0.5), (-0.5, math.inf)],
-    ids=repr,
-)
-def test_a_joint_whose_limits_are_no_finite_range_fails(lower, upper):
-    described = described_with_limits({"wrist_flex": (lower, upper)})
+def test_a_joint_whose_limits_are_one_position_fails():
+    described = described_with_limits({"wrist_flex": (0.5, 0.5)})
     with pytest.raises(ValueError, match="URDF joint wrist_flex has unusable limits"):
         limits.from_description(described)
+
+
+@pytest.mark.parametrize("lower, upper", [(-math.inf, 0.5), (-0.5, math.inf), (0.5, -0.5)], ids=repr)
+def test_the_description_refuses_a_joint_whose_limits_are_no_finite_range(lower, upper):
+    with pytest.raises(ValueError, match='the joint "wrist_flex" moves between the limits'):
+        described_with_limits({"wrist_flex": (lower, upper)})
 
 
 def test_contains_and_clamp():
