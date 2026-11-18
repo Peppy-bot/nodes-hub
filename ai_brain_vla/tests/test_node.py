@@ -390,10 +390,10 @@ async def test_a_scripted_grab_during_a_grab_is_refused_and_abort_ends_the_first
     async with harness.start(with_fake_detector(), parameters=faked()) as h:
         answer_the_camera(h)
         await once_the_brain_has_limbs(h)
-        plan(h, True, True, True)
         first = await grab_fx.send_goal(h, grab_by_pose([0.5, 0.1, 0.75]), 5.0)
         assert first.accepted, first.refusal
-        # The first grab opens the gripper; the backbone holds that move.
+        # The first grab opens the gripper before its checks; the backbone
+        # holds that move.
         _, opening = await accepted_grip(h)
         assert (await get_state_fx.poll(h, 5.0)).current_action == "grab_item"
         second = await result_of(grab_fx, h, grab_by_pose([0.4, -0.1, 0.75]))

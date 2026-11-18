@@ -54,8 +54,9 @@ makes no model call. A `grab_item` takes the item's seen point lowered 2.5 cm
 the backbone's `check_arm_move` that the pre-grasp point 7.5 cm above, the
 grasp point and the lifted point 7.5 cm above all plan, trying the gripper
 pointing down at 8 rolls (a grab by pose with an orientation tries that one
-alone), then reaches, closes with the goal's `max_effort` and lifts. A grab
-that no roll reaches ends with the jaws open.
+alone), then reaches, descends on a line down that stops on contact, closes
+with the goal's `max_effort` where the line down ended and lifts. A grab that
+no roll reaches ends with the jaws open.
 It judges the hold
 twice: from the close's `final_opening`, below 0.05 of which the grab fails
 with `closed on nothing`, then from the first `limb_states` snapshot captured
@@ -66,17 +67,21 @@ that fails once the descent was sent first opens the gripper and moves the
 arm straight back up to the pre-grasp point, unless a stop ended the step.
 `drop_item` opens the gripper where it is; `place_item` carries the item to
 15 cm above the pose (7.5 cm where the backbone has no plan that high), lowers
-it to 5 cm above the pose and opens there, so the arm does not press the item
-on what it is set on, or where the item comes to rest on something on the way,
-and climbs back. Every move goes through the
+it to the pose on a line down that stops on contact, so the arm does not press
+the item on what it is set on, opens where the line down ended, at the pose or
+where the item came to rest on something on the way, and climbs back. A line
+down that fails or that a stop ended fails the place, and the gripper still
+holds the item. Every move goes through the
 backbone that the `limb_motion` slot binds, and the `limb_state` slot gives
 the measured openings and grasp points, so the launcher binds both to the
 robot's backbone. Each arm move completes once the backbone has measured the
 grasp point within 2 cm and 0.15 rad of its goal, and fails with `timeout`
 when it is still outside them 2 s after the planned end of the motion: the
-brain waits for no arrival of its own. When a placed item comes to rest on
-something on the way down, the arm stops short and its move fails so; the
-brain reads where the arm stopped from `limb_states`.
+brain waits for no arrival of its own. A line down, the descent of a grab and
+of a place, names a contact gap of 2 cm and runs at 5 cm/s: when the fingers
+or the held item meet something on the way down, the backbone ends the move on
+contact and the arm holds where it stands. Every other move names no contact
+check and runs as fast as the joint limits allow.
 
 Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
@@ -144,12 +149,10 @@ forget the item. A `place_item` with the same model gets the same step above
 the spot the held item goes to: the model centres the held item over the
 container or the free patch the target point is in, within 10 cm of that point
 (a container that already holds items is still the spot: the item may rest on
-them), and `ready` lowers the item until it rests or the point 5 cm above the
-target is reached, opens and climbs back. An arm the backbone stops short on the way down,
-anywhere from the pre-place point down and within 5 cm of the line down, has
-set the item on what is under it (a tall fruit meets a bowl's floor well above
-the target; a fruit set on another slides off its top by a few centimetres),
-and the place opens there.
+them), and `ready` lowers the item on the line down to the target, which
+stops on contact: the place opens where the item comes to rest (a tall fruit
+on a bowl's floor well above the target, a fruit on another one already in
+the container), or at the target, and climbs back.
 
 ## Keys
 
