@@ -11,11 +11,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use camera_core::encoding::DEPTH_ENCODING;
 use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
 use camera_core::pose::Pose;
+use camera_core::sensor_mounts::{CameraFrames, DescribedSensors};
 use chain_kinematics::nalgebra::Isometry3;
 use collision_geometry::chain::BodyGeometry;
 use control_core::fault::Fault;
 use control_core::latched_log::LatchedLog;
+use control_core::robot_tree::RobotTree;
 use control_core::{asking, receiving, serving};
+use frame_tree::{FrameName, LookupTime, Stamp};
 use motion_planning_core::{
     Arm, ArmGoal, Arms, CartesianFailure, CartesianRequest, CheckFailure, CheckRequest, Collisions,
     Contact, DepthCamera, Goal, IkGoalSampler, PathCheck, PathFault, PathOrientation, PlanFailure,
@@ -23,15 +26,16 @@ use motion_planning_core::{
     cartesian_path, check_path, insert_cut_out, iteration_bound, plan_path, pose_parts,
     start_inside_limits,
 };
-use occupancy_map::{DistanceField, Frame, Scan, VoxelMap};
+use occupancy_map::{DistanceField, Scan, VoxelMap};
 use ompl_bridge::PLANNING_THREADS;
 use peppygen::consumed_services::camera::depth_stream_info;
-use peppygen::consumed_services::camera_mounts::get_camera_poses;
 use peppygen::consumed_services::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
 use peppygen::consumed_services::identity::{get_description, get_identity};
+use peppygen::consumed_services::sensor_mounts::describe_sensors;
 use peppygen::consumed_services::workspace::describe_workspace;
 use peppygen::consumed_topics::camera::depth_stream;
 use peppygen::consumed_topics::limb_state::limb_states;
+use peppygen::consumed_topics::transforms::transforms;
 // Named apart from the occupancy_map crate, which holds the map itself.
 use peppygen::emitted_topics::motion_planning::occupancy_map as occupancy_map_topic;
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
@@ -50,8 +54,10 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info};
 
+use crate::clock::node_clock;
 use crate::config::Config;
 use crate::fingers::{FingerFault, riders_of_the_arms, with_held_objects};
+use crate::follow::follow_tree;
 use crate::history::{ArmJoints, History, Measured};
 use crate::intake::robot_mask;
 use crate::own_body::OwnBody;
@@ -105,21 +111,22 @@ const OWN_BODY_WAY_OUT: &str = "move the arms to the home posture with move_to_h
 const CLEAR_OR_ALLOW_WAY_OUT: &str = "move the arms clear first, or allow the pair with \
                                       set_allowed_collision";
 
-/// The links of the perception camera the map reads.
+/// The links of the perception camera the map reads. The transforms link, bound to every
+/// publisher of the robot's tree, is bound too.
 struct CameraLinks {
     /// rgbd_camera: the depth frames and their stream's description.
     camera: ProducerRef,
     /// camera_geometry: the depth lens and the depth frame's offset.
     geometry: ProducerRef,
-    /// camera_mounts: where the robot's design carries the camera.
-    camera_mounts: ProducerRef,
     /// workspace: which camera is the perception camera.
     workspace: ProducerRef,
+    /// sensor_mounts: the robot frame and the camera's frame in the robot's tree.
+    sensor_mounts: ProducerRef,
 }
 
 /// The perception camera's slots, as the launcher bound them.
 enum CameraSlots {
-    /// The four slots bound.
+    /// The camera's slots bound.
     Linked(CameraLinks),
     /// The camera and geometry slots vacant: the map stays empty.
     Vacant,
@@ -129,38 +136,44 @@ enum CameraSlots {
 }
 
 /// The perception camera's slots, as the launcher bound them: camera and geometry
-/// decide whether the map reads a camera, and a camera the map reads needs
-/// camera_mounts and workspace bound too.
+/// decide whether the map reads a camera, and a camera the map reads needs workspace,
+/// sensor_mounts and transforms bound too.
 fn camera_slots(runner: &NodeRunner) -> CameraSlots {
     let slots = [
         ("camera", depth_stream_info::bound_producer(runner)),
         ("geometry", get_depth_intrinsics::bound_producer(runner)),
-        ("camera_mounts", get_camera_poses::bound_producer(runner)),
         ("workspace", describe_workspace::bound_producer(runner)),
+        ("sensor_mounts", describe_sensors::bound_producer(runner)),
     ];
+    let tree_bound = !transforms::bound_producers(runner).is_empty();
     let names = |bound: bool| -> Vec<&str> {
         slots
             .iter()
             .filter(|(_, producer)| producer.is_some() == bound)
             .map(|(name, _)| *name)
+            .chain((tree_bound == bound).then_some("transforms"))
             .collect()
     };
-    match slots.map(|(_, producer)| producer) {
-        [
-            Some(camera),
-            Some(geometry),
-            Some(camera_mounts),
-            Some(workspace),
-        ] => CameraSlots::Linked(CameraLinks {
+    match (slots.map(|(_, producer)| producer), tree_bound) {
+        (
+            [
+                Some(camera),
+                Some(geometry),
+                Some(workspace),
+                Some(sensor_mounts),
+            ],
+            true,
+        ) => CameraSlots::Linked(CameraLinks {
             camera: camera.clone(),
             geometry: geometry.clone(),
-            camera_mounts: camera_mounts.clone(),
             workspace: workspace.clone(),
+            sensor_mounts: sensor_mounts.clone(),
         }),
-        [None, None, _, _] => CameraSlots::Vacant,
+        ([None, None, _, _], _) => CameraSlots::Vacant,
         _ => CameraSlots::Mixed(format!(
             "the launcher binds the planner's {} and leaves its {} vacant; bind camera, \
-             geometry, camera_mounts and workspace, or leave camera and geometry vacant",
+             geometry, workspace, sensor_mounts and transforms, or leave camera and geometry \
+             vacant",
             listed(&names(true), "and"),
             listed(&names(false), "and")
         )),
@@ -209,7 +222,7 @@ struct Node<const N: usize, const D: usize, const K: usize> {
     config: Config,
     /// The robot frame, the URDF's root link: the frame of the map, of each depth
     /// frame's sensor and of the robot cut out of it.
-    frame: Frame,
+    frame: FrameName,
     arms: PerArm<ArmModel<N>, K>,
     /// The robot's body around its arms, which the map cuts out of each frame.
     body: BodyGeometry,
@@ -384,7 +397,7 @@ fn serve_robot<const N: usize, const D: usize, const K: usize>(
     tokio::spawn(follow_limb_states(runner.clone(), node.clone()));
     match slots {
         CameraSlots::Linked(links) => {
-            tokio::spawn(follow_depth(runner.clone(), node.clone(), links));
+            tokio::spawn(follow_depth(runner.clone(), node.clone(), links, fault));
         }
         CameraSlots::Vacant => info!("{NO_CAMERA}"),
         CameraSlots::Mixed(reason) => {
@@ -636,12 +649,34 @@ fn openings_of<const N: usize, const K: usize>(
     found.transpose()
 }
 
-/// The perception camera as the map reads it.
+/// The perception camera as the map reads it: its frame in the robot's tree, which places
+/// it at the stamp of each depth frame, and its depth stream.
 struct PerceptionCamera {
-    depth: DepthCamera,
+    /// The camera's color optical frame.
+    frame: FrameName,
+    /// The depth optical frame in the color optical frame.
+    depth_in_color: Pose,
+    lens: Pinhole,
+    depth_model: DepthModel,
+    /// Meters per depth count.
+    depth_unit: f32,
     /// The alignment the lens and the depth frame's offset describe: a depth frame read
     /// with them carries it in its header (camera_geometry's `align_mode`).
     align_mode: String,
+}
+
+impl PerceptionCamera {
+    /// The depth stream of the camera whose color optical frame stands at `color_in_robot`
+    /// in the robot frame.
+    fn depth_at(&self, color_in_robot: &Pose) -> DepthCamera {
+        DepthCamera::new(
+            color_in_robot,
+            &self.depth_in_color,
+            self.lens,
+            self.depth_model,
+            self.depth_unit,
+        )
+    }
 }
 
 /// Why the perception camera cannot be read.
@@ -665,7 +700,7 @@ async fn discover_camera<const N: usize, const D: usize, const K: usize>(
     let token = runner.cancellation_token().clone();
     let passing = LatchedLog::warn("perception camera");
     loop {
-        match describe_camera(runner, links).await {
+        match describe_camera(runner, links, &node.frame).await {
             Ok(camera) => {
                 passing.success();
                 node.wait_on(AWAITING_FRAME);
@@ -688,9 +723,12 @@ async fn discover_camera<const N: usize, const D: usize, const K: usize>(
     }
 }
 
+/// The perception camera that workspace names, its frame from sensor_mounts, in the robot
+/// frame `robot_frame`, and its depth stream from geometry and camera.
 async fn describe_camera(
     runner: &Arc<NodeRunner>,
     links: &CameraLinks,
+    robot_frame: &FrameName,
 ) -> std::result::Result<PerceptionCamera, CameraFault> {
     let name = describe_workspace::poll(
         runner,
@@ -707,11 +745,11 @@ async fn describe_camera(
             "the robot names no perception camera".to_string(),
         ));
     }
-    let poses = get_camera_poses::poll(runner, &links.camera_mounts, SERVICE_TIMEOUT)
+    let sensors = describe_sensors::poll(runner, &links.sensor_mounts, SERVICE_TIMEOUT)
         .await
-        .map_err(|e| CameraFault::Passing(format!("get_camera_poses: {e}")))?
+        .map_err(|e| CameraFault::Passing(format!("describe_sensors: {e}")))?
         .data;
-    let color_in_robot = placed_camera(&poses, &name)?;
+    let frame = camera_frame(&sensors, &name, robot_frame)?;
     let intrinsics = get_depth_intrinsics::poll(runner, &links.geometry, SERVICE_TIMEOUT)
         .await
         .map_err(|e| CameraFault::Passing(format!("get_depth_intrinsics: {e}")))?
@@ -753,79 +791,71 @@ async fn describe_camera(
         intrinsics.width, intrinsics.height, intrinsics.align_mode
     );
     Ok(PerceptionCamera {
-        depth: DepthCamera::new(
-            &color_in_robot,
-            &depth_in_color,
-            lens,
-            depth_model,
-            info.depth_unit,
-        ),
+        frame,
+        depth_in_color,
+        lens,
+        depth_model,
+        depth_unit: info.depth_unit,
         align_mode: intrinsics.align_mode,
     })
 }
 
-/// Where camera_mounts' `poses` place the color frame of the camera `name` in the robot
-/// frame. An answer whose lists do not give each named camera its three coordinates,
-/// four quaternion components and carrier, no camera by that name, one an arm carries,
-/// or a pose that is none, is a lasting fault.
-fn placed_camera(
-    poses: &get_camera_poses::ResponseData,
+/// The frame of the camera `name` in the robot's tree, as sensor_mounts' `sensors` names
+/// it ([`CameraFrames::of`]). An answer that places no camera of that name, or that names
+/// a robot frame other than `robot_frame`, the root link of the planner's description, is a
+/// lasting fault.
+fn camera_frame(
+    sensors: &describe_sensors::ResponseData,
     name: &str,
-) -> std::result::Result<Pose, CameraFault> {
-    let (positions, partial_position) = poses.positions.as_chunks::<3>();
-    let (orientations, partial_orientation) = poses.orientations.as_chunks::<4>();
-    let count = poses.camera_names.len();
-    if !partial_position.is_empty()
-        || !partial_orientation.is_empty()
-        || positions.len() != count
-        || orientations.len() != count
-        || poses.carried_by.len() != count
-    {
+    robot_frame: &FrameName,
+) -> std::result::Result<FrameName, CameraFault> {
+    let described = DescribedSensors {
+        robot_frame: &sensors.robot_frame,
+        sensor_names: &sensors.sensor_names,
+        sensor_kinds: &sensors.sensor_kinds,
+        sensor_frames: &sensors.sensor_frames,
+        carried_by: &sensors.carried_by,
+    };
+    let frames =
+        CameraFrames::of(&described, name).map_err(|e| CameraFault::Lasting(e.to_string()))?;
+    if frames.robot_frame != *robot_frame {
         return Err(CameraFault::Lasting(format!(
-            "camera_mounts' get_camera_poses names {count} cameras and gives {} position \
-             values, {} orientation values and {} carried_by entries: 3, 4 and 1 for each \
-             camera",
-            poses.positions.len(),
-            poses.orientations.len(),
-            poses.carried_by.len()
+            "sensor_mounts names the robot frame {:?}, and the robot's description {:?}: bind \
+             sensor_mounts to the initializer of the robot the planner plans for",
+            frames.robot_frame.as_str(),
+            robot_frame.as_str()
         )));
     }
-    let (position, orientation, carrier) = poses
-        .camera_names
-        .iter()
-        .zip(positions.iter().zip(orientations).zip(&poses.carried_by))
-        .find_map(|(named, ((position, orientation), carrier))| {
-            (named == name).then_some((*position, *orientation, carrier))
-        })
-        .ok_or_else(|| {
-            CameraFault::Lasting(format!("camera_mounts places no camera named {name:?}"))
-        })?;
-    if !carrier.is_empty() {
-        return Err(CameraFault::Lasting(format!(
-            "{name} rides on {carrier}; the planner reads a camera the body carries"
-        )));
-    }
-    Pose::new(position, orientation)
-        .map_err(|e| CameraFault::Lasting(format!("camera_mounts' pose of {name}: {e}")))
+    Ok(frames.camera_frame)
 }
 
 /// The newest depth frame that has arrived, as the intake takes it.
 type Newest = Option<Arc<depth_stream::Message>>;
 
 /// Receives the perception camera's depth frames, each in place of the one before it,
-/// and takes the newest into the map whenever the intake is free.
+/// and takes the newest into the map whenever the intake is free, each placed by the
+/// robot's tree at its stamp. The end of the ticks of the planner's simulation clock
+/// raises `fault`.
 async fn follow_depth<const N: usize, const D: usize, const K: usize>(
     runner: Arc<NodeRunner>,
     node: Arc<Node<N, D, K>>,
     links: CameraLinks,
+    fault: Fault,
 ) {
     let token = runner.cancellation_token().clone();
+    let tree = match robot_tree(&runner, &node.config, fault).await {
+        Ok(tree) => tree,
+        Err(e) => {
+            error!("the robot's tree: {e}");
+            return node.wait_on_lasting(format!("the robot's tree: {e}"));
+        }
+    };
     let mut subscription = match depth_stream::subscribe(&runner).await {
         Ok(subscription) => subscription,
         Err(e) => return error!("depth_stream subscribe: {e}"),
     };
     let (newest, frames) = watch::channel::<Newest>(None);
-    tokio::spawn(take_frames(runner.clone(), node, links, frames));
+    tokio::spawn(take_frames(runner.clone(), node, links, tree, frames));
     receiving::receive(
         "depth_stream",
         token.cancelled(),
@@ -838,14 +868,90 @@ async fn follow_depth<const N: usize, const D: usize, const K: usize>(
     .await;
 }
 
+/// The robot's tree on the planner's clock, its cache window `config`'s, filled by the
+/// followers of the transforms link. The end of a simulation clock's ticks raises
+/// `fault`.
+async fn robot_tree(
+    runner: &Arc<NodeRunner>,
+    config: &Config,
+    fault: Fault,
+) -> Result<Arc<RobotTree>> {
+    let clock = node_clock(runner, fault).await?;
+    let tree =
+        RobotTree::new(config.cache_window, clock).map_err(|e| peppygen::Error::Node(e.into()))?;
+    let tree = Arc::new(tree);
+    follow_tree(runner, tree.clone()).await?;
+    Ok(tree)
+}
+
+/// How a depth frame's wait for the robot's tree ends.
+enum Placing {
+    /// The tree places the camera's color optical frame in the robot frame at the
+    /// frame's stamp.
+    Placed(Pose),
+    /// A newer frame arrived while the frame waited, and takes its place.
+    Replaced,
+    /// The tree cannot place the camera at the frame's stamp once the wait ran out.
+    Failed(String),
+}
+
+/// Where `tree` places `camera` in the robot frame of `node` at the stamp of `frame`,
+/// waiting up to the lookup timeout on the planner's clock, as tf2's message filter holds
+/// a message until the tree covers its time; a frame newer than those `arrivals` has seen
+/// ends the wait.
+async fn place_camera<const N: usize, const D: usize, const K: usize>(
+    tree: &RobotTree,
+    node: &Node<N, D, K>,
+    camera: &PerceptionCamera,
+    frame: &depth_stream::Message,
+    arrivals: &mut watch::Receiver<Newest>,
+) -> Placing {
+    let stamp = match Stamp::from_time(frame.header.timestamp) {
+        Ok(stamp) => stamp,
+        Err(e) => return Placing::Failed(format!("its stamp: {e}")),
+    };
+    let lookup = tree.lookup_within(
+        &node.frame,
+        &camera.frame,
+        LookupTime::At(stamp),
+        node.config.lookup_timeout,
+    );
+    let found = tokio::select! {
+        biased;
+        found = lookup => found,
+        () = newer_frame(arrivals) => return Placing::Replaced,
+    };
+    let placed = found.map_err(|e| e.to_string()).and_then(|found| {
+        Pose::new(found.placement.position(), found.placement.orientation())
+            .map_err(|e| e.to_string())
+    });
+    match placed {
+        Ok(color_in_robot) => Placing::Placed(color_in_robot),
+        Err(reason) => Placing::Failed(format!(
+            "the robot's tree places no camera frame {} in {} at its stamp: {reason}",
+            camera.frame, node.frame
+        )),
+    }
+}
+
+/// Resolves once a frame arrives that `arrivals` has not seen; never once the follower of
+/// the frames has ended.
+async fn newer_frame(arrivals: &mut watch::Receiver<Newest>) {
+    if arrivals.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Takes the frames of `frames` into the map, one at a time, once the camera has
 /// described itself: of the frames that wait for the joint positions at their stamps,
-/// the newest whose joint positions are measured (`WaitingFrames`). A frame whose
-/// alignment the description does not describe asks the camera again.
+/// the newest whose joint positions are measured (`WaitingFrames`), once `tree` places
+/// the camera at its stamp (`place_camera`). A frame whose alignment the description does
+/// not describe asks the camera again.
 async fn take_frames<const N: usize, const D: usize, const K: usize>(
     runner: Arc<NodeRunner>,
     node: Arc<Node<N, D, K>>,
     links: CameraLinks,
+    tree: Arc<RobotTree>,
     frames: watch::Receiver<Newest>,
 ) {
     let token = runner.cancellation_token().clone();
@@ -878,7 +984,21 @@ async fn take_frames<const N: usize, const D: usize, const K: usize>(
             intake.camera = camera;
             continue;
         }
-        tokio::task::block_in_place(|| intake.take(&frame));
+        if intake.took_recently(frame.header.timestamp) {
+            continue;
+        }
+        let mut arrivals = waiting.frames.clone();
+        let placing = tokio::select! {
+            _ = token.cancelled() => return,
+            placing = place_camera(&tree, &node, &intake.camera, &frame, &mut arrivals) => placing,
+        };
+        match placing {
+            Placing::Placed(color_in_robot) => {
+                tokio::task::block_in_place(|| intake.take(&frame, &color_in_robot));
+            }
+            Placing::Replaced => {}
+            Placing::Failed(reason) => intake.skip(reason),
+        }
     }
 }
 
@@ -1054,13 +1174,23 @@ impl<const N: usize, const D: usize, const K: usize> Intake<N, D, K> {
         }
     }
 
-    /// Takes `frame` into the map, with the robot cut out where it stood at the frame's
-    /// stamp, its grippers at their openings then and the objects attached to its grasp
-    /// links held there, and the planning scene's other objects where they stand, unless
-    /// it comes within a frame interval after the last one taken, or the camera took it at
-    /// or before the newest joint positions measured when the map was last cleared,
-    /// whenever it arrives. A frame of another encoding than `DEPTH_ENCODING` is skipped.
-    fn take(&mut self, frame: &depth_stream::Message) {
+    /// Whether a frame stamped `at` comes within a frame interval after the last one the
+    /// map took in.
+    fn took_recently(&self, at: SystemTime) -> bool {
+        self.taken.is_some_and(|t| {
+            at.duration_since(t)
+                .is_ok_and(|d| d < self.node.config.frame_interval)
+        })
+    }
+
+    /// Takes `frame`, its camera's color optical frame at `color_in_robot` in the robot
+    /// frame, into the map, with the robot cut out where it stood at the frame's stamp,
+    /// its grippers at their openings then and the objects attached to its grasp links held
+    /// there, and the planning scene's other objects where they stand, unless the camera
+    /// took it at or before the newest joint positions measured when the map was last
+    /// cleared, whenever it arrives. A frame of another encoding than `DEPTH_ENCODING` is
+    /// skipped. The caller leaves out a frame the intake `took_recently`.
+    fn take(&mut self, frame: &depth_stream::Message, color_in_robot: &Pose) {
         let node = &self.node;
         if frame.encoding != DEPTH_ENCODING {
             return self.skip(format!(
@@ -1069,17 +1199,11 @@ impl<const N: usize, const D: usize, const K: usize> Intake<N, D, K> {
             ));
         }
         let at = frame.header.timestamp;
-        let recent = self.taken.is_some_and(|t| {
-            at.duration_since(t)
-                .is_ok_and(|d| d < node.config.frame_interval)
-        });
-        if recent {
-            return;
-        }
         let Some(measured) = node.history.borrow().at(at) else {
             return self.skip("no joint positions were measured at its stamp");
         };
-        let points = match self.camera.depth.points(&frame.frame) {
+        let depth = self.camera.depth_at(color_in_robot);
+        let points = match depth.points(&frame.frame) {
             Ok(points) => points,
             Err(e) => return self.skip(e.to_string()),
         };
@@ -1106,7 +1230,7 @@ impl<const N: usize, const D: usize, const K: usize> Intake<N, D, K> {
             &mut map.voxels,
             &Scan {
                 frame: &node.frame,
-                sensor: self.camera.depth.sensor,
+                sensor: depth.sensor,
                 points: &points,
                 max_range_m: node.config.max_range_m,
             },
@@ -2402,8 +2526,10 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use crate::request::{Named, Planner, Refiner};
+    use camera_core::sensor_mounts::SensorMountsError;
     use chain_kinematics::nalgebra::{Point3, UnitQuaternion, Vector3};
     use collision_geometry::chain::{Padding, RiderBody};
+    use control_core::node_clock::NodeClock;
     use motion_planning_core::OCCUPANCY_MAP;
     use occupancy_map::Voxel;
     use peppygen::exposed_actions::motion_planning::plan_joint_path::{
@@ -2914,56 +3040,49 @@ mod tests {
         ));
     }
 
-    // camera_mounts' answer places the camera it names at its pose. An answer whose lists
-    // do not give each camera its 3 positions, 4 orientations and 1 carrier, a camera it
-    // does not place, and one an arm carries, are lasting faults, each named.
+    // sensor_mounts' answer names the frame of the camera it lists, on an arm or fixed to
+    // the body. An answer that places no camera of the name, as camera_core's CameraFrames
+    // reads it, or that names another robot frame than the description's, is a lasting
+    // fault, each named.
     #[test]
-    fn the_camera_mounts_answer_places_the_camera_or_names_a_lasting_fault() {
-        let poses = get_camera_poses::ResponseData {
-            timestamp: SystemTime::UNIX_EPOCH,
-            camera_names: vec!["wrist".to_string(), "chest".to_string()],
-            positions: vec![0.0, 0.0, 0.0, 0.1, 0.2, 0.3],
-            orientations: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0],
-            carried_by: vec!["openarm_left_link7".to_string(), String::new()],
+    fn the_sensor_mounts_answer_names_the_cameras_frame_or_a_lasting_fault() {
+        let world = FrameName::parse("world").expect("a frame name");
+        let sensors = describe_sensors::ResponseData {
+            robot_frame: "world".to_string(),
+            sensor_names: vec!["wrist".into(), "chest".into()],
+            sensor_kinds: vec!["rgb_camera".into(), "rgbd_camera".into()],
+            sensor_frames: vec!["wrist_optical_frame".into(), "chest_optical_frame".into()],
+            carried_by: vec!["left_arm".into(), String::new()],
         };
-        let chest = placed_camera(&poses, "chest").expect("the chest camera's pose");
-        let expected = Pose::new([0.1, 0.2, 0.3], [0.0, 0.0, 1.0, 0.0]).expect("a pose");
-        assert_eq!(format!("{chest:?}"), format!("{expected:?}"));
-        let ragged = get_camera_poses::ResponseData {
-            positions: vec![0.0; 7],
-            ..poses.clone()
-        };
-        assert_eq!(
-            placed_camera(&ragged, "chest").err(),
-            Some(CameraFault::Lasting(
-                "camera_mounts' get_camera_poses names 2 cameras and gives 7 position values, 8 \
-                 orientation values and 2 carried_by entries: 3, 4 and 1 for each camera"
-                    .to_string()
-            ))
-        );
-        let few_carriers = get_camera_poses::ResponseData {
-            carried_by: vec![String::new()],
-            ..poses.clone()
+        for (name, frame) in [
+            ("chest", "chest_optical_frame"),
+            ("wrist", "wrist_optical_frame"),
+        ] {
+            assert_eq!(
+                camera_frame(&sensors, name, &world),
+                Ok(FrameName::parse(frame).expect("a frame name"))
+            );
+        }
+        let other_robot = describe_sensors::ResponseData {
+            robot_frame: "base_link".to_string(),
+            ..sensors.clone()
         };
         assert_eq!(
-            placed_camera(&few_carriers, "chest").err(),
-            Some(CameraFault::Lasting(
-                "camera_mounts' get_camera_poses names 2 cameras and gives 6 position values, 8 \
-                 orientation values and 1 carried_by entries: 3, 4 and 1 for each camera"
+            camera_frame(&other_robot, "chest", &world),
+            Err(CameraFault::Lasting(
+                "sensor_mounts names the robot frame \"base_link\", and the robot's \
+                 description \"world\": bind sensor_mounts to the initializer of the robot \
+                 the planner plans for"
                     .to_string()
             ))
         );
         assert_eq!(
-            placed_camera(&poses, "head").err(),
-            Some(CameraFault::Lasting(
-                "camera_mounts places no camera named \"head\"".to_string()
-            ))
-        );
-        assert_eq!(
-            placed_camera(&poses, "wrist").err(),
-            Some(CameraFault::Lasting(
-                "wrist rides on openarm_left_link7; the planner reads a camera the body carries"
-                    .to_string()
+            camera_frame(&sensors, "head", &world),
+            Err(CameraFault::Lasting(
+                SensorMountsError::NoSuchSensor {
+                    name: "head".to_string()
+                }
+                .to_string()
             ))
         );
     }
@@ -3022,19 +3141,13 @@ mod tests {
         }
     }
 
-    /// The intake of `node` from a camera of one pixel at the robot frame's origin.
-    fn intake(node: Arc<Node>) -> Intake<ARM_DOF, DUAL_DOF, ARMS> {
-        intake_at(node, &identity())
-    }
-
     /// The pose that moves nothing.
     fn identity() -> Pose {
         Pose::new([0.0; 3], [0.0, 0.0, 0.0, 1.0]).expect("the identity is a pose")
     }
 
-    /// The intake of `node` from a camera of one pixel at `pose`, which sees along its
-    /// optical axis.
-    fn intake_at(node: Arc<Node>, pose: &Pose) -> Intake<ARM_DOF, DUAL_DOF, ARMS> {
+    /// The intake of `node` from a camera of one pixel, which sees along its optical axis.
+    fn intake(node: Arc<Node>) -> Intake<ARM_DOF, DUAL_DOF, ARMS> {
         let lens = Pinhole::parse(&Intrinsics {
             width: 1,
             height: 1,
@@ -3049,7 +3162,11 @@ mod tests {
         Intake::new(
             node,
             PerceptionCamera {
-                depth: DepthCamera::new(pose, &identity(), lens, DepthModel::Z, 0.001),
+                frame: FrameName::parse("chest_optical_frame").expect("a frame name"),
+                depth_in_color: identity(),
+                lens,
+                depth_model: DepthModel::Z,
+                depth_unit: 0.001,
                 align_mode: "depth_to_color".to_string(),
             },
         )
@@ -3079,29 +3196,102 @@ mod tests {
         }
     }
 
+    // A frame whose camera the tree cannot place yet waits for it: a newer frame that
+    // arrives meanwhile takes its place, the camera's transform of the frame's stamp places
+    // it, and with no wait left the tree's failure names the camera's frame.
+    #[tokio::test]
+    async fn a_frame_waits_for_the_tree_until_a_newer_frame_replaces_it_or_the_camera_is_placed() {
+        let waiting_long = Parameters {
+            lookup_timeout_s: 60.0,
+            ..parameters()
+        };
+        let node = started(&waiting_long, true);
+        let camera = intake(Arc::new(started(&parameters(), true))).camera;
+        let tree = RobotTree::new(node.config.cache_window, NodeClock::wall()).expect("a window");
+        let publisher = frame_tree::Publisher {
+            core_node: "core".into(),
+            instance_id: "init_inst".into(),
+        };
+        let camera_at = |seconds: u64| frame_tree::MovingMessage {
+            timestamp: after(seconds * 1_000),
+            child_frames: vec!["chest_optical_frame".into()],
+            parent_frames: vec!["world".into()],
+            positions: vec![0.5, 0.0, 1.0],
+            orientations: vec![0.0, 0.0, 0.0, 1.0],
+            start_timestamp: after(1),
+        };
+        tree.take_moving(&publisher, &camera_at(1)).expect("taken");
+        let (newest, mut arrivals) = watch::channel::<Newest>(None);
+        let frame = frame_at(after(2_000));
+
+        let replaced = tokio::spawn({
+            let newest = newest.clone();
+            async move { newest.send_replace(Some(Arc::new(frame_at(after(3_000))))) }
+        });
+        let placing = place_camera(&tree, &node, &camera, &frame, &mut arrivals).await;
+        replaced.await.expect("the newer frame is sent");
+        assert!(matches!(placing, Placing::Replaced));
+
+        let placed = tokio::join!(
+            place_camera(&tree, &node, &camera, &frame, &mut arrivals),
+            async { tree.take_moving(&publisher, &camera_at(2)).expect("taken") },
+        )
+        .0;
+        let Placing::Placed(pose) = placed else {
+            panic!("the camera's transform of 2 s places the frame");
+        };
+        assert_eq!(pose.origin(), [0.5, 0.0, 1.0]);
+        assert_eq!(pose.orientation(), [0.0, 0.0, 0.0, 1.0]);
+
+        let at_once = started(
+            &Parameters {
+                lookup_timeout_s: 0.0,
+                ..parameters()
+            },
+            true,
+        );
+        let Placing::Failed(reason) = place_camera(
+            &tree,
+            &at_once,
+            &camera,
+            &frame_at(after(9_000)),
+            &mut arrivals,
+        )
+        .await
+        else {
+            panic!("the tree holds the camera at 1 s and 2 s alone");
+        };
+        assert!(
+            reason.starts_with(
+                "the robot's tree places no camera frame chest_optical_frame in world at its stamp: "
+            ),
+            "{reason}"
+        );
+    }
+
     /// The stamp of the newest frame the map of `node` holds.
     fn map_stamp(node: &Node) -> Option<SystemTime> {
         lock(&node.map).stamp
     }
 
-    // The map takes in a frame, skips the one half a frame interval after it, and takes
-    // the one a whole frame interval after it.
+    // Once the map takes in a frame, the frame half a frame interval after it came
+    // recently and the one a whole frame interval after it did not; before any frame, none
+    // did.
     #[test]
-    fn the_map_takes_at_most_one_frame_a_frame_interval() {
+    fn a_frame_within_a_frame_interval_of_the_last_one_taken_came_recently() {
         let node = measured_node(0, 2_000);
         let interval = node.config.frame_interval;
         let first = after(1_000);
         let mut intake = intake(node.clone());
-        intake.take(&frame_at(first));
+        assert!(!intake.took_recently(first), "no frame taken yet");
+        intake.take(&frame_at(first), &identity());
         assert_eq!(map_stamp(&node), Some(first));
-        intake.take(&frame_at(first + interval / 2));
-        assert_eq!(
-            map_stamp(&node),
-            Some(first),
-            "the frame half an interval on"
+        assert!(intake.took_recently(first + interval / 2));
+        assert!(!intake.took_recently(first + interval));
+        assert!(
+            !intake.took_recently(first - interval / 2),
+            "a frame stamped before the last one"
         );
-        intake.take(&frame_at(first + interval));
-        assert_eq!(map_stamp(&node), Some(first + interval));
     }
 
     /// The waiting frames of `node`'s depth frames, which the sender gives, and of its
@@ -3217,7 +3407,7 @@ mod tests {
         measure_at(&node, after(1_100), still());
         clear(&node);
         assert_eq!(given(&mut waiting), Some(after(1_050)));
-        intake.take(&frame_at(after(1_050)));
+        intake.take(&frame_at(after(1_050)), &identity());
         assert_eq!(map_stamp(&node), None, "the frame taken before the clear");
         assert_eq!(snapshot(&node), waiting_on(AWAITING_FRAME.to_string()));
 
@@ -3237,7 +3427,7 @@ mod tests {
     fn a_clock_that_steps_back_clears_the_map() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        intake.take(&frame_at(after(1_000)));
+        intake.take(&frame_at(after(1_000)), &identity());
         assert_eq!(map_stamp(&node), Some(after(1_000)));
         let (newest, mut waiting) = waiting_frames(&node);
         send_frame(&newest, 2_050);
@@ -3258,9 +3448,9 @@ mod tests {
         );
         measure(&node, 600, 2_100);
         assert_eq!(given(&mut waiting), None, "the frame of the clock before");
-        intake.take(&frame_at(after(500)));
+        intake.take(&frame_at(after(500)), &identity());
         assert_eq!(map_stamp(&node), None, "the frame at the restart");
-        intake.take(&frame_at(after(700)));
+        intake.take(&frame_at(after(700)), &identity());
         assert_eq!(map_stamp(&node), Some(after(700)));
     }
 
@@ -3403,7 +3593,7 @@ mod tests {
         measure_at(&node, after(1_000), opened(0.0));
         measure_at(&node, after(1_100), opened(1.0));
         let mut intake = intake(node.clone());
-        intake.take(&frame_at(after(1_050)));
+        intake.take(&frame_at(after(1_050)), &identity());
         assert_eq!(map_stamp(&node), Some(after(1_050)));
         let mut halfway = node.own.clone();
         halfway.set_openings(&PerArm::new([0.5, 0.5]));
@@ -3424,18 +3614,18 @@ mod tests {
     fn a_frame_taken_before_a_clear_marks_nothing() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        intake.take(&frame_at(after(1_000)));
+        intake.take(&frame_at(after(1_000)), &identity());
         assert_eq!(map_stamp(&node), Some(after(1_000)));
         clear(&node);
         assert_eq!(map_stamp(&node), None);
-        intake.take(&frame_at(after(1_500)));
+        intake.take(&frame_at(after(1_500)), &identity());
         assert_eq!(map_stamp(&node), None, "the frame of 1.5 s");
         assert_eq!(
             lock(&node.map).waiting,
             Waiting::Passing(AWAITING_FRAME.to_string())
         );
         measure(&node, 2_100, 2_500);
-        intake.take(&frame_at(after(2_400)));
+        intake.take(&frame_at(after(2_400)), &identity());
         assert_eq!(map_stamp(&node), Some(after(2_400)));
     }
 
@@ -3452,12 +3642,12 @@ mod tests {
         };
         let mut intake = intake(node.clone());
         node.wait_on("a depth frame was skipped: no joint positions were measured at its stamp");
-        intake.take(&frame_at(after(1_000)));
+        intake.take(&frame_at(after(1_000)), &identity());
         clear(&node);
         assert_eq!(snapshot(&node), waiting(AWAITING_FRAME));
 
         measure(&node, 2_100, 2_500);
-        intake.take(&frame_at(after(2_400)));
+        intake.take(&frame_at(after(2_400)), &identity());
         assert_eq!(map_stamp(&node), Some(after(2_400)));
         let lasting = "the perception camera: the robot names no perception camera";
         node.wait_on_lasting(lasting);
@@ -3472,10 +3662,13 @@ mod tests {
     fn a_frame_of_another_encoding_is_skipped() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        intake.take(&depth_stream::Message {
-            encoding: "rgb8".to_string(),
-            ..frame_at(after(1_000))
-        });
+        intake.take(
+            &depth_stream::Message {
+                encoding: "rgb8".to_string(),
+                ..frame_at(after(1_000))
+            },
+            &identity(),
+        );
         assert_eq!(map_stamp(&node), None);
         assert_eq!(
             snapshot(&node),
@@ -3548,8 +3741,8 @@ mod tests {
             .expect("a turn from +z to -x");
         let camera = Pose::new(eye.coords.into(), [facing.i, facing.j, facing.k, facing.w])
             .expect("the camera's pose");
-        let mut intake = intake_at(node.clone(), &camera);
-        intake.take(&frame_seeing(after(1_050), 300));
+        let mut intake = intake(node.clone());
+        intake.take(&frame_seeing(after(1_050), 300), &camera);
         assert_eq!(map_stamp(&node), Some(after(1_050)));
         assert_eq!(lock(&node.map).voxels.occupied().count(), 0);
     }
@@ -3720,10 +3913,10 @@ mod tests {
     #[test]
     fn a_frame_marks_nothing_inside_an_object_where_it_stood_at_the_stamp() {
         let node = Arc::new(started(&parameters(), true));
-        let mut intake = intake_at(node.clone(), &above(BESIDE));
+        let mut intake = intake(node.clone());
         let three_frames = |intake: &mut Intake<ARM_DOF, DUAL_DOF, ARMS>, from_ms: u64| {
             for ms in [from_ms, from_ms + 200, from_ms + 400] {
-                intake.take(&frame_seeing(after(ms), 300));
+                intake.take(&frame_seeing(after(ms), 300), &above(BESIDE));
                 assert_eq!(map_stamp(&node), Some(after(ms)));
             }
         };

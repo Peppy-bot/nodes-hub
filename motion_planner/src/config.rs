@@ -7,6 +7,7 @@ use std::time::Duration;
 use collision_geometry::GeometryError;
 use collision_geometry::chain::Padding;
 use control_core::positive_finite::PositiveFinite;
+use control_core::time::{DurationError, duration_from_secs, wait_from_secs};
 use occupancy_map::Bounds;
 use peppygen::Parameters;
 
@@ -27,6 +28,11 @@ pub struct Config {
     pub frame_interval: Duration,
     /// The time between two messages of occupancy_map.
     pub map_interval: Duration,
+    /// How long the robot's tree keeps each moving transform's stamps, counted back from
+    /// the newest stamp of its child frame.
+    pub cache_window: Duration,
+    /// How long a depth frame waits for the robot's tree to place the camera at its stamp.
+    pub lookup_timeout: Duration,
     pub goal_samples: NonZeroUsize,
     pub max_iterations: NonZeroU64,
     pub planning_attempts: NonZeroU32,
@@ -43,6 +49,12 @@ pub enum ConfigError {
     },
     #[error("padding_scale and padding_offset_m: {0}")]
     Padding(GeometryError),
+    /// A duration parameter refused by control_core's parse of seconds.
+    #[error("{name} {error}")]
+    Duration {
+        name: &'static str,
+        error: DurationError,
+    },
 }
 
 fn refuse<T>(
@@ -86,6 +98,15 @@ fn interval(name: &'static str, rate_hz: f64) -> Result<Duration, ConfigError> {
     })
 }
 
+/// A parse of seconds into a duration, refused naming the parameter `name`.
+fn seconds_of(
+    name: &'static str,
+    seconds: f64,
+    parse: fn(f64) -> Result<Duration, DurationError>,
+) -> Result<Duration, ConfigError> {
+    parse(seconds).map_err(|error| ConfigError::Duration { name, error })
+}
+
 /// The map's box from its lowest and its highest corner: each coordinate finite, and
 /// each of the lowest below the highest's.
 fn map_bounds(min: [f64; 3], max: [f64; 3]) -> Result<Bounds, ConfigError> {
@@ -126,6 +147,12 @@ impl Config {
             max_range_m: positive("max_range_m", params.max_range_m)?,
             frame_interval,
             map_interval,
+            cache_window: seconds_of("cache_window_s", params.cache_window_s, duration_from_secs)?,
+            lookup_timeout: seconds_of(
+                "lookup_timeout_s",
+                params.lookup_timeout_s,
+                wait_from_secs,
+            )?,
             goal_samples: at_least_one(
                 "goal_samples",
                 NonZeroUsize::new(params.goal_samples as usize),
@@ -166,6 +193,45 @@ pub(crate) mod tests {
         assert_eq!(config.map_interval, Duration::from_secs(1));
         assert_eq!(config.planning_attempts.get(), 1);
         assert_eq!(config.start_tolerance.get(), 0.05);
+        assert_eq!(config.cache_window, Duration::from_secs(10));
+        assert_eq!(config.lookup_timeout, Duration::from_millis(100));
+    }
+
+    // The cache window is above 0, and a depth frame's wait for the robot's tree 0 or
+    // above, 0 waiting for nothing and a wait longer than the clock holds the longest one;
+    // each refusal names the parameter in control_core's words.
+    #[test]
+    fn the_cache_window_is_above_0_and_the_lookup_timeout_0_or_above() {
+        for window in [0.0, -1.0, f64::NAN, f64::INFINITY, 1e-12] {
+            let refused_window = refused(Parameters {
+                cache_window_s: window,
+                ..parameters()
+            });
+            let error = duration_from_secs(window).expect_err("a window refused");
+            assert_eq!(refused_window, format!("cache_window_s {error}"));
+        }
+        for timeout in [-0.1, f64::NAN, f64::INFINITY] {
+            let refused_timeout = refused(Parameters {
+                lookup_timeout_s: timeout,
+                ..parameters()
+            });
+            assert_eq!(
+                refused_timeout,
+                format!(
+                    "lookup_timeout_s must be a finite number of seconds, 0 or more, got {timeout}"
+                )
+            );
+        }
+        let wait = |lookup_timeout_s| {
+            Config::parse(&Parameters {
+                lookup_timeout_s,
+                ..parameters()
+            })
+            .expect("a lookup timeout taken")
+            .lookup_timeout
+        };
+        assert_eq!(wait(0.0), Duration::ZERO);
+        assert_eq!(wait(f64::MAX), Duration::MAX);
     }
 
     // Each parameter outside its range stops the node with a message that names it and

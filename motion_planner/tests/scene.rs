@@ -28,13 +28,14 @@ use peppygen::fixtures::exposed_services::motion_planning::{
     apply_attached_collision_object, apply_collision_objects, check_joint_path, get_planning_scene,
     set_allowed_collision,
 };
-use peppygen::fixtures::harness::{Config, Harness, Mocks};
+use peppygen::fixtures::harness::{Harness, Mocks};
 
 use common::{
     ARM_DOF, CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT, OPENARM_V2, OWN_BODY_WAY_OUT, RIGHT, Solid,
     TIMEOUT, arms, at_ms, check, left_path, looking_at, over_the_table, parameters, plan, plan_to,
     planned_waypoints, publish_arms, render, right_ready, start, start_with_camera,
-    start_without_camera, table_across, take_frame, under_the_table, wait_for_the_arms,
+    start_without_camera, table_across, take_frame, under_the_table, vacant_camera_rig,
+    wait_for_the_arms,
 };
 
 /// The left arm's grasp link.
@@ -1029,15 +1030,7 @@ async fn served(harness: &Harness) {
 // itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_refusal_comes_with_its_kind_and_changes_nothing() -> peppygen::Result<()> {
-    let config = Config {
-        parameters: Some(parameters()),
-        camera_vacant: true,
-        geometry_vacant: true,
-        camera_mounts_vacant: true,
-        workspace_vacant: true,
-        ..Config::default()
-    };
-    let (harness, mocks) = start(config).await?;
+    let (harness, mocks) = start(vacant_camera_rig()).await?;
     served(&harness).await;
     let here = Isometry3::translation(0.6, 0.0, 0.4);
     let block = || vec![primitive("box", &[0.05; 3], &Isometry3::identity())];

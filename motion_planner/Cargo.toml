@@ -15,6 +15,7 @@ camera_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package 
 chain_kinematics = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "chain_kinematics" }
 collision_geometry = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "collision_geometry" }
 control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+frame_tree = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "frame_tree" }
 motion_planning_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "motion_planning_core" }
 occupancy_map = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "occupancy_map" }
 ompl_bridge = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "ompl_bridge" }

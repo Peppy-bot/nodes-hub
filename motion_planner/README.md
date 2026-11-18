@@ -13,7 +13,9 @@ limb_motion's `execute_joint_path`, passing every arm of the answer and each arm
 
 ```text
  backbone: limb_states ---------> joint history ---+--> cut-out of the robot
- backbone: camera_mounts, workspace  (2 s)         |    and of the objects
+ backbone: workspace                  (2 s)        |    and of the objects
+ initializer: sensor_mounts; tree: transforms      |
+   --> camera pose at each frame's stamp           |
  camera:   depth_stream, geometry --> depth points +--> voxel map (robot frame)
  apply_collision_objects, apply_attached_collision_object,  |
  set_allowed_collision --> planning scene ------------------+
@@ -90,11 +92,23 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
 
 ## The map
 
-- `workspace.describe_workspace` names the perception camera, and the node reads that
-  camera's pose from `camera_mounts.get_camera_poses`: the camera's depth optical frame
-  stands where that pose puts its color frame, moved by the camera's own
-  `get_depth_to_color_extrinsics`. The depth frames, the lens and the depth model come
-  from the camera the launcher binds to the `camera` and `geometry` slots.
+- `workspace.describe_workspace` names the perception camera, and
+  `sensor_mounts.describe_sensors` names its color optical frame in the robot's tree and
+  the robot frame, which is the root link of the robot's description. The node holds the
+  robot's tree from the `transforms` and `static_transforms` of every publisher bound to
+  its `transforms` slot, each moving transform's stamps within `cache_window_s`, and
+  places the camera at the stamp of each depth frame by a lookup in it: the camera's
+  depth optical frame stands where the lookup puts its color frame, moved by the
+  camera's own `get_depth_to_color_extrinsics`. A camera on the body and one an arm
+  carries are placed alike. The depth frames, the lens and the depth model come from the
+  camera the launcher binds to the `camera` and `geometry` slots.
+- A frame waits up to `lookup_timeout_s` on the planner's clock, the simulation clock in
+  a simulation, for the tree to place the camera at its stamp, as tf2's message filter
+  holds a message; a newer frame that arrives while it waits takes its place, and a frame
+  whose wait runs out is skipped, the refusal of a plan or a check naming the lookup's
+  failure. A clock that goes back drops the stamps of every moving transform of the
+  tree. The end of the ticks of the planner's simulation clock ends the node with an
+  error for its restart policy.
 - A depth frame clears the space along each ray up to its point and marks the voxel
   at the point occupied, as MoveIt's occupancy map does. A point past `max_range_m`
   clears its ray up to that range and marks nothing.
@@ -145,18 +159,18 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   fill it again: a frame
   the camera took at or before the newest joint positions measured at the clear marks
   nothing, however late it arrives.
-- The four camera slots bind as one: with `camera` and `geometry` bound, the map reads
-  the camera, and `camera_mounts` and `workspace` are bound too. With `camera` and
-  `geometry` vacant the map stays empty, whether `camera_mounts` and `workspace` are
-  bound or not, as on a robot without a camera rig: plans and checks keep the clearance
-  from the objects and the robot's own body, and answer no `map_stamp`. Any other
-  binding leaves the map waiting on a camera it cannot read, and every plan and check is
-  refused, the message naming the slots to bind or leave vacant.
+- The camera slots bind as one: with `camera` and `geometry` bound, the map reads the
+  camera, and `workspace`, `sensor_mounts` and `transforms` are bound too. With `camera`
+  and `geometry` vacant the map stays empty, whether the others are bound or not, as on
+  a robot without a camera rig: plans and checks keep the clearance from the objects and
+  the robot's own body, and answer no `map_stamp`. Any other binding leaves the map
+  waiting on a camera it cannot read, and every plan and check is refused, the message
+  naming the slots to bind or leave vacant.
 - While the map holds no frame, a refused plan or check names what the map waits on:
-  the camera's description and the call that failed or the answer that gives no lens,
-  depth model or pose, a frame skipped and why, or a fault in the robot's description,
-  which ends the asking: no perception camera named, none placed by that name, one
-  placed at no pose, or one an arm carries.
+  the camera's description and the call that failed or the answer that gives no lens
+  or depth model, a frame skipped and why, or a fault in the robot's description, which
+  ends the asking: no perception camera named, no sensor of sensor_mounts by that name,
+  one that is no camera, or a robot frame other than the description's root link.
 - `occupancy_map` publishes the map `occupancy_map_rate_hz` times a second, whether or
   not it changed: the center of each occupied voxel in the robot frame, the side of the
   voxels, and, while the map holds no frame of a camera it reads, what it waits on, each
@@ -536,9 +550,11 @@ See `peppy.json5` for the commented list. Every parameter but `occupancy_map_rat
 `d_safe_m`, so the backbone's guard does not slow the arm on a planned path. A
 parameter outside its range stops the node with a message that names it.
 
-The node reads `identity` (`robot_identity:v1`) from the robot's initializer,
-`limb_state`, `camera_mounts` and `workspace` from the backbone, and `camera`
-(`rgbd_camera:v1`) and `geometry` (`camera_geometry:v1`) from the perception camera. The four camera slots are optional, and bind as the plan section says.
+The node reads `identity` (`robot_identity:v1`) and `sensor_mounts` from the robot's
+initializer, `limb_state` and `workspace` from the backbone, `transforms` from every
+publisher of the robot's tree (the initializer and the backbone), and `camera`
+(`rgbd_camera:v1`) and `geometry` (`camera_geometry:v1`) from the perception camera. The
+camera slots are optional, and bind as the map section says.
 
 ## Build, run, test
 

@@ -34,7 +34,9 @@ use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
 use peppygen::fixtures::exposed_services::motion_planning::check_joint_path;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::identity::get_description;
-use peppygen::mock::deps::{camera, camera_mounts, geometry, identity, limb_state, workspace};
+use peppygen::mock::deps::{
+    camera, geometry, identity, limb_state, sensor_mounts, transforms, workspace,
+};
 use robot_description::{ArmId, PerArm};
 
 /// Bounds every wait on the node, past the longest a plan takes. Generous: the
@@ -112,7 +114,7 @@ pub fn posture_of(id: &str, arm: ArmId, name: &str) -> [f64; ARM_DOF] {
     let group = &description.arms()[arm.place()].name;
     description
         .state(group, name)
-        .unwrap_or_else(|| panic!("{group} has the posture {name}"))
+        .unwrap_or_else(|e| panic!("{group} has the posture {name}: {e}"))
         .try_into()
         .expect("a posture of a seven-joint arm")
 }
@@ -320,9 +322,7 @@ pub async fn start_without_camera_with(
     start_vacant(
         Config {
             parameters: Some(params),
-            camera_mounts_vacant: true,
-            workspace_vacant: true,
-            ..vacant_camera()
+            ..vacant_camera_rig()
         },
         arms,
     )
@@ -330,20 +330,42 @@ pub async fn start_without_camera_with(
 }
 
 /// `start_without_camera` with only the camera and geometry slots vacant, as on a robot
-/// without a camera rig whose backbone answers camera_mounts and workspace.
+/// without a camera rig whose initializer answers sensor_mounts and workspace and
+/// publishes the robot's tree.
 pub async fn start_without_the_rig(
     arms: &ArmJoints<ARM_DOF, ARMS>,
 ) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(vacant_camera(), arms).await
 }
 
-/// The harness's configuration with the camera and geometry slots vacant.
+/// The harness's configuration with the camera and geometry slots vacant, and workspace,
+/// sensor_mounts and transforms bound.
 pub fn vacant_camera() -> Config {
     Config {
-        parameters: Some(parameters()),
         camera_vacant: true,
         geometry_vacant: true,
+        ..camera_rig(parameters())
+    }
+}
+
+/// The harness's configuration with the node's parameters `params` and every slot of the
+/// perception camera bound, its transforms slot to one publisher of the robot's tree.
+pub fn camera_rig(params: Parameters) -> Config {
+    Config {
+        parameters: Some(params),
+        transforms_instances: 1,
         ..Config::default()
+    }
+}
+
+/// The harness's configuration with every slot of the perception camera vacant: camera,
+/// geometry, workspace, sensor_mounts and transforms.
+pub fn vacant_camera_rig() -> Config {
+    Config {
+        workspace_vacant: true,
+        sensor_mounts_vacant: true,
+        transforms_instances: 0,
+        ..vacant_camera()
     }
 }
 
@@ -455,19 +477,35 @@ pub async fn wait_for_the_arms(
     panic!("the arms' joint positions never arrived");
 }
 
+/// The refusal of a check of the left arm standing still, once its message holds `text`.
+pub async fn refused_naming(harness: &Harness, text: &str) -> check_joint_path::Failure {
+    let still = left_path(&[], &[left_ready()]);
+    for _ in 0..TIMEOUT.as_secs() {
+        match check(harness, &still).await {
+            Err(failure) if failure.message.contains(text) => return failure,
+            Err(failure) => assert_eq!(
+                failure.kind,
+                check_joint_path::FailureKind::PreconditionFailed,
+                "{failure}"
+            ),
+            Ok(answer) => panic!("the map takes no frame: {answer:?}"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("no refusal names {text:?}");
+}
+
 /// The alignment the camera's frames and geometry carry unless a test names another.
 pub const ALIGNED: &str = "depth_to_color";
 
 /// The node over the harness, with the perception camera at `camera` linked: the
-/// camera's description, its frames `ALIGNED`, is scripted, and the node subscribes to
-/// its depth frames.
+/// camera's description, its frames `ALIGNED`, is scripted, the robot's tree holds the
+/// camera's frame fixed at `camera` in the robot frame, and the node subscribes to its
+/// depth frames.
 pub async fn start_with_camera(camera: &Isometry3<f64>) -> peppygen::Result<(Harness, Mocks)> {
-    let config = Config {
-        parameters: Some(parameters()),
-        ..Config::default()
-    };
-    let (harness, mocks) = start(config).await?;
-    describe_camera(&mocks, camera, ALIGNED)?;
+    let (harness, mocks) = start(camera_rig(parameters())).await?;
+    describe_camera(&mocks, ALIGNED)?;
+    fix_the_camera(&mocks, camera).await?;
     let stream = mocks
         .deps
         .camera
@@ -489,13 +527,15 @@ pub async fn start_with_camera(camera: &Isometry3<f64>) -> peppygen::Result<(Har
     Ok((harness, mocks))
 }
 
-/// Scripts one description of the perception camera at `camera`, its geometry
-/// describing `align_mode`: the answer to each call the node makes once to describe it.
-pub fn describe_camera(
-    mocks: &Mocks,
-    camera: &Isometry3<f64>,
-    align_mode: &str,
-) -> peppygen::Result<()> {
+/// The robot frame of OpenArm v2: the root link of its URDF.
+pub const ROBOT_FRAME: &str = "world";
+
+/// The perception camera's color optical frame in OpenArm v2's tree.
+pub const CAMERA_FRAME: &str = "chest_optical_frame";
+
+/// Scripts one description of the perception camera, its geometry describing
+/// `align_mode`: the answer to each call the node makes once to describe it.
+pub fn describe_camera(mocks: &Mocks, align_mode: &str) -> peppygen::Result<()> {
     let workspace = mocks
         .deps
         .workspace
@@ -511,19 +551,17 @@ pub fn describe_camera(
             reach: None,
             view: None,
         })?;
-    let rotation = camera.rotation;
-    let mounts = mocks
+    mocks
         .deps
-        .camera_mounts
+        .sensor_mounts
         .as_ref()
-        .expect("the camera_mounts slot is linked");
-    mounts
-        .get_camera_poses
-        .enqueue_response(camera_mounts::get_camera_poses::ResponseData {
-            timestamp: SystemTime::UNIX_EPOCH,
-            camera_names: vec![CAMERA.to_string()],
-            positions: camera.translation.vector.iter().copied().collect(),
-            orientations: vec![rotation.i, rotation.j, rotation.k, rotation.w],
+        .expect("the sensor_mounts slot is linked")
+        .describe_sensors
+        .enqueue_response(sensor_mounts::describe_sensors::ResponseData {
+            robot_frame: ROBOT_FRAME.to_string(),
+            sensor_names: vec![CAMERA.to_string()],
+            sensor_kinds: vec!["rgbd_camera".to_string()],
+            sensor_frames: vec![CAMERA_FRAME.to_string()],
             carried_by: vec![String::new()],
         })?;
     let lens = mocks
@@ -566,6 +604,59 @@ pub fn describe_camera(
             encoding: "z16".to_string(),
             depth_unit: DEPTH_UNIT,
         })
+}
+
+/// The publisher of the robot's tree that the harness binds first.
+pub fn tree_publisher(mocks: &Mocks) -> &transforms::Mock {
+    mocks
+        .deps
+        .transforms
+        .first()
+        .expect("the transforms slot is bound")
+}
+
+/// The positions and orientations of a message of the tree that places a frame at `pose`.
+fn placement_arrays(pose: &Isometry3<f64>) -> (Vec<f64>, Vec<f64>) {
+    let rotation = pose.rotation;
+    (
+        pose.translation.vector.iter().copied().collect(),
+        vec![rotation.i, rotation.j, rotation.k, rotation.w],
+    )
+}
+
+/// Publishes the camera's frame fixed at `camera` in the robot frame, on static_transforms.
+pub async fn fix_the_camera(mocks: &Mocks, camera: &Isometry3<f64>) -> peppygen::Result<()> {
+    let (positions, orientations) = placement_arrays(camera);
+    tree_publisher(mocks)
+        .static_transforms
+        .publish(&transforms::static_transforms::Message {
+            child_frames: vec![CAMERA_FRAME.to_string()],
+            parent_frames: vec![ROBOT_FRAME.to_string()],
+            positions,
+            orientations,
+        })
+        .await
+}
+
+/// Publishes the camera's frame at `camera` in the robot frame measured at `at`, on
+/// transforms, as a publisher of the tree that carries the camera on a moving joint does.
+pub async fn move_the_camera(
+    mocks: &Mocks,
+    at: SystemTime,
+    camera: &Isometry3<f64>,
+) -> peppygen::Result<()> {
+    let (positions, orientations) = placement_arrays(camera);
+    tree_publisher(mocks)
+        .transforms
+        .publish(&transforms::transforms::Message {
+            timestamp: at,
+            child_frames: vec![CAMERA_FRAME.to_string()],
+            parent_frames: vec![ROBOT_FRAME.to_string()],
+            positions,
+            orientations,
+            start_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        })
+        .await
 }
 
 /// Publishes the arms at `arms` measured at `at`, both grippers open.
