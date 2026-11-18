@@ -1240,6 +1240,56 @@ mod tests {
         assert!(outcome.same, "{outcome:#?}");
     }
 
+    /// A result too large for its incident: the incident gives its size,
+    /// and the `call` line of each attempt of the step holds it whole.
+    #[tokio::test(start_paused = true)]
+    async fn a_result_too_large_for_its_incident_stays_whole_in_the_journal() {
+        use workflow_documents::result::{INCIDENT_RESULT_LIMIT_BYTES, IncidentResult};
+        let plan = crate::testing::plan(&picking(), Attendance::Unattended);
+        let words = "w".repeat(INCIDENT_RESULT_LIMIT_BYTES);
+        let missed = json!({ "success": false, "item_id": "b1", "message": words });
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found()), Answer::now(found())])
+            .answer(
+                "grab",
+                vec![Answer::now(missed.clone()), Answer::now(missed.clone())],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let dir = tempfile::tempdir().unwrap();
+        let journals = Journals::open(dir.path(), 10, u64::MAX).unwrap();
+        let run = journals.next_run().unwrap();
+        let host = Recorded::new(scripted, &journals, &run);
+        let (_commands, commands_rx) = mpsc::unbounded_channel();
+        let (phase, _phases) = watch::channel(Phase::Preparing);
+        let result = drive(
+            &plan,
+            &host,
+            ResultBase {
+                result: crate::director::empty_result(),
+            },
+            commands_rx,
+            phase,
+            host.now(),
+        )
+        .await;
+        assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+        let [incident] = &result.incidents[..] else {
+            panic!("one incident: {:#?}", result.incidents);
+        };
+        assert_eq!(
+            incident.result,
+            Some(IncidentResult::TooLarge {
+                bytes: missed.to_string().len()
+            })
+        );
+        let journal = journals.text(&run).unwrap();
+        let calls = journal
+            .lines()
+            .filter(|line| line.contains(r#""member":"grab""#) && line.contains(&words))
+            .count();
+        assert_eq!(calls, 2, "each attempt of the grab is in the journal whole");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn the_replay_of_a_journal_makes_the_decisions_of_its_run() {
         let journal = journal_of_a_run().await;
