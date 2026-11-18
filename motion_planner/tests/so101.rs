@@ -37,7 +37,7 @@ use robot_description::RobotDescription;
 
 use common::{
     Ended, OWN_BODY_WAY_OUT, PLANNING_TIME_S, TIMEOUT, at_ms, check, plan, start_identified_as,
-    vacant_camera,
+    vacant_camera_rig,
 };
 
 /// SO-101's description, as robot_description bundles it.
@@ -119,6 +119,7 @@ fn tool_point(q: &[f64; ARM_DOF]) -> [f64; 3] {
 /// them, and the default of the one they leave out.
 fn so101_parameters() -> Parameters {
     Parameters {
+        cache_window_s: 10.0,
         goal_samples: 10,
         map_max_x_m: 0.50,
         map_max_y_m: 0.46,
@@ -126,6 +127,7 @@ fn so101_parameters() -> Parameters {
         map_min_x_m: -0.36,
         map_min_y_m: -0.46,
         map_min_z_m: -0.24,
+        lookup_timeout_s: 0.1,
         max_iterations: 20_000,
         max_range_m: 1.36,
         max_update_rate_hz: 5.0,
@@ -144,9 +146,7 @@ fn so101_parameters() -> Parameters {
 async fn started_at(q: &[f64; ARM_DOF]) -> peppygen::Result<(Harness, Mocks)> {
     let config = Config {
         parameters: Some(so101_parameters()),
-        camera_mounts_vacant: true,
-        workspace_vacant: true,
-        ..vacant_camera()
+        ..vacant_camera_rig()
     };
     let (harness, mocks, _fault) = start_identified_as(config, "so101").await?;
     mocks

@@ -1,0 +1,51 @@
+// transform_server: holds a robot's tree of frames, from the transforms its
+// publishers send, and answers lookups in it for the nodes that hold no tree,
+// as tf2_ros's buffer server does. See README.md.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "transform_server",
+    tag: "v1",
+    description: [
+      "Holds a robot's tree of frames and answers lookups in it for a node that holds no tree, as tf2_ros's buffer server does: where a source frame stands in a target frame, at a time or at the latest time.",
+      "It implements transform_lookup. It keeps the transforms and the static_transforms of every publisher of the tree bound to its transforms link, each moving transform's stamps within the cache window that cache_window_s sets, and answers each lookup_transform from them, waiting up to the request's timeout_s on the node's clock, the simulation clock in a simulation, for the lookup to succeed.",
+    ],
+    implements: [
+      { name: "transform_lookup", tag: "v1", link_id: "transform_lookup" },
+    ],
+    depends_on: {
+      contracts: [
+        // The robot's tree of frames: bound to every publisher of it, the
+        // implementer of robot_identity, which publishes the fixed joints'
+        // transforms, and the backbone, which publishes the transforms of the
+        // joints it measures.
+        { name: "transforms", tag: "v1", link_id: "transforms", cardinality: "one_or_more" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      consumes: [
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "transform_lookup", name: "lookup_transform" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // How long (s) the node keeps each moving transform's stamps, counted
+      // back from the newest stamp of its child frame: finite and above 0. A
+      // lookup at a time older than that finds no value.
+      cache_window_s: "f64",
+    },
+  },
+}

@@ -17,7 +17,7 @@ import logging
 import time
 
 from sim_robot_core.cameras import FramePacer
-from sim_robot_core.models import FingerSpan
+from robot_description_py import FingerSpan
 
 from exts import (
     MujocoActuatorCtrl,
@@ -49,9 +49,10 @@ class _RobotLimbs:
         # actuator on its MJCF defaults.
         self.actuator = MujocoActuatorCtrl(model, data, params=self._gains())
         self.gripper_sensors: dict[str, MujocoGripperSensor] = {}
-        # Each finger joint's closed position and signed travel to fully
-        # open, as the robot's description gives them; commanded opening
-        # fractions scale onto it, and measured positions read back as one.
+        # Where the gripper's closed and open states put each finger joint,
+        # as the robot's description gives them; commanded opening fractions
+        # place the joint on that span, and measured positions read back as
+        # one.
         self.finger_spans: dict[str, list[FingerSpan]] = {}
         # The fingers of each gripper an actuator drives, by their scene
         # names, with their spans. A finger an equality couples to a driven
@@ -278,7 +279,7 @@ class MujocoBridgeExtension:
                 # so the same command drives prismatic fingers, revolute ones
                 # and a single jaw.
                 limbs.actuator.write_targets(
-                    {name: span.position(opening) for name, span in driven}
+                    {name: span.position_at(opening) for name, span in driven}
                 )
 
     def _publish_state(self) -> None:
@@ -303,7 +304,7 @@ class MujocoBridgeExtension:
                     # Opening = mean per-finger travel fraction, the inverse of
                     # the command mapping above.
                     fractions = [
-                        span.opening(position)
+                        span.opening_at(position)
                         for position, span in zip(data["positions"], spans)
                     ]
                     self._io.publish_gripper_states(robot, name, sum(fractions) / len(fractions))

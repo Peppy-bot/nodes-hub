@@ -10,7 +10,7 @@
     tag: "v1",
     description: [
       "The motion authority of an OpenArm robot: it plans, governs and streams every move of both arms and both grippers against one self-collision model. It opens no device: it drives the arm and gripper nodes, or a simulation, over their pairings, so the same node runs on the real robot and in MuJoCo, Isaac Sim or Waldo.",
-      "It plays the follower role toward the one leading node (the web panel, the KER leader arm or a headset): raw setpoints stream in on those pairs and the measured state relays back up them. It plays the leader role toward each arm and each gripper: governed setpoints stream down each pair and the measured state streams back on it. It runs the joint, Cartesian, gripper and posture moves itself, and publishes the collision status.",
+      "It plays the follower role toward the one leading node (the web panel, the KER leader arm or a headset): raw setpoints stream in on those pairs and the measured state relays back up them. It plays the leader role toward each arm and each gripper: governed setpoints stream down each pair and the measured state streams back on it. It runs the joint, Cartesian, gripper and posture moves itself, and publishes the collision status and, at each limb_states, the transform of every arm and finger joint it measures.",
       "Every end-effector pose here, commanded or reported, is the grasp point of the gripper: on the jaw closing axis midway between the pads, not the wrist flange they mount on. Commanding the centre of an object puts the pads around it.",
     ],
     implements: [
@@ -33,11 +33,11 @@
       // first closes both grippers, a gripper move each that the coordinator
       // runs as it runs move_gripper.
       { name: "postures", tag: "v1", link_id: "postures" },
-      // Where the robot's design carries each camera, in the robot frame,
-      // composed with the measured grasp poses for the cameras the arms
-      // carry: the design values, exact in a simulation and nominal on
-      // hardware.
-      { name: "camera_mounts", tag: "v1", link_id: "camera_mounts" },
+      // The transforms of the joints it measures, on transforms at the
+      // timestamp of each limb_states: every arm joint and every finger
+      // joint. It publishes nothing on static_transforms, whose fixed joints
+      // the robot's initializer publishes.
+      { name: "transforms", tag: "v1", link_id: "transforms" },
       // Where the robot can work, from its design alone: where its arms
       // reach and where its perception camera (the one camera that gives
       // depth and that no arm carries: v2's chest) sees, in the robot frame,
@@ -48,8 +48,8 @@
       contracts: [
         { name: "robot_ready", tag: "v1", link_id: "robot_init" },
         // The robot's model, whose bundled description (URDF and SRDF) the arm
-        // models, the self-collision model and the camera mounts are built from,
-        // and the Ready and Home postures the posture moves go to come from. The
+        // models, the self-collision model and the workspace are built from, and
+        // the Ready and Home postures the posture moves go to come from. The
         // backbone asks for it once its setup has returned, until the initializer
         // answers, and holds the digest of the description the initializer serves
         // to the one it was built with. A model whose arms are not left_arm and
@@ -191,6 +191,8 @@
         // The contract-backed readouts; formats come from the contracts.
         { link_id: "collision_status", name: "collision_status" },
         { link_id: "limb_state", name: "limb_states" },
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
       ],
       consumes: [
         // The counterpart-role topic of each pairing slot: the measured state
@@ -225,9 +227,6 @@
         // gate with the moves.
         { link_id: "limb_motion", name: "stop" },
         { link_id: "limb_motion", name: "check_arm_move" },
-        // Where the cameras stand now, answered from bringup: refused until
-        // the coordinator has measured the arms.
-        { link_id: "camera_mounts", name: "get_camera_poses" },
         // Where the robot can work on a surface and whether it can work
         // given points, answered from bringup: they read the design and the
         // perception camera's geometry, never the arms, so they move nothing

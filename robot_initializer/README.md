@@ -1,12 +1,13 @@
 # robot_initializer
 
-The node that brings one robot into being, says who it is and says when it is
-ready. It serves a robot of any model: the launcher names the model in the
-`model` parameter, `openarm_v2` for an OpenArm or `so101` for an SO-101, and
-the rest of the node is the same for every robot. The model is
-one of the models of `robot_description` in public-peppy-libs, whose URDF and
-SRDF hold every fact of the robot the node serves; the node refuses to start on
-a model it holds no description of, naming the models it holds.
+The node that brings one robot into being, says who it is, publishes the
+transforms of its fixed joints, says where it carries its sensors and says
+when it is ready. It serves a robot of any model: the launcher names the model
+in the `model` parameter, `openarm_v2` for an OpenArm or `so101` for an
+SO-101, and the rest of the node is the same for every robot. The model is one
+of the models of `robot_description` in public-peppy-libs, whose URDF and SRDF
+hold every fact of the robot the node serves; the node refuses to start on a
+model it holds no description of, naming the models it holds.
 
 ## Joining a simulation
 
@@ -125,6 +126,31 @@ caller that drives robots of many models, such as a chat agent, asks each
 robot. A description that gives no arm a park state answers empty arrays.
 The answer is fixed when the node starts and served whether or not the robot
 is ready.
+
+## The robot's frames
+
+The node implements `transforms` for the fixed joints of the robot's model:
+once it holds the model, before it joins a scene, it publishes one
+`static_transforms` message with the transform of every fixed joint of the
+URDF, each from the joint's parent link to its child link at the joint's
+origin, in the URDF's order of joints. The topic retains the message, so a
+node that subscribes later receives it too, for as long as this node runs.
+These transforms are the robot's design: exact in a simulation and nominal on
+hardware. A fixed joint whose transform the contract does not take, such as
+one at an origin that is not finite, refuses the node, naming its links. The
+node publishes nothing on `transforms`: the robot's backbone publishes the
+joints it measures there.
+
+The node exposes `describe_sensors` of the `sensor_mounts` contract, from the
+model alone. It answers the robot frame, the root link of the URDF (`world`
+on an OpenArm, `base_link` on an SO-101), and each camera of the model in the
+URDF's order: its name, `rgbd_camera` for a camera the URDF gives a depth
+sensor and `rgb_camera` for one that gives color alone, its frame, the link
+`<camera>_optical_frame`, and the arm that carries it: the arm one of whose
+joints moves the camera's link, or `""` for a camera that no arm's joint
+moves. The answer carries no pose: a lookup in the robot's tree places each
+frame. A model with no camera answers empty arrays. The answer is fixed when
+the node starts.
 
 ## Build
 

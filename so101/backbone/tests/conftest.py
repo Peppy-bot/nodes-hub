@@ -7,7 +7,8 @@
 - a follower whose liveness does not ride the host's clock;
 - one gripper control tick;
 - an execute_joint_path goal, and the joints of its result;
-- the targets and checks of the workspace tests.
+- the targets and checks of the workspace tests;
+- a link's pose in the robot frame, composed from the robot's transforms.
 """
 
 from __future__ import annotations
@@ -221,3 +222,57 @@ def follower_never_stale(monkeypatch):
     pause between a sample and the tick that reads it from failing the plan
     as stale."""
     monkeypatch.setattr("so101_backbone.coordinator.STALE_FOLLOWER_TIMEOUT_S", math.inf)
+
+
+# The tolerance, in meters and radians, within which limb_state holds a
+# grasp pose equal to the place of the arm's grasp link in the tree.
+TREE_TOLERANCE = 1e-9
+
+
+def _rotate(q, v):
+    """`v` rotated by the unit quaternion `q` = [x, y, z, w]."""
+    x, y, z, w = q
+    tx, ty, tz = 2.0 * (y * v[2] - z * v[1]), 2.0 * (z * v[0] - x * v[2]), 2.0 * (x * v[1] - y * v[0])
+    return (
+        v[0] + w * tx + (y * tz - z * ty),
+        v[1] + w * ty + (z * tx - x * tz),
+        v[2] + w * tz + (x * ty - y * tx),
+    )
+
+
+def _multiply(a, b):
+    """The quaternion product a * b, both [x, y, z, w]."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
+
+
+def place_in_robot_frame(transforms, link: str):
+    """The pose (position, quaternion [x, y, z, w]) of `link` in the root of
+    `transforms`, each a (parent, child, position, orientation) of one joint,
+    composed from the root down the chain of parents to the link."""
+    by_child = {child: (parent, position, orientation) for parent, child, position, orientation in transforms}
+    chain = []
+    while link in by_child:
+        parent, position, orientation = by_child[link]
+        chain.append((position, orientation))
+        link = parent
+    position, orientation = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+    for step_position, step_orientation in reversed(chain):
+        moved = _rotate(orientation, step_position)
+        position = tuple(p + m for p, m in zip(position, moved))
+        orientation = _multiply(orientation, step_orientation)
+    return position, orientation
+
+
+def angle_between(a, b) -> float:
+    """The angle (rad) of the rotation from the unit quaternion `a` to `b`."""
+    ax, ay, az, aw = a
+    relative = _multiply((-ax, -ay, -az, aw), b)
+    return 2.0 * math.atan2(math.hypot(*relative[:3]), abs(relative[3]))
+

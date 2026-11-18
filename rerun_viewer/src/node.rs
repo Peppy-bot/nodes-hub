@@ -3,10 +3,13 @@
 
 use std::sync::Arc;
 
+use control_core::fault::Fault;
+use control_core::robot_tree::RobotTree;
 use peppygen::NodeRunner;
 use peppygen::consumed_services::identity::get_description;
 use peppygen::consumed_services::motion_planning::get_planning_scene;
 use peppygen::consumed_topics::camera::video_stream;
+use peppygen::consumed_topics::transforms::transforms;
 use tracing::info;
 
 use crate::canvas::Canvas;
@@ -15,17 +18,22 @@ use crate::draw::draw_notes;
 use crate::wire::Shared;
 use crate::wire::arms::follow_arms;
 use crate::wire::camera::{DepthSettings, follow_color, follow_depth};
+use crate::wire::clock::node_clock;
 use crate::wire::planner_map::follow_planner_map;
 use crate::wire::robot::follow_robot;
 use crate::wire::scene::follow_scene;
+use crate::wire::tree::follow_tree;
 
 /// Starts the followers that draw on `canvas`: the arms always, the robot's body when
-/// the identity link is bound, the camera when the camera link is bound, and the
+/// the identity link is bound, the camera when the camera link is bound, with the robot's
+/// tree that places its points when the transforms link is bound to a publisher, and the
 /// planning scene and the planner's voxel map when the motion_planning link is bound.
+/// The end of a simulation clock's ticks raises `fault`.
 pub async fn setup(
     config: Config,
     runner: Arc<NodeRunner>,
     canvas: Arc<dyn Canvas>,
+    fault: Fault,
 ) -> peppygen::Result<()> {
     peppygen::clock::init(&runner).await?;
     draw_notes(canvas.as_ref());
@@ -55,8 +63,20 @@ pub async fn setup(
             cloud_interval: config.cloud_interval,
             cloud_stride: config.cloud_stride,
             camera_name: config.camera_name.clone(),
+            lookup_timeout: config.lookup_timeout,
         };
-        tokio::spawn(follow_depth(runner.clone(), canvas.clone(), settings));
+        let tree = if transforms::bound_producers(&runner).is_empty() {
+            None
+        } else {
+            let clock = node_clock(&runner, fault).await?;
+            let tree = Arc::new(
+                RobotTree::new(config.cache_window, clock)
+                    .map_err(|e| peppygen::Error::Node(e.into()))?,
+            );
+            follow_tree(&runner, tree.clone()).await?;
+            Some(tree)
+        };
+        tokio::spawn(follow_depth(runner.clone(), canvas.clone(), settings, tree));
     } else {
         info!("the camera link is vacant: no images and no points drawn");
     }

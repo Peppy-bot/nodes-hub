@@ -1,11 +1,11 @@
 """Where the robot frame's axes point in a camera's picture, in words a
 model reads: clock hours, 12 up and 3 right.
 
-A camera's pose is its optical frame in the robot frame (camera_mounts: x
-right in the picture, y down, z forward). A robot-frame direction turned
-into the camera frame has a component across the picture, right and up,
-and one along the optical axis, which the picture does not show. The hour
-is the direction of the across part.
+A camera's pose is its optical frame in the robot frame (camera_geometry's
+optical frame: x right in the picture, y down, z forward). A robot-frame
+direction turned into the camera frame has a component across the picture,
+right and up, and one along the optical axis, which the picture does not
+show. The hour is the direction of the across part.
 """
 
 from __future__ import annotations

@@ -15,8 +15,8 @@ each slot.
         leader_left_gripper . leader_right_gripper     [either mode]
  (streams in)  joint_ or pose_setpoints  |  gripper_setpoints  [pairing slots, leading node]
                            v             v
- collision_ctrl --> +--------------------------------+ --> collision_status, limb_states
- (governor_control) |          coordinator           |     (readout topics)
+ collision_ctrl --> +--------------------------------+ --> collision_status, limb_states,
+ (governor_control) |          coordinator           |     transforms (readout topics)
  move_arm[_joints]  |  planners --> GOVERNOR --> pub | --> get_limb_names (service)
  execute_joint_path |  (per arm)    (16 DOF)         |     (answered from bringup)
  move_gripper ----> |                                |
@@ -513,20 +513,24 @@ they wait behind the readiness gate with the moves; a stop during the seed
 wait stops nothing and a check then gets an error reply with
 `resource_unavailable`, as a goal fails then.
 
-### camera_mounts
+### transforms
 
-`get_camera_poses` answers where the robot's design carries each
-camera, in the robot frame, as the pose of the camera's colour optical frame
-(`+x` to the right of the image, `+y` down it, `+z` along the view): each
-camera's optical frame in the description's URDF, which the simulation
-reads too, so they are exact in a simulation and nominal on hardware. A camera fixed to the base
-(v2's `chest`) has one pose; a camera an arm carries (v2's `wrist_left` and
-`wrist_right`, which hang off the link the grasp point hangs off) is composed
-with that arm's grasp pose from the last `limb_states` snapshot, and the
-answer carries that snapshot's stamp. Served from bringup, an error reply
-with `precondition_failed` and `the robot has not measured its joints yet`
-until a snapshot exists; a v1 robot answers with no camera. A description that mounts a camera on
-a link a moving joint carries, other than the grasp point's, stops bringup.
+Right after each `limb_states` snapshot, the backbone publishes on
+`transforms`, under the snapshot's timestamp, the transform of every joint it
+measures, each from the joint's parent link to its child link as the
+description's URDF places it: each arm joint at the snapshot's joint
+positions, and each finger joint where its gripper's measured opening puts it,
+between the SRDF's `closed` and `open` states, a finger that mimics another
+included. Composed from the robot frame with the transforms of the fixed
+joints, which the robot's initializer publishes on `static_transforms`, they
+place each arm's grasp link at the grasp point the snapshot reports, within
+1e-9 m and rad. Every message gives one start, the wall-clock time of the
+backbone's bringup, which a process runs once. A snapshot with a joint whose
+transform the contract does not take, such as one at a position that is no
+number, gets no transforms message, and the log names the joint's links. The
+backbone publishes nothing on `static_transforms`. Where a camera stands is
+the tree's: the robot's initializer names each camera's frame on
+`sensor_mounts`, and a lookup in the tree places it.
 
 ### workspace
 
@@ -558,7 +562,9 @@ depth along the optical axis, or `range`, the straight-line distance), lies
 inside the camera's depth range. The perception camera is derived
 from the description, never configured: the one camera that gives depth
 and that no arm carries (v2's `chest`; v1 has none, and is judged on reach
-alone). Its pose is the design's, the one `camera_mounts` reports; its
+alone). Its pose is the design's: the transforms of the fixed joints from
+the robot frame down to its optical frame, as the robot's tree places it, and
+a perception camera that a joint of no arm moves stops bringup, naming it; its
 field of view, depth model and depth range are what the camera linked as
 `perception_geometry` (`camera_geometry:v1`) answers at each request,
 within 2 s for each of its two answers.
@@ -619,7 +625,7 @@ The robot's own body is not checked for hiding a point from the camera.
 | `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
 | `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: its arms as `workspace_core`'s reach rule asks them, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
-| `camera_mounts.rs` | the camera_mounts contract: each camera resolved once at bringup into the frame that carries it, then composed with the grasp poses measured last | a mount the backbone cannot place stops bringup |
+| `transforms.rs` | `JointTransforms`: the transform of every arm and finger joint at a snapshot's joints and openings, from the description, and the start of every transform | the publisher of a measured joint is the node that measures it; the fixed joints are the initializer's |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
 | `types.rs` | the limb tables, the world-pose wire codec, every arm's joints in one vector | shared primitives; `ArmId` and `PerArm` come from `robot_description`, `ARM_DOF` and `JointVec` from `srs_model` |
 | `robot.rs` | the robot this node is built for (`ARMS` arms of `ARM_DOF` joints, each arm's and gripper's name, `LIMBS`), a request's arm or gripper by name, the postures of a named state | a model of another shape ends the node, naming the models of this shape |

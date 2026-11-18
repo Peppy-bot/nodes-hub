@@ -6,9 +6,8 @@
 //!
 //! - `startup::wait_until_ready` gates the subscriptions, publishers, actions
 //!   and the coordinator on `robot_init/is_ready` answering `ready: true`, so
-//!   every test pumps that mock service. The `get_limb_names`,
-//!   `get_camera_poses` and workspace services stand outside that gate and
-//!   answer from bringup.
+//!   every test pumps that mock service. The `get_limb_names` and workspace
+//!   services stand outside that gate and answer from bringup.
 //! - `coordinator::seed_all` then gates streaming on a first measured state
 //!   from BOTH arms and BOTH grippers, and `liveness` freezes a limb that goes
 //!   silent for four periods of `follower_state_rate_hz`. The harness pins every pairing slot to a
@@ -2748,64 +2747,77 @@ async fn a_position_goal_completes_at_the_turn_the_hand_starts_with() -> peppyge
     harness.shutdown().await
 }
 
-/// The camera mounts service answers from bringup: an error reply with
-/// `precondition_failed` until the coordinator has measured the arms, then
-/// every camera of the generation under the stamp of the snapshot the poses
-/// come from, a v1 robot with no camera at all.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn camera_poses_are_answered_once_the_arms_are_measured() -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_services::camera_mounts::get_camera_poses;
-
-    let (harness, mocks) = start_ready_vacant(params(), MODEL).await?;
-    let ready = Arc::new(AtomicBool::new(false));
-    pump_is_ready(mocks.deps.robot_init.is_ready, ready.clone());
-
-    let refused = error_reply(
-        get_camera_poses::poll(&harness, DEADLINE).await,
-        get_camera_poses::Failure::of,
-    );
-    assert_eq!(
-        refused,
-        get_camera_poses::Failure::new(
-            get_camera_poses::FailureKind::PreconditionFailed,
-            "the robot has not measured its joints yet"
-        )
-    );
-
-    ready.store(true, Ordering::SeqCst);
-    pump_arm_at_home!(
-        mocks.pairings.left_arm.joint_states,
-        peppygen::paired_topics::left_arm::joint_states,
-        left_home(),
-    );
-    pump_right_arm_and_grippers!(mocks);
-    await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
+/// The next transforms message the node publishes under `timestamp`. The node
+/// publishes one right after each limb_states snapshot, under its timestamp.
+async fn transforms_at(
+    harness: &mut Harness,
+    timestamp: SystemTime,
+) -> peppygen::Result<peppygen::fixtures::emitted_topics::transforms::transforms::Message> {
     let deadline = tokio::time::Instant::now() + DEADLINE;
-    let answer = loop {
-        let refused = match get_camera_poses::poll(&harness, DEADLINE).await {
-            Ok(answer) => break answer,
-            Err(e) => get_camera_poses::Failure::of(&e).ok_or(e)?,
-        };
+    loop {
+        let message = tokio::time::timeout(DEADLINE, harness.emitted.transforms_transforms.next())
+            .await
+            .expect("no transforms before the deadline")?
+            .expect("transforms subscription open");
+        if message.timestamp == timestamp {
+            return Ok(message);
+        }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no measurement reached the service: {refused}"
+            "no transforms under the snapshot's timestamp {timestamp:?}"
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    // v1 carries no camera: an answer with nothing listed.
-    assert!(answer.camera_names.is_empty() && answer.carried_by.is_empty());
-    assert!(answer.positions.is_empty() && answer.orientations.is_empty());
-    harness.shutdown().await
+    }
 }
 
-/// A v2 robot lists the cameras of its description, in its order, one fixed
-/// to the base and looking forward and down, and one carried by each arm,
-/// under the stamp of a limb_states snapshot. Where each camera stands is the
-/// unit tests' (`camera_mounts`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_services::camera_mounts::get_camera_poses;
+/// Where `link` stands in the robot frame: the published `transforms` and the
+/// transforms of the fixed joints of `model`, which the robot's initializer
+/// publishes, composed from the root down to it.
+fn place_in_the_robot_frame(
+    link: &str,
+    transforms: &peppygen::fixtures::emitted_topics::transforms::transforms::Message,
+    model: &str,
+) -> srs_model::nalgebra::Isometry3<f64> {
+    use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
+    let published = transforms
+        .child_frames
+        .iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let [x, y, z] = std::array::from_fn(|axis| transforms.positions[3 * index + axis]);
+            let [i, j, k, w] =
+                std::array::from_fn(|axis| transforms.orientations[4 * index + axis]);
+            (
+                child.clone(),
+                transforms.parent_frames[index].clone(),
+                Isometry3::from_parts(
+                    Translation3::new(x, y, z),
+                    UnitQuaternion::from_quaternion(Quaternion::new(w, i, j, k)),
+                ),
+            )
+        });
+    let fixed = description(model)
+        .fixed_transforms()
+        .into_iter()
+        .map(|t| (t.child.to_owned(), t.parent.to_owned(), t.pose));
+    let tree: Vec<_> = published.chain(fixed).collect();
+    let mut place = Isometry3::identity();
+    let mut at = link.to_owned();
+    while let Some((_, parent, pose)) = tree.iter().find(|(child, _, _)| *child == at) {
+        place = pose * place;
+        at = parent.clone();
+    }
+    place
+}
+
+/// At each limb_states snapshot the node publishes the transform of every arm
+/// and finger joint under the snapshot's timestamp, and composed from the
+/// robot frame with the model's fixed joints they place each arm's grasp link
+/// at the grasp point the snapshot reports. Every message gives one start, the
+/// wall-clock time of the node's bringup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transforms_at_each_snapshot_place_the_grasp_points_it_reports() -> peppygen::Result<()> {
+    let launched = SystemTime::now();
     let (mut harness, mocks) = start_ready_vacant(params(), V2).await?;
     pump_is_ready(
         mocks.deps.robot_init.is_ready,
@@ -2814,39 +2826,52 @@ async fn a_v2_robot_lists_its_three_cameras_in_the_robot_frame() -> peppygen::Re
     pump_arm_at_home!(
         mocks.pairings.left_arm.joint_states,
         peppygen::paired_topics::left_arm::joint_states,
-        left_home(),
+        posture(V2, "left_arm", states::READY),
     );
     pump_right_arm_and_grippers!(mocks);
-    let snapshot = next_snapshot(&mut harness).await?;
 
-    let answer = get_camera_poses::poll(&harness, DEADLINE).await?;
-    assert!(answer.timestamp >= snapshot.timestamp);
-    let described = v2_camera_names();
-    assert_eq!(answer.camera_names, described);
-    let cameras = described.len();
-    for carrier in ["", "left_arm", "right_arm"] {
-        assert_eq!(
-            answer.carried_by.iter().filter(|c| *c == carrier).count(),
-            1,
-            "one camera carried by {carrier:?}"
+    let snapshot = next_snapshot(&mut harness).await?;
+    let transforms = transforms_at(&mut harness, snapshot.timestamp).await?;
+
+    let count = transforms.child_frames.len();
+    assert_eq!(transforms.parent_frames.len(), count);
+    assert_eq!(transforms.positions.len(), 3 * count);
+    assert_eq!(transforms.orientations.len(), 4 * count);
+    let arms = description(V2).arms();
+    let fingers: usize = arms.iter().map(|arm| arm.gripper.fingers.len()).sum();
+    assert_eq!(count, 2 * 7 + fingers, "{:?}", transforms.child_frames);
+    for (index, arm) in arms.iter().enumerate() {
+        let place = place_in_the_robot_frame(&arm.grasp_link, &transforms, V2);
+        let reported_position = &snapshot.positions[3 * index..3 * index + 3];
+        let [x, y, z, w] = std::array::from_fn(|axis| snapshot.orientations[4 * index + axis]);
+        let reported_rotation = srs_model::nalgebra::UnitQuaternion::from_quaternion(
+            srs_model::nalgebra::Quaternion::new(w, x, y, z),
+        );
+        let at = place.translation.vector;
+        assert_all_close(
+            &format!("{} grasp position", arm.name),
+            &[at.x, at.y, at.z],
+            reported_position,
+            1e-9,
+        );
+        let turn = place.rotation.angle_to(&reported_rotation);
+        assert!(
+            turn <= 1e-9,
+            "{} grasp orientation off by {turn} rad",
+            arm.name
         );
     }
-    assert_eq!(answer.positions.len(), 3 * cameras);
-    assert_eq!(answer.orientations.len(), 4 * cameras);
-    // The base camera looks along its optical +Z, to the robot's front and
-    // down: the image's +Y (down the picture) points forward and down.
-    let base = answer
-        .carried_by
-        .iter()
-        .position(String::is_empty)
-        .expect("a camera fixed to the base");
-    let [x, y, z, w] = [0, 1, 2, 3].map(|axis| answer.orientations[4 * base + axis]);
-    // Rotate the unit +Z by the quaternion: v' = q v q*.
-    let view_z = 1.0 - 2.0 * (x * x + y * y);
-    let view_x = 2.0 * (x * z + w * y);
+
+    let started = transforms.start_timestamp;
     assert!(
-        view_x > 0.4 && view_z < -0.8,
-        "the base camera looks forward and down: ({view_x}, {view_z})"
+        launched <= started && started <= SystemTime::now(),
+        "the start {started:?} is the bringup's wall-clock time"
+    );
+    let later = next_snapshot(&mut harness).await?;
+    let again = transforms_at(&mut harness, later.timestamp).await?;
+    assert_eq!(
+        again.start_timestamp, started,
+        "the start holds while the node runs"
     );
     harness.shutdown().await
 }

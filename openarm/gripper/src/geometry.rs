@@ -31,7 +31,7 @@ impl Geometry {
     /// finger opens toward its joint's positive travel, driving `finger`.
     pub fn new(open_rad: f64, finger: &Finger) -> Self {
         Self {
-            open_rad: open_rad * (finger.open - finger.closed).signum(),
+            open_rad: open_rad * finger.span.travel().signum(),
         }
     }
 
@@ -40,7 +40,7 @@ impl Geometry {
     /// closed.
     pub fn one_to_one(finger: &Finger) -> Self {
         Self {
-            open_rad: finger.open - finger.closed,
+            open_rad: finger.span.travel(),
         }
     }
 
@@ -134,7 +134,7 @@ mod tests {
     fn each_mechanism_opens_its_motor_to_its_own_travel() {
         for bundled in every_gripper() {
             let open = bundled.geometry.fraction_to_motor_rad(1.0);
-            let travel = bundled.finger.open - bundled.finger.closed;
+            let travel = bundled.finger.span.travel();
             match bundled.mechanism {
                 Mechanism::ParallelJaws => assert_eq!(
                     open.abs(),

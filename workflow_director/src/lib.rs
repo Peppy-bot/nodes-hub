@@ -19,6 +19,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use peppygen::{NodeRunner, Parameters, Result};
+use peppylib::runtime::CancellationToken;
 use tokio::sync::{broadcast, watch};
 
 mod alerts;
@@ -64,11 +65,12 @@ pub(crate) fn refused(message: impl Into<String>) -> peppygen::Error {
 pub struct Fault(Arc<OnceLock<String>>);
 
 impl Fault {
-    /// Records `message`, unless a fault came first, and shuts the node down.
-    pub(crate) fn raise(&self, runner: &NodeRunner, message: &str) {
+    /// Records `message`, unless a fault came first, and shuts the node down
+    /// through `stopping`, the node's cancellation token.
+    pub(crate) fn raise(&self, stopping: &CancellationToken, message: &str) {
         tracing::error!("{message}");
         let _ = self.0.set(message.to_owned());
-        runner.cancellation_token().cancel();
+        stopping.cancel();
     }
 
     /// The end of the node: the error of its fault, if one was raised.

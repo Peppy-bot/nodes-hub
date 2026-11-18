@@ -17,6 +17,10 @@
       // Whole-robot state snapshots for consumers that hold no pairing:
       // joint positions, the end-effector pose, and the gripper opening.
       { name: "limb_state", tag: "v1", link_id: "limb_state" },
+      // The transforms of the arm's and the gripper's joints, at the
+      // timestamp of each limb_states. The fixed joints' transforms are the
+      // robot initializer's, so nothing goes out on static_transforms.
+      { name: "transforms", tag: "v1", link_id: "transforms" },
       // The per-limb moves: the arm to a joint target, through a joint path
       // or to an end-effector pose, the gripper to an opening. This robot's
       // limb names are "arm" and "gripper".
@@ -147,6 +151,8 @@
         // The contract-backed whole-robot readout; format comes from the
         // contract.
         { link_id: "limb_state", name: "limb_states" },
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
       ],
       consumes: [
         { link_id: "arm", name: "joint_states", refine: { message_format: { positions: { $length: 5 } } } },

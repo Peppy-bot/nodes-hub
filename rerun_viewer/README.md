@@ -4,7 +4,8 @@
 the wire. It serves the [Rerun](https://rerun.io) web viewer (Rerun 0.41.0) and draws:
 
 - the color image of one camera, and its depth image when `depth_image` is set;
-- the depth samples of that camera as points in the robot frame;
+- the depth samples of that camera as points in the robot frame, where the robot's tree
+  of frames places the camera when the depth frame was taken;
 - the motion planner's voxel map: the occupied cubes that its plans keep their clearance
   from, as the planner publishes them;
 - each arm's grasp point with its axes and a trail of its past positions;
@@ -21,8 +22,8 @@ the wire. It serves the [Rerun](https://rerun.io) web viewer (Rerun 0.41.0) and 
 It only listens. It never moves the robot and never changes the planning scene.
 
 It draws only the contracts that its `peppy.json5` lists: `limb_state:v1`,
-`robot_identity:v1`, `rgbd_camera:v1`, `camera_geometry:v1`, `camera_mounts:v1` and
-`motion_planning:v1`.
+`robot_identity:v1`, `rgbd_camera:v1`, `camera_geometry:v1`, `sensor_mounts:v1`,
+`transforms:v1` and `motion_planning:v1`.
 
 ## Start it beside a running stack
 
@@ -35,12 +36,19 @@ peppy node add ./rerun_viewer -sb
 peppy node run rerun_viewer:v1 --instance-id alpha_viewer --clock simulation \
   --link limb_state@alpha_backbone_inst --link identity@alpha_init_inst \
   --link camera@alpha_chest --link geometry@alpha_chest \
-  --link camera_mounts@alpha_backbone_inst --link motion_planning@alpha_planner_inst \
-  bind_ip=<address>
+  --link sensor_mounts@alpha_init_inst \
+  --link transforms@alpha_init_inst --link transforms@alpha_backbone_inst \
+  --link motion_planning@alpha_planner_inst \
+  bind_ip=<address> cache_window_s=<seconds> lookup_timeout_s=<seconds>
 ```
 
 `<address>` is the address of this machine that the browser reaches, such as its
-Tailscale address. Without `bind_ip`, the viewer serves this machine only.
+Tailscale address. Without `bind_ip`, the viewer serves this machine only. The
+`transforms` link takes every publisher of the robot's tree: the initializer, which
+publishes the fixed joints, and the backbone, which publishes the joints it measures.
+Give `cache_window_s` and `lookup_timeout_s` the values that launchers-hub
+`<robot>/fragments/motion_planner.json5` gives the planner: the viewer places depth
+frames as the planner does.
 `--clock simulation` puts the viewer on the simulation's clock, as the other instances of
 a simulated stack are. On a physical robot, leave `--clock` out. To leave a link out, give
 `--vacant-link <link>=<why>` in place of its `--link`.
@@ -110,7 +118,9 @@ their shells.
 | `cloud_stride` | 4 | the points come from every n-th pixel across and down |
 | `scene_poll_hz` | 2.0 | how many times a second it reads the planning scene |
 | `trail_length` | 100 | how many past grasp-point positions each trail holds |
-| `camera_name` | `chest` | the camera of `camera_mounts` that the `camera` link is |
+| `camera_name` | `chest` | the camera of `sensor_mounts` that the `camera` link is |
+| `cache_window_s` | none | how long each moving transform's past stamps are kept, counted back from its newest; finite and above 0 |
+| `lookup_timeout_s` | none | how long a depth frame waits for the tree to place the camera at its time; finite and 0 or above, 0 for no wait |
 
 The color images go to the page as JPEG. The rates bound the work of the node and the
 data on the link: a color frame of the simulated OpenArm chest camera is 1280x720 (2.8 MB
@@ -130,15 +140,22 @@ address on `web_port`.
 | `identity` | `robot_identity:v1` | zero_or_one | no robot links |
 | `camera` | `rgbd_camera:v1` | zero_or_one | no images, no points |
 | `geometry` | `camera_geometry:v1` | zero_or_one | no points |
-| `camera_mounts` | `camera_mounts:v1` | zero_or_one | no points |
+| `sensor_mounts` | `sensor_mounts:v1` | zero_or_one | no points |
+| `transforms` | `transforms:v1` | zero_or_more | no points |
 | `motion_planning` | `motion_planning:v1` | zero_or_one | no scene, no voxel map; each joint is named by its index |
 
-The viewer asks the camera's geometry and pose when a depth frame first needs them, and
-asks again after a failed ask, so a camera that answers late is drawn once it answers. It
-asks the geometry again when the frames change their size or their alignment. For a
-camera that an arm carries, it asks the pose again for each cloud: the points take the
-pose of that ask, which can be some tens of milliseconds after the frame, so the points
-of a camera on a moving arm stand that much off. It reads the planning scene at
+The viewer asks the camera's geometry and its frame on the robot when a depth frame first
+needs them, and asks again after a failed ask, so a camera that answers late is drawn once
+it answers. It asks the geometry again when the frames change their size or their
+alignment. It keeps the robot's tree from the transforms of every publisher of the
+`transforms` link, and places the camera's frame in the robot frame at the time each
+depth frame was taken, so the points of a camera on a moving arm stand where the arm held
+it. A depth frame waits up to `lookup_timeout_s` of the node's clock, the simulation's
+under `--clock simulation`, for the transforms of its time; a newer depth frame takes the
+place of one that waits, and one whose wait runs out draws no points, with the lookup's
+failure in the log. The moving transforms are dropped when the node's clock goes back. A
+simulation clock that closes ends the node with an error, for its restart policy to start
+it again. It reads the planning scene at
 `scene_poll_hz` and draws it at each read, at its time on the node's clock, and logs the
 changes from the read before.
 

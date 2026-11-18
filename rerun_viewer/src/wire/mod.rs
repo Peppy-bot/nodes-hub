@@ -4,9 +4,11 @@
 
 pub mod arms;
 pub mod camera;
+pub mod clock;
 pub mod planner_map;
 pub mod robot;
 pub mod scene;
+pub mod tree;
 
 use std::future::Future;
 use std::pin::Pin;

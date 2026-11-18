@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use control_core::node_clock::NodeClock;
 use peppy_codec::consumer::{
     ActionClient, ConsumerError, ConsumerIdentity, GoalOutcome, MemberBinding, ServiceClient,
     TopicConsumer, contract_topic_codec,
@@ -31,21 +32,6 @@ const ADMISSION: Duration = Duration::from_secs(10);
 /// workflow gives.
 const RESULT_WAIT: Duration = Duration::from_secs(86_400 + 60);
 
-/// The run clock of a run.
-#[derive(Clone)]
-pub enum RunClock {
-    Wall,
-    /// The simulation clock of the director: the time of its last tick.
-    Simulation(watch::Receiver<u64>),
-}
-
-fn wall_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
 /// A client of one member.
 enum Client {
     Service(ServiceClient, MemberBinding),
@@ -60,7 +46,8 @@ pub struct LiveHost {
     latest: Arc<Mutex<BTreeMap<TopicKey, (Json, u64)>>>,
     /// Counts the messages of the topics, so a read that waits for one wakes.
     arrivals: Arc<watch::Sender<u64>>,
-    clock: RunClock,
+    /// The run clock of the run.
+    clock: NodeClock,
     leases: Arc<Leases>,
     events: mpsc::UnboundedSender<Event>,
     cancel_timeout: Duration,
@@ -94,7 +81,7 @@ impl LiveHost {
         plan: &Plan,
         contracts: &BTreeMap<String, Arc<ContractShape>>,
         leases: Arc<Leases>,
-        clock: RunClock,
+        clock: NodeClock,
         events: mpsc::UnboundedSender<Event>,
     ) -> Result<LiveHost, String> {
         let processor = runner.processor();
@@ -172,7 +159,7 @@ impl LiveHost {
             subscriptions.push(tokio::spawn(async move {
                 while let Some((_, message)) = consumer.next_message().await {
                     if let Ok(value) = consumer.decode(&message) {
-                        let at = now_of(&clock);
+                        let at = clock.now_ns();
                         latest
                             .lock()
                             .expect("no reader panics holding the topics")
@@ -298,38 +285,17 @@ fn end_after_cancel(settled: Option<Result<GoalOutcome, ConsumerError>>) -> Call
     }
 }
 
-fn now_of(clock: &RunClock) -> u64 {
-    match clock {
-        RunClock::Wall => wall_ns(),
-        RunClock::Simulation(ticks) => *ticks.borrow(),
-    }
-}
-
-/// Resolves at the first instant of `clock` at or after `at`; a simulation
-/// clock that closed ends no wait past its last tick.
-async fn until_on(clock: &RunClock, at: u64) {
-    match clock {
-        RunClock::Wall => {
-            let now = wall_ns();
-            if at > now {
-                tokio::time::sleep(Duration::from_nanos(at - now)).await;
-            }
-        }
-        RunClock::Simulation(ticks) => crate::clock::until_tick(ticks, at).await,
-    }
-}
-
 impl Host for LiveHost {
     fn now(&self) -> u64 {
-        now_of(&self.clock)
+        self.clock.now_ns()
     }
 
     fn wall_now(&self) -> u64 {
-        wall_ns()
+        crate::journal::wall_ns()
     }
 
     async fn until(&self, at: u64) {
-        until_on(&self.clock, at).await
+        self.clock.until(at).await
     }
 
     async fn call(&self, target: &Target, request: Json, cancel: CancellationToken) -> CallEnd {
