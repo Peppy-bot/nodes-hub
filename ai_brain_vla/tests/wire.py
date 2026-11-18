@@ -12,13 +12,12 @@ from peppygen.consumed_actions.limb_motion import move_arm, move_gripper
 from peppygen.consumed_services.limb_motion import check_arm_move
 from peppygen.consumed_topics.limb_state import limb_states
 from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
-from peppygen.fixtures.exposed_actions.item_manipulation import grab_item as grab_fx
+from peppygen.fixtures.exposed_services.item_manipulation import get_state as get_state_fx
 
 WAIT = 10.0
-# Goals sent before the brain has its first limb_states snapshot; each one
-# is a whole goal round trip.
+# Snapshots published before the brain holds the first one; each one is a
+# get_state round trip.
 ATTEMPTS = 1000
-NO_SNAPSHOT = "no limb_states snapshot received from the robot yet"
 
 
 async def result_of(fixture, h, request):
@@ -88,18 +87,12 @@ def plan(h, *answers: bool) -> None:
 
 
 async def once_the_brain_has_limbs(h) -> None:
-    """Publishes a snapshot stamped 1 s until a grab is no longer refused
-    for want of one: a grab by pose in one orientation, whose one check the
-    backbone refuses, so it moves nothing."""
-    plan(h, False)
+    """Publishes a snapshot stamped 1 s until get_state reports the openings
+    of the grippers: the brain holds a limb_states snapshot, which a grab
+    reads first. Nothing moves."""
     for _ in range(ATTEMPTS):
         await publish_limbs(h)
-        data = await result_of(grab_fx, h, grab_by_pose([0.5, 0.0, 0.9], [0.0, 1.0, 0.0, 0.0]))
-        if data.message != NO_SNAPSHOT:
-            assert data.message.endswith(
-                "with gripper 'left_gripper': orientation 1 of 1, [0.000, 1.000, 0.000, 0.000], has no plan to "
-                "its pre-grasp point [0.500, 0.000, 0.975]: goal pose not planned"
-            ), data.message
+        if (await get_state_fx.poll(h, 5.0)).gripper_openings:
             return
     raise AssertionError("the brain never received the limb_states snapshot")
 

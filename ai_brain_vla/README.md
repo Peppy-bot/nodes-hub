@@ -24,7 +24,7 @@ scan reports is whatever SigLIP can name, not a list someone enrolled.
 
 | `manipulation_model` | what it is |
 |---|---|
-| `scripted` | brain_core's `ScriptedManipulator` on its `CentreProposer`, with no model call: a `grab_item` takes the item's seen point lowered 2.5 cm (a grab by pose takes the pose itself), checks with the backbone's `check_arm_move` that the pre-grasp point 7.5 cm above, the grasp point and the lifted point 7.5 cm above all plan with the gripper pointing down at 8 rolls (a grab by pose with an orientation tries that one alone), then opens, reaches, closes with the goal's `max_effort` and lifts. It opens the jaws as wide as the item and 1.5 cm on each side, fully for an item of no known width. It judges the hold from the close's `final_opening`, below 0.05 of which the grab fails with `closed on nothing`, then from the first `limb_states` snapshot after the lift, which it waits up to 1 s for; below 0.05, or more than 0.05 below the close's opening (jaws that lose the item close further), the grab fails with `slipped while lifting`. A grab that fails once the descent was sent first opens the gripper and moves the arm straight back up to the pre-grasp point, unless a stop ended the step. `drop_item` opens the gripper where it is; `place_item` carries the item to 7.5 cm above the pose, lowers it to the pose and opens there, or where the item comes to rest on something on the way, and climbs back to 7.5 cm above |
+| `scripted` | brain_core's `ScriptedManipulator` on its `CentreProposer`, with no model call: a `grab_item` takes the item's seen point lowered 2.5 cm (a grab by pose takes the pose itself), checks with the backbone's `check_arm_move` that the pre-grasp point 7.5 cm above, the grasp point and the lifted point 7.5 cm above all plan with the gripper pointing down at 8 rolls (a grab by pose with an orientation tries that one alone), then opens, reaches, descends on a line down that stops on contact, closes with the goal's `max_effort` where the line down ended and lifts. It opens the jaws as wide as the item and 1.5 cm on each side, fully for an item of no known width. It judges the hold from the close's `final_opening`, below 0.05 of which the grab fails with `closed on nothing`, then from the first `limb_states` snapshot after the lift, which it waits up to 1 s for; below 0.05, or more than 0.05 below the close's opening (jaws that lose the item close further), the grab fails with `slipped while lifting`. A grab that fails once the descent was sent first opens the gripper and moves the arm straight back up to the pre-grasp point, unless a stop ended the step. `drop_item` opens the gripper where it is; `place_item` carries the item to 15 cm above the pose (7.5 cm where the backbone has no plan that high), lowers it to the pose on a line down that stops on contact, opens where the line down ended, at the pose or where the item came to rest on something on the way, and climbs back; a line down that fails or that a stop ended fails the place, and the gripper still holds the item |
 | `none` | moves nothing: every sequence is refused with "no manipulation model: manipulation_model is 'none'", while abort and get_state work |
 
 `scripted` is the default. Every move goes through the backbone the
@@ -34,9 +34,11 @@ backbone. `get_state` reports, beside the held flag, each gripper's opening
 as the robot last measured it. Each arm move completes once the backbone has
 measured the grasp point within 2 cm and 0.15 rad of its goal, and fails with
 `timeout` when it is still outside them 2 s after the planned end of the
-motion: the brain waits for no arrival of its own. When a placed item comes
-to rest on something on the way down, the arm stops short and its move fails
-so; the brain reads where the arm stopped from `limb_states`.
+motion: the brain waits for no arrival of its own. A line down, the descent
+of a grab and of a place, names a contact gap of 2 cm and runs at 5 cm/s: when
+the fingers or the held item meet something on the way down, the backbone ends
+the move on contact and the arm holds where it stands. Every other move names
+no contact check and runs as fast as the joint limits allow.
 
 Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
