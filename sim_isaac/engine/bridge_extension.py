@@ -20,8 +20,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from robot_description_py import FingerSpan
 from sim_robot_core.cameras import FramePacer
-from sim_robot_core.models import FingerSpan
 from sim_robot_core.registry import Registry
 
 from world import Robot, World
@@ -98,9 +98,9 @@ class RobotLimbs:
             for gripper in self.entry.grippers
         }
         self.joint_index: dict[str, int] = {}
-        # Each finger joint's closed position and signed travel to fully
-        # open, as the robot's description gives them; measured positions
-        # read back as an opening fraction through it.
+        # Where the gripper's closed and open states put each finger joint,
+        # as the robot's description gives them; measured positions read
+        # back as an opening fraction through it.
         self.spans: dict[str, list[FingerSpan]] = {}
         # Last force limit written per gripper, so the cap is not re-sent per tick.
         self.applied_effort: dict[str, float] = {}
@@ -344,7 +344,7 @@ class IsaacBridgeExtension:
             # the same command drives prismatic fingers, revolute ones and a
             # single jaw.
             actuator.write_targets(
-                {name: span.position(setpoint.opening) for name, span in gripper.driven()}
+                {name: span.position_at(setpoint.opening) for name, span in gripper.driven()}
             )
 
     def _publish_state(self, ready: list[RobotLimbs]) -> None:
@@ -392,7 +392,7 @@ class IsaacBridgeExtension:
         spans = limbs.spans.get(name, [])
         if not reading or len(reading["positions"]) != len(spans):
             return None
-        fractions = [span.opening(q) for q, span in zip(reading["positions"], spans)]
+        fractions = [span.opening_at(q) for q, span in zip(reading["positions"], spans)]
         forces = reading["applied_forces"]
         return (
             sum(fractions) / len(fractions),

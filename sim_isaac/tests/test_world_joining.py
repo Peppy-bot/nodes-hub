@@ -12,12 +12,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 import robot_description_py
+from robot_description_py import FingerSpan, Mimic
 
 pytest.importorskip("pxr", reason="USD Python wheels are unavailable on this platform")
 
 from pxr import Sdf, Usd, UsdGeom, UsdPhysics  # noqa: E402  pylint: disable=C0413
 from entries import entry  # noqa: E402  pylint: disable=C0413
-from sim_robot_core.models import FingerSpan, Gripper, Mimic, ModelEntry  # noqa: E402  pylint: disable=C0413
+from sim_robot_core.models import Gripper, ModelEntry  # noqa: E402  pylint: disable=C0413
 
 from _world import known, world_module  # noqa: E402  pylint: disable=C0413
 
@@ -187,8 +188,8 @@ def _rig_of_followers(*pairs):
     joints, spans, mimics = [], [], []
     for followed, follower, multiplier, offset in pairs:
         joints += [followed, follower]
-        spans += [FingerSpan(closed=0.0, travel=1.0), FingerSpan(closed=offset, travel=multiplier)]
-        mimics += [None, Mimic(joint=followed, multiplier=multiplier, offset=offset)]
+        spans += [FingerSpan(0.0, 1.0), FingerSpan(offset, offset + multiplier)]
+        mimics += [None, Mimic(followed, multiplier, offset)]
     rig = ModelEntry(
         model="rig",
         arms=(),
