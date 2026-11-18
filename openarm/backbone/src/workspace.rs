@@ -18,7 +18,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use camera_core::geometry::depth_range_is_valid;
 use camera_core::pinhole::{DepthModel, Pinhole, UnknownDepthModel};
-use robot_description::{ArmId, PerArm};
+use robot_description::chain_kinematics::Tree;
+use robot_description::{ArmId, PerArm, RobotDescription};
 use srs_model::nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy, JointVec};
 use workspace_core::design::{
@@ -27,12 +28,23 @@ use workspace_core::design::{
 };
 use workspace_core::reach::{self as rule, ArmSolver, Attempt, Solves, Unobstructed};
 use workspace_core::surface_block::ArmBodies;
-use workspace_core::{
-    Camera, CameraFacts, Depth, Limits, PerceptionCameraError, REACH_TOLERANCE, Reach,
-};
+use workspace_core::{Camera, CameraFacts, Depth, Limits, REACH_TOLERANCE, Reach};
 
-use crate::camera_mounts::{CameraMounts, DesignCamera};
 use crate::robot::{ARMS, LIMBS};
+
+/// Why the design gives the workspace no one perception camera it can place.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum PerceptionCameraError {
+    #[error(transparent)]
+    Several(#[from] workspace_core::PerceptionCameraError),
+
+    #[error(
+        "the perception camera {camera} moves with a joint of no arm, and the workspace places \
+         it where the design fixes it: join its optical frame to the robot frame by fixed \
+         joints in the robot's URDF"
+    )]
+    Moves { camera: &'static str },
+}
 
 /// Why the perception camera's view cannot be checked now, from what the
 /// camera linked as perception_geometry answered.
@@ -106,24 +118,34 @@ pub struct PerceptionCamera {
 }
 
 impl PerceptionCamera {
-    /// The perception camera of `cameras`, if the design has one.
-    fn of(cameras: &[DesignCamera]) -> Result<Option<Self>, PerceptionCameraError> {
+    /// The perception camera of `description`, if the design has one, where
+    /// the fixed joints from the robot frame down to its optical frame place
+    /// it. A perception camera that a joint of no arm moves is refused.
+    fn of(description: &'static RobotDescription) -> Result<Option<Self>, PerceptionCameraError> {
+        let cameras = description.cameras();
         let facts: Vec<CameraFacts<'static>> = cameras
             .iter()
             .map(|camera| CameraFacts {
-                name: camera.name,
+                name: &camera.name,
                 gives_depth: camera.depth_range.is_some(),
-                carried_by_arm: camera.fixed_pose.is_none(),
+                carried_by_arm: description
+                    .arm_carrying(&camera.parent_link)
+                    .expect("a camera's parent link is a link of the URDF")
+                    .is_some(),
             })
             .collect();
         let Some(name) = workspace_core::perception_camera(&facts)? else {
             return Ok(None);
         };
-        let pose = cameras
+        let camera = cameras
             .iter()
             .find(|camera| camera.name == name)
-            .and_then(|camera| camera.fixed_pose)
-            .expect("the perception camera is a camera of the design that no arm carries");
+            .expect("the perception camera is a camera of the design");
+        let tree = Tree::from_robot(description.robot())
+            .expect("a description holds its URDF to one tree");
+        let pose = tree
+            .fixed_path_to(tree.root(), &camera.frame())
+            .ok_or(PerceptionCameraError::Moves { camera: name })?;
         let translation = pose.translation.vector;
         let rotation = pose.rotation.to_rotation_matrix();
         Ok(Some(Self {
@@ -170,20 +192,20 @@ pub struct Workspace {
 
 impl Workspace {
     /// The workspace of the robot whose arms are `arms`, each built from its
-    /// arm of the description, whose Ready posture is `ready`, whose arm bodies
-    /// are `bodies` and whose cameras are `mounts`. A design with more than one
-    /// camera that could be its perception camera is refused.
+    /// arm of `description`, whose Ready posture is `ready` and whose arm
+    /// bodies are `bodies`, with the cameras of `description`. A design with
+    /// more than one camera that could be its perception camera is refused.
     pub fn new(
         arms: PerArm<Arm, ARMS>,
         ready: &PerArm<JointVec, ARMS>,
         bodies: ArmBodies,
-        mounts: &CameraMounts,
+        description: &'static RobotDescription,
     ) -> Result<Self, PerceptionCameraError> {
         Ok(Self {
             arms,
             ready: *ready,
             bodies: Mutex::new(bodies),
-            perception_camera: PerceptionCamera::of(&mounts.design_cameras())?,
+            perception_camera: PerceptionCamera::of(description)?,
             reach_memo: Mutex::new(ReachMemo::new()),
         })
     }
@@ -423,12 +445,11 @@ mod tests {
     }
 
     fn workspace(model: &str) -> Workspace {
-        let mounts = CameraMounts::resolve(description(model)).expect("the mounts resolve");
         Workspace::new(
             arms(model),
             &postures(model, states::READY),
             arm_bodies(model),
-            &mounts,
+            description(model),
         )
         .expect("one perception camera at most")
     }
@@ -513,27 +534,70 @@ mod tests {
         }
     }
 
+    /// Where the link `link` of `model` stands in the robot frame: the
+    /// transforms of the fixed joints of its description composed from the
+    /// root down to it, as the robot's tree composes them.
+    fn fixed_place_of(model: &str, link: &str) -> Isometry3<f64> {
+        let fixed = description(model).fixed_transforms();
+        let mut place = Isometry3::identity();
+        let mut at = link;
+        while let Some(transform) = fixed.iter().find(|transform| transform.child == at) {
+            place = transform.pose * place;
+            at = transform.parent;
+        }
+        place
+    }
+
     #[test]
-    fn the_perception_camera_of_v2_is_its_base_camera_and_v1_has_none() {
+    fn the_perception_camera_of_v2_is_its_chest_camera_where_the_tree_places_it_and_v1_has_none() {
         let v2 = workspace(V2);
         let perception = v2.perception_camera().expect("v2 has one");
-        let mounts = CameraMounts::resolve(description(V2)).expect("the mounts resolve");
-        let base_cameras: Vec<DesignCamera> = mounts
-            .design_cameras()
-            .into_iter()
-            .filter(|camera| camera.fixed_pose.is_some())
-            .collect();
-        let [base] = base_cameras.as_slice() else {
-            panic!("v2's design fixes one camera to the base: {base_cameras:?}");
-        };
-        assert_eq!(perception.name, base.name);
+        assert_eq!(perception.name, "chest");
         let camera = chest(&v2);
-        let at = base.fixed_pose.expect("fixed").translation.vector;
-        assert_eq!(camera.position, [at.x, at.y, at.z]);
+        let placed = fixed_place_of(V2, "chest_optical_frame");
+        let at = placed.translation.vector;
+        let miss = (Vector3::from(camera.position) - at).norm();
+        assert!(miss <= 1e-12, "{:?} vs {at:?}", camera.position);
+        let rotation = placed.rotation.to_rotation_matrix();
+        for (index, value) in camera.rotation.iter().enumerate() {
+            let expected = rotation[(index / 3, index % 3)];
+            assert!((value - expected).abs() <= 1e-12, "rotation[{index}]");
+        }
         // The optical axis, the third column, looks forward and down.
         let (view_x, view_z) = (camera.rotation[2], camera.rotation[8]);
         assert!(view_x > 0.4 && view_z < -0.8, "({view_x}, {view_z})");
         assert_eq!(workspace(V1).perception_camera(), None);
+    }
+
+    // A depth camera that a joint of no arm turns, as on a pan head, has no
+    // pose the design fixes: the workspace refuses it, naming it.
+    #[test]
+    fn a_perception_camera_on_a_joint_of_no_arm_is_refused_naming_it() {
+        let model = robot_description::model(V2).expect("a bundled model");
+        let fixed_chest = "    <parent link=\"openarm_body_link0\"/>\n    \
+                           <child link=\"chest_optical_frame\"/>";
+        assert!(
+            model.urdf().contains(fixed_chest),
+            "v2 fixes its chest camera to its body"
+        );
+        let on_a_pan_joint = "    <parent link=\"pan_link\"/>\n    \
+                              <child link=\"chest_optical_frame\"/>\n  </joint>\n  \
+                              <link name=\"pan_link\"/>\n  \
+                              <joint name=\"pan_joint\" type=\"revolute\">\n    \
+                              <parent link=\"openarm_body_link0\"/>\n    \
+                              <child link=\"pan_link\"/>\n    <axis xyz=\"0 0 1\"/>\n    \
+                              <limit lower=\"-1\" upper=\"1\" effort=\"1\" velocity=\"1\"/>";
+        let urdf = model.urdf().replace(fixed_chest, on_a_pan_joint);
+        let description = RobotDescription::parse(&urdf, model.srdf()).expect("a description");
+        let refused = PerceptionCamera::of(Box::leak(Box::new(description)))
+            .expect_err("the chest camera is the perception camera and moves");
+        assert_eq!(refused, PerceptionCameraError::Moves { camera: "chest" });
+        assert!(
+            refused
+                .to_string()
+                .starts_with("the perception camera chest moves with a joint of no arm"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -611,7 +675,6 @@ mod tests {
 
     #[test]
     fn a_point_beyond_an_arms_reach_by_less_than_the_reach_tolerance_is_reached() {
-        let mounts = CameraMounts::resolve(description(V2)).expect("the mounts resolve");
         let arms = arms(V2);
         // How far the arms' wrist centres stand outside their reach for the
         // best grasp orientation at `x` ahead, 0.2 m to the left and 0.2 m
@@ -633,8 +696,13 @@ mod tests {
             !an_arm_solves_exactly(&arms, grasp_poses(target)),
             "no arm takes a grasp exactly"
         );
-        let workspace = Workspace::new(arms, &postures(V2, states::READY), arm_bodies(V2), &mounts)
-            .expect("one perception camera at most");
+        let workspace = Workspace::new(
+            arms,
+            &postures(V2, states::READY),
+            arm_bodies(V2),
+            description(V2),
+        )
+        .expect("one perception camera at most");
         assert_eq!(
             workspace.reach(target),
             Reach::Reached {

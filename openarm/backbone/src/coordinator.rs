@@ -40,7 +40,6 @@ use control_core::pacer::Pacer;
 use robot_description::{ArmId, PerArm};
 use srs_model::ARM_DOF;
 
-use crate::camera_mounts::MeasuredGrasps;
 use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::governor::{GovState, Governor, Guard, GuardAt, PathArms};
 use crate::gripper_move::{
@@ -57,6 +56,7 @@ use crate::planner::{
 use crate::publish::{LimbStateSnapshot, Publishers};
 use crate::robot::{ARMS, LIMBS};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
+use crate::transforms::JointTransforms;
 use crate::upstream::{Upstream, UpstreamMode};
 use control_core::chase::rate_limited;
 
@@ -179,7 +179,7 @@ pub async fn run(
     mut requests: mpsc::Receiver<CoordinatorRequest>,
     mut path_checks: PathChecks,
     governor_config: watch::Receiver<GovernorConfig>,
-    measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
+    joint_transforms: JointTransforms,
     config: RunConfig,
     token: CancellationToken,
 ) -> peppygen::Result<()> {
@@ -190,7 +190,7 @@ pub async fn run(
         velocity_filter_cutoff_hz,
         upstream_mode,
     } = config;
-    let publishers = Publishers::declare(&runner, measured_grasps).await?;
+    let publishers = Publishers::declare(&runner, joint_transforms).await?;
 
     // Hold each arm's real pose, not a neutral zero: wait for the first measured
     // state from both arms and seed the held setpoints there before publishing.

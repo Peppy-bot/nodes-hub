@@ -19,7 +19,6 @@
 
 mod actions;
 mod arm_order;
-mod camera_mounts;
 mod coordinator;
 mod failure;
 mod governor;
@@ -37,6 +36,7 @@ mod startup;
 mod streams;
 #[cfg(test)]
 mod test_support;
+mod transforms;
 mod types;
 mod upstream;
 mod workspace;

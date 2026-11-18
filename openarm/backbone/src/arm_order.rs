@@ -58,8 +58,8 @@ impl ArmOrder {
         assert_eq!(array.len(), self.joint_count(), "an array in this order");
         self.0
             .iter()
-            .zip(array.chunks_exact(ARM_DOF))
-            .map(|(&arm, joints)| (arm, joints.try_into().expect("an arm's share of the array")))
+            .zip(array.as_chunks::<ARM_DOF>().0)
+            .map(|(&arm, joints)| (arm, *joints))
     }
 
     /// The joints of `arm` in `array`, an array in this order: none for an
