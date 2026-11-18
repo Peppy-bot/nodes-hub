@@ -35,7 +35,7 @@ NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.2.0.1"  # mirrors nvcr.io/nvidia/isaac-sim upstream version
 ISAAC_IMAGE_REV="1"      # bump when Isaac image content changes without an upstream version bump
-MUJOCO_IMAGE_REV="2"     # bump when MuJoCo image content changes without an upstream version bump
+MUJOCO_IMAGE_REV="3"     # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
 # The mujoco PyPI version that the MuJoCo image installs: the pin of
 # requirements.mujoco.txt, read here so that the tag of the image cannot name
