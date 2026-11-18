@@ -8,6 +8,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use control_core::fault::Fault;
 use peppygen::Parameters;
 use peppygen::consumed_services::identity::get_description;
 use peppygen::consumed_services::motion_planning::{describe_arms, get_planning_scene};
@@ -29,21 +30,22 @@ pub fn every_optional_link_vacant() -> Config {
         identity_vacant: true,
         camera_vacant: true,
         geometry_vacant: true,
-        camera_mounts_vacant: true,
+        sensor_mounts_vacant: true,
         motion_planning_vacant: true,
         ..Config::default()
     }
 }
 
 /// The harness's configuration with the links `bound` bound, the others vacant, and the
-/// node's parameters `parameters`.
+/// node's parameters `parameters`. A bound transforms link has one publisher.
 pub fn bound(links: &[&str], parameters: Parameters) -> Config {
     Config {
         parameters: Some(parameters),
         identity_vacant: !links.contains(&"identity"),
         camera_vacant: !links.contains(&"camera"),
         geometry_vacant: !links.contains(&"geometry"),
-        camera_mounts_vacant: !links.contains(&"camera_mounts"),
+        sensor_mounts_vacant: !links.contains(&"sensor_mounts"),
+        transforms_instances: usize::from(links.contains(&"transforms")),
         motion_planning_vacant: !links.contains(&"motion_planning"),
         ..Config::default()
     }
@@ -56,7 +58,7 @@ pub async fn start(config: Config) -> Result<(Harness, Mocks, Arc<FakeCanvas>), 
     let (harness, mocks) = Harness::start_with(config, move |params, runner| async move {
         let config = rerun_viewer::config::Config::parse(&params)
             .map_err(|e| peppygen::Error::Node(e.into()))?;
-        rerun_viewer::node::setup(config, runner, drawn_on).await
+        rerun_viewer::node::setup(config, runner, drawn_on, Fault::default()).await
     })
     .await
     .map_err(|e| e.to_string())?;

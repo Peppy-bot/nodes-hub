@@ -5545,6 +5545,7 @@ dependencies = [
  "camera_core",
  "chain_kinematics",
  "control_core",
+ "frame_tree",
  "peppygen",
  "peppylib",
  "rerun",
