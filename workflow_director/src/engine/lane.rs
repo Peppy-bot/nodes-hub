@@ -903,10 +903,13 @@ impl<'a, H: Host> Lane<'a, H> {
             Ok(result) => result,
             Err(end) => return end,
         };
+        // A false `done_when` gives the result to the incident of the
+        // failure, so a step with one keeps a copy.
+        let for_the_incident = call.done_when.is_some().then(|| result.clone());
         if let Some(name) = &call.result {
             scope.insert(name.clone(), result);
         }
-        let Some(done_when) = &call.done_when else {
+        let (Some(done_when), Some(result)) = (&call.done_when, for_the_incident) else {
             return StepEnd::Done;
         };
         match self
@@ -917,10 +920,13 @@ impl<'a, H: Host> Lane<'a, H> {
             .await
         {
             Ok(true) => self.monitored(name, &within.cancel).await,
-            Ok(false) => StepEnd::Failed(Failure::new(
-                ATTEMPT_FAILED,
-                format!("`done_when` of `{}` is false", step.id),
-            )),
+            Ok(false) => StepEnd::Failed(
+                Failure::new(
+                    ATTEMPT_FAILED,
+                    format!("`done_when` of `{}` is false", step.id),
+                )
+                .with_result(result),
+            ),
             Err(end) => end,
         }
     }

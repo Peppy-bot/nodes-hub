@@ -72,6 +72,12 @@ run fails its lane. An alert of severity 2 or 3 of a bound physical robot
 refuses the run when it stands at the start, is an incident of the robot's
 lane during the run, and refuses a resume of that lane while it stands.
 
+The incident of a step whose `done_when` is false holds the result of its
+call, of its last attempt for a step with `retry`, so that a reader knows the
+cause of the failure: the result when its JSON text is 8 KiB or less, else
+the size of that text. The `call` line of the step in the journal holds each
+result. The journal, the run result and the suspension give the incident.
+
 `run`, `resume` and `abort` give each event of the run as feedback, and the
 status of the run every 5 s; `run_events` gives every event of every run.
 

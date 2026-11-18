@@ -16,8 +16,9 @@ pub enum Class {
     Lane,
 }
 
-/// The failure of a step: its kind, its message, its class, and the cause
-/// that the incident of the failure names.
+/// The failure of a step: its kind, its message, its class, the cause that
+/// the incident of the failure names, and the result of the call of a step
+/// whose `done_when` is false.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Failure {
     pub kind: String,
@@ -25,6 +26,8 @@ pub struct Failure {
     pub class: Class,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<Box<Cause>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Box<serde_json::Value>>,
 }
 
 /// What caused a failure of the kind `anomaly` or `alert`.
@@ -47,6 +50,7 @@ impl Failure {
             message: message.into(),
             class,
             cause: None,
+            result: None,
         }
     }
 
@@ -54,6 +58,14 @@ impl Failure {
     pub fn because(self, cause: Cause) -> Failure {
         Failure {
             cause: Some(Box::new(cause)),
+            ..self
+        }
+    }
+
+    /// This failure, with `result`, the result of the call of its step.
+    pub fn with_result(self, result: serde_json::Value) -> Failure {
+        Failure {
+            result: Some(Box::new(result)),
             ..self
         }
     }
