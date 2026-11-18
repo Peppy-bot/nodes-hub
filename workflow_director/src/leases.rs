@@ -101,7 +101,7 @@ impl Leases {
                 });
             }
             fault.raise(
-                &runner,
+                runner.cancellation_token(),
                 "the lease goal of the director ended, and its leases with it; the node exits for its restart policy to start it with a new lease goal",
             );
         });
