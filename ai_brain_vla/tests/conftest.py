@@ -6,13 +6,13 @@ and no model."""
 from __future__ import annotations
 
 import asyncio
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Union
 from weakref import WeakKeyDictionary
 
 import numpy as np
 import pytest
 
-from brain_core.ports import Box, CancelToken, Coverage, Deadline, Gripper, Item, Outcome, Pose
+from brain_core.ports import Box, CancelToken, Coverage, Deadline, Gripper, Item, Outcome, Pose, TargetItem
 from peppygen.parameters import Parameters
 
 from ai_brain_vla.perception import gallery, weights
@@ -143,13 +143,18 @@ class FakeManipulator:
         self.calls.append(("grab", item.item_id, gripper.name, max_effort))
         return await self._run(cancel)
 
-    async def drop(self, gripper: Gripper, cancel: CancelToken) -> Outcome:
-        self.calls.append(("drop", gripper.name))
+    async def drop(self, gripper: Gripper, cancel: CancelToken, above: Optional[TargetItem] = None) -> Outcome:
+        self.calls.append(("drop", gripper.name) if above is None else ("drop", gripper.name, above.item_id))
         return await self._run(cancel)
 
-    async def place(self, gripper: Gripper, pose: Pose, cancel: CancelToken) -> Outcome:
-        self.calls.append(("place", gripper.name, pose.position))
-        return await self._run(cancel, final_position=(pose.position[0], pose.position[1], pose.position[2] + 0.01))
+    async def place(self, gripper: Gripper, to: Union[Pose, TargetItem], cancel: CancelToken) -> Outcome:
+        """A place at a pose reports the jaws opened 1 cm above it; a place
+        into a target item, 1 cm above the item's top at its centre."""
+        if isinstance(to, TargetItem):
+            self.calls.append(("place", gripper.name, to.item_id))
+            return await self._run(cancel, final_position=(to.centre[0], to.centre[1], to.top_z + 0.01))
+        self.calls.append(("place", gripper.name, to.position))
+        return await self._run(cancel, final_position=(to.position[0], to.position[1], to.position[2] + 0.01))
 
     async def stop(self) -> None:
         self.stopped += 1

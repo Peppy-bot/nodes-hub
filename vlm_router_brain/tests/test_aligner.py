@@ -18,7 +18,7 @@ from brain_core.limb_state import NO_SNAPSHOT, LimbStateStore
 from brain_core.manipulators.scripted.aligning import Aligned, AlignmentFailed, AlignRequest, GaveUp, OutOfSteps, Stopped
 from brain_core.manipulators.scripted.grasp import GraspDirection, approach, jaw_line_deg, lifted, orientation
 from brain_core.perception.camera import CameraPose
-from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal
+from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal, TargetItem
 from brain_core.robot import MoveEnd, MoveResult
 
 from vlm_router_brain.manipulators.vlm.aligner import MIN_FRAME_WAIT_S, NOT_STARTED, ModelAligner
@@ -452,3 +452,108 @@ async def test_a_place_move_keeps_the_release_height_and_the_history_measures_fr
     assert end.point == (0.51, 0.10, TARGET[2])
     (line,) = model.turns[1].history
     assert "from the target point" in line
+
+
+# Above a target item: the texts name it and its width, the limit is the
+# smaller of 10 cm and half its width less 2 cm, and a drop, with no
+# descent after it, checks the pre point alone.
+
+BOWL = TargetItem("wooden_bowl_1-t0", "wooden bowl", (0.50, 0.10), 0.72, 0.65, 0.18)
+BOWL_BOTTOM = (0.50, 0.10, 0.65)
+
+
+def into_request(target=BOWL, descends=True) -> AlignRequest:
+    point = BOWL_BOTTOM if descends else PRE
+    return AlignRequest(None, LEFT, PRE, point, DOWN_0, LIFT_M, target=(*target.centre, target.top_z), into=target, descends=descends)
+
+
+async def test_a_place_into_a_bowl_names_the_bowl_and_its_width_and_measures_from_its_centre():
+    a, model = aligner('{"action": "ready"}')
+    end = await a.align(into_request(), FakeMoves(), CancelToken())
+    assert isinstance(end, Aligned) and end.point == BOWL_BOTTOM
+    (turn,) = model.turns
+    assert turn.goal.startswith("You guide a robot gripper that holds an item to a free spot of the wooden bowl, about 18 cm wide.")
+    assert "The gripper then goes straight down until the item rests, and opens." in turn.goal
+    assert "from the centre of the wooden bowl;" in turn.state and "12.0 cm above the bottom of the wooden bowl." in turn.state
+    move, ready, give_up = turn.tools
+    # Half of 18 cm less 2 cm: 7 cm.
+    assert move.description.endswith("the gripper stays within 7 cm of the centre of the wooden bowl.")
+    assert ready.description.startswith("the held item is centred above a free spot of the wooden bowl: the gripper goes straight down")
+    assert give_up.description.startswith("no free spot of the wooden bowl is within reach of the moves")
+
+
+async def test_a_step_that_ends_beyond_half_the_bowls_width_less_the_margin_moves_nothing():
+    a, model = aligner('{"action": "move", "dx": 2.5, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    off_centre = (0.55, 0.10, PRE[2])
+    moves = FakeMoves()
+    request = AlignRequest(None, LEFT, off_centre, (0.55, 0.10, 0.65), DOWN_0, LIFT_M, target=(0.50, 0.10, 0.72), into=BOWL)
+    await a.align(request, moves, CancelToken())
+    assert moves.moves == []
+    (line,) = model.turns[1].history
+    assert line.endswith("moved nothing: the gripper stays within 7 cm of the item, this step ends 7.5 cm from it")
+
+
+@pytest.mark.parametrize("width_m, radius_words", [(None, "10 cm"), (0.30, "10 cm"), (0.03, "0 cm")])
+async def test_the_limit_above_a_target_is_10_cm_at_most_and_never_below_0(width_m, radius_words):
+    a, model = aligner('{"action": "ready"}')
+    target = TargetItem("tray_1-t0", "tray", (0.50, 0.10), 0.72, 0.65, width_m)
+    await a.align(into_request(target), FakeMoves(), CancelToken())
+    move = model.turns[0].tools[0]
+    assert move.description.endswith(f"the gripper stays within {radius_words} of the centre of the tray.")
+
+
+async def test_a_drop_above_a_bowl_checks_the_pre_point_alone_and_says_the_jaws_open_at_this_height():
+    a, model = aligner('{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    moves = FakeMoves()
+    end = await a.align(into_request(descends=False), moves, CancelToken())
+    assert moves.checks == [((0.51, 0.10, PRE[2]), DOWN_0)]
+    assert end.pre == (0.51, 0.10, PRE[2])
+    turn = model.turns[0]
+    assert "The jaws then open at this height, with no descent: the item falls into the wooden bowl." in turn.goal
+    assert "; the jaws open at this height." in turn.state
+    assert turn.tools[1].description.startswith("the held item is centred above a free spot of the wooden bowl: the jaws open at this height")
+
+
+# The alignment of a place: two answers, the whole move in the first, no
+# limit of a step, and Aligned when the answers run out after a move.
+
+async def test_a_place_has_two_answers_and_its_goal_asks_for_the_whole_move_in_the_first():
+    a, model = aligner('{"action": "ready"}')
+    await a.align(place_request(), FakeMoves(), CancelToken())
+    (turn,) = model.turns
+    assert turn.max_steps == 2
+    assert "and opens. You have 2 answers: make the whole move in the first, then answer ready." in turn.goal
+    assert turn.tools[0].description.startswith(
+        "moves the gripper sideways by dx and dy and turns it by roll_deg, at the same height. One move goes anywhere at once"
+    )
+
+
+async def test_one_move_of_a_place_goes_anywhere_inside_the_limit_beyond_3_cm():
+    a, model = aligner('{"action": "move", "dx": 8.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    moves = FakeMoves()
+    end = await a.align(place_request(), moves, CancelToken())
+    assert moves.moves[0][0] == (0.58, 0.10, PRE[2]) and isinstance(end, Aligned) and end.steps == 2
+
+
+async def test_a_place_whose_answers_run_out_after_a_move_that_completed_ends_aligned_there():
+    a, model = aligner(
+        '{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}',
+        '{"action": "ready"}',
+    )
+    moves = FakeMoves()
+    end = await a.align(place_request(), moves, CancelToken())
+    assert len(model.turns) == 2
+    assert end == Aligned((0.52, 0.10, PRE[2]), (0.52, 0.10, TARGET[2]), lifted((0.52, 0.10, TARGET[2]), LIFT_M), DOWN_0, steps=2)
+
+
+async def test_a_place_whose_last_answer_moved_nothing_runs_out_of_steps():
+    a, model = aligner('{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "move", "dx": 0, "dy": 20.0, "roll_deg": 0}')
+    end = await a.align(place_request(), FakeMoves(), CancelToken())
+    assert end == OutOfSteps(2)
+
+
+async def test_a_grab_keeps_five_steps_of_3_cm_at_most():
+    a, model = aligner('{"action": "move", "dx": 4.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    moves = FakeMoves()
+    await a.align(request(), moves, CancelToken())
+    assert moves.moves == [] and model.turns[0].max_steps == 5

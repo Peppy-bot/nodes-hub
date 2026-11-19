@@ -71,7 +71,15 @@ it to the pose on a line down that stops on contact, so the arm does not press
 the item on what it is set on, opens where the line down ended, at the pose or
 where the item came to rest on something on the way, and climbs back. A line
 down that fails or that a stop ended fails the place, and the gripper still
-holds the item. Every move goes through the
+holds the item. A `place_item` or a `drop_item` with `target_item_id` names
+the item to put the held item in or on, such as a bowl, from what the brain
+knows of it: an unknown id, the held item itself and an item the other
+gripper holds are refused before any move. A place into a target carries the
+held item to 12.5 cm above the target's top (7.5 cm where the backbone has no
+plan that high), lowers it until it rests on the target's floor or on what
+the target holds, opens there and climbs back; `position` and `orientation`
+are not read. A drop above a target carries the same way and opens at that
+height with no descent. Every move goes through the
 backbone that the `limb_motion` slot binds, and the `limb_state` slot gives
 the measured openings and grasp points, so the launcher binds both to the
 robot's backbone. Each arm move completes once the backbone has measured the
@@ -152,7 +160,20 @@ container or the free patch the target point is in, within 10 cm of that point
 them), and `ready` lowers the item on the line down to the target, which
 stops on contact: the place opens where the item comes to rest (a tall fruit
 on a bowl's floor well above the target, a fruit on another one already in
-the container), or at the target, and climbs back.
+the container), or at the target, and climbs back. A place has 2 answers,
+not 5: its goal text asks for the whole move in the first, one move may go
+anywhere inside the limit, and a place whose last answer was a move that
+completed goes on from there with no `ready`.
+
+Above a target item (a place or a drop with `target_item_id`) the goal text
+names the target and its width ("a free spot of the wooden bowl, about 19 cm
+wide"), the state measures the grasp point from the centre of the target and
+gives the height above its bottom, and `ready` says what follows: the line
+down until the item rests, or, for a drop, the jaws opening at this height.
+The limit is the smaller of 10 cm and half the target's width less 2 cm
+(`target_margin_m`), from the centre of the target, so the held item stays
+clear of the rim. A drop checks the plan of the pre-place point alone, since
+no descent follows.
 
 ## Keys
 
