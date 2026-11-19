@@ -27,10 +27,10 @@ from peppygen.fixtures.exposed_services.brain_model import get_model as get_mode
 from peppygen.fixtures.exposed_services.brain_model import list_models as list_models_fx
 from peppygen.fixtures.exposed_services.item_manipulation import get_state as get_state_fx
 from wire import (
+    CAMERAS,
     WAIT,
     accepted_grip,
     answer_the_camera,
-    answer_the_cameras,
     failure_of,
     grab_by_pose,
     land_move,
@@ -391,8 +391,7 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
     async with harness.start(
         partial(setup, provider=provider), parameters=params(), wrist_cameras_instance_ids=["wrist_left"], motion_planning_vacant=True,
     ) as h:
-        # The learner's answer and one per alignment step.
-        answer_the_cameras(h, mounts_answers=3)
+        answer_the_camera(h)
         await publish_a_capture(h)
         seen = await once_the_brain_sees(identify_fx, h, identify())
         assert seen.status == identify_fx.ResultStatus.COMPLETED, seen.failure
@@ -433,6 +432,7 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
             limbs_done.set()
             done.set()
             await asyncio.gather(stream, wrist)
+        lookups = [(request.source_frame, request.time) for request in h.mocks.deps.transform_lookup.lookup_transform.captured()]
         assert (result.success, result.gripper_name, result.item_id) == (True, "left_gripper", found.item_id), result.message
         line = next(record.getMessage() for record in log.records if "grab of item" in record.getMessage())
         assert "aligned in 2 steps: the grasp point moved 2.2 cm, the jaws close along 135 degrees" in line
@@ -441,6 +441,14 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
         step = provider.calls[2]
         assert "Now: step 1 of 5." in step.prompt and "+x points toward 6 o'clock and +y toward 3 o'clock" in step.prompt
         assert step.schema["json_schema"]["strict"] is False
+        # The identify placed the chest camera at its capture's time; each
+        # step placed the wrist camera at its new picture's time, then the
+        # chest camera at its capture's time again.
+        chest, wrist_left = (CAMERAS[name][0] for name in ("chest", "wrist_left"))
+        assert [frame for frame, _ in lookups] == [chest, wrist_left, chest, wrist_left, chest]
+        assert [time for frame, time in lookups if frame == chest] == [1.0, 1.0, 1.0]
+        first_step, second_step = (time for frame, time in lookups if frame == wrist_left)
+        assert 0.0 < first_step < second_step
 
 
 def described_left_arm():

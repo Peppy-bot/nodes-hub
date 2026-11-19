@@ -25,7 +25,9 @@ async fn a_robot_gives_the_park_states_of_its_description() -> peppygen::Result<
     let park = |arm: &str| {
         description
             .state(arm, states::PARK)
-            .unwrap_or_else(|| panic!("openarm_v2's SRDF gives {arm} a park state"))
+            .unwrap_or_else(|missing| {
+                panic!("openarm_v2's SRDF gives {arm} a park state: {missing}")
+            })
             .to_vec()
     };
 
@@ -50,7 +52,7 @@ async fn a_robot_whose_description_gives_no_park_state_gives_an_empty_guide() ->
         description
             .arms()
             .iter()
-            .all(|arm| description.state(&arm.name, states::PARK).is_none()),
+            .all(|arm| description.state(&arm.name, states::PARK).is_err()),
         "this test needs a model whose SRDF gives no arm a park state, and so101's gives one"
     );
     let (harness, _mocks) =

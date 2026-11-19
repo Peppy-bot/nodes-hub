@@ -11,12 +11,17 @@
       "The node that brings one robot into being and says when it is ready, for a robot of any model, an OpenArm and an SO-101 alike, real or simulated. It opens no device: on a real robot it reads the readiness of the drivers of the limbs, and on a simulated robot it joins the simulation.",
       "It exposes the robot-level is_ready the backbone gates on, true only once everything that answers for the robot reports ready: the drivers of its limbs on a real robot, and the simulation on a simulated one, which answers for every limb of the robot it stands.",
       "It also says who the robot is: get_identity answers the name the robot stands under, the model it is and the core node hosting it, and get_description answers the model's URDF, SRDF and collision meshes, for as long as the node runs. And it gives the robot's guide: get_guide answers the park state of each arm of the model's SRDF.",
+      "It serves what the model alone says of the robot's frames: it publishes the transform of every fixed joint of the model on static_transforms once it holds the model, and describe_sensors answers the robot frame and each camera of the model with its frame and the arm that carries it. The robot's backbone publishes the transforms of the joints it measures.",
       "In a simulation it also joins the scene: it attaches as this robot, naming the copy it runs as, the model to stand and where, and giving the model's URDF and SRDF, and holds that goal for as long as the robot is in the scene; the robot's limbs pair to the engine through the backbone. Its setup ends once the simulation stands the robot.",
     ],
     implements: [
       { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
       { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
       { name: "robot_guide", tag: "v1", link_id: "robot_guide" },
+      // The fixed joints' transforms, on static_transforms; the node
+      // publishes nothing on transforms.
+      { name: "transforms", tag: "v1", link_id: "transforms" },
+      { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts" },
     ],
     depends_on: {
       contracts: [
@@ -33,12 +38,19 @@
     },
   },
   interfaces: {
+    topics: {
+      emits: [
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
+      ],
+    },
     services: {
       exposes: [
         { link_id: "robot_ready", name: "is_ready" },
         { link_id: "robot_identity", name: "get_identity" },
         { link_id: "robot_identity", name: "get_description" },
         { link_id: "robot_guide", name: "get_guide" },
+        { link_id: "sensor_mounts", name: "describe_sensors" },
       ],
       consumes: [
         { link_id: "limbs", name: "set_model" },

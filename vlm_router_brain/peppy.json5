@@ -52,13 +52,18 @@
         // position, so both searches are refused naming the slot until it
         // answers.
         { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
-        // Where that camera stands on the robot: the pose of its optical
-        // frame in the robot frame, served by the robot's backbone for the
-        // camera the `camera_name` parameter names. Optional like the two
-        // above: without it no pixel can become a position, so both
-        // searches are refused naming the slot until it answers and names
-        // the camera.
-        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+        // Where the robot carries that camera: the robot frame and the
+        // frame of the camera the `camera_name` parameter names, from the
+        // robot's model. Optional like the two above: without it no pixel
+        // can become a position, so both searches are refused naming the
+        // slot until it answers and names the camera.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
+        // Where the frame of that camera, and of each wrist camera, stands
+        // in the robot frame at the time of each picture, from the robot's
+        // tree of frames.
+        // Optional like sensor_mounts: without it no pixel can become a
+        // position, so both searches are refused naming the slot.
+        { name: "transform_lookup", tag: "v1", link_id: "transform_lookup", cardinality: "zero_or_one" },
         // The robot's motion planner: it plans the arm's transit to the
         // point above an item and above the spot of a place around what the
         // chest camera sees and what its planning scene holds, and the brain
@@ -114,7 +119,8 @@
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_color_intrinsics" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
-        { link_id: "camera_mounts", name: "get_camera_poses" },
+        { link_id: "sensor_mounts", name: "describe_sensors" },
+        { link_id: "transform_lookup", name: "lookup_transform" },
       ],
     },
   },
@@ -153,12 +159,16 @@
       // camera. Empty names none.
       wrist_cameras: { $type: "string", $default: "left_arm:wrist_left,right_arm:wrist_right" },
       // The name the camera the brain looks through runs under on the
-      // robot, as the robot's camera_mounts lists it: the brain reads the
-      // pose of that camera, in the robot frame, from the `camera_mounts`
-      // slot, once, and reports every position in that frame. A camera an
-      // arm carries moves between the answer and a scan, so the brain looks
-      // through one fixed to the robot's body.
+      // robot, as the robot's sensor_mounts lists it: the brain places that
+      // camera in the robot frame at the time of each picture and reports
+      // every position in that frame.
       camera_name: "string",
+      // How long a lookup of a camera's place waits for the robot's
+      // transforms of a picture's time (s), from 0 to 1, the longest wait
+      // transform_lookup takes; the node stops at its start on any other.
+      // They reach the brain after the picture by the robot's own latency,
+      // so the launcher sets it for the robot.
+      lookup_timeout_s: "f64",
     },
   },
 }

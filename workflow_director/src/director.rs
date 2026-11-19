@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use control_core::node_clock::NodeClock;
 use peppygen::NodeRunner;
 use serde_json::{Value as Json, json};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -35,7 +36,7 @@ use crate::engine::{self, Phase, ResultBase, RunCommand, outside_the_envelope};
 use crate::fleet::{self, Fleet, Snapshot};
 use crate::journal::{self, Journals, Record, wall_ns};
 use crate::leases::{LeaseEventKind, Leases};
-use crate::live::{LiveHost, RunClock};
+use crate::live::LiveHost;
 use crate::replay::{Planned, Recorded, journal_command};
 use crate::sign_off::{SignOff, SignOffRecord, SignOffs, refusal_of_no_record};
 use crate::trial::{TrialEntry, Trials, robots_of_trials};
@@ -469,15 +470,16 @@ impl Director {
             return self.end_released(run, refuse(message), &taken, phase).await;
         }
         let run_clock = match &self.clock {
-            ClockSource::Simulation { ticks, domain }
-                if reads_the_clock(domain, &plan, &snapshot.fleet) =>
-            {
-                if let Err(message) = clock::first_tick(ticks).await {
+            ClockSource::Simulation {
+                clock: simulation,
+                domain,
+            } if reads_the_clock(domain, &plan, &snapshot.fleet) => {
+                if let Err(message) = clock::first_tick(simulation).await {
                     return self.end_released(run, refuse(message), &taken, phase).await;
                 }
-                RunClock::Simulation(ticks.clone())
+                simulation.clone()
             }
-            _ => RunClock::Wall,
+            _ => NodeClock::wall(),
         };
         let note = {
             let director = Arc::clone(self);
@@ -491,18 +493,15 @@ impl Director {
             Ok(alerts) => alerts,
             Err(message) => return self.end_released(run, refuse(message), &taken, phase).await,
         };
-        let stops = match &run_clock {
-            RunClock::Simulation(ticks) => {
-                let roles = plan.roles.keys().cloned().collect();
-                Some(tokio::spawn(clock::watch_for_stops(
-                    ticks.clone(),
-                    phase.subscribe(),
-                    roles,
-                    commands_tx.clone(),
-                )))
-            }
-            RunClock::Wall => None,
-        };
+        let stops = run_clock.ticks().map(|ticks| {
+            let roles = plan.roles.keys().cloned().collect();
+            tokio::spawn(clock::watch_for_stops(
+                ticks,
+                phase.subscribe(),
+                roles,
+                commands_tx.clone(),
+            ))
+        });
         let (events_tx, mut events_rx) = mpsc::unbounded_channel::<Event>();
         let live = LiveHost::new(
             Arc::clone(&self.runner),

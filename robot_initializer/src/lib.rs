@@ -13,6 +13,10 @@
 //! it is and the core node hosting it, which is the name it joins a scene
 //! under, and the description of that model. And it gives its guide: the
 //! park pose of each arm that its description gives one.
+//!
+//! Every robot also gives what its model alone says of its frames: the
+//! transforms of the model's fixed joints, on static_transforms, and where
+//! it carries its sensors, on describe_sensors.
 
 #![forbid(unsafe_code)]
 
@@ -27,11 +31,14 @@ mod guide;
 mod identity;
 mod join;
 mod readiness;
+mod sensors;
+mod static_transforms;
 
 use guide::Guide;
 use identity::Identity;
 use join::Joined;
 pub use join::{HostClock, Moment, StandClock};
+use sensors::SensorMounts;
 
 /// The robot's own error: a fact about this robot, which is what a launcher
 /// reads back when the node refuses to start.
@@ -64,6 +71,8 @@ pub async fn setup_with_clock<C: StandClock>(
     identity::serve(identity.clone(), runner.clone());
     description::serve(model, runner.clone());
     guide::serve(Guide::of(&description), runner.clone());
+    sensors::serve(SensorMounts::of(&description), runner.clone());
+    static_transforms::publish(&description, &runner).await?;
     match join::scene(&identity, &description, &params.placement, &runner, clock).await? {
         Joined::OwnHardware | Joined::Standing => readiness::serve(runner, model.id()),
         // A node that is stopping serves no readiness.

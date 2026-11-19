@@ -335,7 +335,8 @@ sequenceDiagram
 | `limbs` | required | Each arm with its gripper, `"left_arm:left_gripper,right_arm:right_gripper"` |
 | `perception_model` | `gemini-robotics-er-2-preview` | A catalog model that serves perception, or `none` |
 | `manipulation_model` | `scripted` | `scripted`, `none`, or a catalog model that serves manipulation, which aligns the scripted grab |
-| `camera_name` | required | The camera the brain looks through, as the robot's `camera_mounts` names it |
+| `camera_name` | required | The camera the brain looks through, as the robot's `sensor_mounts` names it |
+| `lookup_timeout_s` | required | How long a lookup of a camera's place waits for the robot's transforms of a picture's time (s), from 0 to 1, the longest wait `transform_lookup` takes |
 | `wrist_cameras` | `left_arm:wrist_left,right_arm:wrist_right` | Each arm with the instance id of the wrist camera it carries; an arm not named has no wrist camera |
 
 ## Tests

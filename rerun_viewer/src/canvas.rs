@@ -643,23 +643,23 @@ mod tests {
     #[test]
     fn an_address_a_port_or_a_memory_limit_out_of_range_is_refused() {
         assert_eq!(
-            parse("localhost", 9090, 9876, "1GB").unwrap_err().name,
+            parse("localhost", 9090, 9876, "1GB").unwrap_err().name(),
             "bind_ip"
         );
         assert_eq!(
-            parse("127.0.0.1", 0, 9876, "1GB").unwrap_err().name,
+            parse("127.0.0.1", 0, 9876, "1GB").unwrap_err().name(),
             "web_port"
         );
         assert_eq!(
-            parse("127.0.0.1", 9090, 0, "1GB").unwrap_err().name,
+            parse("127.0.0.1", 9090, 0, "1GB").unwrap_err().name(),
             "grpc_port"
         );
         assert_eq!(
-            parse("127.0.0.1", 9090, 9090, "1GB").unwrap_err().name,
+            parse("127.0.0.1", 9090, 9090, "1GB").unwrap_err().name(),
             "grpc_port"
         );
         assert_eq!(
-            parse("127.0.0.1", 9090, 9876, "lots").unwrap_err().name,
+            parse("127.0.0.1", 9090, 9876, "lots").unwrap_err().name(),
             "memory_limit"
         );
     }
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(timeout(2.5).unwrap(), Some(Duration::from_millis(2500)));
         for refused in [-1.0, f64::NAN, f64::INFINITY, 1e-12] {
             assert_eq!(
-                timeout(refused).unwrap_err().name,
+                timeout(refused).unwrap_err().name(),
                 "page_stall_timeout_s",
                 "{refused}"
             );

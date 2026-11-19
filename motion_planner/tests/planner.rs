@@ -30,12 +30,12 @@ use robot_description::{ArmId, states};
 
 use common::{
     ARM_DOF, BOTH, CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT, OPENARM_V2, RIGHT, TIMEOUT, along, arms,
-    at_ms, check, describe_camera, facing_the_robot, left_elbow, left_path, left_ready,
+    at_ms, camera_rig, check, describe_camera, facing_the_robot, left_elbow, left_path, left_ready,
     over_the_table, parameters, plan, plan_from, plan_to, planned_waypoints, posture, posture_of,
     publish_arms, publish_arms_with_grippers_at, render, right_ready, start, start_described,
     start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
     start_without_the_rig, take_frame, take_frame_aligned, under_a_seen_table, under_the_table,
-    vacant_camera, wait_for_the_arms,
+    vacant_camera_rig, wait_for_the_arms,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -128,7 +128,7 @@ async fn a_plan_or_a_check_waits_for_a_depth_frame() -> peppygen::Result<()> {
 async fn a_frame_of_another_alignment_asks_the_camera_again() -> peppygen::Result<()> {
     let camera = facing_the_robot();
     let (harness, mocks) = start_with_camera(&camera).await?;
-    describe_camera(&mocks, &camera, "none")?;
+    describe_camera(&mocks, "none")?;
     publish_arms(&mocks, at_ms(0), &arms(left_ready(), right_ready())).await?;
     let nothing = vec![None; (common::WIDTH * common::HEIGHT) as usize];
     take_frame_aligned(&harness, &mocks, at_ms(0), &nothing, left_ready(), "none").await?;
@@ -322,12 +322,7 @@ fn grasp_axes(side: ArmId) -> (Vector3<f64>, Vector3<f64>) {
 // arms, which bear the names of OpenArm v2's, and a joint goal of its left arm plans.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn openarm_v1_plans_from_its_description_alone() -> peppygen::Result<()> {
-    let config = Config {
-        camera_mounts_vacant: true,
-        workspace_vacant: true,
-        ..vacant_camera()
-    };
-    let (harness, mocks, _fault) = start_identified_as(config, "openarm_v1").await?;
+    let (harness, mocks, _fault) = start_identified_as(vacant_camera_rig(), "openarm_v1").await?;
     let v1 = robot_description::model("openarm_v1")
         .expect("robot_description bundles OpenArm v1")
         .description();
@@ -362,12 +357,8 @@ async fn each_openarm_plans_to_and_from_home_with_its_grippers_shut_and_open()
     for model in ["openarm_v1", "openarm_v2"] {
         for opening in [0.0, 1.0] {
             for (start, end) in [(states::HOME, states::READY), (states::READY, states::HOME)] {
-                let config = Config {
-                    camera_mounts_vacant: true,
-                    workspace_vacant: true,
-                    ..vacant_camera()
-                };
-                let (harness, mocks, _fault) = start_identified_as(config, model).await?;
+                let (harness, mocks, _fault) =
+                    start_identified_as(vacant_camera_rig(), model).await?;
                 let at = |arm, name| posture_of(model, arm, name);
                 let stand = arms(at(LEFT, start), at(RIGHT, start));
                 publish_arms_with_grippers_at(&mocks, at_ms(0), &stand, opening).await?;
@@ -803,8 +794,8 @@ async fn a_robot_without_a_camera_plans_without_a_map() -> peppygen::Result<()> 
     harness.shutdown().await
 }
 
-// With the camera and geometry vacant and camera_mounts and workspace bound, as on
-// OpenArm without its camera rig, the map stays empty too.
+// With the camera and geometry vacant and workspace, sensor_mounts and transforms bound,
+// as on OpenArm without its camera rig, the map stays empty too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_robot_without_its_camera_rig_plans_without_a_map() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_the_rig(&arms(left_ready(), right_ready())).await?;
@@ -858,21 +849,20 @@ async fn each_planner_and_refiner_answers_a_path_to_the_goal() -> peppygen::Resu
     harness.shutdown().await
 }
 
-// With the camera and geometry bound and camera_mounts vacant, the map cannot place the
+// With the camera and geometry bound and sensor_mounts vacant, the map cannot place the
 // camera: every check and plan is refused, the message naming the slots to bind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_camera_without_its_mounts_refuses_every_plan_and_check() -> peppygen::Result<()> {
+async fn a_camera_without_its_sensor_mounts_refuses_every_plan_and_check() -> peppygen::Result<()> {
     let config = Config {
-        parameters: Some(parameters()),
-        camera_mounts_vacant: true,
-        ..Config::default()
+        sensor_mounts_vacant: true,
+        ..camera_rig(parameters())
     };
     let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), &arms(left_ready(), right_ready())).await?;
     let reason = format!(
-        "{NO_DEPTH_FRAME}: the launcher binds the planner's camera, geometry and workspace \
-         and leaves its camera_mounts vacant; bind camera, geometry, camera_mounts and \
-         workspace, or leave camera and geometry vacant"
+        "{NO_DEPTH_FRAME}: the launcher binds the planner's camera, geometry, workspace and \
+         transforms and leaves its sensor_mounts vacant; bind camera, geometry, workspace, \
+         sensor_mounts and transforms, or leave camera and geometry vacant"
     );
     let failure = check(&harness, &left_path(&left_ready(), &[left_elbow(1.3)]))
         .await

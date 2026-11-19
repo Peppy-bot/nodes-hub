@@ -4,8 +4,9 @@ cameras and its start posture), written out for a fake robot of a test."""
 
 from __future__ import annotations
 
+from robot_description_py import FingerSpan
 from sim_robot_core.cameras import CameraConfig
-from sim_robot_core.models import Arm, FingerSpan, Gripper, ModelEntry
+from sim_robot_core.models import Arm, Gripper, ModelEntry
 
 
 def entry(
@@ -26,10 +27,7 @@ def entry(
             Gripper(
                 name=name,
                 joints=tuple(fingers),
-                spans=tuple(
-                    FingerSpan(closed=closed, travel=opened - closed)
-                    for closed, opened in fingers.values()
-                ),
+                spans=tuple(FingerSpan(closed, opened) for closed, opened in fingers.values()),
                 mimics=(None,) * len(fingers),
             )
             for name, fingers in (grippers or {}).items()

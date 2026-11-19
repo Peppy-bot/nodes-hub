@@ -1,14 +1,14 @@
 //! Node composition: setup parses every parameter and serves the limb names, then,
 //! once the robot's initializer names the model, the node builds the arm models and
 //! the self-collision governor from its description, wires the channels, and spawns
-//! the services answered from bringup (camera mounts, workspace) plus the
+//! the services answered from bringup (workspace) plus the
 //! readiness-gated coordination loop, every action handler and every stream
 //! listener. All motion and stream logic lives in the sibling modules; this is only
 //! the assembly.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use control_core::fault::Fault;
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
@@ -26,7 +26,6 @@ use tracing::{error, info};
 use workspace_core::surface_block::ArmBodies;
 
 use crate::actions;
-use crate::camera_mounts::{self, CameraMounts};
 use crate::coordinator::{self, ArmChannels};
 use crate::governor;
 use crate::identity;
@@ -38,6 +37,7 @@ use crate::robot::{self, ARMS, LIMBS};
 use crate::startup;
 use crate::streams;
 use crate::streams::LeaderActivity;
+use crate::transforms::JointTransforms;
 use crate::types::limb_names;
 use crate::upstream::UpstreamMode;
 use crate::workspace::Workspace;
@@ -132,11 +132,8 @@ pub enum NodeError {
     #[error("build the self-collision governor")]
     Governor(#[source] governor::GovernorError),
 
-    #[error("place the cameras the description carries")]
-    CameraMounts(#[from] camera_mounts::CameraMountError),
-
     #[error("find the perception camera among the cameras the description carries")]
-    PerceptionCamera(#[from] workspace_core::PerceptionCameraError),
+    PerceptionCamera(#[from] crate::workspace::PerceptionCameraError),
 
     #[error("build the arm bodies the workspace holds clear of a surface")]
     WorkspaceBodies(#[from] workspace_core::surface_block::ArmBodiesError),
@@ -375,8 +372,8 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
         governor: governor_settings,
     } = launch;
     // The robot's description, held to the arms this node drives, for the life of the
-    // process: the arm models, the self-collision model, the cameras and the postures all
-    // read it, and the cameras and the workspace name what they read by its names.
+    // process: the arm models, the self-collision model, the workspace, the transforms
+    // and the postures all read it, and name what they read by its names.
     let driven: &'static Driven<ARM_DOF, ARMS> = Box::leak(Box::new(driven));
     let (model, description) = (driven.model(), driven.description());
     info!("driving {}", model.id());
@@ -436,15 +433,15 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
         },
     );
 
-    // The cameras the robot carries, each placed in the frame that
-    // carries it: a mount this backbone cannot place stops bringup here.
-    let mounts = Arc::new(CameraMounts::resolve(description)?);
-
     // Where the robot can work, judged from its design on arm models of its
     // own (the planners own theirs), its ready posture and its perception
     // camera: a design with more than one candidate stops bringup here.
     let bodies = ArmBodies::new(description, meshes_dir)?;
-    let workspace = Arc::new(Workspace::new(build_arms()?, &ready, bodies, &mounts)?);
+    let workspace = Arc::new(Workspace::new(build_arms()?, &ready, bodies, description)?);
+
+    // The transforms of the joints the coordinator measures, every one
+    // started now, at the bringup a process runs once.
+    let joint_transforms = JointTransforms::new(description, SystemTime::now());
 
     let limits = PerArm::from_fn(|arm| models[arm].limits());
     // The chase clamps every streamed/planned target into these limits with
@@ -482,9 +479,6 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
     // request or the start of a joint path. The coordinator answers each on
     // the tick after it is queued.
     let (request_tx, request_rx) = mpsc::channel(8);
-    // The grasp poses of the last limb_state snapshot, for the camera
-    // mounts service.
-    let (grasps_tx, grasps_rx) = watch::channel(None);
     let move_slots = PerArm::from_fn(|_| MoveSlot::default());
     let gripper_move_slots = PerArm::from_fn(|_| MoveSlot::default());
     // Whether each limb's follower delivers fresh state: the coordinator
@@ -521,17 +515,8 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
     .unzip();
     let (goal_txs, gripper_goal_txs) = goal_txs.unzip();
 
-    // Where the cameras stand, answered for the life of the node from the
-    // grasp poses the coordinator measured last, and refused until it has.
-    tokio::spawn(camera_mounts::serve(
-        node_runner.clone(),
-        node_runner.cancellation_token().clone(),
-        mounts,
-        grasps_rx,
-    ));
-
     // Where the robot can work, answered for the life of the node from the
-    // design alone, so ahead of the readiness gate like the mounts.
+    // design alone, so ahead of the readiness gate.
     workspace_service::spawn(
         node_runner.clone(),
         node_runner.cancellation_token().clone(),
@@ -557,7 +542,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
             request_rx,
             PathChecks::new(path_checker),
             config_rx,
-            grasps_tx,
+            joint_transforms,
             coordinator::RunConfig {
                 cycle_period,
                 stale_limit,

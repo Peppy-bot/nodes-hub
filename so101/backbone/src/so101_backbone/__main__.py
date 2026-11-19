@@ -1,8 +1,8 @@
 """Wiring: parse parameters, check the description the robot's initializer
 serves, build the kinematics, limits, and coordinator, and run the control
-tick, the upstream consumers, the state relays, the limb name service, the
-stop and plan check services, one server per exposed action, and the
-workspace services."""
+tick, the upstream consumers, the state relays, the readouts (limb_states and
+the joints' transforms), the limb name service, the stop and plan check
+services, one server per exposed action, and the workspace services."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from control_core_py import runtime
 from control_core_py.runtime import CancellationToken
 from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.limb_state import limb_states
+from peppygen.emitted_topics.transforms import transforms
 from peppygen.exposed_actions.limb_motion import (
     execute_joint_path,
     move_arm,
@@ -58,6 +59,7 @@ from so101_backbone.kinematics import Kinematics
 from so101_backbone.model import ARM, DESCRIPTION, urdf_path
 from so101_backbone.params import UpstreamMode
 from so101_backbone.reach import fit_reach_ball
+from so101_backbone.transforms import transforms_message
 from so101_backbone.wire import parse_arm_states, parse_gripper_states, parse_pose_setpoint
 from so101_backbone.workspace import ReachWorker
 
@@ -241,13 +243,17 @@ async def _publish_readouts(
     coordinator: Coordinator,
     kinematics: Kinematics,
     pose_mode: bool,
+    started_s: float,
     token: CancellationToken,
 ):
     """The FK-backed readouts, one solve per snapshot: limb_states (the
     pairing-free whole-robot readout; any stale limb skips the tick, a
-    partial robot is not a snapshot) and, in pose mode, the pose_states
-    relay on the leader slot. Stamps are the measurement's capture time."""
+    partial robot is not a snapshot), the transforms of the arm's and the
+    gripper's joints of that snapshot, which started over at `started_s`,
+    and, in pose mode, the pose_states relay on the leader slot. Stamps are
+    the measurement's capture time."""
     limb_publisher = await limb_states.declare_publisher(node_runner)
+    transforms_publisher = await transforms.declare_publisher(node_runner)
     pose_publisher = await leader_pose_states.declare_publisher(node_runner) if pose_mode else None
     failing = runtime.Latch()
     async for _ in runtime.ticks(_READOUT_PERIOD_S, token):
@@ -278,12 +284,17 @@ async def _publish_readouts(
                         [opening],
                     )
                 )
+                await transforms_publisher.publish(
+                    transforms_message(timestamp, measured, opening, started_s)
+                )
             failing.clear()
         except Exception as e:
             failing.trip(f"readout publish failing: {e!r}")
 
 
 async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Task]:
+    # Every transform this process publishes starts over when it starts.
+    started_s = time.time()
     config = params_mod.parse(params)
     await peppygen.clock.init(node_runner)
 
@@ -453,7 +464,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         asyncio.create_task(
             _publish_readouts(
                 node_runner, coordinator, kinematics,
-                config.upstream_mode is UpstreamMode.POSE, token,
+                config.upstream_mode is UpstreamMode.POSE, started_s, token,
             )
         )
     )

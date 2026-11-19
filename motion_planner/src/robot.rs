@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use chain_kinematics::nalgebra::{Isometry3, Vector3};
 use chain_kinematics::{ChainSpec, JointKind, JointSelection, Tree};
 use collision_geometry::chain::{BodyGeometry, CarriedPart, ChainGeometry, Rider, RiderBody};
+use frame_tree::{FrameName, FrameNameError};
 use motion_planning_core::{Arm, RiderOffTheArm};
-use occupancy_map::{Frame, FrameError};
 use robot_description::{ArmId, PerArm, RobotDescription};
 use self_collision_model::{CollisionError, SelfCollisionModel};
 
@@ -59,7 +59,7 @@ pub struct ArmModel<const N: usize> {
 /// A robot's model, of `K` arms of `N` joints, `D` in all.
 pub struct RobotModel<const N: usize, const D: usize, const K: usize> {
     /// The robot frame: the URDF's root link, where the arms and the body are placed.
-    pub frame: Frame,
+    pub frame: FrameName,
     pub arms: PerArm<ArmModel<N>, K>,
     /// The links fixed around the arms.
     pub body: BodyGeometry,
@@ -72,7 +72,7 @@ pub enum ModelError {
     #[error("the robot's collision pieces: {0}")]
     Geometry(#[from] collision_geometry::GeometryError),
     #[error("the robot frame: {0}")]
-    Frame(#[from] FrameError),
+    Frame(#[from] FrameNameError),
     #[error(transparent)]
     SelfModel(#[from] CollisionError),
     #[error("a finger of the robot's own body: {0}")]
@@ -194,7 +194,7 @@ fn stands_fixed(tree: &Tree, arm: &robot_description::Arm) -> Result<(), ModelEr
 fn moving_below(tree: &Tree, link: usize) -> Option<String> {
     tree.children_of(link).iter().find_map(|&joint| {
         let joint = tree.joint(joint);
-        if joint.kind.is_movable() {
+        if joint.placement.kind.is_movable() {
             return Some(tree.link(joint.child).name.clone());
         }
         moving_below(tree, joint.child)
@@ -231,9 +231,11 @@ fn closing_axis(tree: &Tree, arm: &robot_description::Arm) -> Result<&'static st
         .find(|joint| joint.name == finger.joint)
         .expect("a finger's joint is a joint of the URDF");
     let to_grasp = pose_of(&arm.grasp_link).rotation.inverse() * pose_of(&finger.link).rotation;
-    let closing = match joint.kind {
+    let closing = match joint.placement.kind {
         JointKind::Prismatic { axis } => to_grasp * axis.into_inner(),
-        JointKind::Revolute { axis } => Vector3::z().cross(&(to_grasp * axis.into_inner())),
+        JointKind::Revolute { axis } | JointKind::Continuous { axis } => {
+            Vector3::z().cross(&(to_grasp * axis.into_inner()))
+        }
         JointKind::Fixed => unreachable!("a finger's joint moves"),
     };
     frame_axis(&closing).ok_or_else(|| ModelError::ClosingAxis {
@@ -270,7 +272,7 @@ fn built<const N: usize, const D: usize, const K: usize>(
     }
     let frame = {
         let tree = arms[ArmId::new(0)].geometry.chain().tree();
-        Frame::parse(&tree.link(tree.root()).name)?
+        FrameName::parse(&tree.link(tree.root()).name)?
     };
     Ok(RobotModel {
         frame,
@@ -385,7 +387,7 @@ pub(crate) mod tests {
         let group = &description.arms()[arm.place()].name;
         description
             .state(group, name)
-            .unwrap_or_else(|| panic!("{group} of {id} has the posture {name}"))
+            .unwrap_or_else(|e| panic!("{group} of {id} has the posture {name}: {e}"))
             .try_into()
             .expect("a posture holds a value for each joint of the arm")
     }
@@ -688,7 +690,7 @@ pub(crate) mod tests {
         let [finger] = &described.description.arms()[0].gripper.fingers[..] else {
             panic!("SO-101's gripper moves one jaw");
         };
-        (0.0 - finger.closed) / (finger.open - finger.closed)
+        finger.span.opening_at(0.0)
     }
 
     // At the opening that puts the jaw's joint at 0, the jaw hangs where the URDF's joint

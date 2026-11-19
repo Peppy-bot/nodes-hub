@@ -33,6 +33,7 @@ impl Guide {
             .filter_map(|arm| {
                 description
                     .state(&arm.name, states::PARK)
+                    .ok()
                     .map(|joints| ParkPose {
                         arm: arm.name.clone(),
                         joint_positions: joints.to_vec(),

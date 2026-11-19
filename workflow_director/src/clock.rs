@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use futures::{Stream, StreamExt};
-
+use control_core::node_clock::{NodeClock, follow_ticks};
 use peppygen::NodeRunner;
 use peppylib::messaging::TopicBuffer;
+use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, watch};
 use workflow_documents::Name;
 
@@ -27,66 +27,71 @@ const CLOCK_STOP: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 pub enum ClockSource {
     Wall,
-    /// The simulation clock: the time of its last tick, 0 before the first,
-    /// and its domain as the fleet listing names it.
+    /// The simulation clock, 0 before its first tick, and its domain as the
+    /// fleet listing names it.
     Simulation {
-        ticks: watch::Receiver<u64>,
+        clock: NodeClock,
         domain: String,
     },
 }
 
 impl ClockSource {
-    /// The clock the launcher binds the director to. A tick that does not
-    /// decode is left out; the end of the subscription raises `fault`, since
-    /// the runs of the node read that clock.
+    /// The clock the launcher binds the director to, with its domain for a simulation
+    /// clock. The end of a simulation clock's ticks raises `fault`, since the runs of the
+    /// node read that clock.
     pub async fn of(runner: &Arc<NodeRunner>, fault: Fault) -> peppygen::Result<ClockSource> {
-        let Some(domain) = runner.processor().clock().domain().map(ToString::to_string) else {
-            return Ok(ClockSource::Wall);
-        };
-        let subscription = peppylib::clock::subscribe(runner, TopicBuffer::KeepLatest).await?;
-        let (sender, ticks) = watch::channel(0);
-        let runner = Arc::clone(runner);
-        let tick_times = futures::stream::unfold(subscription, |mut subscription| async move {
-            let next = subscription
+        let clock = node_clock(runner, fault).await?;
+        Ok(match runner.processor().clock().domain() {
+            None => ClockSource::Wall,
+            Some(domain) => ClockSource::Simulation {
+                clock,
+                domain: domain.to_string(),
+            },
+        })
+    }
+}
+
+/// Why the node ends when its simulation clock closes.
+const CLOCK_CLOSED: &str = "the simulation clock of the node closed: no run that reads it goes \
+                            on past its last tick, so the node exits for its restart policy to \
+                            subscribe again";
+
+/// The clock the launcher binds the node to. The end of a simulation clock's ticks raises
+/// `fault`, since the runs of the node read that clock.
+pub(crate) async fn node_clock(
+    runner: &Arc<NodeRunner>,
+    fault: Fault,
+) -> peppygen::Result<NodeClock> {
+    if runner.processor().clock().domain().is_none() {
+        return Ok(NodeClock::wall());
+    }
+    let mut subscription = peppylib::clock::subscribe(runner, TopicBuffer::KeepLatest).await?;
+    let (clock, feed) = NodeClock::simulation();
+    tokio::spawn(follow_ticks(
+        async move || {
+            subscription
                 .on_next_tick()
                 .await
                 .map(|tick| tick.map(|tick| tick.time()))
-                .map_err(|error| error.to_string());
-            Some((next, subscription))
-        });
-        tokio::spawn(follow_ticks(Box::pin(tick_times), sender, move || {
-            fault.raise(
-                &runner,
-                "the simulation clock of the director closed; the node exits for its restart policy to subscribe again",
-            );
-        }));
-        Ok(ClockSource::Simulation { ticks, domain })
-    }
+        },
+        feed,
+        clock_closed(fault, runner.cancellation_token().clone()),
+    ));
+    Ok(clock)
 }
 
-/// Gives the time of each tick of `tick_times` on `sender`, leaving out a
-/// tick that does not decode, up to the end of the clock (`Ok(None)`), where
-/// it calls `closed`.
-async fn follow_ticks(
-    mut tick_times: impl Stream<Item = Result<Option<u64>, String>> + Unpin,
-    sender: watch::Sender<u64>,
-    closed: impl FnOnce(),
-) {
-    while let Some(next) = tick_times.next().await {
-        match next {
-            Ok(Some(time)) => {
-                sender.send_replace(time);
-            }
-            Ok(None) => break,
-            Err(error) => tracing::warn!("a tick of the simulation clock did not decode: {error}"),
-        }
-    }
-    closed();
+/// What the end of the simulation clock's ticks does: it raises `fault` and stops the node
+/// that `stopping` cancels.
+fn clock_closed(fault: Fault, stopping: CancellationToken) -> impl FnOnce() {
+    move || fault.raise(&stopping, CLOCK_CLOSED)
 }
 
-/// Waits up to [`CLOCK_STOP`] of wall time for the first tick of `ticks`.
-pub async fn first_tick(ticks: &watch::Receiver<u64>) -> Result<(), String> {
-    let mut ticks = ticks.clone();
+/// Waits up to [`CLOCK_STOP`] of wall time for the first tick of `clock`; the
+/// wall clock reads its time at once.
+pub async fn first_tick(clock: &NodeClock) -> Result<(), String> {
+    let Some(mut ticks) = clock.ticks() else {
+        return Ok(());
+    };
     if ticks.has_changed().is_err() {
         return Err("the simulation clock closed".to_owned());
     }
@@ -97,15 +102,6 @@ pub async fn first_tick(ticks: &watch::Receiver<u64>) -> Result<(), String> {
             "the simulation clock gave no tick in {} s",
             CLOCK_STOP.as_secs()
         )),
-    }
-}
-
-/// Resolves at the first tick of `ticks` at or after `at`; a clock that
-/// closed ends no wait past its last tick.
-pub async fn until_tick(ticks: &watch::Receiver<u64>, at: u64) {
-    let mut ticks = ticks.clone();
-    if ticks.wait_for(|now| *now >= at).await.is_err() {
-        std::future::pending::<()>().await;
     }
 }
 
@@ -211,47 +207,52 @@ mod tests {
         watching.await.unwrap();
     }
 
-    /// A tick that does not decode is left out, the ticks after it go on,
-    /// and the end of the clock calls its close once.
+    /// The end of the simulation clock's ticks raises the fault and stops the
+    /// node.
     #[tokio::test]
-    async fn a_tick_that_does_not_decode_is_left_out_and_the_end_closes_the_clock() {
-        let ticks = futures::stream::iter(vec![
-            Ok(Some(1)),
-            Err("a tick that does not decode".to_owned()),
-            Ok(Some(2)),
-            Ok(None),
-            Ok(Some(3)),
-        ]);
-        let (sender, times) = watch::channel(0);
-        let closes = std::sync::atomic::AtomicU32::new(0);
-        follow_ticks(ticks, sender, || {
-            closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        })
+    async fn the_end_of_the_simulation_clocks_ticks_raises_the_fault_and_stops_the_node() {
+        let fault = Fault::default();
+        let stopping = CancellationToken::new();
+        let (clock, feed) = NodeClock::simulation();
+        let mut ticks = vec![Ok::<_, String>(Some(5)), Ok(None)].into_iter();
+        follow_ticks(
+            async || ticks.next().expect("a receive past the end"),
+            feed,
+            clock_closed(fault.clone(), stopping.clone()),
+        )
         .await;
-        assert_eq!(
-            *times.borrow(),
-            2,
-            "the tick after the bad one came, and none after the end"
-        );
-        assert_eq!(closes.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(clock.now_ns(), 5);
+        assert!(stopping.is_cancelled(), "the node stops");
+        let ended = fault.end().expect_err("the fault ends the node");
+        assert!(ended.to_string().contains(CLOCK_CLOSED), "{ended}");
     }
 
-    /// A clock that closed gives no first tick and no instant to wait for: a
-    /// run refuses it, and a wait on it does not end.
+    /// A clock that closed gives no first tick: a run refuses it. A clock
+    /// that ticked gives its first tick at once, and the wall clock needs none.
     #[tokio::test(start_paused = true)]
-    async fn a_closed_clock_gives_no_first_tick_and_ends_no_wait() {
-        let (ticks, ticks_rx) = watch::channel(5u64);
-        drop(ticks);
+    async fn a_closed_clock_gives_no_first_tick_and_a_ticked_one_does() {
+        let (clock, feed) = NodeClock::simulation();
+        feed.tick(5);
+        assert_eq!(first_tick(&clock).await, Ok(()));
+        drop(feed);
         assert_eq!(
-            first_tick(&ticks_rx).await,
+            first_tick(&clock).await,
             Err("the simulation clock closed".to_owned())
         );
-        let waited = tokio::time::timeout(CLOCK_STOP, until_tick(&ticks_rx, 9)).await;
-        assert!(waited.is_err(), "a wait on a closed clock stands");
-        let reached = tokio::time::timeout(CLOCK_STOP, until_tick(&ticks_rx, 5)).await;
-        assert!(
-            reached.is_ok(),
-            "an instant the clock reached ends the wait"
+        assert_eq!(first_tick(&NodeClock::wall()).await, Ok(()));
+    }
+
+    /// A simulation clock that gives no tick within [`CLOCK_STOP`] of wall
+    /// time gives no first tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_with_no_tick_within_the_bound_gives_no_first_tick() {
+        let (clock, _feed) = NodeClock::simulation();
+        assert_eq!(
+            first_tick(&clock).await,
+            Err(format!(
+                "the simulation clock gave no tick in {} s",
+                CLOCK_STOP.as_secs()
+            ))
         );
     }
 }

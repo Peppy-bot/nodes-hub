@@ -10,7 +10,10 @@ from functools import partial
 
 from brain_core.perception import geometry
 from brain_core.ports import Box
-from conftest import PARAMS, FakeDetector, FakeManipulator, answer_the_camera, camera_poses, colour_intrinsics, depth_frame, rgb_frame
+from conftest import (
+    PARAMS, ROBOT_FRAME, FakeDetector, FakeManipulator, answer_the_camera, colour_intrinsics, depth_frame, rgb_frame,
+    sensors_described,
+)
 from peppygen.consumed_actions.limb_motion import move_gripper
 from peppygen.exposed_actions.brain_model import switch_model as switch_action
 from peppygen.exposed_actions.item_manipulation import abort as abort_action
@@ -295,7 +298,7 @@ async def test_an_abort_over_the_wire_stops_the_running_sequence():
 async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch):
     # A sim relay gives an error reply until its simulation has spoken; the
     # brain asks again and the first scan after the answer succeeds.
-    monkeypatch.setattr(geometry, "INTRINSICS_RETRY_S", 0.0)
+    monkeypatch.setattr(geometry, "RETRY_S", 0.0)
     detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)])
     async with harness.start(with_fakes(detector), parameters=faked()) as h:
         answer_the_camera(h, colour=False)
@@ -317,15 +320,20 @@ async def test_the_robot_is_asked_again_until_it_names_the_camera(monkeypatch):
     # The robot answers, but carries no camera by the name the brain looks
     # through: the brain keeps asking, and the first scan after the answer
     # that names it succeeds.
-    monkeypatch.setattr(geometry, "INTRINSICS_RETRY_S", 0.0)
+    monkeypatch.setattr(geometry, "RETRY_S", 0.0)
     detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)])
     async with harness.start(with_fakes(detector), parameters=faked()) as h:
-        wrists_only = camera_poses(names=("wrist_left", "wrist_right"))
-        answer_the_camera(h, mounts=(wrists_only, wrists_only, camera_poses()))
+        wrists_only = sensors_described(names=("wrist_left", "wrist_right"))
+        answer_the_camera(h, sensors=(wrists_only, wrists_only, sensors_described()))
         await publish_a_capture(h)
         scan = await scanned(h)
         assert scan.labels == ["cup"]
-        assert h.mocks.deps.camera_mounts.get_camera_poses.captured_count() == 3
+        assert h.mocks.deps.sensor_mounts.describe_sensors.captured_count() == 3
+        # The scan placed the camera where it stood when its capture was
+        # taken, waiting as long as the launcher set.
+        [lookup] = h.mocks.deps.transform_lookup.lookup_transform.captured()
+        assert (lookup.target_frame, lookup.source_frame) == (ROBOT_FRAME, "chest_color_optical_frame")
+        assert (lookup.time, lookup.timeout_s) == (1.0, PARAMS["lookup_timeout_s"])
 
 
 # The scripted grab over the wire: the real scripted manipulator, the

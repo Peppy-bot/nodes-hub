@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use control_core::fault::Fault;
 use peppygen::{NodeBuilder, Result};
 use rerun_viewer::canvas::RerunCanvas;
 use rerun_viewer::config::Config;
@@ -12,11 +13,16 @@ use rerun_viewer::node::setup;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt().init();
-    NodeBuilder::new().run(|params, runner| async move {
+    let fault = Fault::default();
+    let raised = fault.clone();
+    NodeBuilder::new().run(move |params, runner| async move {
         let config = Config::parse(&params).map_err(|e| peppygen::Error::Node(e.into()))?;
         let viewer = RerunCanvas::serve(&config.viewer, &page_layout(config.depth_image))
             .map_err(|e| peppygen::Error::Node(e.into()))?;
         let canvas = LiveCanvas::start(Arc::new(viewer));
-        setup(config, runner, Arc::new(canvas)).await
-    })
+        setup(config, runner, Arc::new(canvas), raised).await
+    })?;
+    fault
+        .take()
+        .map_or(Ok(()), |reason| Err(peppygen::Error::Node(reason)))
 }

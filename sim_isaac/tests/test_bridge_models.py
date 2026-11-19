@@ -30,8 +30,8 @@ def _finger(model: str, joint: str):
 # the SO-101's jaw closes below its joint's zero, and an OpenArm v2's fingers
 # close at zero, the left ones opening toward positive by as much as the
 # right ones open toward negative.
-_SO101_JAW = (_finger("so101", "gripper").closed, _finger("so101", "gripper").open)
-_OPENARM_V2_FINGER_OPEN = _finger("openarm_v2", "openarm_left_finger_joint1").open
+_SO101_JAW = (_finger("so101", "gripper").span.closed, _finger("so101", "gripper").span.open)
+_OPENARM_V2_FINGER_OPEN = _finger("openarm_v2", "openarm_left_finger_joint1").span.open
 
 
 class _Views:
@@ -222,21 +222,21 @@ class TestFingerSpans:
         (span,) = _limbs(engine, "charlo", "so101").spans["gripper"]
         closed, opened = _SO101_JAW
 
-        assert span.position(0.0) == pytest.approx(closed)
-        assert span.position(1.0) == pytest.approx(opened)
-        assert span.position(0.5) == pytest.approx((closed + opened) / 2.0)
-        assert span.opening(opened) == pytest.approx(1.0)
+        assert span.position_at(0.0) == pytest.approx(closed)
+        assert span.position_at(1.0) == pytest.approx(opened)
+        assert span.position_at(0.5) == pytest.approx((closed + opened) / 2.0)
+        assert span.opening_at(opened) == pytest.approx(1.0)
         # The jaw's zero is not its closed pose.
-        assert span.opening(0.0) == pytest.approx(-closed / (opened - closed))
+        assert span.opening_at(0.0) == pytest.approx(-closed / (opened - closed))
 
     def test_an_openarms_fingers_open_from_zero_each_toward_its_own_side(self, engine):
         spans = _limbs(engine, "alpha", "openarm_v2").spans
 
         assert _OPENARM_V2_FINGER_OPEN > 0.0
-        assert [span.position(1.0) for span in spans["left_gripper"]] == [_OPENARM_V2_FINGER_OPEN] * 2
-        assert [span.position(1.0) for span in spans["right_gripper"]] == [-_OPENARM_V2_FINGER_OPEN] * 2
+        assert [span.position_at(1.0) for span in spans["left_gripper"]] == [_OPENARM_V2_FINGER_OPEN] * 2
+        assert [span.position_at(1.0) for span in spans["right_gripper"]] == [-_OPENARM_V2_FINGER_OPEN] * 2
         for gripper in ("left_gripper", "right_gripper"):
-            assert [span.position(0.0) for span in spans[gripper]] == [0.0, 0.0]
+            assert [span.position_at(0.0) for span in spans[gripper]] == [0.0, 0.0]
 
 
 @pytest.fixture(name="fleet")

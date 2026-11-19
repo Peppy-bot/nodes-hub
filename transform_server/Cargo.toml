@@ -1,0 +1,20 @@
+[package]
+name = "transform_server"
+version = "0.1.0"
+edition = "2024"
+description = "Holds a robot's tree of frames and answers lookups in it for the nodes that hold no tree"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[dependencies]
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+frame_tree = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "frame_tree" }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+
+[dev-dependencies]
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+tokio = { version = "1", features = ["test-util"] }

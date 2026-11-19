@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional, Sequence, Union
+from weakref import WeakKeyDictionary
 
 import numpy as np
 import pytest
@@ -22,7 +23,18 @@ PARAMS = {
     "manipulation_model": "none",
     "perception_gallery": "",
     "camera_name": "chest",
+    "lookup_timeout_s": 0.5,
 }
+
+# The robot's cameras, each with its frame and its place in the robot frame
+# at every time: the chest at the robot's origin looking along +Z.
+ROBOT_FRAME = "base_link"
+CAMERAS = {"chest": ("chest_color_optical_frame", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])}
+# How long the answerer of the lookups waits for the next one: longer than a
+# test runs, so it stops when the harness stops its mocks.
+LOOKUP_WAIT_S = 3600.0
+# The answerer of each harness's lookups, kept while it runs.
+_ANSWERERS: WeakKeyDictionary = WeakKeyDictionary()
 
 # A deadline no search reaches, and one every search has passed.
 NEVER = Deadline(at=float("inf"), budget_s=float("inf"))
@@ -148,13 +160,13 @@ class FakeManipulator:
         self.stopped += 1
 
 
-def answer_the_camera(h, *, colour: bool = True, mounts=None) -> None:
-    """The camera and robot mocks of a harness answer what the brain asks
-    at start: the depth unit, the depth intrinsics, the known colour
+def answer_the_camera(h, *, colour: bool = True, sensors=None) -> None:
+    """The camera and robot mocks of a harness answer what the brain asks:
+    at start, the depth unit, the depth intrinsics, the known colour
     intrinsics unless `colour` is false and the test answers them itself,
-    and where the camera stands once per answer in `mounts`, the chest
-    camera at the origin looking along the robot's +Z when none are
-    given."""
+    and the robot's sensors once per answer in `sensors`, the cameras of
+    CAMERAS when none are given; then the place of each camera of CAMERAS in
+    the robot frame for every lookup the brain makes."""
     from peppygen.consumed_services.camera import depth_stream_info
     from peppygen.consumed_services.geometry import get_depth_intrinsics
 
@@ -169,20 +181,45 @@ def answer_the_camera(h, *, colour: bool = True, mounts=None) -> None:
             depth_model="z", min_depth_m=0.1, max_depth_m=10.0, align_mode="depth_to_color",
         )
     )
-    for answer in mounts if mounts is not None else (camera_poses(),):
-        h.mocks.deps.camera_mounts.get_camera_poses.enqueue_response(answer)
+    for answer in sensors if sensors is not None else (sensors_described(),):
+        h.mocks.deps.sensor_mounts.describe_sensors.enqueue_response(answer)
+    _ANSWERERS[h] = asyncio.get_running_loop().create_task(_answer_lookups(h.mocks.deps.transform_lookup.lookup_transform))
 
 
-def camera_poses(names=("chest",)):
-    """The robot's response: every camera of `names` at the origin, its
-    optical frame the robot frame's."""
-    from peppygen.consumed_services.camera_mounts import get_camera_poses
+def sensors_described(names=tuple(CAMERAS)):
+    """The robot's describe_sensors response: each camera of `names` an
+    rgbd camera fixed to the base, its frame `<name>_color_optical_frame`."""
+    from peppygen.consumed_services.sensor_mounts import describe_sensors
 
-    return get_camera_poses.ResponseData(
-        timestamp=7.0, camera_names=list(names),
-        positions=[0.0, 0.0, 0.0] * len(names), orientations=[0.0, 0.0, 0.0, 1.0] * len(names),
+    return describe_sensors.ResponseData(
+        robot_frame=ROBOT_FRAME,
+        sensor_names=list(names),
+        sensor_kinds=["rgbd_camera"] * len(names),
+        sensor_frames=[f"{name}_color_optical_frame" for name in names],
         carried_by=[""] * len(names),
     )
+
+
+async def _answer_lookups(service) -> None:
+    """Answers each lookup of a camera's frame in the robot frame with its
+    place of CAMERAS, and any other with the failure `unknown_frame`, until
+    the harness stops its mocks."""
+    from peppygen.consumed_services.transform_lookup import lookup_transform
+
+    places = {frame: (position, orientation) for frame, position, orientation in CAMERAS.values()}
+    while True:
+        try:
+            request, responder = await service.next_request(LOOKUP_WAIT_S)
+        except Exception:  # pylint: disable=broad-exception-caught
+            # The harness stopped its mocks.
+            return
+        if request.target_frame != ROBOT_FRAME or request.source_frame not in places:
+            await responder.respond_failure(
+                lookup_transform.FailureKind.UNKNOWN_FRAME, f"no transform names {request.source_frame}"
+            )
+            continue
+        position, orientation = places[request.source_frame]
+        await responder.respond(lookup_transform.ResponseData(position=position, orientation=orientation, timestamp=request.time))
 
 
 def colour_intrinsics():

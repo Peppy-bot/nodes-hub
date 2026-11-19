@@ -19,9 +19,12 @@ from conftest import (
     MEASURED,
     NEAR,
     START_TOLERANCE_RAD,
+    TREE_TOLERANCE,
+    angle_between,
     assert_rectangle_inside_reach,
     joint_path_goal,
     path_result_joints,
+    place_in_robot_frame,
 )
 from path_timing_py import JointTrajectory
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
@@ -77,7 +80,7 @@ from so101_backbone import description_check, postures
 from so101_backbone.__main__ import setup
 from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S
 from so101_backbone.kinematics import Kinematics
-from so101_backbone.model import MODEL, urdf_path
+from so101_backbone.model import ARM, DESCRIPTION, MODEL, urdf_path
 
 TIMEOUT_S = 10.0
 # The bound of an answer that measures reach: the first starts the worker
@@ -311,6 +314,54 @@ async def test_the_limb_names_are_answered_before_any_snapshot():
         assert names.arm_names == ["arm"]
         assert names.joints_per_arm == [5]
         assert names.gripper_names == ["gripper"]
+
+
+async def next_stamped_from(subscription, timestamp: float):
+    """The first message of `subscription` stamped at `timestamp` or later,
+    each read bounded by TIMEOUT_S."""
+    while True:
+        message = await asyncio.wait_for(subscription.next(), TIMEOUT_S)
+        if message.timestamp >= timestamp:
+            return message
+
+
+async def snapshot_with_its_transforms(h):
+    """A limb_states snapshot and the transforms message of the same stamp,
+    read in step, so a message either subscription dropped is passed over."""
+    limb, tree = h.emitted.limb_state_limb_states, h.emitted.transforms_transforms
+    snapshot = await next_stamped_from(limb, -math.inf)
+    message = await next_stamped_from(tree, snapshot.timestamp)
+    while message.timestamp != snapshot.timestamp:
+        snapshot = await next_stamped_from(limb, message.timestamp)
+        if snapshot.timestamp != message.timestamp:
+            message = await next_stamped_from(tree, snapshot.timestamp)
+    return snapshot, message
+
+
+async def test_each_snapshot_goes_out_with_the_transforms_of_its_joints():
+    # The process starts within the harness's start, so the start every
+    # message carries lies between the two clock readings around it.
+    before_start_s = time.time()
+    async with started() as h:
+        after_start_s = time.time()
+        feeder = await feeding_measured(h, opening=0.5)
+        try:
+            snapshot, message = await snapshot_with_its_transforms(h)
+            later = await next_stamped_from(h.emitted.transforms_transforms, math.nextafter(message.timestamp, math.inf))
+        finally:
+            feeder.cancel()
+
+    assert message.timestamp == snapshot.timestamp
+    assert before_start_s <= message.start_timestamp <= after_start_s
+    assert later.start_timestamp == message.start_timestamp
+    fixed = [(t.parent, t.child, t.position, t.orientation) for t in DESCRIPTION.fixed_transforms()]
+    moving = [
+        (parent, child, message.positions[3 * i : 3 * i + 3], message.orientations[4 * i : 4 * i + 4])
+        for i, (parent, child) in enumerate(zip(message.parent_frames, message.child_frames, strict=True))
+    ]
+    position, orientation = place_in_robot_frame(fixed + moving, ARM.grasp_link)
+    assert max(abs(a - b) for a, b in zip(position, snapshot.positions)) <= TREE_TOLERANCE
+    assert angle_between(orientation, snapshot.orientations) <= TREE_TOLERANCE
 
 
 async def test_malformed_follower_state_neither_anchors_nor_relays():

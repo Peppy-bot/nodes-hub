@@ -12,10 +12,9 @@ from so101_backbone.model import ARM, DESCRIPTION
 
 
 def _posture(name: str) -> tuple[float, ...]:
-    positions = DESCRIPTION.state(ARM.name, name)
-    if positions is None:
-        raise ValueError(f"SO-101's SRDF gives the arm no {name!r} state")
-    return tuple(positions)
+    """The arm's state `name`; the description raises KeyError, naming the arm
+    and the state, when the SRDF gives the arm no such state."""
+    return tuple(DESCRIPTION.state(ARM.name, name))
 
 
 # Where the arm rests and parks.

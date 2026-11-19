@@ -19,9 +19,11 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use control_core::throttle::Throttle;
+use frame_tree::MovingMessage;
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
+use peppygen::emitted_topics::transforms::transforms;
 use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
@@ -30,12 +32,11 @@ use peppylib::{Payload, TopicPublisher};
 use robot_description::PerArm;
 use srs_model::JointVec;
 use srs_model::nalgebra::Isometry3;
-use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::camera_mounts::MeasuredGrasps;
 use crate::robot::ARMS;
 use crate::streams::{GripperState, THROTTLED_WARN_PERIOD};
+use crate::transforms::JointTransforms;
 use crate::types::{arm_pose_arrays, limb_names, world_pose_arrays};
 
 /// Now on this instance's bound clock: the timeline its messages are
@@ -74,6 +75,18 @@ type LimbStateBuild = fn(
     Vec<f64>,
     Vec<String>,
     Vec<f64>,
+) -> peppygen::Result<Payload>;
+
+/// The transforms of one measurement: each child frame, its parent frame, the
+/// child's position and orientation in the parent, index-aligned, and when
+/// they all started.
+type TransformsBuild = fn(
+    SystemTime,
+    Vec<String>,
+    Vec<String>,
+    Vec<f64>,
+    Vec<f64>,
+    SystemTime,
 ) -> peppygen::Result<Payload>;
 
 /// One whole-robot state snapshot, gathered by the coordinator at the readout
@@ -208,6 +221,24 @@ impl Publisher<LimbStateBuild> {
     }
 }
 
+impl Publisher<TransformsBuild> {
+    /// Publish `message`, the transforms of one measurement, under its
+    /// timestamp.
+    pub async fn send(&self, message: MovingMessage) {
+        self.emit_at(message.timestamp, |timestamp| {
+            (self.build)(
+                timestamp,
+                message.child_frames,
+                message.parent_frames,
+                message.positions,
+                message.orientations,
+                message.start_timestamp,
+            )
+        })
+        .await;
+    }
+}
+
 impl<Build> Publisher<Build> {
     /// Emit one failure line for this slot, at most once per throttle window.
     fn log_throttled(&self, emit: impl FnOnce()) {
@@ -217,32 +248,42 @@ impl<Build> Publisher<Build> {
         }
     }
 
-    /// Stamp, build and publish, naming the slot in either failure. A publish
-    /// error is a transient wire condition; a build error (or a clock that has
-    /// not ticked) means the message was never formed. Neither is fatal: the
-    /// next tick tries again. The stamp the message was formed under, once it
-    /// was.
+    /// Stamp with the clock's now, build and publish ([`Self::emit_at`]). A
+    /// clock that has not ticked forms no message, and the next tick tries
+    /// again.
     async fn emit(
         &self,
         build: impl FnOnce(SystemTime) -> peppygen::Result<Payload>,
     ) -> Option<SystemTime> {
-        let stamped = clock_now().and_then(|timestamp| {
-            build(timestamp)
-                .map(|msg| (timestamp, msg))
-                .map_err(|e| e.to_string())
-        });
-        match stamped {
-            Ok((timestamp, msg)) => {
-                if let Err(e) = self.publisher.publish(msg).await {
-                    self.log_throttled(|| warn!("{} publish: {e}", self.what));
-                }
-                Some(timestamp)
-            }
+        match clock_now() {
+            Ok(timestamp) => self.emit_at(timestamp, build).await,
             Err(e) => {
                 self.log_throttled(|| error!("{} build: {e}", self.what));
                 None
             }
         }
+    }
+
+    /// Build under `timestamp` and publish, naming the slot in either
+    /// failure. A publish error is a transient wire condition; a build error
+    /// means the message was never formed. Neither is fatal: the next tick
+    /// tries again. The stamp the message was formed under, once it was.
+    async fn emit_at(
+        &self,
+        timestamp: SystemTime,
+        build: impl FnOnce(SystemTime) -> peppygen::Result<Payload>,
+    ) -> Option<SystemTime> {
+        let msg = match build(timestamp) {
+            Ok(msg) => msg,
+            Err(e) => {
+                self.log_throttled(|| error!("{} build: {e}", self.what));
+                return None;
+            }
+        };
+        if let Err(e) = self.publisher.publish(msg).await {
+            self.log_throttled(|| warn!("{} publish: {e}", self.what));
+        }
+        Some(timestamp)
     }
 }
 
@@ -264,18 +305,19 @@ pub struct Publishers {
     status: Publisher<StatusBuild>,
     /// The whole-robot state snapshot, on its contract-backed topic.
     limb_states: Publisher<LimbStateBuild>,
-    /// The grasp poses of the last snapshot, under its stamp: what the
-    /// camera mounts service composes the carried cameras with.
-    measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
+    /// The transforms of the joints each snapshot measures, on transforms.
+    transforms: Publisher<TransformsBuild>,
+    /// What the transforms of a snapshot are worked out from.
+    joint_transforms: JointTransforms,
 }
 
 impl Publishers {
     pub async fn declare(
         runner: &NodeRunner,
-        measured_grasps: watch::Sender<Option<MeasuredGrasps>>,
+        joint_transforms: JointTransforms,
     ) -> peppygen::Result<Self> {
         Ok(Self {
-            measured_grasps,
+            joint_transforms,
             arm_setpoints: PerArm::new([
                 Publisher::declare(
                     "left_arm joint_setpoints".to_owned(),
@@ -358,6 +400,12 @@ impl Publishers {
                 limb_states::build_message as LimbStateBuild,
             )
             .await?,
+            transforms: Publisher::declare(
+                "transforms".to_owned(),
+                transforms::declare_publisher(runner),
+                transforms::build_message as TransformsBuild,
+            )
+            .await?,
         })
     }
 
@@ -376,14 +424,20 @@ impl Publishers {
             .await;
     }
 
-    /// Publish one whole-robot state snapshot, and hand its grasp poses to
-    /// the camera mounts service under the same stamp.
+    /// Publish one whole-robot state snapshot, then the transforms of the
+    /// joints it measures under the same timestamp.
     pub async fn send_limb_states(&self, snapshot: &LimbStateSnapshot) {
-        if let Some(timestamp) = self.limb_states.send(snapshot).await {
-            self.measured_grasps.send_replace(Some(MeasuredGrasps {
-                timestamp,
-                poses: snapshot.poses,
-            }));
+        let Some(timestamp) = self.limb_states.send(snapshot).await else {
+            return;
+        };
+        match self
+            .joint_transforms
+            .message_at(timestamp, &snapshot.joints, &snapshot.openings)
+        {
+            Ok(message) => self.transforms.send(message).await,
+            Err(e) => self
+                .transforms
+                .log_throttled(|| error!("transforms build: {e}")),
         }
     }
 }

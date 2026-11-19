@@ -23,12 +23,16 @@
         // meshes, which the viewer draws each link with. Without it, the
         // viewer draws no links.
         { name: "robot_identity", tag: "v1", link_id: "identity", cardinality: "zero_or_one" },
-        // The camera to draw: its frames (camera), its geometry (geometry)
-        // and where the robot carries it (camera_mounts). Without camera and
-        // geometry, the viewer draws no images and no points.
+        // The camera to draw: its frames (camera), its geometry (geometry),
+        // the robot frame and the camera's frame (sensor_mounts), and the
+        // robot's tree of frames, which places the camera at the time of
+        // each depth frame (transforms), bound to every publisher of the
+        // tree. Without camera and geometry, the viewer draws no images and
+        // no points; without sensor_mounts or transforms, no points.
         { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
         { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
-        { name: "camera_mounts", tag: "v1", link_id: "camera_mounts", cardinality: "zero_or_one" },
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
+        { name: "transforms", tag: "v1", link_id: "transforms", cardinality: "zero_or_more" },
         // The planning scene, the voxel map, and the names of the arms'
         // joints and links. Without it, the viewer draws no scene and no
         // map, and names each joint by its index.
@@ -42,6 +46,8 @@
         { link_id: "limb_state", name: "limb_states" },
         { link_id: "camera", name: "video_stream" },
         { link_id: "camera", name: "depth_stream" },
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
         { link_id: "motion_planning", name: "occupancy_map" },
       ],
     },
@@ -51,7 +57,7 @@
         { link_id: "camera", name: "depth_stream_info" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
         { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
-        { link_id: "camera_mounts", name: "get_camera_poses" },
+        { link_id: "sensor_mounts", name: "describe_sensors" },
         { link_id: "motion_planning", name: "describe_arms" },
         { link_id: "motion_planning", name: "get_planning_scene" },
       ],
@@ -110,9 +116,18 @@
       // How many past grasp-point positions each arm's trail holds: 1 or
       // more.
       trail_length: { $type: "u32", $default: 100 },
-      // The camera of camera_mounts that the camera link is, by the name the
+      // The camera of sensor_mounts that the camera link is, by the name the
       // robot runs it under.
       camera_name: { $type: "string", $default: "chest" },
+      // How long (s) the viewer keeps each moving transform's past stamps,
+      // counted back from its newest: finite and above 0. A depth frame
+      // older than that is placed by no lookup.
+      cache_window_s: "f64",
+      // How long (s) a depth frame waits, on the node's clock, for the tree
+      // to place the camera at its time: finite and 0 or above, 0 for no
+      // wait. A newer depth frame takes the place of one that waits, and
+      // one whose wait runs out draws no points.
+      lookup_timeout_s: "f64",
     },
   },
 }
