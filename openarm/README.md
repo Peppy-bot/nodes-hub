@@ -18,7 +18,7 @@
 
 A simulation plays the follower role of every limb pairing, so the backbone leads the simulation exactly as it leads the real drivers and the backbone and the UI never know which simulation is underneath. Every robot joins its simulation through its own `robot_initializer`, which attaches it over the `simulation_robot` contract naming the copy it runs as and the model to stand. A simulation holds every robot's pairs on one slot per kind of pair (`arms`, `grippers`, `rgb_cameras`, `rgbd_cameras`): a pair's robot is the copy it belongs to, and a limb pair's limb is the link it comes from on the backbone, which is why the backbone's downstream links carry its limbs' names (`left_arm`, `right_arm`, `left_gripper`, `right_gripper`). The same contract answers whether the robot stands with a pair for every limb of its model, which is the readiness the initializer reports, and a robot whose pairs are not its model's limbs and cameras does not stay. An initializer that died and came back attaches the robot it already stands: the engine hands that robot's stay to the new goal, so a copy registering again changes nothing in the scene. `sim_mujoco`, `sim_isaac` and `waldo` each stand any number of robots in one scene, of any model they carry, an OpenArm of either generation beside an SO-101.
 
-The third simulation, `waldo`, is published by the `private-nodes-hub` repository. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 8080 with a self-signed certificate.
+The third simulation, `waldo`, is published by the `private-nodes-hub` repository. Its launcher option is `waldo`, and its Bevy browser viewer is served over https on port 23817 with a self-signed certificate.
 
 The [launchers](https://github.com/Peppy-bot/launchers-hub)
 run robots as named copies: `simulation` runs one simulation and simulated
@@ -632,10 +632,10 @@ Not an error. The requested angle was beyond that joint's physical range, so the
 **The Isaac stream is a black screen**
 Stop the stack, clear the shader cache with `rm -rf ~/.cache/isaac-sim`, and launch again.
 
-**Port 8080 is already in use**
+**Waldo's port 23817 is already in use**
 An older instance is still running. Find it with `peppy stack list` and stop it with `peppy node stop <instance_id>`.
 
-**A commander panel is not on 8765 or 8766, or the MuJoCo viewer is not on 8080**
+**A commander panel is not on 8765 or 8766, or the MuJoCo viewer is not on 23818**
 Both commanders and the MuJoCo viewer prefer their configured port and take one
 from the operating system when another process holds it, so a second copy on a
 host comes up on a port of its own. The URLs the launch printed under
