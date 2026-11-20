@@ -22,7 +22,7 @@ async fn an_openarm_v2_names_its_chest_camera_and_the_camera_each_arm_carries()
         Harness::start_with(on_its_own_hardware(), robot_initializer::setup).await?;
 
     let answer = describe_sensors::poll(&harness, WIRE).await?;
-    assert_eq!(answer.robot_frame, "world");
+    assert_eq!(answer.robot_frame, "base_link");
     assert_eq!(answer.sensor_names, ["wrist_left", "wrist_right", "chest"]);
     assert_eq!(
         answer.sensor_kinds,
@@ -65,7 +65,7 @@ async fn a_robot_whose_model_carries_no_camera_answers_empty_arrays() -> peppyge
     let (harness, _mocks) = Harness::start_with(config, robot_initializer::setup).await?;
 
     let answer = describe_sensors::poll(&harness, WIRE).await?;
-    assert_eq!(answer.robot_frame, "world");
+    assert_eq!(answer.robot_frame, "base_link");
     assert!(answer.sensor_names.is_empty() && answer.sensor_kinds.is_empty());
     assert!(answer.sensor_frames.is_empty() && answer.carried_by.is_empty());
 

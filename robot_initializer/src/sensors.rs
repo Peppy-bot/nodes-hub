@@ -128,14 +128,14 @@ mod tests {
             carried_by: carried_by.to_owned(),
         };
         let answer = SensorMounts {
-            robot_frame: "world".to_owned(),
+            robot_frame: "base_link".to_owned(),
             sensors: vec![
                 sensor("wrist", RGB_CAMERA, "left_arm"),
                 sensor("chest", RGBD_CAMERA, NO_ARM),
             ],
         }
         .response();
-        assert_eq!(answer.robot_frame, "world");
+        assert_eq!(answer.robot_frame, "base_link");
         assert_eq!(answer.sensor_names, ["wrist", "chest"]);
         assert_eq!(answer.sensor_kinds, [RGB_CAMERA, RGBD_CAMERA]);
         assert_eq!(

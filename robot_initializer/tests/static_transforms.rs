@@ -1,12 +1,13 @@
 //! The transforms of the robot's fixed joints, over the wire: the node
 //! publishes one static_transforms message once it holds the model, before
-//! a simulation stands the robot, holding the transform of every fixed joint
-//! of the model's URDF and of no other joint. The topic retains it, so a node
-//! that subscribes after the publication receives it too.
+//! a simulation stands the robot, holding the transform record of every fixed
+//! joint of the model's URDF and of no other joint, with no timestamp since
+//! each holds at every time. The topic retains it, so a node that subscribes after
+//! the publication receives it too.
 
 use std::time::Duration;
 
-use peppygen::emitted_topics::transforms::static_transforms;
+use peppygen::emitted_topics::transforms::static_transforms::{self, MessageTransformsItem};
 use peppygen::fixtures::emitted_topics::transforms::static_transforms::Message;
 use peppygen::fixtures::harness::Harness;
 use peppygen::mock::deps::simulation::attach;
@@ -34,8 +35,9 @@ async fn first_message(harness: &mut Harness) -> Message {
         .expect("the subscription stays open")
 }
 
-/// Asserts that `message` holds the transform of every fixed joint of the
-/// URDF of `model`, in the URDF's order, at the joint's origin, and no other.
+/// Asserts that `message` holds the transform record of every fixed joint of
+/// the URDF of `model`, in the URDF's order, at the joint's origin, and no
+/// other.
 fn assert_holds_the_fixed_joints_of(model: &str, message: &Message) {
     let description = robot_description::model(model)
         .expect("a bundled model")
@@ -47,14 +49,14 @@ fn assert_holds_the_fixed_joints_of(model: &str, message: &Message) {
         .filter(|joint| joint.joint_type == JointType::Fixed)
         .collect();
     assert!(!fixed.is_empty(), "{model} has fixed joints");
-    let children: Vec<&str> = fixed.iter().map(|j| j.child.link.as_str()).collect();
-    let parents: Vec<&str> = fixed.iter().map(|j| j.parent.link.as_str()).collect();
-    assert_eq!(message.child_frames, children, "{model}");
-    assert_eq!(message.parent_frames, parents, "{model}");
-    assert_eq!(message.positions.len(), 3 * fixed.len(), "{model}");
-    assert_eq!(message.orientations.len(), 4 * fixed.len(), "{model}");
-    for (index, joint) in fixed.iter().enumerate() {
-        let position = &message.positions[3 * index..3 * index + 3];
+    assert_eq!(message.transforms.len(), fixed.len(), "{model}");
+    for (record, joint) in message.transforms.iter().zip(&fixed) {
+        assert_eq!(
+            (record.frame.as_str(), record.child_frame.as_str()),
+            (joint.parent.link.as_str(), joint.child.link.as_str()),
+            "{model}"
+        );
+        let position = record.position;
         for (published, urdf) in position.iter().zip(joint.origin.xyz.0) {
             assert!(
                 (published - urdf).abs() <= TOLERANCE,
@@ -63,8 +65,7 @@ fn assert_holds_the_fixed_joints_of(model: &str, message: &Message) {
                 joint.origin.xyz.0
             );
         }
-        let [x, y, z, w] = std::array::from_fn(|axis| message.orientations[4 * index + axis]);
-        let published = UnitQuaternion::from_quaternion([x, y, z, w].into());
+        let published = UnitQuaternion::from_quaternion(record.orientation.into());
         let [roll, pitch, yaw] = joint.origin.rpy.0;
         let urdf = UnitQuaternion::from_euler_angles(roll, pitch, yaw);
         assert!(
@@ -136,10 +137,16 @@ async fn a_node_that_subscribes_after_the_publication_receives_it() -> peppygen:
         .expect("the retained message reaches a later subscriber")
         .expect("the subscription stays open");
     let expected = static_transforms::build_message(
-        published.child_frames,
-        published.parent_frames,
-        published.positions,
-        published.orientations,
+        published
+            .transforms
+            .into_iter()
+            .map(|record| MessageTransformsItem {
+                frame: record.frame,
+                child_frame: record.child_frame,
+                position: record.position,
+                orientation: record.orientation,
+            })
+            .collect(),
     )?;
     assert_eq!(received.payload(), expected);
 

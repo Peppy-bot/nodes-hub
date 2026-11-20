@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Once};
 use std::time::Duration;
 
+use peppygen::consumed_actions::simulation::attach;
 use peppygen::fixtures::harness::{Config, Harness};
 use peppygen::parameters::placement::Placement;
 use peppygen::{NodeRunner, Parameters};
@@ -37,6 +38,25 @@ pub fn parameters(model: &str) -> Parameters {
             yaw: 0.0,
         },
     }
+}
+
+/// Asserts that `spot` stands a robot at `position` in world, turned `yaw`
+/// about +z, with no timestamp.
+pub fn assert_stands_at(
+    spot: &attach::SimulationRobotAttachActionGoalPlacement,
+    position: [f64; 3],
+    yaw: f64,
+) {
+    assert_eq!(spot.frame.as_deref(), Some("world"));
+    assert_eq!(spot.timestamp, None);
+    assert_eq!(spot.position, position);
+    let [x, y, z, w] = spot.orientation;
+    assert_eq!((x, y), (0.0, 0.0), "a turn about +z alone");
+    assert!(
+        (z - (yaw / 2.0).sin()).abs() <= 1e-15 && (w - (yaw / 2.0).cos()).abs() <= 1e-15,
+        "{:?} turns {yaw} rad about +z",
+        spot.orientation
+    );
 }
 
 /// The same robot, standing at the placement it is given.

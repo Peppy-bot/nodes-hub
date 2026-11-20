@@ -43,6 +43,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::geometry::WORLD;
+use frame_tree::arithmetic::quaternion_of_yaw;
 use peppygen::consumed_actions::simulation::attach;
 use peppygen::parameters::placement::Placement;
 use peppygen::{DEFAULT_FEEDBACK_BOUND, NodeRunner, ProducerRef, Result};
@@ -208,9 +210,11 @@ fn stand_budget(setup: Duration) -> std::result::Result<Duration, String> {
         })
 }
 
-/// Where the launcher asks this robot to stand, as the engine takes it.
-/// `auto` leaves the spot to the engine. A spot that is not a number is
-/// refused here, before it reaches the wire.
+/// Where the launcher asks this robot to stand, as the engine takes it: a
+/// pose in world, its orientation the turn of yaw about +z, with no
+/// timestamp, as a command at the latest time. `auto` leaves the spot to the
+/// engine. A spot that is not a number is refused here, before it reaches the
+/// wire.
 fn spot_of(
     placement: &Placement,
 ) -> std::result::Result<Option<attach::SimulationRobotAttachActionGoalPlacement>, String> {
@@ -225,8 +229,10 @@ fn spot_of(
         ));
     }
     Ok(Some(attach::SimulationRobotAttachActionGoalPlacement {
+        frame: Some(WORLD.to_owned()),
+        timestamp: None,
         position: [placement.x, placement.y, placement.z],
-        yaw: placement.yaw,
+        orientation: quaternion_of_yaw(placement.yaw),
     }))
 }
 

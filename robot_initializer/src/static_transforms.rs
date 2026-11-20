@@ -1,13 +1,14 @@
 //! The transforms of this robot's fixed joints, which the node publishes on
 //! transforms' static_transforms once it holds the model: one message that
-//! holds every fixed joint of the model's URDF, each from the joint's parent
-//! link to its child link at the joint's origin. The topic retains the
-//! message, so a node that subscribes later receives it too, for as long as
-//! this node runs. The node publishes nothing on transforms: the robot's
-//! backbone publishes the joints it measures.
+//! holds every fixed joint of the model's URDF, each a transform record from
+//! the joint's parent link (frame) to its child link (child_frame) at the
+//! joint's origin, with no timestamp since each holds at every time. The topic
+//! retains the message, so a node that subscribes later receives it too, for
+//! as long as this node runs. The node publishes nothing on transforms: the
+//! robot's backbone publishes the joints it measures.
 
-use frame_tree::StaticMessage;
-use peppygen::emitted_topics::transforms::static_transforms;
+use frame_tree::{StaticMessage, TransformRecord};
+use peppygen::emitted_topics::transforms::static_transforms::{self, MessageTransformsItem};
 use peppygen::{NodeRunner, Result};
 use robot_description::RobotDescription;
 
@@ -31,17 +32,32 @@ fn message_of(description: &RobotDescription) -> Result<StaticMessage> {
         .map_err(|refusal| refused(format!("static_transforms: {refusal}")))
 }
 
-/// Publishes the transforms of the fixed joints of `description`, once.
+/// The record of the wire for a transform record of the tree, field for
+/// field.
+fn item_of(record: TransformRecord) -> MessageTransformsItem {
+    let TransformRecord {
+        frame,
+        child_frame,
+        position,
+        orientation,
+    } = record;
+    MessageTransformsItem {
+        frame,
+        child_frame,
+        position,
+        orientation,
+    }
+}
+
+/// Publishes the transforms of the fixed joints of `description`, once,
+/// with no timestamp: each holds at every time.
 pub async fn publish(description: &RobotDescription, runner: &NodeRunner) -> Result<()> {
     let message = message_of(description)?;
-    let joints = message.child_frames.len();
+    let joints = message.transforms.len();
     let publisher = static_transforms::declare_publisher(runner).await?;
     publisher
         .publish(static_transforms::build_message(
-            message.child_frames,
-            message.parent_frames,
-            message.positions,
-            message.orientations,
+            message.transforms.into_iter().map(item_of).collect(),
         )?)
         .await?;
     tracing::info!("static_transforms published: the transforms of {joints} fixed joints");
@@ -58,10 +74,7 @@ mod tests {
             let description = model.description();
             let message = message_of(&description).expect("a bundled model's fixed joints");
             let count = description.fixed_transforms().len();
-            assert_eq!(message.child_frames.len(), count, "{}", model.id());
-            assert_eq!(message.parent_frames.len(), count, "{}", model.id());
-            assert_eq!(message.positions.len(), 3 * count, "{}", model.id());
-            assert_eq!(message.orientations.len(), 4 * count, "{}", model.id());
+            assert_eq!(message.transforms.len(), count, "{}", model.id());
         }
     }
 
