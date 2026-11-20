@@ -18,14 +18,18 @@ GOAL_TIMEOUT = 10.0
 SUBSCRIBER_TIMEOUT = 10.0
 
 
-def _frame_message(frame_id: int, rgb: bytes) -> video_stream.Message:
-    """A tiny typed video_stream frame; the brain only reads frame[0:3]."""
+def _frame_message(capture_index: int, rgb: bytes) -> video_stream.Message:
+    """A tiny typed video_stream frame; the brain only reads data[0:3]."""
     return video_stream.Message(
-        header=video_stream.MessageHeader(timestamp=100.0 + frame_id, frame_id=frame_id),
+        header=video_stream.MessageHeader(
+            frame="camera_color_optical_frame",
+            timestamp=100.0 + capture_index,
+            capture_index=capture_index,
+        ),
         encoding="rgb8",
         width=2,
         height=1,
-        frame=rgb,
+        data=rgb,
     )
 
 
