@@ -1,0 +1,40 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base:latest
+
+%labels
+    Name room_mapper
+    Version v1
+
+%files
+    . /opt/room_mapper
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    cd /opt/room_mapper
+    cargo build --release
+    # The binary is GPL-3.0-or-later and links mapping_core, so COPYING, NOTICE and
+    # mapping_core's NOTICE ship beside it. mapping_core's NOTICE is read from the one
+    # mapping_core package that cargo metadata names for the host.
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    cargo metadata --format-version 1 --locked --filter-platform "$host" \
+        > /tmp/metadata.json
+    manifests=$(grep -o '"manifest_path":"[^"]*/mapping_core/Cargo.toml"' \
+        /tmp/metadata.json) || {
+        echo "the build resolved no mapping_core package, whose NOTICE the image ships" >&2
+        exit 1
+    }
+    rm /tmp/metadata.json
+    if [ "$(printf '%s\n' "$manifests" | wc -l)" -ne 1 ]; then
+        echo "the build resolved more than one mapping_core package: $manifests" >&2
+        exit 1
+    fi
+    mapping_core=${manifests#\"manifest_path\":\"}
+    mapping_core=${mapping_core%/Cargo.toml\"}
+    cp COPYING NOTICE target/release/
+    cp "$mapping_core/NOTICE" target/release/MAPPING_CORE_NOTICE
+
+%runscript
+    cd /opt/room_mapper
+    exec ./target/release/room_mapper "$@"

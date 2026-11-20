@@ -111,6 +111,11 @@
         path: "robot_initializer/peppy.json5"
       }
     },
+    room_mapper: {
+      v1: {
+        path: "room_mapper/peppy.json5"
+      }
+    },
     scene_commander: {
       v1: {
         path: "scene_commander/peppy.json5"
