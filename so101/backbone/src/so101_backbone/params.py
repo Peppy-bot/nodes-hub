@@ -37,6 +37,9 @@ class Config:
     # How long (s) the placement of a command waits for the robot's tree,
     # from 0 to MAX_LOOKUP_TIMEOUT_S.
     lookup_timeout_s: float
+    # How long (s) robot_stop's stop waits for the control loop to take and
+    # answer it before it answers attempt_failed.
+    stop_answer_timeout_s: float
 
 
 def parse(params) -> Config:
@@ -64,6 +67,9 @@ def parse(params) -> Config:
         ),
         start_tolerance_rad=require_positive("start_tolerance_rad", params.start_tolerance_rad),
         lookup_timeout_s=_lookup_timeout(params.lookup_timeout_s),
+        stop_answer_timeout_s=require_positive(
+            "stop_answer_timeout_s", params.stop_answer_timeout_s
+        ),
     )
 
 

@@ -23,6 +23,7 @@ GOOD = {
     "max_gripper_rate_frac_s": 10.0,
     "start_tolerance_rad": 0.05,
     "lookup_timeout_s": 0.1,
+    "stop_answer_timeout_s": 1.5,
 }
 
 
@@ -40,6 +41,10 @@ def test_the_joint_path_parameters_parse():
     config = parse()
     assert config.max_joint_acceleration_rad_s2 == (38.96,) * 5
     assert config.start_tolerance_rad == 0.05
+
+
+def test_the_stop_answer_timeout_parses():
+    assert parse().stop_answer_timeout_s == 1.5
 
 
 def test_pose_mode_parses():
@@ -65,6 +70,8 @@ def test_a_lookup_timeout_transform_lookup_does_not_take_is_refused_naming_it(ti
         ("max_joint_velocity_rad_s_3", 0.0),
         ("max_gripper_rate_frac_s", -1.0),
         ("max_stream_ee_velocity_m_s", 0.0),
+        ("stop_answer_timeout_s", 0.0),
+        ("stop_answer_timeout_s", float("inf")),
         # The ceiling, not just the floor: one past BUS_MAX_RATE_HZ, so raising
         # the bound without revisiting this row cannot pass unnoticed.
         ("control_rate_hz", BUS_MAX_RATE_HZ + 1),

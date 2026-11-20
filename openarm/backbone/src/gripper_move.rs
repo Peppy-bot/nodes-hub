@@ -118,7 +118,7 @@ impl GripperGoal {
         }
     }
 
-    /// End unstarted as cancelled by the stop service, for `reason`, which
+    /// End unstarted as cancelled by the robot stop, for `reason`, which
     /// names the stop, reporting `reported_frac`. The move slot is the
     /// caller's concern.
     pub async fn stop(self, reason: &str, reported_frac: f64) {
@@ -428,7 +428,7 @@ pub enum GripperTerminal {
     /// this long; the move fails with `timeout`.
     TravelTimedOut(Duration),
     /// The goal was cancelled, for this reason: by its caller, or by the
-    /// stop service, whose reason names the stop.
+    /// robot stop, whose reason names the stop.
     Cancelled(String),
 }
 
@@ -1275,7 +1275,7 @@ mod tests {
         assert!(mv.is_none() && !move_slot.is_claimed());
     }
 
-    /// The stop service ends a close that waits on its queue cancelled, for
+    /// The robot stop ends a close that waits on its queue cancelled, for
     /// the stop's reason.
     #[tokio::test]
     async fn a_stop_ends_a_queued_close_cancelled_for_its_reason() {

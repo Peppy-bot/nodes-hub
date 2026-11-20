@@ -135,7 +135,7 @@ pub enum Outcome<F = Failure> {
     /// ended.
     Contact { this_arm: bool },
     /// The move was cancelled, for this reason: by its caller, or by the
-    /// stop service, whose reason names the stop.
+    /// robot stop, whose reason names the stop.
     Cancelled(String),
     /// The move failed, and its goal gives no result.
     Failed(F),
@@ -363,7 +363,7 @@ impl Goal {
         }
     }
 
-    /// End unstarted as cancelled by the stop service, for `reason`, which
+    /// End unstarted as cancelled by the robot stop, for `reason`, which
     /// names the stop, reporting `measured`. The move slot is the caller's
     /// concern.
     pub async fn stop(self, reason: &str, measured: Measurement, planner: &Planner) {
@@ -750,7 +750,7 @@ impl Planner {
         }
     }
 
-    /// End the active move for the stop service: its goal ends cancelled
+    /// End the active move for the robot stop: its goal ends cancelled
     /// for `reason`, which names the stop, reporting `measured`, the joints
     /// measured when the stop came. The arm holds where it stands, as after
     /// a cancel ([`Planner::hold_where_it_stands`]); the command of an arm

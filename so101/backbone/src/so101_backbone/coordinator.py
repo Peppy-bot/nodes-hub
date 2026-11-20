@@ -32,10 +32,13 @@ gets a setpoint, an active plan fails, and the standing command resets. The
 first tick after any silence re-engages from the measured position, governed
 by the same caps, exactly like every other tick.
 
-The stop service ends every plan installed, whoever admitted it: each plan
+The robot stop ends every plan installed, whoever admitted it: each plan
 is cut as a cancel cuts it, and carries the stop's message for its goal to
-end with. A plan the coordinator fails carries the
-failure kind and the message its goal fails with.
+end with. It also ends the arm goal admitted with its plan not installed
+yet (an UnstartedGoal), which carries the message of the first robot stop
+that ended it and ends with it before any plan of it is installed. A plan
+the coordinator fails carries the failure kind and the message its goal
+fails with.
 """
 
 from __future__ import annotations
@@ -207,6 +210,15 @@ NO_CONTACT_CHECK_M = 0.0
 
 
 @dataclass
+class UnstartedGoal:
+    """An admitted arm goal whose plan is not installed yet, from the claim
+    of the arm until its plan is installed or the goal ends: the message of
+    the robot stop that ended it, None until one did."""
+
+    stopped: str | None = None
+
+
+@dataclass
 class ArmPlan:
     profile: JointTrajectory
     # How the plan ends past the planned end of its profile, judged on the
@@ -225,7 +237,7 @@ class ArmPlan:
     # The sample the stream stood at when the plan was cut; last_sample
     # reports it instead of re-evaluating the profile at a later clock.
     frozen: tuple[float, ...] | None = None
-    # The stop service's message when it cut the plan: the goal ends as
+    # The robot stop's message when it cut the plan: the goal ends as
     # cancelled with it.
     stopped: str | None = None
     # Whether the plan completed on contact, the arm short of its target.
@@ -291,7 +303,7 @@ class GripperPlan:
     # How long past the planned end the settle timeout completed the plan,
     # before the jaws stood still; None when they stood still.
     still_moving_after_s: float | None = None
-    # The stop service's message when it cut the plan: the goal ends as
+    # The robot stop's message when it cut the plan: the goal ends as
     # cancelled with it.
     stopped: str | None = None
 
@@ -412,11 +424,8 @@ class Coordinator:
         self._gripper = _LimbChannel[float, GripperPlan]()
         self._ik_failing = Latch()
         self._out_of_reach = Latch()
-        # How many stops have run, and the message of the last one: a goal
-        # whose plan was not installed when a stop ran reads them to end as
-        # stopped instead of installing its plan afterwards.
-        self.stop_count = 0
-        self.last_stop: str | None = None
+        # The arm goal admitted with its plan not installed yet, or None.
+        self._unstarted_arm_goal: UnstartedGoal | None = None
 
     # -------------------------------------------------------------- busy slots
 
@@ -505,12 +514,29 @@ class Coordinator:
         arm when the plan ends, so the arm's leader holders are dropped here
         and again at release. The plan commands the arm from its first tick,
         so it takes the place of the goal's hold and of a hold the arm is
-        still owed."""
+        still owed. The goal is unstarted no more."""
         self._drop_arm_leader_input()
         self._arm.held = None
         self._arm.owes_hold = False
+        self._unstarted_arm_goal = None
         self._arm.plan = ArmPlan(profile=profile, settle=settle, contact_gap_m=contact_gap_m)
         return self._arm.plan
+
+    def track_unstarted_arm_goal(self, goal: UnstartedGoal) -> None:
+        """Hold `goal`, the goal that claimed the arm and whose plan its
+        drive installs, until adopt_arm_plan installs the plan, the drive
+        ends it (end_unstarted_arm_goal) or the arm is released: a robot stop
+        meanwhile ends it (see stop_all)."""
+        assert self._arm.busy and self._arm.plan is None, (
+            "only the goal that claimed the arm, with no plan installed, is unstarted"
+        )
+        self._unstarted_arm_goal = goal
+
+    def end_unstarted_arm_goal(self, goal: UnstartedGoal) -> None:
+        """Let go of `goal`, which ends before its plan is installed: a robot
+        stop from here on ends it no more and names no limb for it."""
+        if self._unstarted_arm_goal is goal:
+            self._unstarted_arm_goal = None
 
     def hold_arm(self, joints: tuple[float, ...]) -> None:
         """Command the arm to hold at `joints` each tick, for the goal that
@@ -555,24 +581,27 @@ class Coordinator:
         plan.done.set()
 
     def stop_all(self, message: str) -> list[str]:
-        """Cut every installed plan for the stop service, whoever admitted
-        it, each as a cancel cuts it and carrying `message` for its goal to
-        end with. The names of the limbs whose plan was cut; the busy slots
-        release with the goals, as after a cancel."""
-        self.stop_count += 1
-        self.last_stop = message
+        """End every goal for the robot stop, whoever admitted it, each
+        carrying `message` to end with: every installed plan, cut as a cancel
+        cuts it, and the unstarted arm goal that no robot stop ended yet. The
+        names of the limbs whose goal it ended, sorted by name; the busy
+        slots release with the goals, as after a cancel."""
         stopped = []
         arm_plan = self._arm.plan
         if arm_plan is not None:
             arm_plan.stopped = message
             self.abort_arm_plan(arm_plan)
             stopped.append(ARM.name)
+        unstarted = self._unstarted_arm_goal
+        if unstarted is not None and unstarted.stopped is None:
+            unstarted.stopped = message
+            stopped.append(ARM.name)
         gripper_plan = self._gripper.plan
         if gripper_plan is not None:
             gripper_plan.stopped = message
             self.abort_gripper_plan(gripper_plan)
             stopped.append(ARM.gripper.name)
-        return stopped
+        return sorted(stopped)
 
     def arm_published(self, delivered: bool, command: tuple[float, ...] | None) -> None:
         """The outcome of publishing this tick's arm setpoint, and the value
@@ -634,6 +663,7 @@ class Coordinator:
         on the measured position exactly like the silence path."""
         self._arm.busy = False
         self._arm.held = None
+        self._unstarted_arm_goal = None
         self._arm.reset_command()
         self._drop_arm_leader_input()
 

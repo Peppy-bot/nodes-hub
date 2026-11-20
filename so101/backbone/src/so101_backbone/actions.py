@@ -11,7 +11,7 @@ the planned end; a gripper move completes, past the planned end of its
 travel, once the jaws stand still or its settle timeout runs out, and
 reports the opening measured then, where an object may hold the jaws.
 Cancelling freezes the limb where the trajectory stands, and so does the
-stop service, whoever started the move: the goal then ends cancelled, with
+robot stop, whoever started the move: the goal then ends cancelled, with
 the reason of the cancel or of the stop, and its result. A failed goal
 gives no result. A move_to_home goal claims the gripper and the arm, closes
 the gripper, a gripper plan that ends as every gripper move ends, and plans
@@ -40,7 +40,7 @@ import asyncio
 import math
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeVar
 
 from control_core_py.geometry import GeometryError, PoseTarget, Stamped
@@ -58,6 +58,7 @@ from so101_backbone.coordinator import (
     PlanFailure,
     POSTURE_SETTLE,
     PoseSettle,
+    UnstartedGoal,
     joint_past_tolerance,
 )
 from so101_backbone.failures import FailureKind, Refusal
@@ -254,9 +255,9 @@ class JointPathMove:
     settle: JointSettle
     # The contact gap of the goal (m), 0 for no contact check.
     contact_gap_m: float
-    # The stop count at admission: a stop since ends the goal before it
-    # moves, the planning included.
-    stops_before: int
+    # The goal until its plan is installed: a robot stop since admission
+    # ends it before it moves, the planning included.
+    unstarted: UnstartedGoal = field(default_factory=UnstartedGoal)
 
 
 @dataclass(frozen=True)
@@ -269,9 +270,9 @@ class PoseMove:
     settle: PoseSettle
     # The contact gap of the goal (m), 0 for no contact check.
     contact_gap_m: float
-    # The stop count at admission: a stop since ends the goal before it
-    # moves, the solve included.
-    stops_before: int
+    # The goal until its plan is installed: a robot stop since admission
+    # ends it before it moves, the solve included.
+    unstarted: UnstartedGoal = field(default_factory=UnstartedGoal)
 
 
 @dataclass(frozen=True)
@@ -289,9 +290,9 @@ class HomeMove:
     duration_s: float
     # How the arm move ends past the planned end of its trajectory.
     settle: JointSettle
-    # The stop count at admission: a stop since ends the goal before its arm
-    # moves.
-    stops_before: int
+    # The goal until the plan of its arm move is installed: a robot stop
+    # since admission ends it before its arm moves, the close included.
+    unstarted: UnstartedGoal = field(default_factory=UnstartedGoal)
 
 
 @dataclass(frozen=True)
@@ -436,6 +437,9 @@ class ActionLayer:
         # gives a capture time.
         self._now_s = now_s
         self._effort_unsupported = Latch()
+        # The robot stops handed to the control loop that it has not taken
+        # yet, in the order they came: each one's reason and its answer.
+        self._stops: list[tuple[str, asyncio.Future[list[str]]]] = []
 
     # -------------------------------------------------------------- admission
 
@@ -510,9 +514,8 @@ class ActionLayer:
             goal=_joint_path_goal(arm, duration_s, self._limits),
             settle=_joint_settle(tuple(arm.settle_tolerances_rad), settle_timeout_s),
             contact_gap_m=_require_contact_gap(contact_gap_m),
-            stops_before=self._coordinator.stop_count,
         )
-        self._claim_free_arm()
+        self._claim_arm_for(move)
         return move
 
     def _joint_move(
@@ -658,8 +661,8 @@ class ActionLayer:
         the verified IK solve runs in the drive task so a hard pose never
         stalls the event loop inside the goal decide callback, failing the
         accepted goal when no solution exists."""
-        move = _pose_move(goal, fields, self._coordinator.stop_count)
-        self._claim_free_arm()
+        move = _pose_move(goal, fields)
+        self._claim_arm_for(move)
         return move
 
     async def _placed_goal(self, target: Stamped[PoseTarget], duration_s: float) -> PoseGoal:
@@ -689,6 +692,14 @@ class ActionLayer:
             ARM_WORDS,
         )
 
+    def _claim_arm_for(self, move: JointPathMove | PoseMove | HomeMove) -> None:
+        """Claim the arm's busy slot for `move`, whose drive installs its
+        plan: `move` is an unstarted goal from here on, which a robot stop
+        ends (see Coordinator.track_unstarted_arm_goal). Raises Refusal, and
+        claims nothing, as _free_arm_anchor does."""
+        self._claim_free_arm()
+        self._coordinator.track_unstarted_arm_goal(move.unstarted)
+
     def _admit_posture(self, target: tuple[float, ...], duration_s: float) -> ArmPlan:
         """A posture move completes once the arm settles at the posture
         (POSTURE_SETTLE), and reports the measured grasp point. It claims the
@@ -706,19 +717,14 @@ class ActionLayer:
         _require_duration(duration_s, "duration_s")
         self._move_within_ceiling(self._free_arm_anchor(), target, duration_s, POSTURE_SETTLE)
         close = self._claim_close()
+        move = HomeMove(close=close, target=target, duration_s=duration_s, settle=POSTURE_SETTLE)
         try:
-            self._claim_free_arm()
+            self._claim_arm_for(move)
         except BaseException:
             # A failure between the two claims must not hold the gripper.
             self._walk_back_close(close)
             raise
-        return HomeMove(
-            close=close,
-            target=target,
-            duration_s=duration_s,
-            settle=POSTURE_SETTLE,
-            stops_before=self._coordinator.stop_count,
-        )
+        return move
 
     def _claim_close(self) -> GripperPlan | None:
         """The close of the gripper for a move_to_home goal, installed with
@@ -1001,16 +1007,28 @@ class ActionLayer:
             closed = await self._wait_out(ctx, move.close, self._coordinator.abort_gripper_plan)
         except Exception as e:
             log(f"move_to_home close failed: {e!r}")
-            await _end_guarded(
-                ctx.fail, FailureKind.ATTEMPT_FAILED, f"the close of the gripper failed: {e!r}"
+            await self._end_unstarted(
+                move,
+                ctx.fail,
+                FailureKind.ATTEMPT_FAILED,
+                f"the close of the gripper failed: {e!r}",
             )
             return False
         finally:
             self._coordinator.release_gripper()
         if isinstance(closed, _Completed):
             return True
-        await _end_guarded(_end_goal, ctx, closed, results)
+        await self._end_unstarted(move, _end_goal, ctx, closed, results)
         return False
+
+    async def _end_unstarted(
+        self, move: JointPathMove | PoseMove | HomeMove, end, *args
+    ) -> None:
+        """End the goal of `move` before its plan is installed, with
+        `end(*args)` as _end_guarded runs it: a robot stop from here on ends
+        the goal no more and names no limb for it."""
+        self._coordinator.end_unstarted_arm_goal(move.unstarted)
+        await _end_guarded(end, *args)
 
     async def _drive_arm_plan(self, ctx, plan: ArmPlan, results) -> None:
         """Finish the goal of an installed arm `plan` with `results`, then
@@ -1040,12 +1058,12 @@ class ActionLayer:
         `plan_from(start)` plans the trajectory, or raises Refusal with the
         kind and the message the goal fails with, nothing installed; any
         other exception fails the goal with `attempt_failed`, its message led
-        by the planning of `words`, the caller's name for it. A stop since
-        admission ends the goal cancelled
-        with the stop's reason and `unmoved_results(start)`, nothing
-        installed: a stop before the planning, and a stop during it whose
-        planning gives a trajectory. A planning that raises fails the goal as
-        above, whether or not a stop came during it. Otherwise the goal ends
+        by the planning of `words`, the caller's name for it. A robot stop
+        since admission ends the goal cancelled with the message of the first
+        such stop and `unmoved_results(start)`, nothing installed: a stop
+        before the planning, and a stop during it whose planning gives a
+        trajectory. A planning that raises fails the goal as above, whether or
+        not a stop came during it. Otherwise the goal ends
         with `results(joints, ended_on_contact, action_time)`: `joints` where
         the arm stands as the goal ends (see _final_arm_positions),
         `ended_on_contact` whether the plan completed on contact,
@@ -1055,32 +1073,34 @@ class ActionLayer:
         try:
             start = find_start()
             if start is None:
-                await _end_guarded(ctx.fail, FOLLOWER_SILENT.kind, FOLLOWER_SILENT.message)
+                await self._end_unstarted(
+                    move, ctx.fail, FOLLOWER_SILENT.kind, FOLLOWER_SILENT.message
+                )
                 return
 
             async def end_stopped() -> None:
-                await _end_guarded(
-                    ctx.complete_cancelled, self._coordinator.last_stop, *unmoved_results(start)
+                await self._end_unstarted(
+                    move, ctx.complete_cancelled, move.unstarted.stopped, *unmoved_results(start)
                 )
 
-            if self._coordinator.stop_count != move.stops_before:
+            if move.unstarted.stopped is not None:
                 await end_stopped()
                 return
             started = time.monotonic()
             try:
                 profile = await plan_from(start)
             except Refusal as e:
-                await _end_guarded(ctx.fail, e.kind, str(e))
+                await self._end_unstarted(move, ctx.fail, e.kind, str(e))
                 return
             except Exception as e:
                 # A planning surprise ends the accepted goal too, so its
                 # caller gets an answer.
                 log(f"{words.planning} failed: {e!r}")
-                await _end_guarded(
-                    ctx.fail, FailureKind.ATTEMPT_FAILED, f"{words.planning} failed: {e!r}"
+                await self._end_unstarted(
+                    move, ctx.fail, FailureKind.ATTEMPT_FAILED, f"{words.planning} failed: {e!r}"
                 )
                 return
-            if self._coordinator.stop_count != move.stops_before:
+            if move.unstarted.stopped is not None:
                 await end_stopped()
                 return
             plan = self._coordinator.adopt_arm_plan(profile, move.settle, contact_gap_m)
@@ -1097,8 +1117,8 @@ class ActionLayer:
             # Past the planning, a surprise ahead of the wait for the plan:
             # the goal has no end yet, and its caller gets one.
             log(f"{words.goal} failed: {e!r}")
-            await _end_guarded(
-                ctx.fail, FailureKind.ATTEMPT_FAILED, f"{words.goal} failed: {e!r}"
+            await self._end_unstarted(
+                move, ctx.fail, FailureKind.ATTEMPT_FAILED, f"{words.goal} failed: {e!r}"
             )
         finally:
             self._coordinator.release_arm()
@@ -1150,11 +1170,55 @@ class ActionLayer:
         return PlanCheck(reachable=True, reason="", duration_s=profile.duration_s)
 
     def stop_moves(self, reason: str) -> list[str]:
-        """End every planned move in flight for the stop service: the names
-        of the limbs whose move was cut."""
+        """End every goal for the robot stop, as Coordinator.stop_all ends
+        them: the names of the limbs whose goal it ended, sorted by name."""
         message = _stop_message(reason)
         log(f"stop requested: {message}")
         return self._coordinator.stop_all(message)
+
+    async def request_stop(self, reason: str) -> list[str]:
+        """Hand the robot stop to the control loop, which runs it as
+        stop_moves does at the start of its next tick (see take_stops), and
+        give its answer. Raises Refusal with `attempt_failed` when the loop
+        does not take and answer it within the stop_answer_timeout_s of the
+        config; the loop runs it once it takes it."""
+        answer = asyncio.get_running_loop().create_future()
+        self._stops.append((reason, answer))
+        timeout_s = self._config.stop_answer_timeout_s
+        try:
+            return await asyncio.wait_for(answer, timeout_s)
+        except TimeoutError:
+            message = (
+                f"the control loop did not answer within {timeout_s:g}s: call again, and check "
+                "the node's log for what holds up the control loop"
+            )
+            log(f"stop: {message}")
+            raise Refusal(FailureKind.ATTEMPT_FAILED, message) from None
+
+    def take_stops(self) -> None:
+        """Run each robot stop handed to the control loop since its last
+        tick, in the order they came, as stop_moves does, and answer each one
+        whose caller still waits: with the limbs it stopped, or with Refusal
+        `attempt_failed` naming the error of a stop that raised, the stops
+        after it running on. The control loop calls it at the start of each
+        tick."""
+        stops, self._stops = self._stops, []
+        for reason, answer in stops:
+            try:
+                stopped = self.stop_moves(reason)
+            except Exception as e:  # pylint: disable=W0718
+                log(f"robot stop failed: {e!r}")
+                if not answer.done():
+                    answer.set_exception(
+                        Refusal(
+                            FailureKind.ATTEMPT_FAILED,
+                            f"the control loop failed the robot stop: {e!r}: call again, and check "
+                            "the node's log for the failure",
+                        )
+                    )
+                continue
+            if not answer.done():
+                answer.set_result(stopped)
 
     async def drive_pose(self, ctx, move: PoseMove, solver, kinematics) -> None:
         """Solve the pose of `move` and run the move, as _drive_arm_move does;
@@ -1311,9 +1375,9 @@ def _pose_fields(d) -> _PoseFields:
     )
 
 
-def _pose_move(goal: PoseGoal, fields: _PoseFields, stops_before: int) -> PoseMove:
+def _pose_move(goal: PoseGoal, fields: _PoseFields) -> PoseMove:
     """The move_arm goal `goal`, its target placed, settling as `fields`
-    asks, admitted at stop count `stops_before`."""
+    asks."""
     settle = PoseSettle(
         position=goal.position,
         orientation=goal.orientation,
@@ -1325,7 +1389,6 @@ def _pose_move(goal: PoseGoal, fields: _PoseFields, stops_before: int) -> PoseMo
         goal=goal,
         settle=settle,
         contact_gap_m=fields.contact_gap_m,
-        stops_before=stops_before,
     )
 
 

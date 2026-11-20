@@ -1,6 +1,6 @@
 """The lease follows the grip on the wire: the pose stream and the posture
 button against the generated mocks of the daemon target `fleet`, of the
-robot's `limb_motion` and of its postures, on an injected clock.
+robot's `robot_stop` and of its postures, on an injected clock.
 
 Each test follows a fixed order of events: the clock moves only once every
 loop of the test waits on it, so one tick is one step of each loop, and an
@@ -20,7 +20,7 @@ import pytest
 from peppygen.consumed_actions.fleet import changes, lease
 from peppygen.consumed_actions.postures import move_to_home
 from peppygen.consumed_services.fleet import check_move, release, take
-from peppygen.consumed_services.limb_motion import stop
+from peppygen.consumed_services.robot_stop import stop
 from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
 from peppygen.paired_topics.right_gripper import (
     gripper_setpoints as right_gripper_setpoints,
@@ -54,7 +54,7 @@ from tests.helpers import (
 from xr_commander import config, fleet, postures, publish
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import primary_pressed
-from xr_commander.drive import Driver, LimbStops
+from xr_commander.drive import Driver, RobotStops
 from xr_commander.fleet import LEASE_NAME, Fleet, FleetCalls, Following, Timing
 
 ROBOT = "backbone_inst"
@@ -74,7 +74,7 @@ HAND_AWAY = pose_at((0.1, 0.0, 0.0))
 
 class Rig:
     """The headset's right hand on one robot of the fleet listing, with the
-    daemon, the robot's limb_motion and its postures played by the mocks."""
+    daemon, the robot's robot_stop and its postures played by the mocks."""
 
     def __init__(self, h, clock: ManualClock) -> None:
         self.h = h
@@ -93,7 +93,7 @@ class Rig:
                 check_move_module=check_move,
                 timing=timing,
             ),
-            LimbStops(h.node_runner, robots, stop, timing),
+            RobotStops(h.node_runner, robots, stop, timing),
             timing=timing,
             on_change=lambda: None,
             clock=clock,
@@ -108,7 +108,7 @@ class Rig:
         self.arm_at = POSE
         self.arm_frame = ROBOT_FRAME
         self.daemon = h.mocks.deps.fleet
-        self.stops = h.mocks.deps.limb_motion[0].limb_motion_stop
+        self.stops = h.mocks.deps.robot_stop[0].robot_stop_stop
         self.postures = h.mocks.deps.postures[0].move_to_home
         self.wire = h.mocks.pairings.right_arm[0].pose_setpoints
         self.status = postures.PostureStatus(clock)
@@ -250,7 +250,7 @@ class Rig:
 async def rig(*loops: str):
     """The rig with the named loops of the headset running."""
     async with boot_clocked(
-        limb_motion_instance_ids=[ROBOT],
+        robot_stop_instance_ids=[ROBOT],
         postures_instance_ids=[ROBOT],
         right_arm_members={ROBOT: None},
         right_gripper_members={ROBOT: None},

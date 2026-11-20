@@ -7,7 +7,7 @@ import contextlib
 
 from peppygen.consumed_actions.fleet import changes, lease
 from peppygen.consumed_services.fleet import check_move, release, take
-from peppygen.consumed_services.limb_motion import stop
+from peppygen.consumed_services.robot_stop import stop
 
 from tests.helpers import (
     CALL_S,
@@ -26,7 +26,7 @@ from tests.helpers import (
 )
 from xr_commander import fleet
 from xr_commander.bus import Answered, Failed, Unanswered
-from xr_commander.drive import LimbStops
+from xr_commander.drive import RobotStops
 from xr_commander.fleet import (
     LEASE_NAME,
     DaemonLost,
@@ -502,13 +502,13 @@ async def test_each_call_the_daemon_does_not_answer_ends_unanswered():
         assert (await mock.check_move.next_request(CALL_S))[0].robot == "alpha"
 
 
-def stops_of(h, call_timeout_s=CALL_S) -> LimbStops:
+def stops_of(h, call_timeout_s=CALL_S) -> RobotStops:
     robots = PairedRobots(h.node_runner, arms={}, grippers={})
-    return LimbStops(h.node_runner, robots, stop, Timing(call_timeout_s=call_timeout_s))
+    return RobotStops(h.node_runner, robots, stop, Timing(call_timeout_s=call_timeout_s))
 
 
 ROBOT_AND_BRAVO = {
-    "limb_motion_instance_ids": ["backbone_inst"],
+    "robot_stop_instance_ids": ["backbone_inst"],
     "right_arm_members": {"backbone_inst": None, "bravo_backbone_inst": "bravo"},
 }
 
@@ -516,7 +516,7 @@ ROBOT_AND_BRAVO = {
 async def test_a_stop_reaches_the_robots_own_backbone_with_the_reason_that_names_the_headset():
     async with boot(**ROBOT_AND_BRAVO) as h:
         stops = stops_of(h)
-        mock = h.mocks.deps.limb_motion[0].limb_motion_stop
+        mock = h.mocks.deps.robot_stop[0].robot_stop_stop
 
         async def answer():
             request, responder = await mock.next_request(CALL_S)
@@ -525,15 +525,15 @@ async def test_a_stop_reaches_the_robots_own_backbone_with_the_reason_that_names
 
         stopped, _ = await asyncio.gather(stops.stop("backbone_inst"), answer())
         assert stopped is None
-        # Bravo has no limb_motion of its own: nothing to stop it with.
+        # Bravo has no robot_stop of its own: nothing to stop it with.
         assert await stops.stop("bravo") == (
-            "bravo has no limb_motion: the launcher links none to the headset"
+            "bravo has no robot_stop: the launcher links none to the headset"
         )
 
 
 async def test_a_stop_that_fails_or_gets_no_answer_says_why():
     async with boot(**ROBOT_AND_BRAVO) as h:
-        mock = h.mocks.deps.limb_motion[0].limb_motion_stop
+        mock = h.mocks.deps.robot_stop[0].robot_stop_stop
 
         async def fail():
             _, responder = await mock.next_request(CALL_S)

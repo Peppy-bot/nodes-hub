@@ -13,7 +13,7 @@
 //!   gets no command, and the goal goes on.
 //!
 //! Cancel flips a shared flag the shares poll, so each limb stops the way a
-//! cancelled move of its own stops; the stop service ends the shares in
+//! cancelled move of its own stops; the robot stop ends the shares in
 //! flight the same way, and the goal ends cancelled for the stop's reason.
 //! A cancel, a stop or a failure during the close ends the goal before the
 //! arms move. A stop that comes while the goal holds a limb and the
@@ -44,8 +44,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
 use crate::actions::{
-    ARM_WORDS, GRIPPER_WORDS, LimbWords, ask_coordinator, check_limb_free, claim_slots,
-    collect_ends, move_seconds_from_wire,
+    ARM_WORDS, COORDINATOR_REPLY_TIMEOUT, GRIPPER_WORDS, LimbWords, ask_coordinator,
+    check_limb_free, claim_slots, collect_ends, move_seconds_from_wire,
 };
 use crate::coordinator::{CoordinatorRequest, GraspMeasurement, MeasuredGrasp, newest_of};
 use crate::failure::{Failure, FailureKind};
@@ -320,6 +320,7 @@ async fn measure_grasps(requests: &mpsc::Sender<CoordinatorRequest>) -> GraspAns
         requests,
         CoordinatorRequest::MeasureGrasps { reply },
         answer,
+        COORDINATOR_REPLY_TIMEOUT,
     )
     .await
 }
@@ -853,7 +854,7 @@ mod tests {
         );
     }
 
-    /// The stop service ended both closes. The goal ends cancelled for the
+    /// The robot stop ended both closes. The goal ends cancelled for the
     /// stop's reason.
     #[tokio::test]
     async fn a_stop_during_the_close_cancels_the_goal_before_the_arms_move() {
@@ -977,7 +978,7 @@ mod tests {
         Outcome::Failed(Failure::new(kind, message))
     }
 
-    /// The shares of both arms, ended by the stop service.
+    /// The shares of both arms, ended by the robot stop.
     fn stopped_outcomes() -> [Outcome; 2] {
         [
             Outcome::Cancelled("stopped: operator".to_string()),
@@ -1086,7 +1087,7 @@ mod tests {
         );
     }
 
-    /// The stop service ended both arms' shares. The goal ends cancelled
+    /// The robot stop ended both arms' shares. The goal ends cancelled
     /// for the stop's reason.
     #[test]
     fn a_stopped_arm_ends_the_goal_cancelled_for_the_stops_reason() {

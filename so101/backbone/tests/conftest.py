@@ -56,6 +56,10 @@ START_TOLERANCE_RAD = 0.05
 # within in the tests, near the ramp of the SO-101's servos.
 MAX_JOINT_ACCELERATION_RAD_S2 = 40.0
 
+# How long (s) a robot stop waits for the control loop in the tests: a hang
+# guard, which only the test of a stop that no tick takes runs out.
+STOP_ANSWER_TIMEOUT_S = 10.0
+
 # The sentence each workspace answer of this robot, which has no perception
 # camera, ends with.
 NOT_CHECKED = "The view is not checked: the robot has no perception camera."
@@ -144,6 +148,7 @@ def make_config(**overrides) -> Config:
         "max_stream_ee_velocity_m_s": 1e9,
         "max_gripper_rate_frac_s": 1e9,
         "start_tolerance_rad": START_TOLERANCE_RAD,
+        "stop_answer_timeout_s": STOP_ANSWER_TIMEOUT_S,
     }
     return Config(**{**base, **overrides})
 

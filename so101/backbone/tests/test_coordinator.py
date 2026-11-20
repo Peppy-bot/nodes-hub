@@ -18,6 +18,7 @@ from so101_backbone.coordinator import (
     StillRun,
     JointSettle,
     PoseSettle,
+    UnstartedGoal,
 )
 from so101_backbone.failures import FailureKind
 from so101_backbone.kinematics import Kinematics
@@ -672,7 +673,6 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(
     c.measured_joints.set(MEASURED)
     c.measured_gripper.set(0.0)
     assert c.stop_all("stopped: nothing yet") == []
-    assert (c.stop_count, c.last_stop) == (1, "stopped: nothing yet")
 
     assert c.try_claim_arm() and c.try_claim_gripper()
     arm_plan = c.adopt_arm_plan(plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M)
@@ -699,9 +699,49 @@ def test_a_stop_cuts_every_installed_plan_with_its_message_and_names_the_limbs(
     c.arm_published(True, MEASURED)
     assert c.arm_tick(now + 0.02) is None
     assert c.gripper_tick(now + 0.01) is None
-    assert c.stop_count == 2
     # The goals release the slots, as after a cancel; the stop does not.
     assert c.arm_busy
+
+
+def test_a_stop_ends_the_unstarted_arm_goal_once_and_names_the_arm(
+    fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    goal = UnstartedGoal()
+    c.track_unstarted_arm_goal(goal)
+
+    assert c.stop_all("stopped: first") == ["arm"]
+    assert goal.stopped == "stopped: first"
+    # A second stop finds the goal ended: it keeps the first stop's message.
+    assert c.stop_all("stopped: second") == []
+    assert goal.stopped == "stopped: first"
+
+
+@pytest.mark.parametrize("let_go", ["install", "end", "release"])
+def test_an_arm_goal_unstarted_no_more_is_not_stopped(
+    let_go, fake_kinematics, follower_never_stale
+):
+    c = make_coordinator(fake_kinematics)
+    c.measured_joints.set(MEASURED)
+    assert c.try_claim_arm()
+    goal = UnstartedGoal()
+    c.track_unstarted_arm_goal(goal)
+    if let_go == "install":
+        # The installed plan is the goal from here on: the stop cuts it.
+        plan_of_it = c.adopt_arm_plan(
+            plan(MEASURED, FAR_TARGET, 1.0, (100.0,) * 5), ANYWHERE, NO_CONTACT_CHECK_M
+        )
+        assert c.stop_all("stopped") == ["arm"]
+        assert plan_of_it.stopped == "stopped"
+    elif let_go == "end":
+        c.end_unstarted_arm_goal(goal)
+        assert c.stop_all("stopped") == []
+    else:
+        c.release_arm()
+        assert c.stop_all("stopped") == []
+    assert goal.stopped is None
 
 
 def arm_settle(tolerances_rad=(0.1,) * 5, timeout_s=2.0) -> JointSettle:
