@@ -38,6 +38,9 @@
       // joint. It publishes nothing on static_transforms, whose fixed joints
       // the robot's initializer publishes.
       { name: "transforms", tag: "v1", link_id: "transforms" },
+      // The robot stop the robot's MCP endpoint calls as robot.stop: it
+      // ends every limb and posture move this backbone runs.
+      { name: "robot_stop", tag: "v1", link_id: "robot_stop" },
       // Where the robot can work, from its design alone: where its arms
       // reach and where its perception camera (the one camera that gives
       // depth and that no arm carries: v2's chest) sees, in the robot frame,
@@ -237,7 +240,7 @@
         // the plan check of a Cartesian move that moves nothing. Both are
         // answered by the coordinator, so they wait behind the readiness
         // gate with the moves.
-        { link_id: "limb_motion", name: "stop" },
+        { link_id: "robot_stop", name: "stop" },
         { link_id: "limb_motion", name: "check_arm_move" },
         // Where the robot can work on a surface and whether it can work
         // given points, answered from bringup: they read the design and the
@@ -322,6 +325,10 @@
       // Require > 0. The launcher decides it: the most an arm may stand off
       // the start its caller planned from, or move while its path is judged.
       start_tolerance_rad: "f64",
+      // How long (s) robot_stop's stop waits for the control loop to take
+      // and answer it before it answers attempt_failed: below the deadline of
+      // the stop's callers. Above 0.
+      stop_answer_timeout_s: "f64",
       // End-effector linear-speed cap (m/s) on every stream, and on nothing else,
       // used only until the first governor_control message; after that the
       // commander's streamed cap (openarm_web_commander) governs. Require > 0. The

@@ -35,8 +35,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::actions::{
-    ARM_WORDS, admit_limb, blocking_ask_coordinator, check_limb_free, contact_gap_from_wire,
-    move_seconds_from_wire, tolerance_from_wire,
+    ARM_WORDS, COORDINATOR_REPLY_TIMEOUT, admit_limb, blocking_ask_coordinator, check_limb_free,
+    contact_gap_from_wire, move_seconds_from_wire, tolerance_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind, TargetFailure, Unplaced};
@@ -364,6 +364,7 @@ fn check_plan(
         requests,
         CoordinatorRequest::CheckArmMove { request, reply },
         answer,
+        COORDINATOR_REPLY_TIMEOUT,
     )
     .map_err(|reason| {
         error!("check_arm_move: {reason}");

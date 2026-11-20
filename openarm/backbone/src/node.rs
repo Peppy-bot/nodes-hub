@@ -83,6 +83,9 @@ pub enum NodeError {
     #[error("parameter lookup_timeout_s")]
     LookupTimeout(#[source] DurationError),
 
+    #[error("parameter stop_answer_timeout_s must be a number of seconds a timer holds, got {0}")]
+    StopAnswerTimeout(f64),
+
     #[error("parameter max_joint_velocity_rad_s_{joint}")]
     JointVelocityCap {
         joint: usize,
@@ -219,6 +222,7 @@ struct Launch {
     max_joint_acceleration_rad_s2: JointVec,
     max_stream_ee_velocity: PositiveFinite,
     start_tolerance: PositiveFinite,
+    stop_answer_timeout: Duration,
     velocity_filter_cutoff_hz: f64,
     upstream_mode: UpstreamMode,
     governor: governor::Settings,
@@ -266,6 +270,8 @@ impl Launch {
             duration_from_secs(params.cache_window_s).map_err(NodeError::CacheWindow)?;
         let lookup_timeout =
             wait_from_secs(params.lookup_timeout_s).map_err(NodeError::LookupTimeout)?;
+        let stop_answer_timeout = duration_from_secs(params.stop_answer_timeout_s)
+            .map_err(|_| NodeError::StopAnswerTimeout(params.stop_answer_timeout_s))?;
         // Enforce the documented contract: the cutoff must sit below the control loop's
         // Nyquist frequency, or the low-pass does not attenuate (and above it is
         // meaningless). A hard bound at Nyquist; the node default sits well under it.
@@ -299,6 +305,7 @@ impl Launch {
             max_joint_acceleration_rad_s2,
             max_stream_ee_velocity,
             start_tolerance,
+            stop_answer_timeout,
             velocity_filter_cutoff_hz: params.velocity_filter_cutoff_hz,
             upstream_mode: params.upstream_mode.parse::<UpstreamMode>()?,
             governor,
@@ -411,6 +418,7 @@ fn run(
         max_joint_acceleration_rad_s2,
         max_stream_ee_velocity,
         start_tolerance,
+        stop_answer_timeout,
         velocity_filter_cutoff_hz,
         upstream_mode,
         governor: governor_settings,
@@ -671,7 +679,12 @@ fn run(
         ));
         spawn_supervised(
             &mut set,
-            actions::stop::run_stop(runner.clone(), token.clone(), request_tx.clone()),
+            actions::stop::run_robot_stop(
+                runner.clone(),
+                token.clone(),
+                request_tx.clone(),
+                stop_answer_timeout,
+            ),
         );
         spawn_supervised(
             &mut set,
@@ -728,9 +741,8 @@ fn run(
             streams::run_governor_config_listener(runner.clone(), config_tx),
         );
 
-        // The first task to finish is fatal: cancel the node so the daemon
-        // restarts a clean process rather than running on with a dead
-        // coordination loop or a missing action handler while reporting healthy.
+        // The first task to finish ends the node: it cancels the node, every
+        // other task stops and the process exits.
         if let Some(joined) = set.join_next().await {
             match joined {
                 Ok(Ok(())) => error!("backbone task exited; shutting node down"),

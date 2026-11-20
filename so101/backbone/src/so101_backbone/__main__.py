@@ -2,7 +2,7 @@
 serves, build the kinematics, limits, the placement of commands by the
 robot's tree and the coordinator, and run the control tick, the upstream
 consumers, the state relays, the readouts (limb_states and the joints'
-transforms), the limb name service, the stop and plan check services, one
+transforms), the limb name service, the robot stop and the plan check, one
 server per exposed action, and the workspace services."""
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ from peppygen.exposed_actions.limb_motion import (
     move_gripper,
 )
 from peppygen.exposed_actions.postures import move_to_home, move_to_ready
-from peppygen.exposed_services.limb_motion import check_arm_move, stop
+from peppygen.exposed_services.limb_motion import check_arm_move
+from peppygen.exposed_services.robot_stop import stop as robot_stop
 from peppygen.exposed_services.limb_state import get_limb_names
 from peppygen.paired_topics.arm import joint_setpoints as follower_joint_setpoints
 from peppygen.paired_topics.arm import joint_states as follower_joint_states
@@ -93,7 +94,11 @@ def _limb_names(_request) -> get_limb_names.Response:
 
 
 async def _run_control(
-    node_runner: NodeRunner, coordinator: Coordinator, period_s: float, token: CancellationToken
+    node_runner: NodeRunner,
+    coordinator: Coordinator,
+    layer: ActionLayer,
+    period_s: float,
+    token: CancellationToken,
 ):
     arm_pub = await follower_joint_setpoints.declare_publisher(node_runner)
     gripper_pub = await follower_gripper_setpoints.declare_publisher(node_runner)
@@ -101,6 +106,7 @@ async def _run_control(
     gripper_computing = runtime.Latch()
     arm_failing = runtime.Latch()
     gripper_failing = runtime.Latch()
+    stops_failing = runtime.Latch()
     rate = runtime.RateMeter("control loop", 1.0 / period_s)
 
     def stamped(stamp: float | None) -> float:
@@ -126,6 +132,13 @@ async def _run_control(
 
     async for _ in runtime.ticks(period_s, token):
         rate.tick()
+        # The robot stops handed since the last tick run first, so the limbs'
+        # setpoints below are the ones the stops leave.
+        try:
+            layer.take_stops()
+            stops_failing.clear()
+        except Exception as e:
+            stops_failing.trip(f"robot stop failed: {e!r}")
         now = time.monotonic()
         # Guarded per limb: the motion authority's loop must survive anything
         # one limb's tick computation (IK included) throws, holding that limb
@@ -371,7 +384,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         coordinator.leader_gripper.set(opening, wire_timestamp_s=m.timestamp)
 
     tasks = [
-        asyncio.create_task(_run_control(node_runner, coordinator, period_s, token)),
+        asyncio.create_task(_run_control(node_runner, coordinator, layer, period_s, token)),
         asyncio.create_task(
             _relay_states(
                 node_runner,
@@ -467,8 +480,15 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         for module, decide, drive, pending, label in action_servers
     )
 
-    def on_stop(request) -> stop.Response:
-        return stop.Response(stopped=layer.stop_moves(request.data.reason))
+    # robot_stop's stop, the robot stop the robot's MCP endpoint calls: the
+    # control loop runs it, and a stop the loop does not take and answer in
+    # time gets an error reply with `attempt_failed`.
+    async def on_robot_stop(request) -> robot_stop.Response:
+        try:
+            stopped = await layer.request_stop(request.data.reason)
+        except Refusal as e:
+            raise robot_stop.Failure(e.kind, str(e)) from None
+        return robot_stop.Response(stopped=stopped)
 
     async def on_check_arm_move(request) -> check_arm_move.Response:
         d = request.data
@@ -482,7 +502,9 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             reachable=check.reachable, reason=check.reason, duration_s=check.duration_s
         )
 
-    tasks.append(asyncio.create_task(runtime.serve(node_runner, stop, on_stop, "stop")))
+    tasks.append(
+        asyncio.create_task(runtime.serve(node_runner, robot_stop, on_robot_stop, "robot_stop"))
+    )
     tasks.append(
         asyncio.create_task(
             runtime.serve(node_runner, check_arm_move, on_check_arm_move, "check_arm_move")

@@ -798,7 +798,8 @@ async def test_move_to_home_closes_the_gripper_then_moves_the_arm_home(
 
 
 def stop_the_close(layer, _ctx):
-    assert layer.stop_moves("the operator asked") == ["gripper"]
+    # The stop ends the close and the arm move that waits for it.
+    assert layer.stop_moves("the operator asked") == ["arm", "gripper"]
 
 
 @pytest.mark.parametrize(
@@ -847,8 +848,8 @@ async def test_a_stop_between_the_close_and_the_arm_move_ends_move_to_home_cance
     coordinator, layer = home_layer(kinematics)
     move = admit_home(layer)
     run_gripper_plan_to_its_end(coordinator, move.close, 0.0)
-    # The close ended and no plan is installed: the stop names no limb.
-    assert layer.stop_moves("the operator asked") == []
+    # The close ended and the arm move waits for its plan: the stop ends it.
+    assert layer.stop_moves("the operator asked") == ["arm"]
     ctx = FakeGoalContext()
     await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
@@ -2253,6 +2254,43 @@ async def test_a_stopped_plan_ends_cancelled_with_the_stops_reason(follower_neve
     assert coordinator.try_claim_arm(), "the goal released the arm"
 
 
+async def test_the_control_loop_runs_a_requested_stop_at_its_tick_and_answers_it(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0)
+    answering = asyncio.create_task(layer.request_stop("the operator asked"))
+    await asyncio.sleep(0)
+    # The stop waits for the control loop: the plan runs until a tick takes it.
+    assert not plan.aborted
+    layer.take_stops()
+
+    assert await answering == ["arm"]
+    assert plan.stopped == "stopped: the operator asked"
+
+
+async def test_a_stop_no_tick_takes_in_its_answer_time_fails_and_runs_once_taken(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer(stop_answer_timeout_s=0.01)
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0)
+    # No tick of the control loop runs while the stop waits.
+    with pytest.raises(Refusal) as refused:
+        await layer.request_stop("the operator asked")
+    assert refusal_of(refused) == (
+        FailureKind.ATTEMPT_FAILED,
+        "the control loop did not answer within 0.01 s",
+    )
+    assert not plan.aborted
+
+    # The next tick takes the stop: it still ends the plan.
+    layer.take_stops()
+    assert plan.stopped == "stopped: the operator asked"
+    assert plan.aborted
+
+
 async def test_a_goal_whose_sender_is_gone_ends_cancelled_with_that_reason(
     follower_never_stale,
 ):
@@ -2336,10 +2374,11 @@ async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
         def __init__(self, layer_holder):
             super().__init__()
             self.layer_holder = layer_holder
+            self.stop_answers = []
 
         def inverse_kinematics(self, seed, position, orientation, **bars):
             # The stop lands while the solve runs off the event loop.
-            self.layer_holder[0].stop_moves("the operator asked")
+            self.stop_answers.append(self.layer_holder[0].stop_moves("the operator asked"))
             return super().inverse_kinematics(seed, position, orientation, **bars)
 
     holder = []
@@ -2352,6 +2391,10 @@ async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
+    # The first stop ended the goal and named its arm; a stop at a later
+    # solve of the same walk finds it ended.
+    assert kinematics.stop_answers[0] == ["arm"]
+    assert all(answer == [] for answer in kinematics.stop_answers[1:])
     reason, _final_pose, _ended_on_contact, _t = ctx.cancelled
     assert reason == "stopped: the operator asked"
     assert coordinator._arm.plan is None, "nothing was installed after the stop"
@@ -2365,7 +2408,7 @@ async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     coordinator, layer = make_layer(kinematics)
     coordinator.measured_joints.set((0.0,) * 5)
     goal = admit_pose(layer, (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
-    assert layer.stop_moves("the operator asked") == []
+    assert layer.stop_moves("the operator asked") == ["arm"]
     ctx = FakeGoalContext()
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
@@ -2385,7 +2428,7 @@ async def test_a_stop_before_the_path_drive_runs_ends_the_goal_as_stopped(follow
     coordinator, layer = make_layer()
     coordinator.measured_joints.set(MEASURED)
     move = admit_path(layer, *CORNERED)
-    assert layer.stop_moves("the operator asked") == []
+    assert layer.stop_moves("the operator asked") == ["arm"]
     ctx = await drive_path_cancelled_at_once(layer, move)
 
     assert ctx.completed is None and ctx.failed is None
@@ -2402,10 +2445,11 @@ async def test_a_stop_while_the_path_is_planned_off_the_loop_ends_the_goal_witho
     coordinator, layer = make_layer()
     coordinator.measured_joints.set(MEASURED)
     planning_threads = []
+    answers = []
 
     def plan_while_a_stop_lands(*arguments):
         planning_threads.append(threading.get_ident())
-        layer.stop_moves("the operator asked")
+        answers.append(layer.stop_moves("the operator asked"))
         return JointTrajectory.through(*arguments)
 
     monkeypatch.setattr(
@@ -2417,13 +2461,64 @@ async def test_a_stop_while_the_path_is_planned_off_the_loop_ends_the_goal_witho
     # The path was planned on a thread of its own, off the event loop.
     assert len(planning_threads) == 1
     assert planning_threads[0] != threading.get_ident()
-    # The stop landed during the planning: the goal ends cancelled with the
-    # stop's reason and where the arm stands, and nothing is installed.
+    # The stop landed during the planning and named the arm: the goal ends
+    # cancelled with the stop's reason and where the arm stands, and nothing
+    # is installed.
+    assert answers == [["arm"]]
     assert ctx.completed is None and ctx.failed is None
     reason, arms, action_time = ctx.cancelled
     assert (reason, action_time) == ("stopped: the operator asked", 0.0)
     assert path_result_joints(arms) == list(MEASURED)
     assert coordinator._arm.plan is None
+    assert coordinator.try_claim_arm()
+
+
+async def test_a_goal_admitted_before_its_plan_keeps_the_reason_of_the_first_stop(
+    follower_never_stale,
+):
+    # Two stops land between the admission of a path and its drive: the first
+    # ends the goal and names its arm, the second finds that goal ended and
+    # names no limb.
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set(MEASURED)
+    move = admit_path(layer, *CORNERED)
+    assert layer.stop_moves("the first") == ["arm"]
+    assert layer.stop_moves("the second") == []
+    ctx = await drive_path_cancelled_at_once(layer, move)
+
+    reason, arms, _action_time = ctx.cancelled
+    assert reason == "stopped: the first"
+    assert path_result_joints(arms) == list(MEASURED)
+    assert coordinator.try_claim_arm()
+
+
+class StoppedWhileFailing(FakeGoalContext):
+    """A goal context whose failure a robot stop lands in, the stop's
+    answer recorded."""
+
+    def __init__(self, layer):
+        super().__init__()
+        self.layer = layer
+        self.stop_answer = None
+
+    async def fail(self, kind, message):
+        self.stop_answer = self.layer.stop_moves("the operator asked")
+        await super().fail(kind, message)
+
+
+async def test_a_stop_while_a_goal_fails_before_its_plan_names_no_limb(follower_never_stale):
+    # The path is refused for its expected start in its drive, so the goal
+    # fails before its plan is installed. A stop that lands while the failure
+    # goes out, the arm still claimed, ends no goal.
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set(MEASURED)
+    move = admit_path(layer, CORNERED[0], expected_start=(0.0, 0.1, 0.28, 0.3, 0.4))
+    ctx = StoppedWhileFailing(layer)
+    await layer.drive_joint_path(ctx, move)
+
+    assert ctx.failed[0] is FailureKind.PRECONDITION_FAILED
+    assert ctx.stop_answer == []
+    assert ctx.cancelled is None
     assert coordinator.try_claim_arm()
 
 

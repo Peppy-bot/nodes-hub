@@ -80,12 +80,15 @@ impl MoveSlot {
     /// the stop: for a stop that ended no goal of this slot, so the goal is
     /// admitted and the coordinator has not taken it. A free slot gets no
     /// mark, and a goal that an earlier stop marked keeps that stop's reason.
-    pub fn stop_unstarted(&self, reason: &str) {
+    /// Whether this stop marked a goal.
+    pub fn stop_unstarted(&self, reason: &str) -> bool {
         self.with_holder(|holder| {
-            if *holder == Holder::Goal {
+            let unstarted = *holder == Holder::Goal;
+            if unstarted {
                 *holder = Holder::StoppedGoal(reason.to_string());
             }
-        });
+            unstarted
+        })
     }
 
     /// The reason of the stop that came before the coordinator took the goal

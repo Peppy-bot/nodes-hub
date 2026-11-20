@@ -133,7 +133,7 @@ pub struct PathGoal {
 }
 
 impl PathGoal {
-    /// End the goal before its path starts, cancelled by the stop service for
+    /// End the goal before its path starts, cancelled by the robot stop for
     /// `reason`: each arm reports the joints `measured` gives it, as an arm
     /// move stopped before it starts does, and its move slot is freed.
     pub fn stop(

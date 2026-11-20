@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use control_core::filters::LowPassFilter;
 use control_core::pacer::Pacer;
 use control_core::robot_tree::RobotTree;
+use control_core::stop_reason::stop_reason;
 use robot_description::{ArmId, PerArm};
 use srs_model::ARM_DOF;
 
@@ -172,15 +173,6 @@ pub enum CoordinatorRequest {
         goal: PathGoal,
         started: oneshot::Sender<Result<(), Failure>>,
     },
-}
-
-/// The reason every goal a stop ends is cancelled for: the stop, and the
-/// reason of the stop request.
-fn stop_reason(reason: &str) -> String {
-    if reason.is_empty() {
-        return "stopped".to_string();
-    }
-    format!("stopped: {reason}")
 }
 
 /// Run the coordination loop. Holds the governor and both planners. Runs until
@@ -584,7 +576,9 @@ async fn serve_queued(
 ///   ([`MoveSlot::stop_unstarted`](crate::move_slot::MoveSlot::stop_unstarted)),
 ///   and ends when the loop takes it.
 /// - Each goal the stop ends is cancelled, for a reason that names the
-///   stop. The answer names the limbs whose move was in flight. Each arm
+///   stop. The answer names each limb whose move in flight, queued goal or
+///   admitted goal the loop has not taken the stop ended, once each, in
+///   ascending byte order. Each arm
 ///   whose move had played holds where it stands: its command moves to the
 ///   joints it measures. Every other setpoint holds where it was last
 ///   governed.
@@ -621,6 +615,7 @@ async fn serve_request(
                 while let Ok(goal) = channel.goals.try_recv() {
                     let _release = channel.move_slot.release_on_drop();
                     goal.stop(&reason, measured, planner).await;
+                    stopped.push(LIMBS.arm_name(arm).to_string());
                 }
                 let measured_frac = gripper_fraction(&channel.gripper);
                 if let Some(m) = gripper_moves[arm].take() {
@@ -636,12 +631,19 @@ async fn serve_request(
                 while let Ok(goal) = channel.gripper_goals.try_recv() {
                     let _release = channel.gripper_move_slot.release_on_drop();
                     goal.stop(&reason, measured_frac).await;
+                    stopped.push(LIMBS.gripper_name(arm).to_string());
                 }
                 // Every goal the loop held is ended and its slot freed, so a
                 // slot still claimed holds a goal the loop has not taken.
-                channel.move_slot.stop_unstarted(&reason);
-                channel.gripper_move_slot.stop_unstarted(&reason);
+                if channel.move_slot.stop_unstarted(&reason) {
+                    stopped.push(LIMBS.arm_name(arm).to_string());
+                }
+                if channel.gripper_move_slot.stop_unstarted(&reason) {
+                    stopped.push(LIMBS.gripper_name(arm).to_string());
+                }
             }
+            stopped.sort_unstable();
+            stopped.dedup();
             let _ = reply.send(stopped);
             None
         }
@@ -1701,7 +1703,9 @@ mod tests {
     /// A stop ends every move in flight, whoever started it, and every goal
     /// admitted but not started yet: each ends cancelled for a reason that
     /// names the stop and the reason of its request. The answer names the
-    /// limbs whose move was in flight, and both arms are free again.
+    /// limbs it stopped, the left arm's posture share in flight and the right
+    /// arm's queued one, in ascending byte order, and both arms are free
+    /// again.
     #[tokio::test]
     async fn a_stop_ends_each_move_cancelled_for_the_stops_reason() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
@@ -1747,7 +1751,7 @@ mod tests {
         .await;
         assert_eq!(
             answer.await.expect("the loop answers the stop"),
-            ["left_arm"]
+            ["left_arm", "right_arm"]
         );
         let stopped = Outcome::Cancelled("stopped: the operator asked".to_string());
         assert_eq!(
@@ -1757,15 +1761,6 @@ mod tests {
         assert_eq!(queued.try_recv().expect("the queued goal ends"), stopped);
         assert!(!channels[LEFT].move_slot.is_claimed());
         assert!(!channels[RIGHT].move_slot.is_claimed());
-    }
-
-    #[test]
-    fn the_stop_reason_names_the_stop_and_the_reason_of_its_request() {
-        assert_eq!(
-            stop_reason("the operator asked"),
-            "stopped: the operator asked"
-        );
-        assert_eq!(stop_reason(""), "stopped");
     }
 
     /// During the seed wait, a grasp request gets no pose for either arm,
@@ -1960,7 +1955,8 @@ mod tests {
     }
 
     /// A stop marks each goal that holds a limb and that the loop has not
-    /// taken, on the move slot of the limb, and no free limb.
+    /// taken, on the move slot of the limb, and no free limb; it names each
+    /// limb it marked, in ascending byte order.
     #[tokio::test]
     async fn a_stop_marks_the_goals_that_the_loop_has_not_taken() {
         let (mut channels, mut planners) = both_arms();
@@ -1970,7 +1966,7 @@ mod tests {
             "the gripper is free"
         );
         let stopped = stop_alone(&mut channels, &mut planners, Instant::now()).await;
-        assert!(stopped.is_empty(), "no move was in flight");
+        assert_eq!(stopped, ["left_arm", "right_gripper"]);
 
         let reason = Some("stopped: the operator asked".to_string());
         assert_eq!(channels[LEFT].move_slot.take_stop(), reason);
@@ -2016,14 +2012,15 @@ mod tests {
 
     /// A stop that came on an earlier tick than the start of a path, after
     /// the admission of its goal, ends the path before it starts, each arm
-    /// cancelled for the stop's reason, and frees its arms.
+    /// cancelled for the stop's reason, and frees its arms; it names both
+    /// arms, whose admitted goal it ended.
     #[tokio::test]
     async fn a_stop_before_the_tick_that_takes_a_path_ends_the_path() {
         let (mut channels, mut planners) = both_arms();
         let (goal, mut done_rx) = path_goal(&channels, &["left_arm", "right_arm"]);
         let now = Instant::now();
         let stopped = stop_alone(&mut channels, &mut planners, now).await;
-        assert!(stopped.is_empty(), "no move was in flight");
+        assert_eq!(stopped, ["left_arm", "right_arm"]);
 
         let later = now + Duration::from_millis(10);
         let (started, judgment) =
@@ -2096,8 +2093,8 @@ mod tests {
 
     /// A stop ends the path of every execute_joint_path goal queued behind
     /// it before the path starts, each arm cancelled for the stop's reason
-    /// with the joints it measures, and frees its arms; a path queued after
-    /// the stop's tick starts.
+    /// with the joints it measures, and frees its arms, and names both arms;
+    /// a path queued after the stop's tick starts.
     #[tokio::test]
     async fn a_stop_ends_a_path_queued_behind_it_before_the_path_starts() {
         let (mut channels, mut planners) = both_arms();
@@ -2117,7 +2114,10 @@ mod tests {
         let now = Instant::now();
         let judgments = serve_all(&mut requests, &mut channels, &mut planners, LIVE, now).await;
         assert!(judgments.is_empty(), "no path starts");
-        assert!(stopped.await.expect("the loop answers the stop").is_empty());
+        assert_eq!(
+            stopped.await.expect("the loop answers the stop"),
+            ["left_arm", "right_arm"]
+        );
         assert_eq!(answer.await.expect("the loop takes the path"), Ok(()));
         for arm in [RIGHT, LEFT] {
             let report = done_rx.try_recv().expect("each arm reports");

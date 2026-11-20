@@ -30,9 +30,9 @@ use crate::robot::{ARMS, LIMBS};
 use crate::settle::ContactGap;
 use crate::streams::LeaderActivity;
 
-/// How long a service waits for the coordinator's answer before it gives an
-/// error reply: many ticks of the slowest control rate, so only a loop that
-/// has stopped ticking runs it out.
+/// How long the plan check and the grasp measurement of a posture wait for
+/// the coordinator's answer before they give an error: many ticks of the
+/// slowest control rate, so only a loop that has stopped ticking runs it out.
 const COORDINATOR_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The longest a move may be asked to take, and the longest it may be given
@@ -155,8 +155,7 @@ fn admit_limb(
 }
 
 /// Hand `request` to the coordinator and wait for the answer it sends on
-/// `answer`, for at most [`COORDINATOR_REPLY_TIMEOUT`]. The error names
-/// what went wrong:
+/// `answer`, for at most `within`. The error names what went wrong:
 /// - the coordinator is not running;
 /// - it has too many requests queued;
 /// - it dropped the request;
@@ -165,6 +164,7 @@ async fn ask_coordinator<T>(
     requests: &mpsc::Sender<CoordinatorRequest>,
     request: CoordinatorRequest,
     answer: oneshot::Receiver<T>,
+    within: Duration,
 ) -> std::result::Result<T, String> {
     requests.try_send(request).map_err(|e| match e {
         mpsc::error::TrySendError::Full(_) => {
@@ -172,12 +172,10 @@ async fn ask_coordinator<T>(
         }
         mpsc::error::TrySendError::Closed(_) => "the coordinator is not running".to_string(),
     })?;
-    match tokio::time::timeout(COORDINATOR_REPLY_TIMEOUT, answer).await {
+    match tokio::time::timeout(within, answer).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_)) => Err("the coordinator dropped the request".to_string()),
-        Err(_) => Err(format!(
-            "the coordinator did not answer within {COORDINATOR_REPLY_TIMEOUT:?}"
-        )),
+        Err(_) => Err(format!("the coordinator did not answer within {within:?}")),
     }
 }
 
@@ -214,8 +212,9 @@ fn blocking_ask_coordinator<T>(
     requests: &mpsc::Sender<CoordinatorRequest>,
     request: CoordinatorRequest,
     answer: oneshot::Receiver<T>,
+    within: Duration,
 ) -> std::result::Result<T, String> {
-    wait_for(ask_coordinator(requests, request, answer))
+    wait_for(ask_coordinator(requests, request, answer, within))
 }
 
 #[cfg(test)]

@@ -491,13 +491,14 @@ reporting, so its last measurement is stale, or the coordinator did not
 answer. A backbone clock that has not ticked then gives no time, and the goal
 fails with `attempt_failed`.
 
-### Services of limb_motion
+### Services of robot_stop and limb_motion
 
-`stop` ends every planned move in flight, whoever started it: the arm moves
-through their planners, the gripper moves through their terminal, the
-posture moves through the limbs whose shares are in flight (both grippers
-during the close of `move_to_home`, both arms otherwise), and the goals
-admitted but not started yet. A goal that holds a limb and that the
+`stop` of `robot_stop`, the robot stop the robot's MCP endpoint calls
+as `robot.stop`, ends every planned move in flight, whoever started it: the
+arm moves through their planners, the gripper moves through their terminal,
+the posture moves through the limbs whose shares are in flight (both
+grippers during the close of `move_to_home`, both arms otherwise), and the
+goals admitted but not started yet. A goal that holds a limb and that the
 coordinator has not taken when the stop comes ends when the coordinator
 takes it: the stop marks the move slot of the limb. This ends a goal on its
 way from its action to the coordinator, and a `move_to_home` goal between
@@ -507,11 +508,13 @@ goal too. Each arm whose move the stop ends holds where it stands, as after
 a cancel: its command moves to the joints it measures on the stop's tick. An
 arm with no fresh measurement, and an arm whose joint path had not started
 to play, keeps the command it was last governed to, and so does each gripper.
-The answer's `stopped` names the limbs whose move was in flight, empty when
-none was. The stop does not latch: a goal admitted after it runs.
+The answer's `stopped` names each limb whose move in flight or admitted goal
+the stop ended, once each and in ascending byte order, empty when it ended
+none. The stop does not latch: a goal admitted after it runs.
 A leader's streamed setpoints are not stopped.
-A coordinator that does not answer cannot carry the stop out: the stop then
-gives an error reply with `attempt_failed`.
+A coordinator that does not take and answer the stop within
+`stop_answer_timeout_s` cannot carry it out: the stop then gives an error
+reply with `attempt_failed`, and the coordinator runs it once it takes it.
 
 `check_arm_move` takes the target and the duration of a
 `move_arm` goal, places the target as the goal's is placed, and answers whether
@@ -729,7 +732,11 @@ the goal and again at the path's run start, where the arm measures once the
 path is judged; and at the run start from where it measured when the
 coordinator took the goal, both clamped into its joint limits. Set it to the
 most an arm may stand off the start its caller planned from, or move while
-its path is judged. All ten pairing slots (six toward the leading node, four
+its path is judged.
+`stop_answer_timeout_s`, required too, is how long (s) the robot stop waits
+for the coordinator to take and answer it before it gives an error reply
+with `attempt_failed`: set it below the deadline of the stop's callers, the
+robots' MCP endpoint's `robot.stop` among them. All ten pairing slots (six toward the leading node, four
 toward the followers) are optional and established by the launcher: each one
 either names a peer, from this instance's `links` or the peer's own, or is
 declared `{ vacant: "<why>" }`, and a slot left unmentioned by both ends
