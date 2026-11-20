@@ -16,6 +16,7 @@ use camera_core::controls::{AutoManualMode, ControlFailure, VALUE_UNAVAILABLE};
 use camera_core::encoding::{ColorEncoding, DEPTH_ENCODING};
 use camera_core::geometry::Z_DEPTH_MODEL;
 use camera_core::pinhole::Intrinsics;
+use camera_core::sensor_mounts::{CAMERA, DESCRIBE_SENSORS_TIMEOUT, DescribedSensors, read_sensor};
 use camera_core::v4l2::{
     CID_AUTO_WHITE_BALANCE, CID_BRIGHTNESS, CID_CONTRAST, CID_GAIN, CID_WHITE_BALANCE_TEMPERATURE,
 };
@@ -23,6 +24,7 @@ use control_core::latched_log::LatchedLog;
 use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 
+use peppygen::consumed_services::sensor_mounts::describe_sensors;
 use peppygen::emitted_topics::camera::{depth_stream, video_stream};
 use peppygen::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
@@ -76,9 +78,9 @@ struct Opened {
 /// the node its frames.
 type SessionGeometry = std::result::Result<Geometry, String>;
 
-/// One processed capture: rectified left RGB plus depth, sharing a frame id.
+/// One processed capture: rectified left RGB plus depth, sharing a capture index.
 struct FrameSet {
-    frame_id: u32,
+    capture_index: u32,
     timestamp: SystemTime,
     left_rgb: Vec<u8>,
     depth_z16: Vec<u8>,
@@ -116,6 +118,40 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     // The synchronized clock stamping every emission.
     peppygen::clock::init(&node_runner).await?;
 
+    // The frame every picture names, read once before the camera opens: with
+    // the sensor_mounts link bound, the one the robot's sensor_mounts gives
+    // the camera's name, and a name it does not list fails the node here;
+    // with the link vacant, the camera's name.
+    let asker = Arc::clone(&node_runner);
+    let describe = describe_sensors::bound_producer(&node_runner)
+        .cloned()
+        .map(|mounts| {
+            async move || {
+                describe_sensors::poll(&asker, &mounts, DESCRIBE_SENSORS_TIMEOUT)
+                    .await
+                    .map(|answer| DescribedSensors {
+                        sensor_names: answer.data.sensor_names,
+                        sensor_kinds: answer.data.sensor_kinds,
+                        sensor_frames: answer.data.sensor_frames,
+                        carried_by: answer.data.carried_by,
+                    })
+            }
+        });
+    let Some(camera) = read_sensor(
+        CAMERA,
+        node_runner.copy(),
+        node_runner.processor().bound_instance_id(),
+        describe,
+        node_runner.cancellation_token().cancelled(),
+    )
+    .await
+    .map_err(std::io::Error::other)?
+    else {
+        return Ok(());
+    };
+    let camera_frame = camera.frame.to_string();
+    info!("each picture names frame {camera_frame}");
+
     let (frame_tx, frame_rx) = mpsc::channel::<FrameSet>(EMIT_CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel();
     let cancel = node_runner.cancellation_token().clone();
@@ -144,18 +180,24 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     } = ready_rx
         .await
         .map_err(|_| std::io::Error::other("pipeline exited before opening the camera"))?
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| std::io::Error::other(format!("open zed pipeline: {e}")))?;
     info!(
         "zed_camera {resolution} ({}x{}) @ {fps} fps, depth {}x{}",
         color.width, color.height, depth.width, depth.height
     );
 
-    spawn_emit_task(node_runner.clone(), frame_rx, color, depth);
+    spawn_emit_task(
+        node_runner.clone(),
+        frame_rx,
+        color,
+        depth,
+        camera_frame.clone(),
+    );
     spawn_stream_infos(node_runner.clone(), color, depth, fps.per_second());
     let geometry = Arc::new(geometry);
     spawn_get_color_intrinsics(node_runner.clone(), geometry.clone());
     spawn_get_depth_intrinsics(node_runner.clone(), geometry.clone());
-    spawn_get_depth_to_color_extrinsics(node_runner.clone(), geometry);
+    spawn_get_depth_to_color_extrinsics(node_runner.clone(), geometry, camera_frame);
     spawn_set_color_exposure(node_runner.clone());
     spawn_set_color_white_balance(node_runner.clone(), camera.clone());
     spawn_set_color_gain(node_runner.clone(), camera.clone());
@@ -187,7 +229,7 @@ fn run_pipeline(
     let mut yuyv = vec![0u8; (2 * color.width * color.height * 2) as usize];
     let mut left_rgb = vec![0u8; (color.width * color.height * 3) as usize];
     let mut depth_mm = vec![0u16; (depth.width * depth.height) as usize];
-    let mut frame_id: u32 = 0;
+    let mut capture_index: u32 = 0;
     let processing_failures = LatchedLog::warn("depth processing");
     let capture_stamps = LatchedLog::warn("capture stamps");
 
@@ -225,12 +267,12 @@ fn run_pipeline(
         processing_failures.success();
 
         let frame = FrameSet {
-            frame_id,
+            capture_index,
             timestamp,
             left_rgb: left_rgb.clone(),
             depth_z16: depth_mm.iter().flat_map(|d| d.to_le_bytes()).collect(),
         };
-        frame_id = frame_id.wrapping_add(1);
+        capture_index = capture_index.wrapping_add(1);
         // Latest-value semantics: drop the frame if the emitter is behind.
         let _ = frame_tx.try_send(frame);
     }
@@ -285,11 +327,13 @@ fn open_pipeline(config: &PipelineConfig) -> std::result::Result<(CvDepth, Opene
     ))
 }
 
+/// Publishes each frameset's two pictures, each naming `camera_frame`.
 fn spawn_emit_task(
     runner: Arc<NodeRunner>,
     mut frame_rx: mpsc::Receiver<FrameSet>,
     color: Size,
     depth: Size,
+    camera_frame: String,
 ) {
     tokio::spawn(async move {
         let color_pub = match video_stream::declare_publisher(&runner).await {
@@ -302,16 +346,13 @@ fn spawn_emit_task(
         };
         while let Some(frame) = frame_rx.recv().await {
             let FrameSet {
-                frame_id,
+                capture_index,
                 timestamp,
                 left_rgb,
                 depth_z16,
             } = frame;
-            let color_header = video_stream::MessageHeader {
-                timestamp,
-                frame_id,
-                align_mode: ALIGN_MODE.to_string(),
-            };
+            let (color_header, depth_header) =
+                picture_headers(&camera_frame, capture_index, timestamp);
             match video_stream::build_message(
                 color_header,
                 COLOR_ENCODING.name().to_string(),
@@ -327,11 +368,6 @@ fn spawn_emit_task(
                 Err(e) => error!("video_stream build_message: {e}"),
             }
 
-            let depth_header = depth_stream::MessageHeader {
-                timestamp,
-                frame_id,
-                align_mode: ALIGN_MODE.to_string(),
-            };
             match depth_stream::build_message(
                 depth_header,
                 DEPTH_ENCODING.to_string(),
@@ -349,6 +385,29 @@ fn spawn_emit_task(
         }
         info!("emit task stopped");
     });
+}
+
+/// The headers of a frameset's colour and depth pictures: the camera's frame, the capture
+/// time, the capture index and the alignment, the same in both.
+fn picture_headers(
+    camera_frame: &str,
+    capture_index: u32,
+    timestamp: SystemTime,
+) -> (video_stream::MessageHeader, depth_stream::MessageHeader) {
+    (
+        video_stream::MessageHeader {
+            timestamp,
+            frame: camera_frame.to_owned(),
+            capture_index,
+            align_mode: ALIGN_MODE.to_owned(),
+        },
+        depth_stream::MessageHeader {
+            timestamp,
+            frame: camera_frame.to_owned(),
+            capture_index,
+            align_mode: ALIGN_MODE.to_owned(),
+        },
+    )
 }
 
 fn spawn_stream_infos(runner: Arc<NodeRunner>, color: Size, depth: Size, fps: u8) {
@@ -462,9 +521,11 @@ fn depth_intrinsics(
 }
 
 /// get_depth_to_color_extrinsics: depth is matched in the colour stream's own
-/// view, so the two optical frames are one and the transform is the identity.
+/// view, so the two optical frames are one and the transform is the identity,
+/// in `camera_frame`, holding at every time.
 fn depth_to_color_extrinsics(
     geometry: &SessionGeometry,
+    camera_frame: &str,
 ) -> std::result::Result<
     get_depth_to_color_extrinsics::Response,
     get_depth_to_color_extrinsics::Failure,
@@ -477,20 +538,24 @@ fn depth_to_color_extrinsics(
     })?;
     Ok(get_depth_to_color_extrinsics::Response::new(
         ALIGN_MODE.to_string(),
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
+        get_depth_to_color_extrinsics::ResponseDepthToColor {
+            frame: camera_frame.to_owned(),
+            position: [0.0, 0.0, 0.0],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+        },
     ))
 }
 
-/// One camera_geometry service answering from the session's geometry.
+/// One camera_geometry service answering from the session's geometry. A
+/// service whose answer names the camera's frame takes it as `$frame`.
 macro_rules! spawn_geometry_service {
-    ($fn_name:ident, $service:ident, $respond:ident) => {
-        fn $fn_name(runner: Arc<NodeRunner>, geometry: Arc<SessionGeometry>) {
+    ($fn_name:ident, $service:ident, $respond:ident $(, $frame:ident)?) => {
+        fn $fn_name(runner: Arc<NodeRunner>, geometry: Arc<SessionGeometry> $(, $frame: String)?) {
             tokio::spawn(async move {
                 serving::serve(
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
-                    || $service::handle_requests(&runner, |_req| $respond(&geometry)),
+                    || $service::handle_requests(&runner, |_req| $respond(&geometry $(, &$frame)?)),
                 )
                 .await;
             });
@@ -511,7 +576,8 @@ spawn_geometry_service!(
 spawn_geometry_service!(
     spawn_get_depth_to_color_extrinsics,
     get_depth_to_color_extrinsics,
-    depth_to_color_extrinsics
+    depth_to_color_extrinsics,
+    camera_frame
 );
 
 /// Writes one control and reads it back: the value the driver kept, or why
@@ -636,6 +702,9 @@ mod tests {
     use super::*;
     use zed_camera::geometry::RectifiedLeft;
 
+    /// The frame sensor_mounts gives the camera.
+    const CAMERA_FRAME: &str = "chest_color_optical_frame";
+
     fn session() -> SessionGeometry {
         Geometry::new(
             Size {
@@ -676,10 +745,37 @@ mod tests {
         // The value every frame header carries.
         assert_eq!(depth.align_mode, ALIGN_MODE);
 
-        let pose = depth_to_color_extrinsics(&session()).unwrap();
+        let pose = depth_to_color_extrinsics(&session(), CAMERA_FRAME).unwrap();
         assert_eq!(pose.align_mode, depth.align_mode);
-        assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
-        assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pose.depth_to_color.position, [0.0, 0.0, 0.0]);
+        assert_eq!(pose.depth_to_color.orientation, [0.0, 0.0, 0.0, 1.0]);
+        // The pose of the depth optical frame in the camera's frame, holding at every time.
+        assert_eq!(pose.depth_to_color.frame, CAMERA_FRAME);
+    }
+
+    #[test]
+    fn both_pictures_of_a_frameset_name_the_camera_frame_and_one_capture_index() {
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_780_000_000);
+        let (color, depth) = picture_headers(CAMERA_FRAME, 7, timestamp);
+        for (frame, capture_index, at, align_mode) in [
+            (
+                color.frame,
+                color.capture_index,
+                color.timestamp,
+                color.align_mode,
+            ),
+            (
+                depth.frame,
+                depth.capture_index,
+                depth.timestamp,
+                depth.align_mode,
+            ),
+        ] {
+            assert_eq!(frame, CAMERA_FRAME);
+            assert_eq!(capture_index, 7);
+            assert_eq!(at, timestamp);
+            assert_eq!(align_mode, ALIGN_MODE);
+        }
     }
 
     #[test]
@@ -694,7 +790,7 @@ mod tests {
         assert_eq!(depth.kind, get_depth_intrinsics::FailureKind::Rejected);
         assert!(depth.message.contains("focal lengths"));
 
-        let pose = depth_to_color_extrinsics(&none).unwrap_err();
+        let pose = depth_to_color_extrinsics(&none, CAMERA_FRAME).unwrap_err();
         assert_eq!(
             pose.kind,
             get_depth_to_color_extrinsics::FailureKind::Rejected
@@ -731,5 +827,141 @@ mod tests {
         let unknown = color_exposure(exposure_request("dim", 120)).unwrap_err();
         assert_eq!(unknown.kind, set_color_exposure::FailureKind::Rejected);
         assert!(unknown.message.contains("\"dim\""), "{}", unknown.message);
+    }
+}
+
+/// The node's start over the generated harness, with a device path that holds no device and
+/// its sensor_mounts link bound to the generated mock or vacant: the node reads the frame every
+/// picture names before it opens the camera, so each start ends at the camera's open, or before
+/// it when a bound sensor_mounts places no camera of the node's name.
+#[cfg(test)]
+mod start {
+    use std::time::Duration;
+
+    use peppygen::Parameters;
+    use peppygen::fixtures::harness::{Config, Harness};
+    use peppygen::mock::deps::sensor_mounts::describe_sensors::ResponseData;
+    use peppygen::parameters::depth::Depth;
+
+    /// Bounds every wait for a request or the end of the start. Generous: the assertions are
+    /// about what happens, never about how fast.
+    const TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// The name the camera runs under. The harness runs the node outside any copy, so the
+    /// instance id is the name as it is.
+    const CAMERA: &str = "chest";
+
+    fn config(instance_id: &str) -> Config {
+        Config {
+            parameters: Some(Parameters {
+                // A device path that holds no device, so the camera's open fails.
+                device_path: "/dev/video97".to_owned(),
+                resolution: "vga".to_owned(),
+                frame_rate: 30,
+                depth: Depth {
+                    min_depth_m: 0.3,
+                    downscale: 1,
+                    block_size: 5,
+                },
+            }),
+            instance_id: Some(instance_id.to_owned()),
+            ..Config::default()
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// A robot with this chest camera and a wrist camera on its left arm.
+    fn sensors() -> ResponseData {
+        ResponseData {
+            robot_frame: "base_link".to_owned(),
+            sensor_names: strings(&[CAMERA, "wrist_left"]),
+            sensor_kinds: strings(&["rgbd_camera", "rgb_camera"]),
+            sensor_frames: strings(&[
+                "chest_color_optical_frame",
+                "wrist_left_color_optical_frame",
+            ]),
+            carried_by: strings(&["", "left_arm"]),
+        }
+    }
+
+    /// The error the node's start failed with, once its setup returned.
+    async fn start_error(harness: Harness) -> String {
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        while !harness.setup_finished() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the setup never returned"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        harness
+            .shutdown()
+            .await
+            .expect_err("the start fails")
+            .to_string()
+    }
+
+    /// The node running as `instance_id` with its sensor_mounts link bound to the robot
+    /// `sensors` describes, its ask of describe_sensors answered: how many asks reached
+    /// sensor_mounts, and the error its start failed with.
+    async fn failed_start(instance_id: &str) -> peppygen::Result<(usize, String)> {
+        let (harness, mocks) = Harness::start_with(config(instance_id), super::setup).await?;
+        let mounts = mocks
+            .deps
+            .sensor_mounts
+            .expect("a bound sensor_mounts link starts its mock");
+        mounts
+            .describe_sensors
+            .next_request(TIMEOUT)
+            .await?
+            .respond(sensors())
+            .await?;
+        let refusal = start_error(harness).await;
+        Ok((mounts.describe_sensors.captured_count(), refusal))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_camera_sensor_mounts_lists_reads_its_frame_and_then_opens_its_device()
+    -> peppygen::Result<()> {
+        let (asks, refusal) = failed_start(CAMERA).await?;
+        assert_eq!(asks, 1);
+        assert!(refusal.contains("open zed pipeline"), "{refusal}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_camera_with_its_sensor_mounts_link_vacant_opens_its_device_asking_nothing()
+    -> peppygen::Result<()> {
+        let config = Config {
+            sensor_mounts_vacant: true,
+            ..config(CAMERA)
+        };
+        let (harness, mocks) = Harness::start_with(config, super::setup).await?;
+        assert!(
+            mocks.deps.sensor_mounts.is_none(),
+            "a vacant boot starts no sensor_mounts mock"
+        );
+        let refusal = start_error(harness).await;
+        assert!(refusal.contains("open zed pipeline"), "{refusal}");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_camera_sensor_mounts_does_not_list_fails_its_start_before_it_opens_its_device()
+    -> peppygen::Result<()> {
+        let (asks, refusal) = failed_start("head").await?;
+        assert_eq!(asks, 1);
+        assert!(
+            refusal.contains(
+                "sensor_mounts' describe_sensors names no sensor \"head\" (its sensor_names: \
+                 chest, wrist_left): run the camera under one of those names, or bind its \
+                 sensor_mounts link to the robot that carries it"
+            ),
+            "{refusal}"
+        );
+        Ok(())
     }
 }
