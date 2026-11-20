@@ -131,7 +131,7 @@ def _route_frames(slots: list[CameraFrame | None], index: dict[plan_mod.Producer
             encoding=m.encoding,
             width=m.width,
             height=m.height,
-            data=m.frame,
+            data=m.data,
             timestamp_ns=timestamp,
         )
 
