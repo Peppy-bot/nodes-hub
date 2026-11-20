@@ -576,6 +576,7 @@ class SimTopicIO:
             WORLD,
             snapshot.timestamp_s,
             [object_states.MessageObjectsItem(**record.fields()) for record in snapshot.objects],
+            [object_states.MessageRobotsItem(**record.fields()) for record in snapshot.robots],
         )
         return self._publish_batch(
             self._object_states_guard, object_states.TOPIC_NAME, [(pub, payload)]

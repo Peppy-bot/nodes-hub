@@ -438,7 +438,11 @@ engine publishes a clock domain and has not stepped yet. A `spawn_object`,
 `move_object`, `move_robot` or `apply_force` goal with no frame is in `world`,
 one in another frame is refused with `unknown_frame` as it arrives, before
 anything changes, and its timestamp, given or left out, places its value in
-`world` at any time.
+`world` at any time. `get_object_states` and the `object_states` stream give
+a record for each robot the engine stands, from the feedback of its attach
+goal that reports it standing: a robot of this engine stands fixed to the
+world, so its record is its placement, the pose of its robot frame, with zero
+velocities.
 An orientation whose squared norm lies 0.01 or more from 1 is refused with
 `rejected`, and each one taken is normalized; a `move_robot` target turns
 about +z alone, and a target with no orientation keeps the heading the base

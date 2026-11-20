@@ -15,6 +15,7 @@ import contextlib
 import importlib
 import json
 import logging
+import math
 import threading
 from concurrent.futures import Future
 from pathlib import Path
@@ -97,6 +98,17 @@ class _World:
         self.moved.append((name, target))
 
 
+class _Registry:
+    """The robots the engine has stood, by name, as SceneActionIO reads
+    them."""
+
+    def __init__(self, *names):
+        self._names = names
+
+    def standing(self):
+        return {name: SimpleNamespace(name=name) for name in self._names}
+
+
 def _world(*robots):
     """The stage's robots, each as (instance, model, position, orientation),
     the pose of its base in world."""
@@ -155,7 +167,7 @@ def provider(monkeypatch):
 
     stamps = FakeStamps()
     world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0), IDENTITY))
-    io = module.SceneActionIO(object(), Mock(), stamps, world)
+    io = module.SceneActionIO(object(), Mock(), stamps, world, _Registry("alpha"))
     # The stage by object_id: where the launcher put each object.
     stage = {}
     reader = FakeReader(stage, importlib.import_module("object_state").ObjectRecord)
@@ -534,6 +546,56 @@ def test_the_listing_names_every_robot_the_stage_stands_in_world_as_of_now(provi
         "robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "orientation": [0.0, 0.0, 0.0, 1.0],
         "attached": True,
     }
+
+
+def test_the_object_states_give_each_standing_robot_at_its_placement_at_rest(provider):
+    provider.io._world = _world(
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), IDENTITY),
+        ("bravo", "so101", (0.0, -1.5, 0.0), _QUARTER_TURN),
+    )
+    provider.io._robots = _Registry("alpha", "bravo")
+    provider.io.capture_object_states()
+
+    robots = provider.io._handle_get_object_states(None).robots
+
+    half = math.sqrt(0.5)
+    assert [vars(robot) for robot in robots] == [
+        {
+            "robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+            "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
+        },
+        {
+            "robot": "bravo", "model": "so101", "position": [0.0, -1.5, 0.0],
+            "orientation": [0.0, 0.0, pytest.approx(half), pytest.approx(half)],
+            "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
+        },
+    ]
+
+
+def test_the_object_states_give_a_robot_from_when_the_engine_has_stood_it(provider):
+    # bravo is on the stage, and the engine has not stood it yet: its attach
+    # has not reported it standing.
+    provider.io._world = _world(
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), IDENTITY),
+        ("bravo", "so101", (0.0, -1.5, 0.0), IDENTITY),
+    )
+    provider.io.capture_object_states()
+    assert [r.robot for r in provider.io._handle_get_object_states(None).robots] == ["alpha"]
+
+    provider.io._robots = _Registry("alpha", "bravo")
+    provider.io.capture_object_states()
+    assert [r.robot for r in provider.io._handle_get_object_states(None).robots] == [
+        "alpha",
+        "bravo",
+    ]
+
+
+def test_an_empty_stage_gives_no_robot(provider):
+    provider.io._world = _world()
+    provider.io.capture_object_states()
+
+    assert provider.io._handle_get_object_states(None).robots == []
 
 
 def test_the_listing_follows_the_robots_that_join(provider):
