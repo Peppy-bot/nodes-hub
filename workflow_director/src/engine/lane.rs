@@ -28,7 +28,7 @@ use super::failure::{
 };
 use super::hold::{BranchCommand, Hold, Met};
 use super::host::{CallEnd, Host};
-use super::plan::{BoundCall, CallSite, MemberKind, read_path, request};
+use super::plan::{BoundArg, BoundCall, CallSite, MemberKind, read_path, request};
 use super::state::LaneClock;
 use super::{Interrupt, LEADER_RETRY_NS, NoInterrupt, RunCtx};
 
@@ -892,10 +892,20 @@ impl<'a, H: Host> Lane<'a, H> {
             .expect("the checker binds each call step");
         let settle = bound.target.kind == MemberKind::Action;
         let name = self.name_in(step, within);
+        let observed = match self
+            .read_or_fail(
+                &within.cancel,
+                self.observed_for(bound, scope, &within.cancel),
+            )
+            .await
+        {
+            Ok(observed) => observed,
+            Err(end) => return end,
+        };
         let result = match self
             .leaf(
                 &within.cancel,
-                self.send(bound, scope, &within.cancel),
+                self.send(bound, &observed, &within.cancel),
                 settle,
             )
             .await
@@ -931,6 +941,33 @@ impl<'a, H: Host> Lane<'a, H> {
         }
     }
 
+    /// `scope` with each observation that the arguments of `bound` read,
+    /// read once for its request, so the values of one record come from one
+    /// message.
+    async fn observed_for(
+        &self,
+        bound: &BoundCall,
+        scope: &Scope,
+        cancel: &CancellationToken,
+    ) -> Read<Scope> {
+        let mut observed = scope.clone();
+        let roots = bound.args.values().flat_map(BoundArg::roots);
+        for root in roots.collect::<BTreeSet<_>>() {
+            if observed.contains_key(&root) || !self.ctx.plan.observations.contains_key(&root) {
+                continue;
+            }
+            match self
+                .ctx
+                .observe(&root, &StepWait { lane: self, cancel })
+                .await?
+            {
+                Ok(json) => observed.insert(root, json),
+                Err(failure) => return Ok(Err(failure)),
+            };
+        }
+        Ok(Ok(observed))
+    }
+
     /// Sends a bound call until it ends, again every second of run time
     /// while a leader's stream refuses it, so a call of the safe state of a
     /// park, whose lane time stands, goes again too.
@@ -940,9 +977,8 @@ impl<'a, H: Host> Lane<'a, H> {
         scope: &Scope,
         cancel: &CancellationToken,
     ) -> Result<Json, StepEnd> {
-        let request = request(&bound.args, scope).map_err(|missing| {
-            StepEnd::Failed(Failure::new(PRECONDITION_FAILED, missing.to_string()))
-        })?;
+        let request = request(&bound.args, scope)
+            .map_err(|unsent| StepEnd::Failed(Failure::new(unsent.kind(), unsent.to_string())))?;
         loop {
             // A step cancelled before a try sends nothing, as when the leaf
             // settles work that it never started.

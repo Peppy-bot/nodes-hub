@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use serde_json::Value as Json;
 use workflow_documents::expression::{Expression, PathStep, RefPath, Type};
+
+use super::failure::{PRECONDITION_FAILED, REJECTED};
+use crate::frames::{BETWEEN_ROBOTS_IN_WORLD, FrameOfValues, Placed};
 use workflow_documents::run::{Attendance, RunDocument, Severity};
 use workflow_documents::work_cell::ParameterKind;
 use workflow_documents::{Bound, Name, RobotName, StepId, Validation, Workflow};
@@ -63,12 +66,36 @@ pub enum BoundArg {
     Object(BTreeMap<String, BoundArg>),
     List(Vec<BoundArg>),
     Ref(RefPath),
+    /// The timestamp at the path, of the record whose values a request
+    /// takes: a record that leaves it out, as a report does for values that
+    /// hold at every time, leaves it out of the object that holds the
+    /// argument too, which a request reads as the latest time.
+    Timestamp(RefPath),
+    /// The frame of the record whose values a request in one frame takes.
+    Frame(FrameOfValues),
+    /// The records that name their frame which a `$ref` gives a field.
+    Placed(Placed),
     /// The row that the key selects, each row in the canonical form of the
     /// field it goes to.
     Table {
         rows: BTreeMap<String, Json>,
         key: Box<BoundArg>,
     },
+}
+
+impl BoundArg {
+    /// The root of each path that the argument reads.
+    pub fn roots(&self) -> BTreeSet<Name> {
+        match self {
+            BoundArg::Literal(_) => BTreeSet::new(),
+            BoundArg::Object(fields) => fields.values().flat_map(BoundArg::roots).collect(),
+            BoundArg::List(items) => items.iter().flat_map(BoundArg::roots).collect(),
+            BoundArg::Ref(path) | BoundArg::Timestamp(path) => BTreeSet::from([path.root.clone()]),
+            BoundArg::Frame(frame) => BTreeSet::from([frame.frame.root.clone()]),
+            BoundArg::Placed(placed) => placed.roots(),
+            BoundArg::Table { key, .. } => key.roots(),
+        }
+    }
 }
 
 /// A call step or a call of a `safe_state`, bound.
@@ -183,6 +210,9 @@ pub struct Plan {
     /// of its assumptions, a false one included, and waits for the
     /// judgement of the operator before the initialization.
     pub of_a_trial: bool,
+    /// The roles whose literal records the checker held against the links
+    /// of their robots, which the URDF of robot_identity:v1 gives.
+    pub reads_links: BTreeSet<Name>,
 }
 
 impl Plan {
@@ -201,6 +231,41 @@ pub struct NoValue {
     pub path: String,
 }
 
+/// Why the request of a call is not sent.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum Unsendable {
+    #[error(transparent)]
+    NoValue(#[from] NoValue),
+    #[error(
+        "`{path}` is in `{frame}`, a frame of the robot of `{from}`, and goes to the robot of `{to}`: {why}; give the call a point, a pose or a twist of a report of the robot of `{to}` by `$ref`",
+        why = BETWEEN_ROBOTS_IN_WORLD
+    )]
+    OfAnotherRobot {
+        path: String,
+        frame: String,
+        from: Name,
+        to: Name,
+    },
+}
+
+impl Unsendable {
+    pub fn no_value(path: &RefPath) -> Unsendable {
+        Unsendable::NoValue(NoValue {
+            path: path.to_string(),
+        })
+    }
+
+    /// The failure kind of a call whose request is not sent: a value the run
+    /// does not hold yet fails its precondition, and a value of another
+    /// robot's frame is a request no member takes.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Unsendable::NoValue(_) => PRECONDITION_FAILED,
+            Unsendable::OfAnotherRobot { .. } => REJECTED,
+        }
+    }
+}
+
 /// The value at `path` in `scope`.
 pub fn read_path(scope: &BTreeMap<Name, Json>, path: &RefPath) -> Result<Json, NoValue> {
     let missing = || NoValue {
@@ -217,30 +282,59 @@ pub fn read_path(scope: &BTreeMap<Name, Json>, path: &RefPath) -> Result<Json, N
     Ok(value.clone())
 }
 
+/// The field at `path` in `scope`, of the record that its last step leaves:
+/// `None` when the record leaves the field out. A path whose last step names
+/// no field is read whole.
+pub fn read_field(scope: &BTreeMap<Name, Json>, path: &RefPath) -> Result<Option<Json>, NoValue> {
+    let Some((PathStep::Field(field), record_steps)) = path.steps.split_last() else {
+        return read_path(scope, path).map(Some);
+    };
+    let record = RefPath {
+        root: path.root.clone(),
+        steps: record_steps.to_vec(),
+    };
+    Ok(read_path(scope, &record)?.get(field.as_str()).cloned())
+}
+
 /// The JSON of `arg` in `scope`.
-fn resolve(arg: &BoundArg, scope: &BTreeMap<Name, Json>) -> Result<Json, NoValue> {
+fn resolve(arg: &BoundArg, scope: &BTreeMap<Name, Json>) -> Result<Json, Unsendable> {
     match arg {
         BoundArg::Literal(value) => Ok(value.clone()),
-        BoundArg::Object(fields) => fields
-            .iter()
-            .map(|(key, arg)| resolve(arg, scope).map(|value| (key.clone(), value)))
-            .collect::<Result<serde_json::Map<_, _>, _>>()
-            .map(Json::Object),
+        BoundArg::Object(fields) => {
+            let resolved = fields
+                .iter()
+                .map(|(key, arg)| Ok(resolve_field(arg, scope)?.map(|value| (key.clone(), value))))
+                .collect::<Result<Vec<_>, Unsendable>>()?;
+            Ok(Json::Object(resolved.into_iter().flatten().collect()))
+        }
         BoundArg::List(items) => items
             .iter()
             .map(|arg| resolve(arg, scope))
             .collect::<Result<Vec<_>, _>>()
             .map(Json::Array),
-        BoundArg::Ref(path) => read_path(scope, path),
+        BoundArg::Ref(path) | BoundArg::Timestamp(path) => Ok(read_path(scope, path)?),
+        BoundArg::Frame(frame) => frame.resolve(scope),
+        BoundArg::Placed(placed) => placed.resolve(scope),
         BoundArg::Table { rows, key } => {
             let key = resolve(key, scope)?;
             key.as_str()
                 .and_then(|key| rows.get(key))
                 .cloned()
-                .ok_or_else(|| NoValue {
-                    path: format!("the row {key} of a table"),
+                .ok_or_else(|| {
+                    Unsendable::NoValue(NoValue {
+                        path: format!("the row {key} of a table"),
+                    })
                 })
         }
+    }
+}
+
+/// The JSON of `arg`, a field of an object, in `scope`: `None` for a
+/// timestamp that its record leaves out.
+fn resolve_field(arg: &BoundArg, scope: &BTreeMap<Name, Json>) -> Result<Option<Json>, Unsendable> {
+    match arg {
+        BoundArg::Timestamp(path) => Ok(read_field(scope, path)?),
+        arg => resolve(arg, scope).map(Some),
     }
 }
 
@@ -248,6 +342,6 @@ fn resolve(arg: &BoundArg, scope: &BTreeMap<Name, Json>) -> Result<Json, NoValue
 pub fn request(
     args: &BTreeMap<String, BoundArg>,
     scope: &BTreeMap<Name, Json>,
-) -> Result<Json, NoValue> {
+) -> Result<Json, Unsendable> {
     resolve(&BoundArg::Object(args.clone()), scope)
 }

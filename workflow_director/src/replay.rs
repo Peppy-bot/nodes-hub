@@ -7,7 +7,7 @@
 //! compares the decisions of each lane: the calls it sends and the events it
 //! gives.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use crate::engine::failure::Failure;
 use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
 use crate::engine::plan::{Target, TopicKey, Watch};
 use crate::engine::{self, ChecksJudged, Phase, ResultBase, RunCommand};
-use crate::fleet::{Fleet, Snapshot};
+use crate::fleet::{Fleet, RobotLinks, Snapshot};
 use crate::journal::{self, Journals, Record};
 
 /// The inputs of the plan of a run, as its journal keeps them.
@@ -36,6 +36,8 @@ pub struct Planned {
     /// The pinned documents of the contracts of the fleet, by sha256.
     pub documents: BTreeMap<String, String>,
     pub models: BTreeMap<String, String>,
+    /// The links of each robot, as its URDF names them.
+    pub links: BTreeMap<String, RobotLinks>,
     pub allowed: String,
     pub binding: BTreeMap<Name, RobotName>,
     pub run_document: RunDocument,
@@ -746,6 +748,8 @@ pub fn replay(text: &str) -> Result<Outcome, String> {
         contracts,
         unreadable: BTreeMap::new(),
         models: planned.models.clone(),
+        links: planned.links.clone(),
+        unread_links: BTreeSet::new(),
         ready: true,
     };
     let document = &planned.run_document;
@@ -1016,7 +1020,7 @@ mod tests {
             { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
             { "id": "grab", "timeout_s": 30, "retry": 1, "call": {
                 "member": "arm.grab",
-                "args": { "item_id": { "$ref": "seen.item_id" }, "position": { "$ref": "seen.position" }, "speed": 1 },
+                "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
                 "as": "grabbed", "done_when": "grabbed.success",
             } },
         ] }),
@@ -1088,6 +1092,7 @@ mod tests {
                 .map(|(pin, shape)| (pin.clone(), shape.document.clone()))
                 .collect(),
             models: BTreeMap::new(),
+            links: fleet.links.clone(),
             allowed: crate::testing::allowed().to_string(),
             binding,
             run_document: document,
@@ -1159,7 +1164,7 @@ mod tests {
             { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
             { "id": "grab", "timeout_s": 30, "call": {
                 "member": "arm.grab",
-                "args": { "item_id": { "$ref": "seen.item_id" }, "position": { "$ref": "seen.position" }, "speed": 1 },
+                "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
                 "as": "grabbed",
                 "done_when": "grabbed.success",
             } },

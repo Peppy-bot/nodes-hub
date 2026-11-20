@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use peppy_codec::contract::{InterfaceKind, MessageFormat, PeppyContract, PeppyContractParser};
+use peppy_codec::value;
 use serde_json::Value as Json;
 use workflow_documents::expression::{FieldType, Type};
 
@@ -257,9 +258,14 @@ impl Field {
                 Ok(literal.clone())
             }
             (FieldKind::Double, Json::Number(_)) => Ok(literal.clone()),
-            (FieldKind::String | FieldKind::Bytes | FieldKind::Time, Json::String(_)) => {
-                Ok(literal.clone())
-            }
+            (FieldKind::String | FieldKind::Bytes, Json::String(_)) => Ok(literal.clone()),
+            (FieldKind::Time, Json::String(_)) => value::value_time(literal, "time")
+                .map(|_| literal.clone())
+                .map_err(|_| {
+                    format!(
+                        "{literal} is no time: give RFC 3339 text in UTC, such as \"2026-11-18T12:00:00Z\", or leave the timestamp of a command out for the latest time"
+                    )
+                }),
             (FieldKind::Enum(values), Json::String(value)) if values.contains(value) => {
                 Ok(literal.clone())
             }
@@ -362,5 +368,30 @@ pub(crate) mod tests {
                 .canonical(&serde_json::json!("fast"))
                 .is_err()
         );
+    }
+
+    /// A time is RFC 3339 text in UTC, as the codec writes one.
+    #[test]
+    fn a_time_literal_is_rfc_3339_text() {
+        let shape = ContractShape::parse(TEST_ARM, &"a".repeat(64)).unwrap();
+        let FieldKind::Object(target) = &shape.members["grab"].input.0["target"].kind else {
+            panic!("the target of a grab is a record");
+        };
+        let timestamp = &target.0["timestamp"];
+        for time in ["2026-11-18T12:00:00Z", "2026-11-18T12:00:00.250000000Z"] {
+            let literal = serde_json::json!(time);
+            assert_eq!(timestamp.canonical(&literal), Ok(literal));
+        }
+        for not_a_time in ["0", "2026-11-18", "2026-11-18T12:00:00+01:00"] {
+            let refused = timestamp
+                .canonical(&serde_json::json!(not_a_time))
+                .unwrap_err();
+            assert_eq!(
+                refused,
+                format!(
+                    "\"{not_a_time}\" is no time: give RFC 3339 text in UTC, such as \"2026-11-18T12:00:00Z\", or leave the timestamp of a command out for the latest time"
+                )
+            );
+        }
     }
 }

@@ -465,8 +465,8 @@ impl<H: Host> RunCtx<'_, H> {
             ObservationRead::Service { args } => {
                 let request = match request(args, &BTreeMap::new()) {
                     Ok(request) => request,
-                    Err(missing) => {
-                        return Ok(Err(Failure::new(PRECONDITION_FAILED, missing.to_string())));
+                    Err(unsent) => {
+                        return Ok(Err(Failure::new(unsent.kind(), unsent.to_string())));
                     }
                 };
                 match self

@@ -30,6 +30,7 @@ mod contract;
 mod director;
 mod engine;
 mod fleet;
+mod frames;
 mod journal;
 mod leases;
 mod live;

@@ -18,7 +18,8 @@ use super::host::{CallEnd, Host};
 use super::plan::{MonitorPlan, Plan, Target, Watch};
 use super::{Phase, ResultBase, ResumeRefusal, RunCommand, drive};
 use crate::testing::{
-    Answer, ScriptedHost, found, home, name, one_arm, plan, rest, validation, with_beta,
+    Answer, FOUND_AT, LINKS, ScriptedHost, found, home, name, one_arm, plan, rest, validation,
+    with_beta,
 };
 
 /// The refusal of a resume that a check of it refused.
@@ -32,7 +33,7 @@ fn refused_by_a_check(answer: Result<(), ResumeRefusal>) -> workflow_documents::
 fn grab(retry: u32, done_when: &str) -> Json {
     json!({ "id": "grab", "timeout_s": 30, "retry": retry, "call": {
         "member": "arm.grab",
-        "args": { "item_id": { "$ref": "seen.item_id" }, "position": { "$ref": "seen.position" }, "speed": 1 },
+        "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
         "as": "grabbed", "done_when": done_when,
     } })
 }
@@ -101,7 +102,11 @@ async fn a_run_calls_its_steps_in_order_and_completes() {
     assert_eq!(host.members(), ["find", "find", "grab"]);
     let grab = &host.calls_of("grab")[0];
     assert_eq!(grab.request["item_id"], "b1");
-    assert_eq!(grab.request["position"], json!([0.3, 0.0, 0.1]));
+    assert_eq!(
+        grab.request["target"],
+        json!({ "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] }),
+        "the grab takes the point of the find with its frame and its time"
+    );
     let kinds: Vec<EventKind> = host
         .event_kinds()
         .into_iter()
@@ -301,6 +306,138 @@ async fn a_bound_that_passes_cancels_the_goal_and_fails_with_timeout() {
     );
 }
 
+/// A grasp point of the observation of limb_states reaches the grab as a pose with the frame and the timestamp of
+/// the message that the call read it from.
+#[tokio::test(start_paused = true)]
+async fn a_grasp_point_of_an_observation_reaches_the_grab_with_the_frame_and_the_time_of_its_message()
+ {
+    let tree = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "grab", "timeout_s": 30, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "arms.grasp_points[1]" }, "speed": 1 },
+        } },
+    ] });
+    let mut value = one_arm("alpha", tree, json!([]));
+    value["observations"]["arms"] =
+        json!({ "topic": "arm.limb_states", "role": "alpha", "max_age_s": 5 });
+    let plan = plan(&value, Attendance::Attended);
+    let host = arm().answer(
+        "grab",
+        vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+    );
+    let turned = [
+        0.0,
+        0.0,
+        std::f64::consts::FRAC_1_SQRT_2,
+        std::f64::consts::FRAC_1_SQRT_2,
+    ];
+    host.publish(
+        "limb_states",
+        json!({
+            "frame": LINKS[0],
+            "timestamp": FOUND_AT,
+            "arm_names": ["left_arm", "right_arm"],
+            "grasp_points": [
+                { "position": [0.1, 0.2, 0.3], "orientation": [0.0, 0.0, 0.0, 1.0] },
+                { "position": [0.4, -0.2, 0.3], "orientation": turned },
+            ],
+        }),
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        host.calls_of("grab")[0].request["target"],
+        json!({ "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.4, -0.2, 0.3], "orientation": turned })
+    );
+}
+
+/// The point that the observation of `alpha` reads goes to a call of `beta` only in world: in a link of `alpha`
+/// the call fails with rejected, sending nothing.
+#[tokio::test(start_paused = true)]
+async fn a_point_of_another_role_goes_to_its_call_in_world_alone() {
+    let value = with_beta(
+        one_arm("alpha", rest("rest"), json!([])),
+        json!({ "id": "reach", "timeout_s": 5, "call": {
+            "member": "arm.check_reach", "args": { "points": [{ "$ref": "target.item_point" }] },
+        } }),
+    );
+    let plan = plan(&value, Attendance::Unattended);
+    let found_in = |frame: &str| {
+        let mut answer = found();
+        answer["item_point"]["frame"] = json!(frame);
+        vec![Answer::now(answer)]
+    };
+    let in_a_link = arm().answer("find", found_in(LINKS[0]));
+    let (result, _) = run(&plan, &in_a_link, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let failed = result.failed.as_ref().unwrap();
+    assert_eq!(
+        (failed.step.as_str(), failed.failure_kind.as_str()),
+        ("beta.reach", "rejected")
+    );
+    assert!(
+        failed.message.contains(
+            "is in `base_link`, a frame of the robot of `alpha`, and goes to the robot of `beta`"
+        ),
+        "{failed:?}"
+    );
+    assert!(in_a_link.calls_of("check_reach").is_empty());
+    let in_world = arm().answer("find", found_in("world")).answer(
+        "check_reach",
+        vec![Answer::now(json!({ "reachable": true, "margin": 0.1 }))],
+    );
+    let (result, _) = run(&plan, &in_world, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        in_world.calls_of("check_reach")[0].request["points"][0]["frame"],
+        "world"
+    );
+}
+
+/// A request in one frame of `beta` takes the point that the observation of `alpha` reads in world alone: in a link
+/// of `alpha` the call fails with rejected, sending nothing, and in world it is sent in world.
+#[tokio::test(start_paused = true)]
+async fn a_request_in_one_frame_takes_a_point_of_another_role_in_world_alone() {
+    let value = with_beta(
+        one_arm("alpha", rest("rest"), json!([])),
+        json!({ "id": "near", "timeout_s": 5, "call": {
+            "member": "arm.check_positions", "args": { "points": [{ "$ref": "target.item_point" }] },
+        } }),
+    );
+    let plan = plan(&value, Attendance::Unattended);
+    let found_in = |frame: &str| {
+        let mut answer = found();
+        answer["item_point"]["frame"] = json!(frame);
+        vec![Answer::now(answer)]
+    };
+    let in_a_link = arm().answer("find", found_in(LINKS[0]));
+    let (result, _) = run(&plan, &in_a_link, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    let failed = result.failed.as_ref().unwrap();
+    assert_eq!(
+        (failed.step.as_str(), failed.failure_kind.as_str()),
+        ("beta.near", "rejected")
+    );
+    assert!(
+        failed.message.contains(
+            "`target.item_point` is in `base_link`, a frame of the robot of `alpha`, and goes to the robot of `beta`"
+        ),
+        "{failed:?}"
+    );
+    assert!(in_a_link.calls_of("check_positions").is_empty());
+    let in_world = arm().answer("find", found_in("world")).answer(
+        "check_positions",
+        vec![Answer::now(json!({ "all_workable": true }))],
+    );
+    let (result, _) = run(&plan, &in_world, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        in_world.calls_of("check_positions")[0].request,
+        json!({ "frame": "world", "timestamp": FOUND_AT, "points": [{ "position": [0.3, 0.0, 0.1] }] })
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_bound_that_passes_with_the_bound_inside_it_fails_the_outer_step() {
     // The look answers at once, so both bounds pass at 5 s.
@@ -308,7 +445,7 @@ async fn a_bound_that_passes_with_the_bound_inside_it_fails_the_outer_step() {
         { "id": "look", "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
         { "id": "grab", "timeout_s": 5, "call": {
             "member": "arm.grab",
-            "args": { "item_id": { "$ref": "seen.item_id" }, "position": { "$ref": "seen.position" }, "speed": 1 },
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
         } },
     ] });
     let plan = plan(&one_arm("alpha", tree, home()), Attendance::Unattended);
@@ -470,7 +607,7 @@ async fn a_failed_reach_assumption_refuses_the_run_before_any_command() {
         &one_arm("alpha", find_then_grab(grab(0, "grabbed.success")), home()),
         Attendance::Attended,
     );
-    let missing = json!({ "found": false, "item_id": "", "position": [0.0, 0.0, 0.0], "kind": "unknown", "count": "0" });
+    let missing = json!({ "found": false, "item_id": "", "item_point": { "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.0, 0.0, 0.0] }, "kind": "unknown", "count": "0" });
     let host = ScriptedHost::new().answer("find", vec![Answer::now(missing)]);
     let (result, _) = run(&plan, &host, Vec::new()).await;
     assert_eq!(result.ending, Ending::Refused, "{result:#?}");
@@ -487,7 +624,7 @@ async fn a_for_each_runs_its_body_per_item_and_a_parallel_any_cancels_the_rest()
             "id": "one", "sequence": [
                 { "id": "where", "timeout_s": 5, "call": { "member": "eyes.locate", "args": { "item_id": { "$ref": "item" } }, "as": "at" } },
                 { "id": "race", "timeout_s": 20, "policy": "any", "parallel": [
-                    { "id": "take", "call": { "member": "arm.grab", "args": { "item_id": { "$ref": "item" }, "position": { "$ref": "at.position" }, "speed": 2 }, "as": "took", "done_when": "took.success" } },
+                    { "id": "take", "call": { "member": "arm.grab", "args": { "item_id": { "$ref": "item" }, "target": { "$ref": "at.item_point" }, "speed": 2 }, "as": "took", "done_when": "took.success" } },
                     { "id": "rest", "call": { "member": "arm.home", "args": { "duration_s": 9 } } },
                 ] },
             ],
@@ -498,12 +635,12 @@ async fn a_for_each_runs_its_body_per_item_and_a_parallel_any_cancels_the_rest()
         .answer("find", vec![Answer::now(found())])
         .answer(
             "scan",
-            vec![Answer::now(json!({ "item_ids": ["b1", "b2", "b3"] }))],
+            vec![Answer::now(scanned_three())],
         )
         .answer(
             "locate",
             vec![Answer::now(
-                json!({ "found": true, "position": [0.2, 0.1, 0.0] }),
+                json!({ "found": true, "item_point": { "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.2, 0.1, 0.0] } }),
             )],
         )
         .answer(
@@ -1724,12 +1861,12 @@ async fn an_abort_during_the_success_check_ends_the_run_aborted() {
 
 /// The answer of `find` for a cup, which no block case of a `match` takes.
 fn a_cup() -> Json {
-    json!({ "found": true, "item_id": "c1", "position": [0.3, 0.0, 0.1], "kind": "cup", "count": "1" })
+    json!({ "found": true, "item_id": "c1", "item_point": { "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] }, "kind": "cup", "count": "1" })
 }
 
 /// The answer of `find` for no item.
 fn nothing() -> Json {
-    json!({ "found": false, "item_id": "", "position": [0.0, 0.0, 0.0], "kind": "unknown", "count": "0" })
+    json!({ "found": false, "item_id": "", "item_point": { "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.0, 0.0, 0.0] }, "kind": "unknown", "count": "0" })
 }
 
 /// The incident alerts that stand on the robot of `alpha`, as the watch of its
@@ -1790,6 +1927,248 @@ async fn a_resume_is_refused_while_an_alert_stands_on_the_robot_of_its_lane() {
     );
 }
 
+/// The answer of `scan` for three blocks.
+fn scanned_three() -> Json {
+    json!({
+        "item_ids": ["b1", "b2", "b3"],
+        "frame": LINKS[0],
+        "timestamp": FOUND_AT,
+        "points": [{ "position": [0.3, 0.0, 0.1] }, { "position": [0.3, 0.1, 0.1] }, { "position": [0.3, 0.2, 0.1] }],
+    })
+}
+
+/// A reach check that names its frame at its level takes the points of a scan by `$ref`: it is sent in the frame and
+/// at the timestamp of the scan, each point with its position, and the grab of an item of that scan runs after it.
+#[tokio::test(start_paused = true)]
+async fn a_reach_check_in_one_frame_sends_the_frame_and_the_time_of_the_scan_of_its_points() {
+    let tree = json!({ "id": "pick", "sequence": [
+        { "id": "scan", "timeout_s": 5, "call": { "member": "eyes.scan", "args": { "description": "blocks" }, "as": "scanned" } },
+        { "id": "near", "timeout_s": 5, "call": {
+            "member": "arm.check_positions", "args": { "points": { "$ref": "scanned.points" } },
+            "as": "near", "done_when": "near.all_workable",
+        } },
+        { "id": "grab", "timeout_s": 30, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "scanned.item_ids[1]" }, "target": { "$ref": "scanned.points[1]" }, "speed": 1 },
+        } },
+    ] });
+    let mut value = one_arm("alpha", tree, json!([]));
+    value.as_object_mut().unwrap().remove("assumptions");
+    let plan = plan(&value, Attendance::Unattended);
+    let host = arm()
+        .answer("scan", vec![Answer::now(scanned_three())])
+        .answer(
+            "check_positions",
+            vec![Answer::now(json!({ "all_workable": true }))],
+        )
+        .answer(
+            "grab",
+            vec![Answer::now(json!({ "success": true, "item_id": "b2" }))],
+        );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        host.calls_of("check_positions")[0].request,
+        json!({
+            "frame": LINKS[0],
+            "timestamp": FOUND_AT,
+            "points": [{ "position": [0.3, 0.0, 0.1] }, { "position": [0.3, 0.1, 0.1] }, { "position": [0.3, 0.2, 0.1] }],
+        })
+    );
+    assert_eq!(
+        host.calls_of("grab")[0].request["target"],
+        json!({ "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.3, 0.1, 0.1] })
+    );
+}
+
+/// A reach check in one frame takes the point that a look found, which names its own frame and time: it is sent in
+/// that frame at that timestamp with the point's position, and the grab of the item runs after it.
+#[tokio::test(start_paused = true)]
+async fn a_reach_check_in_one_frame_sends_the_frame_and_the_time_of_the_point_it_found() {
+    let tree = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "near", "timeout_s": 5, "call": {
+            "member": "arm.check_positions", "args": { "points": [{ "$ref": "seen.item_point" }] },
+            "as": "near", "done_when": "near.all_workable",
+        } },
+        { "id": "grab", "timeout_s": 30, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
+        } },
+    ] });
+    let mut value = one_arm("alpha", tree, json!([]));
+    value.as_object_mut().unwrap().remove("assumptions");
+    let plan = plan(&value, Attendance::Unattended);
+    let host = arm()
+        .answer("find", vec![Answer::now(found())])
+        .answer(
+            "check_positions",
+            vec![Answer::now(json!({ "all_workable": true }))],
+        )
+        .answer(
+            "grab",
+            vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+        );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        host.calls_of("check_positions")[0].request,
+        json!({ "frame": LINKS[0], "timestamp": FOUND_AT, "points": [{ "position": [0.3, 0.0, 0.1] }] })
+    );
+    assert_eq!(
+        host.calls_of("grab")[0].request["target"],
+        json!({ "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] })
+    );
+}
+
+/// A reach check in one frame takes a pose that holds at every time, which its report gives with no timestamp: it is
+/// sent in the frame of the pose with no timestamp, which names the latest time.
+#[tokio::test(start_paused = true)]
+async fn a_reach_check_in_one_frame_of_a_value_that_holds_at_every_time_sends_no_timestamp() {
+    let tree = json!({ "id": "check", "sequence": [
+        { "id": "where", "timeout_s": 5, "call": { "member": "eyes.lookup", "args": { "source_frame": "tray" }, "as": "tray" } },
+        { "id": "near", "timeout_s": 5, "call": {
+            "member": "arm.check_positions", "args": { "points": [{ "$ref": "tray" }] },
+            "as": "near", "done_when": "near.all_workable",
+        } },
+    ] });
+    let mut value = one_arm("alpha", tree, json!([]));
+    value.as_object_mut().unwrap().remove("assumptions");
+    let plan = plan(&value, Attendance::Unattended);
+    let tray = json!({ "frame": "map", "child_frame": "tray", "position": [1.0, 0.5, 0.8], "orientation": [0.0, 0.0, 0.0, 1.0] });
+    let host = arm().answer("lookup", vec![Answer::now(tray)]).answer(
+        "check_positions",
+        vec![Answer::now(json!({ "all_workable": true }))],
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        host.calls_of("check_positions")[0].request,
+        json!({ "frame": "map", "points": [{ "position": [1.0, 0.5, 0.8] }] })
+    );
+}
+
+/// A reach check in one frame takes the waypoints of a plan, whose values hold at every time: it is sent in the frame
+/// of the plan with no timestamp, which names the latest time.
+#[tokio::test(start_paused = true)]
+async fn a_reach_check_of_the_waypoints_of_a_plan_sends_the_frame_of_the_plan_and_no_timestamp() {
+    let tree = json!({ "id": "check", "sequence": [
+        { "id": "plan", "timeout_s": 5, "call": { "member": "arm.plan_path", "args": { "arm_name": "left_arm" }, "as": "plan" } },
+        { "id": "near", "timeout_s": 5, "call": {
+            "member": "arm.check_positions", "args": { "points": { "$ref": "plan.waypoints" } },
+            "as": "near", "done_when": "near.all_workable",
+        } },
+    ] });
+    let mut value = one_arm("alpha", tree, json!([]));
+    value.as_object_mut().unwrap().remove("assumptions");
+    let plan = plan(&value, Attendance::Unattended);
+    let path = json!({
+        "frame": LINKS[0],
+        "waypoints": [
+            { "joint_positions": [0.0, 0.1], "position": [0.3, 0.0, 0.2], "orientation": [0.0, 0.0, 0.0, 1.0] },
+            { "joint_positions": [0.0, 0.2], "position": [0.3, 0.1, 0.2], "orientation": [0.0, 0.0, 0.0, 1.0] },
+        ],
+    });
+    let host = arm().answer("plan_path", vec![Answer::now(path)]).answer(
+        "check_positions",
+        vec![Answer::now(json!({ "all_workable": true }))],
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(
+        host.calls_of("check_positions")[0].request,
+        json!({ "frame": LINKS[0], "points": [{ "position": [0.3, 0.0, 0.2] }, { "position": [0.3, 0.1, 0.2] }] })
+    );
+}
+
+/// A grab by an item id sends its literal zero target as the workflow gives it, with no frame, which the skill reads
+/// as its robot frame.
+#[tokio::test(start_paused = true)]
+async fn a_literal_target_with_no_frame_is_sent_with_no_frame() {
+    let tree = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "grab", "timeout_s": 30, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "position": [0.0, 0.0, 0.0] }, "speed": 1 },
+        } },
+    ] });
+    let plan = plan(&one_arm("alpha", tree, json!([])), Attendance::Attended);
+    let host = arm().answer(
+        "grab",
+        vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let target = &host.calls_of("grab")[0].request["target"];
+    assert_eq!(target.get("frame"), None, "{target}");
+    let position: Vec<f64> = target["position"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{target}"))
+        .iter()
+        .filter_map(Json::as_f64)
+        .collect();
+    assert_eq!(position, [0.0; 3]);
+}
+
+/// A literal target in the robot frame by its name is sent in that frame, as the workflow gives it.
+#[tokio::test(start_paused = true)]
+async fn a_literal_target_in_the_robot_frame_by_its_name_is_sent_in_that_frame() {
+    let tree = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "grab", "timeout_s": 30, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "frame": LINKS[0], "position": [0.4, 0.1, 0.2] }, "speed": 1 },
+        } },
+    ] });
+    let plan = plan(&one_arm("alpha", tree, json!([])), Attendance::Attended);
+    let host = arm().answer(
+        "grab",
+        vec![Answer::now(json!({ "success": true, "item_id": "b1" }))],
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let target = &host.calls_of("grab")[0].request["target"];
+    assert_eq!(target["frame"], LINKS[0], "{target}");
+}
+
+/// A loop over a scan goes to the location that a table of locations gives the kind of each item it finds.
+#[tokio::test(start_paused = true)]
+async fn a_loop_goes_to_the_location_a_table_gives_each_kind_it_finds() {
+    let tree = json!({ "id": "sort", "sequence": [
+        { "id": "scan", "timeout_s": 5, "call": { "member": "eyes.scan", "args": { "description": "blocks" }, "as": "scanned" } },
+        { "id": "each", "for_each": { "list": "scanned.item_ids", "as": "item" }, "max_items": 5, "body": { "id": "one", "sequence": [
+            { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+            { "id": "go", "timeout_s": 5, "call": { "member": "arm.go_to", "args": { "place": { "$table": "places", "key": { "$ref": "seen.kind" } } } } },
+        ] } },
+    ] });
+    let mut value = one_arm("alpha", tree, json!([]));
+    value.as_object_mut().unwrap().remove("assumptions");
+    value["locations"] = json!(["bin", "shelf"]);
+    value["tables"] = json!({ "places": {
+        "block": { "$location": "bin" }, "cup": { "$location": "shelf" }, "unknown": { "$location": "bin" },
+    } });
+    let plan = plan(&value, Attendance::Unattended);
+    let host = arm()
+        .answer("scan", vec![Answer::now(scanned_three())])
+        .answer(
+            "find",
+            vec![
+                Answer::now(found()),
+                Answer::now(a_cup()),
+                Answer::now(nothing()),
+            ],
+        )
+        .answer("go_to", vec![Answer::now(json!({ "arrived": true })); 3]);
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let places: Vec<Json> = host
+        .calls_of("go_to")
+        .iter()
+        .map(|call| call.request["place"].clone())
+        .collect();
+    assert_eq!(places, [json!("bin"), json!("shelf"), json!("bin")]);
+}
+
 /// An alert of the gripper of `alpha`, as the watch of its alerts gives it.
 fn hot_gripper() -> RunCommand {
     RunCommand::Fault {
@@ -1827,10 +2206,7 @@ async fn the_steps_of_a_for_each_item_name_their_item_and_its_loop_counts_its_fa
                 Answer::now(a_cup()),
             ],
         )
-        .answer(
-            "scan",
-            vec![Answer::now(json!({ "item_ids": ["b1", "b2", "b3"] }))],
-        );
+        .answer("scan", vec![Answer::now(scanned_three())]);
     let (result, _) = run(&plan, &host, Vec::new()).await;
     assert_eq!(result.ending, Ending::Completed, "{result:#?}");
     let looked: Vec<String> = host
@@ -2651,7 +3027,7 @@ async fn a_run_of_a_trial_waits_for_the_judgement_of_its_checks_and_starts_on_it
 /// naming the checks.
 #[tokio::test(start_paused = true)]
 async fn a_judgement_that_the_work_cell_is_not_ready_or_a_check_is_wrong_refuses_the_run() {
-    let not_found = json!({ "found": false, "item_id": "b1", "position": [0.3, 0.0, 0.1], "kind": "block", "count": "1" });
+    let not_found = json!({ "found": false, "item_id": "b1", "item_point": { "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] }, "kind": "block", "count": "1" });
     let host = arm().answer("find", vec![Answer::now(not_found)]);
     let judged = super::ChecksJudged::NotReady;
     let (result, phases) = run(

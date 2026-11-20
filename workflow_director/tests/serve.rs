@@ -5,14 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use peppygen::DEFAULT_FEEDBACK_BOUND;
+use peppygen::exposed_actions::director::locations::GoalTeachItem;
 use peppygen::fixtures::exposed_actions::director::{abort, locations, resume, run};
 use peppygen::fixtures::exposed_services::director::{confirm, robots, runs, status, suspend};
 use serde_json::{Value, json};
 
 mod common;
 use common::{
-    ARM_INSTANCE, ARM_PIN, Home, Lease, ROBOT, Rig, SETTLE, WIRE, feedback_of, home_workflow,
-    listed_robots, on_alpha,
+    ARM_INSTANCE, ARM_PIN, FOUND_AT, Home, Lease, ROBOT, ROBOT_FRAME, Rig, SETTLE, WIRE,
+    feedback_of, home_workflow, listed_robots, on_alpha,
 };
 
 /// The goal of a run of `home_workflow` on `alpha`, once the director lists `alpha`.
@@ -28,25 +29,32 @@ fn go_to_workflow() -> String {
     workflow.to_string()
 }
 
+/// The location `place`, a surface in map, as a teach of `locations` takes it.
+fn teach_item(place: &str) -> GoalTeachItem {
+    GoalTeachItem {
+        name: place.to_owned(),
+        kind: "surface".to_owned(),
+        frame: Some("map".to_owned()),
+        position: [0.0; 3],
+        orientation: [0.0, 0.0, 0.0, 1.0],
+        size: [0.0; 3],
+    }
+}
+
 /// A `locations` goal of `alpha` that teaches `taught`, or lists with `None`: the places each skill knows after.
 async fn locations_of(
     rig: &Rig,
     taught: Option<&[&str]>,
 ) -> peppygen::Result<locations::GoalHandle> {
-    let teach = taught.map(|places| {
-        places
-            .iter()
-            .map(
-                |place| peppygen::exposed_actions::director::locations::GoalTeachItem {
-                    name: (*place).to_owned(),
-                    kind: "surface".to_owned(),
-                    position: [0.0; 3],
-                    orientation: [1.0, 0.0, 0.0, 0.0],
-                    size: [0.0; 3],
-                },
-            )
-            .collect()
-    });
+    let teach = taught.map(|places| places.iter().map(|place| teach_item(place)).collect());
+    locations_teaching(rig, teach).await
+}
+
+/// A `locations` goal of `alpha` that teaches the locations `teach`, or lists with `None`.
+async fn locations_teaching(
+    rig: &Rig,
+    teach: Option<Vec<GoalTeachItem>>,
+) -> peppygen::Result<locations::GoalHandle> {
     let request = locations::GoalRequestData {
         robot: ROBOT.to_owned(),
         teach,
@@ -737,7 +745,7 @@ async fn locations_teaches_the_skills_of_a_robot_and_lists_what_they_know() -> p
         .map(|location| location.name.as_str())
         .collect();
     assert_eq!(names, ["shelf", "crate"]);
-    assert_eq!(*rig.arm.known.lock().unwrap(), ["shelf", "crate"]);
+    assert_eq!(rig.arm.known_names(), ["shelf", "crate"]);
     assert_eq!(
         rig.fleet.calls(),
         [
@@ -782,7 +790,44 @@ async fn locations_teaches_the_skills_of_a_robot_and_lists_what_they_know() -> p
         "{}",
         refusal.message
     );
-    assert_eq!(*rig.arm.known.lock().unwrap(), ["shelf", "crate"]);
+    assert_eq!(rig.arm.known_names(), ["shelf", "crate"]);
+    rig.harness.shutdown().await
+}
+
+/// A location that a teach gives with no frame goes to the skill with no frame, which the skill reads as its robot
+/// frame; one with a frame goes in that frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_location_taught_with_no_frame_lies_in_the_robot_frame() -> peppygen::Result<()> {
+    let rig = Rig::knowing(Home::AtOnce, &["bin"]).await?;
+    listed_robots(&rig).await?;
+    let unframed = GoalTeachItem {
+        frame: None,
+        ..teach_item("shelf")
+    };
+    let taught = locations_teaching(&rig, Some(vec![unframed, teach_item("crate")])).await?;
+    assert!(taught.accepted, "{:?}", taught.refusal);
+    let locations::ResultOutcome::Completed(result) = taught.get_result(WIRE).await?.outcome else {
+        panic!("the teach completes")
+    };
+    let request = rig.arm.taught.lock().unwrap().clone();
+    let sent: Vec<(&str, Option<&str>)> = request
+        .iter()
+        .map(|location| {
+            (
+                location["name"].as_str().expect("a taught location's name"),
+                location
+                    .get("frame")
+                    .map(|frame| frame.as_str().expect("a frame name")),
+            )
+        })
+        .collect();
+    assert_eq!(sent, [("shelf", None), ("crate", Some("map"))]);
+    let frames: Vec<(&str, &str)> = result.skills[0]
+        .locations
+        .iter()
+        .map(|location| (location.name.as_str(), location.frame.as_str()))
+        .collect();
+    assert_eq!(frames, [("shelf", ROBOT_FRAME), ("crate", "map")]);
     rig.harness.shutdown().await
 }
 
@@ -920,5 +965,48 @@ async fn a_producer_that_dies_during_a_cancel_leaves_its_robot_unknown() -> pepp
         panic!("{:?}", ended.outcome)
     };
     assert_eq!(failure.kind.to_string(), "run_suspended");
+    rig.harness.shutdown().await
+}
+
+/// A point that the arm gave in its robot frame before a move reaches the grab after the move with the frame and
+/// the timestamp of its reading, and with no orientation, as a pose given by a point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_point_read_before_a_move_reaches_the_grab_after_it_with_its_time() -> peppygen::Result<()>
+{
+    let rig = Rig::start(Home::AtOnce).await?;
+    // The reach assumption reads `find` once, and the lane once.
+    rig.arm.finds.add_permits(2);
+    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
+    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
+    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
+    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "move", "timeout_s": 5, "call": { "member": "arm.home", "args": { "duration_s": 0 } } },
+        { "id": "grab", "timeout_s": 5, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
+        } },
+    ] });
+    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
+    feedback_of(&mut goal).await;
+    let ended = goal.get_result(WIRE).await?;
+    assert!(
+        matches!(ended.outcome, run::ResultOutcome::Completed(_)),
+        "{:?}",
+        ended.outcome
+    );
+    assert_eq!(
+        *rig.arm.goals.lock().unwrap(),
+        1,
+        "the arm moved before the grab"
+    );
+    let grabbed = rig.arm.grabbed.lock().unwrap().clone();
+    assert_eq!(
+        grabbed
+            .iter()
+            .map(|goal| goal["target"].clone())
+            .collect::<Vec<_>>(),
+        [json!({ "frame": ROBOT_FRAME, "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] })]
+    );
     rig.harness.shutdown().await
 }

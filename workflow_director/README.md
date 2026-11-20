@@ -26,9 +26,11 @@ The node follows the fleet with one `fleet.changes` goal and holds its leases
 with one `fleet.lease` goal for its whole life. The end of that goal, whose
 leases end with it, ends the node with an error, and its restart policy
 `on_failure` starts it again with a new lease goal. Each change of the listing
-reads the pinned document of each new contract pin, and the model of each new
-robot from its `robot_identity:v1`. `robots` gives that snapshot, with the
-contracts of each robot filtered to the allowed ones.
+reads the pinned document of each new contract pin, the model of each new
+robot, and the links of each new robot and of each robot whose entry it
+changes, as the URDF of its description names them, from its
+`robot_identity:v1`. `robots` gives that snapshot, with the contracts of each
+robot filtered to the allowed ones.
 
 ## Checking
 
@@ -36,6 +38,51 @@ contracts of each robot filtered to the allowed ones.
 each alias against every pin of its contract; with roles, each role against
 the pins of its robot. It names each error at its field or at
 `<role>.<step id>`.
+
+A point, a pose or a twist of a request is a record that names its frame
+(`frame`) and its time (`timestamp`), as the geometry types of contracts-hub
+define them; a record whose values hold at every time, as a plan result,
+holds no `timestamp`. Such a record that a workflow gives as a literal names
+the robot frame of the robot of its role, the root link of its URDF, or a
+frame that the robot's tree holds above its robot frame (odom, map, or world
+where a node publishes it), or leaves its frame out: it then goes with none,
+which the skill reads as its robot frame, or as world in a simulation, as the
+zero target of a grab by an item id does. No node publishes a frame above the
+robot frame into a robot's tree, so a workflow passes a point, a pose or a
+twist in another link from a report of a skill of the robot by `$ref`. A
+literal in an empty frame, one in a link of the robot other than its robot
+frame, and one that names a frame for a robot whose links the director does
+not know refuse the workflow, the last since the director then cannot tell
+that robot's robot frame from its other links; without roles, the frame is
+no link other than the robot frame of any robot that implements the contract
+of the call. The check takes a literal
+in any other frame, and the skill refuses one that its tree does not hold
+with `unknown_frame`. A
+record given field by field takes its frame, its timestamp and its values in
+that frame as literals; a command leaves its timestamp out for the latest
+time. A request that names its frame at its own level, as check_positions
+does, takes its values by `$ref` to one record that gives one frame, or to
+one point, pose or twist that names its own, and takes that frame and the
+timestamp of that record with them; a frame or a timestamp given beside them
+that is not the `$ref` of theirs, values of two records, a literal value
+beside them and a list whose values each name a frame of their own refuse the
+workflow. A `$ref` gives a record that names its frame as it is, and a point,
+a pose or a twist that names none with the frame and the timestamp of the
+record that holds it (the `child_frame` of that record for a twist beside
+one), with the fields that the target takes. A record that leaves its
+timestamp out, as a report does for values that hold at every time, or holds
+none, gives the request no timestamp, which names the latest time. A point
+goes to a target that takes a pose whose orientation may be left out, with no
+orientation, and a target whose orientation the member needs refuses it. A
+`$ref` to such a value in a record that holds a position or an orientation of
+its own, which poses the value relative to it, as a shape of a collision
+object is posed relative to its object, refuses the workflow, and so does one
+in a record that gives no frame, and one to a loop element of the list of an
+observation, whose message a call does not read again. A call reads each
+observation that its arguments name once, when it sends its request. A value
+of another role goes to a call only in `world`, a frame the trees of both
+robots hold above their robot frames where a node publishes it: the run fails
+the call with `rejected` when it names another frame.
 
 ## A run
 
@@ -57,7 +104,8 @@ the initialization and the lanes, and at its end releases each lease before
 the event `run_ends`. The lock of the run names each contract it reads: those
 of its calls, observations and monitor, `locations:v1` of each skill it gives
 a location, `alert:v1` of each physical robot and `robot_identity:v1` of each
-robot whose role names a model.
+robot whose role names a model or gives a literal record that names its
+frame.
 
 The calls go through the codec API of peppy, so a workflow can name contracts
 this node was not built with. Before each call of a member with the mark
@@ -83,7 +131,9 @@ status of the run every 5 s; `run_events` gives every event of every run.
 
 `locations` teaches each locations:v1 instance of a robot the locations
 given, or lists what each knows; a teach is refused on a robot with a lease,
-naming its holder. A teach holds the robot while it runs: it takes the lease
+naming its holder. A location holds at every time and gives no timestamp, and
+a location taught with no frame goes to each skill with none, which the skill
+reads as its robot frame. A teach holds the robot while it runs: it takes the lease
 of the robot under the name `locations`, and no run of the director binds
 the robot until the teach ends.
 
