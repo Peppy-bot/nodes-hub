@@ -430,7 +430,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#19ba27210b61d468f04a52bf3350a3d2ca2d5943"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -560,7 +560,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#19ba27210b61d468f04a52bf3350a3d2ca2d5943"
 dependencies = [
  "frame_tree",
  "thiserror 2.0.21",
@@ -1073,7 +1073,7 @@ dependencies = [
 [[package]]
 name = "frame_tree"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#19ba27210b61d468f04a52bf3350a3d2ca2d5943"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2765,7 +2765,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2805,7 +2805,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3058,7 +3058,7 @@ dependencies = [
 [[package]]
 name = "robot_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#19ba27210b61d468f04a52bf3350a3d2ca2d5943"
 dependencies = [
  "chain_kinematics",
  "frame_tree",

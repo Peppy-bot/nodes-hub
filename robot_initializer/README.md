@@ -146,14 +146,16 @@ joints it measures there.
 
 The node exposes `describe_sensors` of the `sensor_mounts` contract, from the
 model alone. It answers the robot frame, the root link of the URDF
-(`base_link` on an OpenArm and on an SO-101), and each camera of the model in the
-URDF's order: its name, `rgbd_camera` for a camera the URDF gives a depth
-sensor and `rgb_camera` for one that gives color alone, its frame, the link
-`<camera>_optical_frame`, and the arm that carries it: the arm one of whose
-joints moves the camera's link, or `""` for a camera that no arm's joint
+(`base_link` on an OpenArm and on an SO-101), each camera of the model, then
+each 2-D lidar, each in the URDF's order. A camera is its name, `rgbd_camera`
+for a camera the URDF gives a depth sensor and `rgb_camera` for one that gives
+color alone, and its frame, the link `<camera>_optical_frame`. A 2-D lidar is
+the name of its `gpu_lidar` sensor, `lidar_2d`, and its frame, the link its
+sensor references. Each sensor names the arm that carries it: the arm one of
+whose joints moves the sensor's link, or `""` for a sensor that no arm's joint
 moves. The answer carries no pose: a lookup in the robot's tree places each
-frame. A model with no camera answers empty arrays. The answer is fixed when
-the node starts.
+frame. A model with no camera and no lidar answers empty arrays. The answer is
+fixed when the node starts.
 
 ## Build
 
