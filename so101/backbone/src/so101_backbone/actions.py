@@ -45,6 +45,7 @@ from typing import TypeVar
 
 from control_core_py.geometry import GeometryError, PoseTarget, Stamped
 from control_core_py.runtime import Latch, log
+from control_core_py.stop_reason import stop_reason
 from path_timing_py import JointTrajectory, distinct_joint_waypoints
 from peppygen.exposed_actions.limb_motion import execute_joint_path, move_arm
 
@@ -188,13 +189,6 @@ class PlanCheck:
     reachable: bool
     reason: str
     duration_s: float
-
-
-def _stop_message(reason: str) -> str:
-    """The reason of every goal a stop ends: the stop and its reason."""
-    if not reason:
-        return "stopped"
-    return f"stopped: {reason}"
 
 
 @dataclass(frozen=True)
@@ -1172,7 +1166,7 @@ class ActionLayer:
     def stop_moves(self, reason: str) -> list[str]:
         """End every goal for the robot stop, as Coordinator.stop_all ends
         them: the names of the limbs whose goal it ended, sorted by name."""
-        message = _stop_message(reason)
+        message = stop_reason(reason)
         log(f"stop requested: {message}")
         return self._coordinator.stop_all(message)
 
