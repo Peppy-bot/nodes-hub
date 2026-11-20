@@ -43,11 +43,12 @@ use super::{
 };
 use crate::actions::MAX_MOVE_DURATION_S;
 use crate::arm_order::ArmOrder;
-use crate::failure::{Failure, FailureKind, stale_failure};
+use crate::failure::{Failure, FailureKind, PathFailure, stale_failure};
 use crate::governor::{GuardAt, PathArms, PathBlocked};
 use crate::move_slot::SlotRelease;
 use crate::robot::{ARMS, DUAL_DOF, LIMBS};
 use crate::settle::{ContactGap, Settle, farthest_outside, joint_shortfall, verdict};
+use crate::streams::ArmState;
 use crate::types::{DualJointVec, arm_joints, dual_joints};
 
 /// The outcome of a share whose goal was cancelled: the action ends its goal
@@ -265,7 +266,7 @@ impl PathJudgment {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShareReport {
     pub arm: ArmId,
-    pub outcome: Outcome,
+    pub outcome: Outcome<PathFailure>,
     pub joints: JointVec,
     pub measured: Measurement,
     pub elapsed_s: f64,
@@ -277,7 +278,7 @@ impl ShareReport {
     /// started.
     fn ended(
         arm: ArmId,
-        outcome: Outcome,
+        outcome: Outcome<PathFailure>,
         planner: &Planner,
         measured: &Measurement,
         elapsed_s: f64,
@@ -294,7 +295,7 @@ impl ShareReport {
     /// The report of the share of `planner`'s arm that failed with
     /// `failure`, before its path started or with no measurement to vouch
     /// for: the joints commanded last.
-    fn failed(planner: &Planner, failure: Failure) -> Self {
+    fn failed(planner: &Planner, failure: PathFailure) -> Self {
         Self::ended(
             planner.arm,
             Outcome::Failed(failure),
@@ -328,18 +329,12 @@ impl ShareReply {
             .then(|| Outcome::Failed(Failure::new(FailureKind::AttemptFailed, OTHER_SHARE_FAILED)))
     }
 
-    /// Report how the share of a path of `arms` ended, its failure as
-    /// [`share_failure`] gives it; a failure raises the flag that ends the
-    /// other shares.
-    fn report(&self, report: ShareReport, arms: PathArms) {
-        let outcome = match report.outcome {
-            Outcome::Failed(failure) => {
-                self.failed.store(true, Ordering::Release);
-                Outcome::Failed(share_failure(failure, report.arm, arms))
-            }
-            other => other,
-        };
-        self.send(ShareReport { outcome, ..report });
+    /// `failure` of the share of the arm `arm` in a path of `arms`, as
+    /// [`share_failure`] gives it, with the flag that ends the other shares
+    /// raised.
+    fn share_failed(&self, failure: Failure, arm: ArmId, arms: PathArms) -> PathFailure {
+        self.failed.store(true, Ordering::Release);
+        share_failure(failure, arm, arms).into()
     }
 
     /// Send `report` to the path's action. Its channel holds a report for
@@ -428,15 +423,17 @@ impl PathShare {
         matches!(self.stage, ShareStage::Following(_))
     }
 
-    /// Fail the share of `planner`'s arm with `failure`, with no result.
+    /// Fail the share of `planner`'s arm with `failure`, as
+    /// [`ShareReply::share_failed`] gives it, with no result.
     pub(super) fn fail(self, planner: &Planner, failure: Failure) {
-        self.reply
-            .report(ShareReport::failed(planner, failure), self.arms);
+        let failure = self.reply.share_failed(failure, planner.arm, self.arms);
+        self.reply.send(ShareReport::failed(planner, failure));
     }
 
-    /// End the share of `planner`'s arm on `outcome` at `now`, the arm
-    /// measuring `measured`: the seconds since its path started, none for a
-    /// share whose path has not started.
+    /// End the share of `planner`'s arm on `outcome` at `now`, its failure as
+    /// [`ShareReply::share_failed`] gives it, the arm measuring `measured`:
+    /// the seconds since its path started, none for a share whose path has
+    /// not started.
     pub(super) fn end(
         self,
         planner: &Planner,
@@ -448,8 +445,10 @@ impl PathShare {
             ShareStage::Awaiting { .. } => 0.0,
             ShareStage::Following(traj) => traj.clock().elapsed_secs(now),
         };
+        let outcome =
+            outcome.map_failure(|failure| self.reply.share_failed(failure, planner.arm, self.arms));
         let report = ShareReport::ended(planner.arm, outcome, planner, &measured, elapsed_s);
-        self.reply.report(report, self.arms);
+        self.reply.send(report);
     }
 }
 
@@ -493,7 +492,7 @@ pub(super) struct ProposedStep {
     pub(super) from: JointVec,
     pub(super) to: JointVec,
     pub(super) at: Instant,
-    pub(super) measured: JointVec,
+    pub(super) measured: ArmState,
 }
 
 impl ProposedStep {
@@ -555,8 +554,9 @@ impl Planner {
         else {
             return false;
         };
-        self.proposed
-            .is_some_and(|step| self.stands_on_contact(*contact, &step.from, &step.measured))
+        self.proposed.is_some_and(|step| {
+            self.stands_on_contact(*contact, &step.from, &step.measured.positions)
+        })
     }
 
     /// Adopt `governed`, play a joint path's clock on at `pace`, and end the
@@ -589,7 +589,7 @@ impl Planner {
         traj.advance(step.at, pace);
         let end = arm_joints(&traj.end(), self.arm);
         let judged = settle_outcome(
-            &step.measured,
+            &step.measured.positions,
             &end,
             contact.on_the_path,
             settle,
@@ -599,13 +599,11 @@ impl Planner {
         let Some(outcome) = judged.map(|outcome| contact.of_this_arm(outcome)) else {
             return;
         };
-        let elapsed_s = traj.clock().elapsed_secs(step.at);
         if outcome.ended_short() {
-            self.hold_where_it_stands(step.measured);
+            self.hold_where_it_stands(step.measured.positions);
         }
         if let Mode::PathShare(share) = std::mem::replace(&mut self.mode, Mode::Follow) {
-            let report = ShareReport::ended(self.arm, outcome, self, &Ok(step.measured), elapsed_s);
-            share.reply.report(report, share.arms);
+            share.end(self, outcome, Ok(step.measured), step.at);
         }
     }
 
@@ -620,12 +618,16 @@ impl Planner {
     pub(super) fn advance_path_share(
         &mut self,
         m: PathShare,
-        measured_q: JointVec,
+        measured: ArmState,
         now: Instant,
     ) -> Advance {
         if let Some(outcome) = m.reply.interruption() {
-            let end = self.end_move(&outcome, self.setpoint, m.runs().then_some(measured_q));
-            m.end(self, outcome, Ok(measured_q), now);
+            let end = self.end_move(
+                &outcome,
+                self.setpoint,
+                m.runs().then_some(measured.positions),
+            );
+            m.end(self, outcome, Ok(measured), now);
             return end;
         }
         let origin = Origin::OnPath(m.arms);
@@ -669,7 +671,7 @@ impl Planner {
     /// End the arm's share that waits for `judgment`, if it holds one, with
     /// `failure`, handing the arm back to Follow with its command where it
     /// held.
-    fn fail_awaited(&mut self, judgment: JudgmentId, failure: &Failure) {
+    fn fail_awaited(&mut self, judgment: JudgmentId, failure: &PathFailure) {
         if !self.awaits(judgment) {
             return;
         }
@@ -780,7 +782,9 @@ pub fn start_path(
                 let busy = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
                 return Err(arms.failure_of(arm, busy));
             }
-            let measured = measured[arm].map_err(|_| arms.failure_of(arm, stale_failure()))?;
+            let measured = measured[arm]
+                .map_err(|_| arms.failure_of(arm, stale_failure()))?
+                .positions;
             if let Some(expected) = expected {
                 let tolerance = planner.cfg.start_tolerance_rad;
                 check_start(arm, StartCheck::Expected, expected, &measured, tolerance)?;
@@ -849,16 +853,15 @@ pub fn judge_path(
     guard: &GuardAt,
     checker: &mut dyn PathGuard,
     stop: &AtomicBool,
-) -> Result<(), Failure> {
+) -> Result<(), PathFailure> {
     if stop.load(Ordering::Acquire) {
-        let stopped = PathBlocked::Stopped.to_string();
-        return Err(Failure::new(FailureKind::Unreachable, stopped));
+        return Err(PathFailure::Unreachable(PathBlocked::Stopped.to_string()));
     }
     let traj = plan.trajectory(Instant::now());
     check_move_time(&traj, "path", "split it into paths of fewer waypoints")?;
     checker
         .check(arms, guard, traj.path(), stop)
-        .map_err(|blocked| Failure::new(FailureKind::Unreachable, blocked))
+        .map_err(PathFailure::Unreachable)
 }
 
 /// The most an arm of a joint path may stand from the start the path was
@@ -917,7 +920,7 @@ pub enum Resumed {
 pub fn resume_judged_path(
     planners: &mut PerArm<Planner, ARMS>,
     judgment: &PathJudgment,
-    verdict: &Result<(), Failure>,
+    verdict: &Result<(), PathFailure>,
     measured: &PerArm<Measurement, ARMS>,
     now: Instant,
 ) -> Resumed {
@@ -933,7 +936,7 @@ pub fn resume_judged_path(
     }
     let measured_at_start = awaited
         .iter()
-        .map(|&(arm, start)| Some((arm, start, measured[arm].ok()?)))
+        .map(|&(arm, start)| Some((arm, start, measured[arm].ok()?.positions)))
         .collect::<Option<Vec<(ArmId, ShareStart, JointVec)>>>();
     let Some(measured_at_start) = measured_at_start else {
         return Resumed::AwaitsMeasurement;
@@ -951,7 +954,7 @@ pub fn resume_judged_path(
                 start.check_run_start(arm, &at, run, tolerance).err()
             });
     if let Some(failure) = refused {
-        fail_awaiting_shares(planners, judgment.id, &failure);
+        fail_awaiting_shares(planners, judgment.id, &failure.into());
         return Resumed::Done;
     }
     let path_start = judgment.plan.start();
@@ -966,7 +969,7 @@ pub fn resume_judged_path(
     if let Some((arm, joint, off)) = still_moving {
         if judgment.judgments >= max_path_judgments(planners[arm].cfg.cycle_period) {
             let failure = unsettled(arm, joint, off, judgment.judgments);
-            fail_awaiting_shares(planners, judgment.id, &failure);
+            fail_awaiting_shares(planners, judgment.id, &failure.into());
             return Resumed::Done;
         }
         let run_start = PerArm::from_fn(|arm| {
@@ -1010,7 +1013,7 @@ fn unsettled(arm: ArmId, joint: usize, off: f64, judgments: u32) -> Failure {
 fn fail_awaiting_shares(
     planners: &mut PerArm<Planner, ARMS>,
     judgment: JudgmentId,
-    failure: &Failure,
+    failure: &PathFailure,
 ) {
     for arm in PerArm::<(), ARMS>::ids() {
         planners[arm].fail_awaited(judgment, failure);
@@ -1164,7 +1167,7 @@ mod tests {
     use crate::test_support::{
         ARMS_WOULD_MEET, BOTH_HELD, NO_STOP, OpenGuard, Refusing, claimed, claimed_move_slot,
         distance_to_segment, measured_at_setpoints, path_goal_through, plan_config,
-        planner_holding, share_reply, test_guard, test_settle,
+        planner_holding, share_reply, standing_at, test_guard, test_settle,
     };
 
     /// Where the path tests take the arms from [`BOTH_HELD`], inside v1's
@@ -1185,7 +1188,9 @@ mod tests {
     }
 
     /// The outcome of the report `received` holds.
-    fn outcome(received: Result<ShareReport, mpsc::error::TryRecvError>) -> Option<Outcome> {
+    fn outcome(
+        received: Result<ShareReport, mpsc::error::TryRecvError>,
+    ) -> Option<Outcome<PathFailure>> {
         received.ok().map(|report| report.outcome)
     }
 
@@ -1212,7 +1217,7 @@ mod tests {
         goal: PathGoal,
         checker: &mut dyn PathGuard,
         now: Instant,
-    ) -> Result<(), Failure> {
+    ) -> Result<(), PathFailure> {
         let measured = measured_at_setpoints(planners);
         let guard = test_guard(planners);
         let judgment = start_path(planners, goal, &measured)?;
@@ -1242,7 +1247,13 @@ mod tests {
         for arm in PerArm::<(), ARMS>::ids() {
             ticks.push(
                 planners[arm]
-                    .tick(measured[arm], None, &mut goals, &move_slot, now)
+                    .tick(
+                        standing_at(measured[arm]),
+                        None,
+                        &mut goals,
+                        &move_slot,
+                        now,
+                    )
                     .await,
             );
         }
@@ -1298,7 +1309,7 @@ mod tests {
     ) -> (
         PerArm<Planner, ARMS>,
         PathJudgment,
-        Result<(), Failure>,
+        Result<(), PathFailure>,
         mpsc::Receiver<ShareReport>,
     ) {
         let mut planners = planners_holding(BOTH_HELD);
@@ -1312,7 +1323,7 @@ mod tests {
         let goal = path_goal_through(&arms, waypoints, Duration::ZERO, settle, reply, |arm| {
             &move_slots[arm]
         });
-        let measured = PerArm::new([Ok(left), Ok(BOTH_HELD[RIGHT])]);
+        let measured = PerArm::new([Ok(standing_at(left)), Ok(standing_at(BOTH_HELD[RIGHT]))]);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
         let verdict = judge_path(
             &judgment.plan,
@@ -1326,7 +1337,7 @@ mod tests {
 
     /// The left arm measuring `left`, the right arm where the tests hold it.
     fn left_measuring(left: JointVec) -> PerArm<Measurement, ARMS> {
-        PerArm::new([Ok(left), Ok(BOTH_HELD[RIGHT])])
+        PerArm::new([Ok(standing_at(left)), Ok(standing_at(BOTH_HELD[RIGHT]))])
     }
 
     /// A path starts at the joints each arm it names measures, the arm it
@@ -1468,14 +1479,18 @@ mod tests {
     /// judgment and its verdict.
     fn both_path_measured_at(
         measured: PerArm<JointVec, ARMS>,
-    ) -> (PerArm<Planner, ARMS>, PathJudgment, Result<(), Failure>) {
+    ) -> (PerArm<Planner, ARMS>, PathJudgment, Result<(), PathFailure>) {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm", "right_arm"]);
         let move_slots = claimed(&arms);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
-        let judgment =
-            start_path(&mut planners, goal, &measured.map(|_, q| Ok(q))).expect("the path starts");
+        let judgment = start_path(
+            &mut planners,
+            goal,
+            &measured.map(|_, q| Ok(standing_at(q))),
+        )
+        .expect("the path starts");
         let verdict = judge_path(
             &judgment.plan,
             judgment.arms,
@@ -1511,7 +1526,7 @@ mod tests {
             commit_both(&mut planners, &candidates);
         }
         let judged_at = t0 + tick * 3;
-        let measured = start.map(|_, q| Ok(q));
+        let measured = start.map(|_, q| Ok(standing_at(q)));
         let resumed = resume_judged_path(&mut planners, &judgment, &verdict, &measured, judged_at);
         assert!(matches!(resumed, Resumed::Done), "the path starts");
         assert_eq!(
@@ -1549,11 +1564,11 @@ mod tests {
         assert!(!planners[LEFT].moving(), "before it plays");
         assert_eq!(
             outcome(done_rx.try_recv()),
-            Some(Outcome::Failed(Failure::new(
+            Some(Outcome::Failed(PathFailure::Failed(Failure::new(
                 FailureKind::PreconditionFailed,
                 "left_arm stands 0.020 rad at joint 2 from where it stood when the path was \
                  taken, past the 0.010 rad start tolerance; send the path again"
-            )))
+            ))))
         );
     }
 
@@ -1603,11 +1618,11 @@ mod tests {
         );
         assert_eq!(
             outcome(done_rx.try_recv()),
-            Some(Outcome::Failed(Failure::new(
+            Some(Outcome::Failed(PathFailure::Failed(Failure::new(
                 FailureKind::PreconditionFailed,
                 "left_arm stands 0.012 rad from expected_start_joint_positions at joint 2, past \
                  the 0.010 rad start tolerance; plan the path from where the arm stands"
-            )))
+            ))))
         );
     }
 
@@ -1698,7 +1713,7 @@ mod tests {
         moved[RIGHT][3] += 0.005;
         let (mut planners, judgment, verdict) = both_path_measured_at(BOTH_HELD);
         let now = Instant::now();
-        let measured = moved.map(|_, q| Ok(q));
+        let measured = moved.map(|_, q| Ok(standing_at(q)));
         let Resumed::JudgeAgain(again) =
             resume_judged_path(&mut planners, &judgment, &verdict, &measured, now)
         else {
@@ -1766,13 +1781,13 @@ mod tests {
             );
             assert_eq!(
                 outcome(done_rx.try_recv()),
-                Some(Outcome::Failed(Failure::new(
+                Some(Outcome::Failed(PathFailure::Failed(Failure::new(
                     FailureKind::PreconditionFailed,
                     format!(
                         "left_arm still moved 0.008 rad at joint 1 while its path was judged {last} \
                          times; let the arm settle and send the path again"
                     )
-                )))
+                ))))
             );
         }
     }
@@ -1847,8 +1862,9 @@ mod tests {
             BOTH_HELD[LEFT],
             "the command holds"
         );
-        let Some(Outcome::Failed(failure)) = outcome(done_rx.try_recv()) else {
-            panic!("the share fails");
+        let Some(Outcome::Failed(PathFailure::Failed(failure))) = outcome(done_rx.try_recv())
+        else {
+            panic!("the share fails with a failure of the moves");
         };
         assert_eq!(failure.kind, FailureKind::Rejected, "{}", failure.message);
         assert!(
@@ -1976,10 +1992,10 @@ mod tests {
         commit_both(&mut planners, &BOTH_HELD);
         assert_eq!(
             outcome(done_rx.try_recv()),
-            Some(Outcome::Failed(Failure::new(
+            Some(Outcome::Failed(PathFailure::Failed(Failure::new(
                 FailureKind::Timeout,
                 "still short of the end of its path, 1.0 s after the planned end"
-            )))
+            ))))
         );
         assert!(!move_slots[LEFT].is_claimed(), "the failure frees the arm");
     }
@@ -2037,7 +2053,7 @@ mod tests {
         let measured_off = |by: f64| {
             let mut right = BOTH_HELD[RIGHT];
             right[2] += by;
-            PerArm::new([Ok(BOTH_HELD[LEFT]), Ok(right)])
+            PerArm::new([Ok(standing_at(BOTH_HELD[LEFT])), Ok(standing_at(right))])
         };
         let try_start = |expected_starts: Vec<Option<JointVec>>,
                          measured: PerArm<Measurement, ARMS>| {
@@ -2106,6 +2122,7 @@ mod tests {
             Err(
                 Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT)
                     .labelled(LIMBS.arm_name(LEFT))
+                    .into()
             )
         );
         assert!(!planners[RIGHT].moving(), "the right arm does not start");
@@ -2116,7 +2133,7 @@ mod tests {
         let move_slots = claimed(&both);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, &move_slots);
-        let measured = PerArm::new([Ok(BOTH_HELD[LEFT]), Err(Unmeasured::Stale)]);
+        let measured = PerArm::new([Ok(standing_at(BOTH_HELD[LEFT])), Err(Unmeasured::Stale)]);
         let failed = start_path(&mut planners, goal, &measured).map(|_| ());
         assert_eq!(failed, Err(stale_failure().labelled(LIMBS.arm_name(RIGHT))));
         assert!(!planners[LEFT].moving() && !planners[RIGHT].moving());
@@ -2126,7 +2143,7 @@ mod tests {
         let move_slots = claimed(&left);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&left, &BOTH_TO, Duration::ZERO, reply, &move_slots);
-        let measured = PerArm::new([Err(Unmeasured::Stale), Ok(BOTH_HELD[RIGHT])]);
+        let measured = PerArm::new([Err(Unmeasured::Stale), Ok(standing_at(BOTH_HELD[RIGHT]))]);
         let failed = start_path(&mut planners, goal, &measured).map(|_| ());
         assert_eq!(
             failed,
@@ -2146,7 +2163,7 @@ mod tests {
         let move_slots = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
-        let unreachable = Failure::new(FailureKind::Unreachable, ARMS_WOULD_MEET);
+        let unreachable = PathFailure::Unreachable(ARMS_WOULD_MEET.to_string());
         let started = start(&mut planners, goal, &mut Refusing, Instant::now());
         assert_eq!(started, Err(unreachable.clone()));
         assert!(!planners[LEFT].moving() && !planners[RIGHT].moving());
@@ -2185,6 +2202,9 @@ mod tests {
             &NO_STOP,
         )
         .expect_err("past 60 s");
+        let PathFailure::Failed(judged) = judged else {
+            panic!("the path is judged with a failure of the moves: {judged:?}");
+        };
         assert_eq!(judged.kind, FailureKind::Rejected);
         assert!(
             judged
@@ -2220,10 +2240,7 @@ mod tests {
         );
         assert_eq!(
             judged,
-            Err(Failure::new(
-                FailureKind::Unreachable,
-                PathBlocked::Stopped.to_string()
-            ))
+            Err(PathFailure::Unreachable(PathBlocked::Stopped.to_string()))
         );
     }
 
@@ -2241,7 +2258,7 @@ mod tests {
             .expect("queue the goal");
         planner
             .tick(
-                BOTH_HELD[LEFT],
+                standing_at(BOTH_HELD[LEFT]),
                 None,
                 &mut goals,
                 &move_slot,
@@ -2312,7 +2329,7 @@ mod tests {
         for arm in PerArm::<(), ARMS>::ids() {
             assert!(
                 planners[arm]
-                    .stop_active("stopped: operator", Ok(BOTH_HELD[arm]), t0)
+                    .stop_active("stopped: operator", Ok(standing_at(BOTH_HELD[arm])), t0)
                     .await,
                 "a share waiting for its judgment is a move in flight"
             );
@@ -2479,7 +2496,13 @@ mod tests {
         let (_goal_tx, mut goals) = mpsc::channel(1);
         let held = planner.setpoint();
         planner
-            .tick(held, None, &mut goals, &MoveSlot::default(), at)
+            .tick(
+                standing_at(held),
+                None,
+                &mut goals,
+                &MoveSlot::default(),
+                at,
+            )
             .await
             .candidate
     }
@@ -2620,13 +2643,13 @@ mod tests {
         let ticks = tick_both(&mut planners, start_at + Duration::from_millis(200)).await;
         commit_both(&mut planners, &ticks.map(|_, tick| tick.candidate));
         planners[RIGHT].fail_active(stale_failure()).await;
-        let Some(Outcome::Failed(stale)) = outcome(done_rx.try_recv()) else {
+        let Some(Outcome::Failed(PathFailure::Failed(stale))) = outcome(done_rx.try_recv()) else {
             panic!("the stale share fails");
         };
         assert_eq!(stale, stale_failure().labelled(LIMBS.arm_name(RIGHT)));
         let held_left = planners[LEFT].setpoint();
         let tick = tick_both(&mut planners, start_at + Duration::from_millis(300)).await;
-        let Some(Outcome::Failed(ended)) = outcome(done_rx.try_recv()) else {
+        let Some(Outcome::Failed(PathFailure::Failed(ended))) = outcome(done_rx.try_recv()) else {
             panic!("the other share fails");
         };
         assert_eq!(
@@ -2720,7 +2743,10 @@ mod tests {
         let (report, commands) =
             play_to_a_report(&mut planners, &mut done_rx, |_| BOTH_HELD, t0).await;
         assert!(
-            matches!(&report.outcome, Outcome::Failed(failure) if failure.kind == FailureKind::Timeout),
+            matches!(
+                &report.outcome,
+                Outcome::Failed(PathFailure::Failed(failure)) if failure.kind == FailureKind::Timeout
+            ),
             "an arm that stands short cannot settle: {:?}",
             report.outcome
         );
@@ -2852,7 +2878,7 @@ mod tests {
         let period = plan_config().cycle_period;
         let ended_at = t0 + period * u32::try_from(commands.len()).expect("a count of ticks");
         assert!(ended_at < planned_end, "the contact ends the path early");
-        let grasp_point = |q: &JointVec| planners[LEFT].world_ee_pose(q).translation.vector;
+        let grasp_point = |q: &JointVec| planners[LEFT].root_ee_pose(q).translation.vector;
         let left_gaps_m: Vec<f64> = commands
             .iter()
             .map(|commanded| (grasp_point(&commanded[LEFT]) - grasp_point(&BOTH_HELD[LEFT])).norm())
@@ -2932,7 +2958,7 @@ mod tests {
         let t0 = Instant::now();
         let goal = path_goal_with_a_gap(reply, &move_slots);
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
-        let grasp_point = |q: &JointVec| planners[LEFT].world_ee_pose(q).translation.vector;
+        let grasp_point = |q: &JointVec| planners[LEFT].root_ee_pose(q).translation.vector;
         let travel_m = (grasp_point(&BOTH_TO[LEFT]) - grasp_point(&BOTH_HELD[LEFT])).norm();
         assert!(travel_m > 5.0 * GAP_M, "the path travels {travel_m} m");
 
@@ -2956,7 +2982,7 @@ mod tests {
         let (mut planners, _judgment, _verdict, mut done_rx) =
             left_path_measured_at(BOTH_HELD[LEFT], &[BOTH_TO], Duration::from_secs(1));
         let stopped = planners[LEFT]
-            .stop_active("stopped: operator", Ok(elsewhere), at)
+            .stop_active("stopped: operator", Ok(standing_at(elsewhere)), at)
             .await;
         assert!(stopped, "the share was in flight");
         assert!(matches!(

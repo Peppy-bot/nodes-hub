@@ -305,7 +305,7 @@ impl ArmSolver for DesignSolver<'_> {
     }
 
     fn arm_base(&self, arm: usize) -> [f64; 3] {
-        let base = self.arms[ArmId::new(arm)].world_pose(&Isometry3::identity());
+        let base = self.arms[ArmId::new(arm)].root_pose(&Isometry3::identity());
         base.translation.vector.into()
     }
 
@@ -335,7 +335,7 @@ impl ArmSolver for DesignSolver<'_> {
         let grasp = model.base_pose(&grasp_pose(target, rotation));
         let solution =
             model.solve_ik_within(&grasp, REACH_TOLERANCE, ArmAnglePolicy::FromSeed, seed)?;
-        let reached = model.world_ee_pose(&solution.q);
+        let reached = model.root_ee_pose(&solution.q);
         Some(Attempt {
             joints: solution.q.to_vec(),
             grasp_point: reached.translation.vector.into(),
@@ -348,6 +348,7 @@ impl ArmSolver for DesignSolver<'_> {
 mod tests {
     use super::*;
 
+    use control_core::geometry::Point;
     use srs_model::Solution;
     use workspace_core::design::MAX_COORDINATE;
     use workspace_core::messages::robot_frame_placement;
@@ -484,8 +485,9 @@ mod tests {
         SurfaceHeight::from_wire(metres).expect("a finite height")
     }
 
-    fn positions(values: &[f64]) -> Positions {
-        Positions::from_wire(values).expect("valid positions")
+    fn positions(point: [f64; 3]) -> Positions {
+        let point = Point::parse(point).expect("a finite point");
+        Positions::parse(vec![point]).expect("a valid point")
     }
 
     #[test]
@@ -501,7 +503,7 @@ mod tests {
                 else {
                     continue;
                 };
-                let reached = model.world_pose(&model.at(&solution.q).ee_pose());
+                let reached = model.root_pose(&model.at(&solution.q).ee_pose());
                 let position = reached.translation.vector;
                 assert!(
                     (position - Vector3::from(target)).norm() < 1e-6,
@@ -603,7 +605,7 @@ mod tests {
     #[test]
     fn a_point_in_front_at_table_height_is_reached_and_seen() {
         let v2 = workspace(V2);
-        let answer = v2.check(&positions(&[0.30, 0.0, 0.45]), &chest_view(&v2));
+        let answer = v2.check(&positions([0.30, 0.0, 0.45]), &chest_view(&v2));
         let [point] = answer.points.as_slice() else {
             panic!("one point answered: {answer:?}");
         };
@@ -625,7 +627,7 @@ mod tests {
     fn a_point_a_metre_in_front_is_out_of_reach_by_how_far_the_closest_arm_stops() {
         let v2 = workspace(V2);
         let target = [1.0, 0.0, 0.45];
-        let answer = v2.check(&positions(&target), &chest_view(&v2));
+        let answer = v2.check(&positions(target), &chest_view(&v2));
         let point = &answer.points[0];
         let Reach::Short { by } = point.reach else {
             panic!("a metre ahead is out of reach: {point:?}");
@@ -658,7 +660,7 @@ mod tests {
     fn a_point_the_grasp_point_gets_to_tilted_falls_short_by_nothing_in_a_grasp_orientation() {
         let v2 = workspace(V2);
         let target = [0.40, 0.0, 0.30];
-        let answer = v2.check(&positions(&target), &chest_view(&v2));
+        let answer = v2.check(&positions(target), &chest_view(&v2));
         let point = &answer.points[0];
         assert_eq!(point.reach, Reach::Short { by: 0.0 });
         assert_eq!(
@@ -788,7 +790,7 @@ mod tests {
         let view_check = v1.unlinked_view_check();
         assert_eq!(view_check, ViewCheck::NoPerceptionCamera);
         let unchecked = "The view is not checked: the robot has no perception camera.";
-        let checked = v1.check(&positions(&[0.30, -0.2, 0.45]), &view_check);
+        let checked = v1.check(&positions([0.30, -0.2, 0.45]), &view_check);
         let [point] = checked.points.as_slice() else {
             panic!("one point answered: {checked:?}");
         };
@@ -818,7 +820,7 @@ mod tests {
         let unchecked = format!(
             "The view is not checked: no camera geometry is linked for the {camera} camera."
         );
-        let checked = v2.check(&positions(&[0.30, 0.0, 0.45]), &view_check);
+        let checked = v2.check(&positions([0.30, 0.0, 0.45]), &view_check);
         let [point] = checked.points.as_slice() else {
             panic!("one point answered: {checked:?}");
         };

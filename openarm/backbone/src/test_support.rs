@@ -1,7 +1,8 @@
 //! What the unit tests share: the arms by their places, the bundled
 //! descriptions, the arms and the postures built from them, the planner
 //! config and the planners of the tests, the poses the tests hold the arms
-//! at, each arm measured where its planner holds it, how far a point
+//! at, an arm's joint state measured standing still at a time of its own,
+//! each arm measured where its planner holds it, how far a point
 //! stands from a segment, move slots claimed as at a goal's admission, the
 //! goals of joint paths and where their shares report, a path guard that
 //! lets every path through and one that holds every path short, the guard
@@ -11,7 +12,7 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use control_core::path_timing::RoundedPath;
 use robot_description::{ArmId, Driven, PerArm, RobotDescription};
@@ -27,6 +28,7 @@ use crate::planner::{
 };
 use crate::robot::{self, ARMS};
 use crate::settle::{ContactGap, Settle};
+use crate::streams::ArmState;
 
 #[path = "../tests/helpers/params.rs"]
 mod params;
@@ -106,6 +108,7 @@ pub(crate) fn plan_config() -> PlanConfig {
             hi: 10.0,
         }; ARM_DOF],
         start_tolerance_rad: 0.01,
+        robot_frame: description(V1).root_link(),
     }
 }
 
@@ -130,9 +133,25 @@ pub(crate) fn planner_holding(arm: ArmId, held: JointVec) -> Planner {
     planner
 }
 
+/// When the arms of the unit tests are measured: a time of its own, apart
+/// from the node's clock.
+pub(crate) fn measured_at() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// The joint state of an arm standing still at `positions`, measured at
+/// [`measured_at`].
+pub(crate) fn standing_at(positions: JointVec) -> ArmState {
+    ArmState {
+        positions,
+        velocities: [0.0; ARM_DOF],
+        timestamp: measured_at(),
+    }
+}
+
 /// Each arm measured where its planner holds it.
 pub(crate) fn measured_at_setpoints(planners: &PerArm<Planner, ARMS>) -> PerArm<Measurement, ARMS> {
-    PerArm::from_fn(|arm| Ok(planners[arm].setpoint()))
+    PerArm::from_fn(|arm| Ok(standing_at(planners[arm].setpoint())))
 }
 
 /// How far `q` stands from the segment from `a` to `b`.

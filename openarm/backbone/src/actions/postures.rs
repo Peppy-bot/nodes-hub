@@ -24,20 +24,22 @@
 //! other posture runs is refused with `precondition_failed`.
 //!
 //! A goal that completes or ends cancelled gives the grasp pose of each arm,
-//! in limb_state's arm order. The coordinator measures both arms then, after
-//! the shares of both arms ended. When an arm has no fresh measurement then,
-//! the result gives no pose. A goal that fails gives no result.
+//! in limb_state's arm order, in the robot frame at the newest of the arms'
+//! joint-state times. The coordinator measures both arms then, after the
+//! shares of both arms ended. When an arm has no fresh measurement then, the
+//! result gives no pose, at the time on the node's clock of that check. A
+//! goal that fails gives no result.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use control_core::geometry::pose_arrays;
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::{NodeRunner, Result};
 use robot_description::{ArmId, PerArm};
 use srs_model::JointVec;
-use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, warn};
 
@@ -45,14 +47,15 @@ use crate::actions::{
     ARM_WORDS, GRIPPER_WORDS, LimbWords, ask_coordinator, check_limb_free, claim_slots,
     collect_ends, move_seconds_from_wire,
 };
-use crate::coordinator::{CoordinatorRequest, GraspMeasurement};
+use crate::coordinator::{CoordinatorRequest, GraspMeasurement, MeasuredGrasp, newest_of};
 use crate::failure::{Failure, FailureKind};
 use crate::gripper_move::GripperGoal;
 use crate::move_slot::MoveSlot;
 use crate::planner::{Goal, JointReply, Outcome, PostureShare, Unmeasured};
+use crate::publish::clock_now;
 use crate::robot::{ARMS, LIMBS};
 use crate::streams::LeaderActivity;
-use crate::types::{arm_pose_arrays, limb_names};
+use crate::types::limb_names;
 
 /// What a posture action needs of one kind of limb, the arms or the
 /// grippers, by arm: the queue that takes its goals, its move slots, and
@@ -295,12 +298,14 @@ async fn run_posture(
 }
 
 /// The poses a posture result gives: the grasp pose of each arm in place
-/// order, or none.
+/// order, each a position and an orientation [x, y, z, w] in the robot frame,
+/// at `timestamp`, the newest of the arms' joint-state times; or none, at the
+/// time of the check that found no fresh pose.
 #[derive(Debug)]
 struct ArmPoses {
+    timestamp: SystemTime,
     arm_names: Vec<String>,
-    positions: Vec<f64>,
-    orientations: Vec<f64>,
+    grasp_points: Vec<([f64; 3], [f64; 4])>,
 }
 
 /// What the coordinator answers when the goal asks for the grasp pose of
@@ -323,9 +328,7 @@ async fn measure_grasps(requests: &mpsc::Sender<CoordinatorRequest>) -> GraspAns
 /// - the coordinator did not answer;
 /// - the seed wait is not over, so the robot has not measured every limb;
 /// - the follower of an arm stopped reporting.
-fn measured_poses(
-    answer: GraspAnswer,
-) -> std::result::Result<PerArm<Isometry3<f64>, ARMS>, String> {
+fn measured_poses(answer: GraspAnswer) -> std::result::Result<PerArm<MeasuredGrasp, ARMS>, String> {
     let grasps = answer?;
     let pose = |arm: ArmId| {
         let grasp: GraspMeasurement = grasps[arm];
@@ -337,34 +340,54 @@ fn measured_poses(
     PerArm::from_fn(pose).transpose()
 }
 
-/// The poses of a posture result from `answer`: every arm's grasp pose, or
-/// no pose at all when an arm has no fresh measurement or the coordinator
-/// does not answer. The log of `action` says why there is none.
-fn arm_poses(answer: GraspAnswer, action: &str) -> ArmPoses {
+/// The poses of a posture result from `answer`: every arm's grasp pose, at
+/// the newest of the arms' joint-state times ([`newest_of`]), or no pose at
+/// all, at `checked_at`, when an arm has no fresh measurement or the
+/// coordinator does not answer. The log of `action` says why there is none.
+fn arm_poses(answer: GraspAnswer, checked_at: SystemTime, action: &str) -> ArmPoses {
     match measured_poses(answer) {
-        Ok(poses) => {
-            let (positions, orientations) = arm_pose_arrays(&poses);
-            ArmPoses {
-                arm_names: limb_names().arm_names,
-                positions,
-                orientations,
-            }
-        }
+        Ok(grasps) => ArmPoses {
+            timestamp: newest_of(grasps.map(|_, grasp| grasp.timestamp)),
+            arm_names: limb_names().arm_names,
+            grasp_points: grasps
+                .iter()
+                .map(|grasp| pose_arrays(&grasp.pose))
+                .collect(),
+        },
         Err(reason) => {
             warn!("{action}: the result gives no arm poses: {reason}");
             ArmPoses {
+                timestamp: checked_at,
                 arm_names: Vec::new(),
-                positions: Vec::new(),
-                orientations: Vec::new(),
+                grasp_points: Vec::new(),
             }
         }
     }
 }
 
+/// The poses of a posture result, as the coordinator measures them now
+/// ([`arm_poses`]), checked at the time on the node's clock its answer comes;
+/// a node clock that has not ticked then gives no time, and the goal fails
+/// with `attempt_failed`.
+async fn measured_arm_poses(
+    requests: &mpsc::Sender<CoordinatorRequest>,
+    action: &str,
+) -> std::result::Result<ArmPoses, Failure> {
+    let answer = measure_grasps(requests).await;
+    let checked_at = clock_now().map_err(|reason| {
+        Failure::new(
+            FailureKind::AttemptFailed,
+            format!("the result's check of the arms has no time: {reason}"),
+        )
+    })?;
+    Ok(arm_poses(answer, checked_at, action))
+}
+
 /// Expand one posture action's run loop: expose it, admit each goal
 /// ([`admit_posture`]), run it ([`run_posture`]) and end it: a goal that
 /// completes or ends cancelled gives the grasp poses that the coordinator
-/// measures then. `posture` is each arm's posture the action moves it to.
+/// measures then, in `robot_frame`, as `$grasp_point`, the action's item of
+/// its grasp points. `posture` is each arm's posture the action moves it to.
 /// `arms_fresh` tells whether the followers of the arms deliver fresh state.
 /// `grippers` are the grippers that the action closes
 /// ahead of the arms, or `None` for an action that sends them no command.
@@ -372,7 +395,7 @@ fn arm_poses(answer: GraspAnswer, action: &str) -> ArmPoses {
 /// ends, then claims the freed limbs. Written once here because the two
 /// generated action modules carry distinct types with an identical surface.
 macro_rules! posture_runner {
-    ($fn_name:ident, $action:ident, $name:literal) => {
+    ($fn_name:ident, $action:ident, $grasp_point:ident, $name:literal) => {
         impl PostureGoal for $action::GoalContext {
             fn cancel_signal(&self) -> impl Future<Output = ()> {
                 $action::GoalContext::cancel_signal(self)
@@ -390,7 +413,18 @@ macro_rules! posture_runner {
             arms_fresh: PerArm<Arc<AtomicBool>, ARMS>,
             grippers: Option<Limbs<GripperGoal>>,
             requests: mpsc::Sender<CoordinatorRequest>,
+            robot_frame: &'static str,
         ) -> Result<()> {
+            let grasp_points = |poses: &ArmPoses| -> Vec<$action::$grasp_point> {
+                poses
+                    .grasp_points
+                    .iter()
+                    .map(|&(position, orientation)| $action::$grasp_point {
+                        position,
+                        orientation,
+                    })
+                    .collect()
+            };
             let mut handle = $action::ActionHandle::expose(&runner).await?;
             loop {
                 let accepted = handle
@@ -417,20 +451,34 @@ macro_rules! posture_runner {
                     PostureEnd::Failed(failure) => {
                         ctx.fail(failure.kind.into(), failure.message).await
                     }
-                    PostureEnd::Completed => {
-                        let poses = arm_poses(measure_grasps(&requests).await, $name);
-                        ctx.complete(poses.arm_names, poses.positions, poses.orientations)
+                    PostureEnd::Completed => match measured_arm_poses(&requests, $name).await {
+                        Ok(poses) => {
+                            let points = grasp_points(&poses);
+                            ctx.complete(
+                                robot_frame.to_owned(),
+                                poses.timestamp,
+                                poses.arm_names,
+                                points,
+                            )
                             .await
-                    }
+                        }
+                        Err(failure) => ctx.fail(failure.kind.into(), failure.message).await,
+                    },
                     PostureEnd::Cancelled(reason) => {
-                        let poses = arm_poses(measure_grasps(&requests).await, $name);
-                        ctx.complete_cancelled(
-                            reason,
-                            poses.arm_names,
-                            poses.positions,
-                            poses.orientations,
-                        )
-                        .await
+                        match measured_arm_poses(&requests, $name).await {
+                            Ok(poses) => {
+                                let points = grasp_points(&poses);
+                                ctx.complete_cancelled(
+                                    reason,
+                                    robot_frame.to_owned(),
+                                    poses.timestamp,
+                                    poses.arm_names,
+                                    points,
+                                )
+                                .await
+                            }
+                            Err(failure) => ctx.fail(failure.kind.into(), failure.message).await,
+                        }
                     }
                 };
                 if let Err(e) = ended {
@@ -441,15 +489,25 @@ macro_rules! posture_runner {
     };
 }
 
-posture_runner!(run_move_to_ready, move_to_ready, "move_to_ready");
-posture_runner!(run_move_to_home, move_to_home, "move_to_home");
+posture_runner!(
+    run_move_to_ready,
+    move_to_ready,
+    MoveToReadyResultGraspPointsItem,
+    "move_to_ready"
+);
+posture_runner!(
+    run_move_to_home,
+    move_to_home,
+    MoveToHomeResultGraspPointsItem,
+    "move_to_home"
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use robot_description::states;
-    use srs_model::nalgebra::Vector3;
+    use srs_model::nalgebra::{Isometry3, Vector3};
 
     use crate::gripper_move::{EffortCap, GripperReply};
     use crate::robot::LIMBS;
@@ -889,9 +947,29 @@ mod tests {
         Isometry3::new(Vector3::new(0.3, y, 0.25), Vector3::new(0.0, 0.0, y))
     }
 
-    /// The coordinator's answer with each arm measured at [`grasp_of`].
-    fn both_measured() -> GraspAnswer {
-        Ok(PerArm::from_fn(|arm| Ok(grasp_of(arm))))
+    /// The time of the tests' check of the arms, 30 s after the epoch: apart
+    /// from every joint time [`measured_grasp`] stamps.
+    fn checked_at() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(30)
+    }
+
+    /// The measured grasp of `arm` at [`grasp_of`], its joints stamped
+    /// `seconds` after the epoch.
+    fn measured_grasp(arm: ArmId, seconds: u64) -> MeasuredGrasp {
+        MeasuredGrasp {
+            pose: grasp_of(arm),
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+        }
+    }
+
+    /// The coordinator's answer with each arm measured at [`grasp_of`], the
+    /// left arm's joints stamped at `left_s` and the right arm's at `right_s`
+    /// seconds after the epoch.
+    fn both_measured(left_s: u64, right_s: u64) -> GraspAnswer {
+        Ok(PerArm::new([
+            Ok(measured_grasp(LEFT, left_s)),
+            Ok(measured_grasp(RIGHT, right_s)),
+        ]))
     }
 
     /// An arm's share that failed with `kind` and `message`.
@@ -1039,31 +1117,48 @@ mod tests {
     }
 
     /// The result gives the arms in limb_state's order, each with its own
-    /// pose. Each orientation is `[x, y, z, w]`.
+    /// pose, at the newest of the arms' joint-state times. Each orientation
+    /// is `[x, y, z, w]`.
     #[test]
     fn the_posture_poses_come_in_arm_name_order() {
-        let poses = arm_poses(both_measured(), "move_to_ready");
-        let (positions, orientations) = arm_pose_arrays(&PerArm::from_fn(grasp_of));
-        assert_eq!(poses.arm_names, ["left_arm", "right_arm"]);
-        assert_eq!(poses.positions, positions);
-        assert_eq!(poses.orientations, orientations);
-        let (sin, cos) = 0.1f64.sin_cos();
-        let expected = [0.0, 0.0, sin, cos, 0.0, 0.0, -sin, cos];
-        for (i, (got, want)) in poses.orientations.iter().zip(expected).enumerate() {
-            assert!(
-                (got - want).abs() < 1e-12,
-                "orientations[{i}] = {got}, expected {want}"
+        for (left_s, right_s) in [(12, 15), (15, 12)] {
+            let poses = arm_poses(
+                both_measured(left_s, right_s),
+                checked_at(),
+                "move_to_ready",
             );
+            assert_eq!(
+                poses.timestamp,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(15),
+                "the newest joint time of the arms stamped at {left_s} s and {right_s} s"
+            );
+        }
+        let poses = arm_poses(both_measured(12, 15), checked_at(), "move_to_ready");
+        assert_eq!(poses.arm_names, ["left_arm", "right_arm"]);
+        let expected: Vec<_> = PerArm::<_, ARMS>::from_fn(grasp_of)
+            .iter()
+            .map(pose_arrays)
+            .collect();
+        assert_eq!(poses.grasp_points, expected);
+        let (sin, cos) = 0.1f64.sin_cos();
+        let orientations = [[0.0, 0.0, sin, cos], [0.0, 0.0, -sin, cos]];
+        for (arm, ((_, got), want)) in poses.grasp_points.iter().zip(orientations).enumerate() {
+            for (axis, (got, want)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "arm {arm} orientation[{axis}] = {got}, expected {want}"
+                );
+            }
         }
     }
 
-    /// When an arm has no fresh measurement, or the coordinator does not
+    /// When an arm has no fresh measurement or the coordinator does not
     /// answer, the result gives no pose for any arm:
     /// - the seed wait is not over, so neither arm has a pose;
     /// - the follower of the right arm stopped reporting;
     /// - the coordinator is not running.
     #[test]
-    fn an_arm_without_a_measured_pose_empties_the_posture_arrays() {
+    fn an_arm_without_a_measured_pose_gives_no_pose_at_the_time_of_the_check() {
         let unmeasured = [
             (
                 Ok(PerArm::new([
@@ -1073,7 +1168,10 @@ mod tests {
                 "the robot has not measured every limb yet",
             ),
             (
-                Ok(PerArm::new([Ok(grasp_of(LEFT)), Err(Unmeasured::Stale)])),
+                Ok(PerArm::new([
+                    Ok(measured_grasp(LEFT, 12)),
+                    Err(Unmeasured::Stale),
+                ])),
                 "right_arm stopped reporting its joints",
             ),
             (
@@ -1083,9 +1181,15 @@ mod tests {
         ];
         for (answer, reason) in unmeasured {
             assert_eq!(measured_poses(answer.clone()), Err(reason.to_string()));
-            let poses = arm_poses(answer, "move_to_ready");
-            assert!(poses.arm_names.is_empty(), "{:?}", poses.arm_names);
-            assert!(poses.positions.is_empty() && poses.orientations.is_empty());
+            assert_no_poses(arm_poses(answer, checked_at(), "move_to_ready"));
         }
+    }
+
+    /// A result with no pose names no arm, gives no grasp point, and its
+    /// timestamp is the time of the check, [`checked_at`].
+    fn assert_no_poses(poses: ArmPoses) {
+        assert!(poses.arm_names.is_empty(), "{:?}", poses.arm_names);
+        assert!(poses.grasp_points.is_empty(), "{:?}", poses.grasp_points);
+        assert_eq!(poses.timestamp, checked_at());
     }
 }

@@ -768,7 +768,7 @@ mod tests {
     use super::*;
     use crate::robot::LIMBS;
     use crate::test_support::{
-        LEFT, NO_PATHS, NO_STOP, RIGHT, V1, V2, bundled_arm, description, postures,
+        LEFT, NO_PATHS, NO_STOP, RIGHT, V1, V2, bundled_arm, description, postures, standing_at,
     };
     use control_core::chase::{chase_step, rate_limited};
     use control_core::path_timing::RoundedPath;
@@ -1533,7 +1533,7 @@ mod tests {
         use std::time::{Duration, Instant};
 
         use crate::arm_order::ArmOrder;
-        use crate::failure::FailureKind;
+        use crate::failure::PathFailure;
         use crate::planner::{Outcome, Resumed, judge_path, resume_judged_path, start_path};
         use crate::settle::Settle;
         use crate::test_support::{claimed, path_goal_through, planner_holding, share_reply};
@@ -1567,7 +1567,7 @@ mod tests {
             reply,
             |arm| &move_slots[arm],
         );
-        let measuring = |q: &GovState| PerArm::from_fn(|arm| Ok(q.arms[arm]));
+        let measuring = |q: &GovState| PerArm::from_fn(|arm| Ok(standing_at(q.arms[arm])));
         let judgment =
             start_path(&mut planners, goal, &measuring(&taken)).expect("the goal is taken");
         let guard = g.guard_at(taken);
@@ -1594,11 +1594,9 @@ mod tests {
         let failure = verdict
             .clone()
             .expect_err("from where the arm stands, the guard holds the path");
-        assert_eq!(
-            failure.kind,
-            FailureKind::Unreachable,
-            "{}",
-            failure.message
+        assert!(
+            matches!(failure, PathFailure::Unreachable(_)),
+            "{failure:?}"
         );
         let resumed = resume_judged_path(&mut planners, &again, &verdict, &measuring(&run), now);
         assert!(matches!(resumed, Resumed::Done), "the path ends");
@@ -1619,7 +1617,7 @@ mod tests {
     // both arms at once.
     #[test]
     fn a_path_of_both_arms_into_each_other_fails_its_judgment_unreachable() {
-        use crate::failure::FailureKind;
+        use crate::failure::PathFailure;
         use crate::planner::{PathPlan, judge_path};
 
         let mut g = v2_governor(true);
@@ -1640,14 +1638,15 @@ mod tests {
         }
         let judged = judge_path(&plan, PathArms::Both, &guard, &mut checker, &NO_STOP)
             .expect_err("the hands meet on the path");
-        assert_eq!(judged.kind, FailureKind::Unreachable, "{}", judged.message);
-        let pair = judged
-            .message
+        let PathFailure::Unreachable(message) = judged else {
+            panic!("the path is judged unreachable: {judged:?}");
+        };
+        let pair = message
             .strip_prefix("the path brings ")
             .and_then(|rest| rest.split_once(" to "))
             .and_then(|(names, _)| names.split_once(" and "));
         let Some((a, b)) = pair else {
-            panic!("the path brings a pair under the stop: {}", judged.message);
+            panic!("the path brings a pair under the stop: {message}");
         };
         // The place of the arm whose base link `link` is or hangs below.
         let robot = description(V2).robot();
@@ -3749,7 +3748,7 @@ max={} us | over budget {over}/{}",
         let mut planner = Planner::new(LEFT, model, cfg);
         planner.commit(start[LEFT]);
         let command = if streams_pose {
-            Upstream::Pose(planner.world_ee_pose(&far))
+            Upstream::Pose(planner.root_ee_pose(&far))
         } else {
             Upstream::Joints(far)
         };
@@ -3766,7 +3765,7 @@ max={} us | over budget {over}/{}",
         let mut fastest = 0.0_f64;
         for k in 0..300u32 {
             let tick = runtime.block_on(planner.tick(
-                held.arms[LEFT],
+                standing_at(held.arms[LEFT]),
                 Some(command),
                 &mut goals,
                 &move_slot,
@@ -3784,8 +3783,8 @@ max={} us | over budget {over}/{}",
                 );
             }
             let (from, to) = (
-                planner.world_ee_pose(&held.arms[LEFT]),
-                planner.world_ee_pose(&governed.arms[LEFT]),
+                planner.root_ee_pose(&held.arms[LEFT]),
+                planner.root_ee_pose(&governed.arms[LEFT]),
             );
             fastest = fastest.max((to.translation.vector - from.translation.vector).norm() / DT);
             planner.commit(governed.arms[LEFT]);
@@ -3842,11 +3841,11 @@ max={} us | over budget {over}/{}",
             });
             let mut planner = Planner::new(RIGHT, model, cfg);
             planner.commit(start[RIGHT]);
-            let straight_pose = planner.world_ee_pose(&straight);
+            let straight_pose = planner.root_ee_pose(&straight);
             let commands = if streams_pose {
                 [
                     Upstream::Pose(straight_pose),
-                    Upstream::Pose(planner.world_ee_pose(&start[RIGHT])),
+                    Upstream::Pose(planner.root_ee_pose(&start[RIGHT])),
                 ]
             } else {
                 [Upstream::Joints(straight), Upstream::Joints(start[RIGHT])]
@@ -3863,7 +3862,7 @@ max={} us | over budget {over}/{}",
                 for k in 0..TICKS_EACH_WAY {
                     let now = t0 + period * (way * TICKS_EACH_WAY + k);
                     let tick = runtime.block_on(planner.tick(
-                        held.arms[RIGHT],
+                        standing_at(held.arms[RIGHT]),
                         Some(command),
                         &mut goals,
                         &move_slot,
@@ -3886,7 +3885,7 @@ max={} us | over budget {over}/{}",
                         );
                     }
                     straightest = straightest.min(governed.arms[RIGHT][ELBOW]);
-                    let hand = planner.world_ee_pose(&governed.arms[RIGHT]);
+                    let hand = planner.root_ee_pose(&governed.arms[RIGHT]);
                     closest = closest.min(pose_miss(&hand, &straight_pose).position_m);
                     planner.commit(governed.arms[RIGHT]);
                     held = governed;

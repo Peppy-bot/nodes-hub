@@ -23,7 +23,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 
 use control_core::path_timing::RoundedPath;
 
-use crate::failure::{Failure, FailureKind};
+use crate::failure::{Failure, FailureKind, PathFailure};
 use crate::governor::{GuardAt, PathArms, PathChecker};
 use crate::planner::{
     Measurement, PathGuard, PathJudgment, Planner, Resumed, judge_path, resume_judged_path,
@@ -162,7 +162,7 @@ impl Judging {
 
 /// The verdict on a path: whether the judgment lets the path run, or the
 /// failure of the path.
-type Verdict = Result<(), Failure>;
+type Verdict = Result<(), PathFailure>;
 
 /// The paths being judged beside the loop, and the checker that judges
 /// them, one path at a time.
@@ -260,5 +260,5 @@ impl Drop for PathChecks {
 
 /// The verdict on a path whose judgment did not come: the checker failed.
 fn checker_failed() -> Verdict {
-    Err(Failure::new(FailureKind::AttemptFailed, CHECKER_FAILED))
+    Err(Failure::new(FailureKind::AttemptFailed, CHECKER_FAILED).into())
 }

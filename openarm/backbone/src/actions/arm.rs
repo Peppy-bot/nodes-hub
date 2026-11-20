@@ -3,22 +3,27 @@
 //! asks whether a Cartesian goal has a plan without moving. Each validates
 //! the goal (arm_name, finiteness, duration, the settle it asks for, and
 //! joint limits for joint moves), refusing a value it does not take with
-//! `rejected`, and refuses it while the arm's follower delivers no fresh
-//! state or a leader streams the arm ([`admit_limb`]); a move claims the
-//! target arm's move slot, then hands the accepted goal to that arm's
-//! planner over its goal channel. The planner runs the motion - governed
-//! against the other arm - settles it, ends the goal, and releases the move
-//! slot at the terminal. The check claims nothing: the coordinator
-//! asks the planner and answers whether a plan exists, or the refusal a
-//! goal would get, as an error reply.
+//! `rejected`; a Cartesian goal or check then has its target placed in the
+//! robot frame by the robot's tree ([`Placer`]), refused with the failure of
+//! the lookup when the tree cannot place it. Each refuses it while the arm's
+//! follower delivers no fresh state or a leader streams the arm
+//! ([`admit_limb`]); a move claims the target arm's move slot, then hands
+//! the accepted goal, its target as placed, to that arm's planner over its
+//! goal channel. The planner runs the motion - governed against the other
+//! arm - settles it, ends the goal, and releases the move slot at the
+//! terminal. The check claims nothing: the coordinator asks the planner and
+//! answers whether a plan exists, or the refusal a goal would get, as an
+//! error reply.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use crate::robot::{ARMS, arm_in};
+use control_core::geometry::{PoseTarget, Stamped};
 use control_core::positive_finite::PositiveFinite;
 use control_core::serving;
+use control_core::sync::lock_ignoring_poison;
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
@@ -34,12 +39,12 @@ use crate::actions::{
     move_seconds_from_wire, tolerance_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
-use crate::failure::{Failure, FailureKind};
+use crate::failure::{Failure, FailureKind, TargetFailure, Unplaced};
 use crate::move_slot::MoveSlot;
+use crate::placement::Placer;
 use crate::planner::{ArmMoveRequest, Goal, JointReply, PlanCheck};
 use crate::settle::{ContactGap, PoseTolerance, Settle};
 use crate::streams::LeaderActivity;
-use crate::types::{orientation_from_wire, position_from_wire};
 
 /// Parse the wire pair of the `settle_position_tolerance_m` and
 /// `settle_orientation_tolerance_rad` fields, each a positive finite number, or the
@@ -65,49 +70,99 @@ pub(super) fn joint_tolerances_from_wire(
     Err("each settle_tolerances_rad entry must be a positive number".to_string())
 }
 
-/// Parse the fields `move_arm` and `check_arm_move` share into the
-/// [`ArmMoveRequest`] both take, or the refusal both give.
-fn arm_move_request(
-    arm_name: &str,
+/// The target of a `move_arm` goal or a `check_arm_move` request, field for
+/// field: each member generates a type of its own.
+struct TargetFields<'a> {
+    frame: &'a str,
+    timestamp: Option<SystemTime>,
     position: [f64; 3],
     orientation: Option<[f64; 4]>,
+}
+
+/// A refusal of a value the backbone does not take.
+fn rejected(reason: String) -> Failure {
+    Failure::new(FailureKind::Rejected, reason)
+}
+
+/// The fields `move_arm` and `check_arm_move` share, parsed off the wire:
+/// the arm, the target in its frame at its timestamp, and the duration.
+struct ArmMoveFields {
+    arm: ArmId,
+    target: Stamped<PoseTarget>,
+    duration: Duration,
+}
+
+/// Parse the fields `move_arm` and `check_arm_move` share, or the refusal
+/// both give with `rejected` for a value the backbone does not take.
+fn arm_move_fields(
+    arm_name: &str,
+    target: TargetFields<'_>,
     duration_s: f64,
-) -> std::result::Result<ArmMoveRequest, String> {
-    let goal_pose_has = |reason| format!("goal pose has {reason}");
-    let arm = arm_in("arm_name", arm_name)?;
-    let position = position_from_wire(position).map_err(goal_pose_has)?;
-    let orientation = orientation
-        .map(orientation_from_wire)
-        .transpose()
-        .map_err(goal_pose_has)?;
-    let duration = move_seconds_from_wire("duration_s", duration_s)?;
-    Ok(ArmMoveRequest {
+) -> std::result::Result<ArmMoveFields, Failure> {
+    let arm = arm_in("arm_name", arm_name).map_err(rejected)?;
+    let target = PoseTarget::parse(target.position, target.orientation)
+        .and_then(|value| Stamped::parse(target.frame, target.timestamp, value))
+        .map_err(|e| rejected(format!("the target: {e}")))?;
+    let duration = move_seconds_from_wire("duration_s", duration_s).map_err(rejected)?;
+    Ok(ArmMoveFields {
         arm,
-        position,
-        orientation,
+        target,
         duration,
     })
 }
 
-/// A `move_arm` goal parsed off the wire: the move to plan, the settle it
-/// asks for, and its contact gap.
+/// The [`ArmMoveRequest`] of `fields`, its target placed in the robot frame
+/// by `placer`, or the failure of the lookup.
+fn placed_request(
+    placer: &Placer,
+    fields: ArmMoveFields,
+) -> std::result::Result<ArmMoveRequest, Unplaced> {
+    let target = placer
+        .place_now(&fields.target)
+        .map_err(|e| Unplaced::of("the target", &e))?
+        .value;
+    Ok(ArmMoveRequest {
+        arm: fields.arm,
+        position: target.position().into(),
+        orientation: target.orientation().map(Into::into),
+        duration: fields.duration,
+    })
+}
+
+/// A `move_arm` goal parsed off the wire: the move to plan, its target
+/// placed in the robot frame, the settle it asks for, and its contact gap.
 struct MoveArmGoal {
     request: ArmMoveRequest,
     settle: Settle<PoseTolerance>,
     contact: ContactGap,
 }
 
-fn move_arm_goal(d: &move_arm::GoalRequestData) -> std::result::Result<MoveArmGoal, String> {
-    let request = arm_move_request(&d.arm_name, d.position, d.orientation, d.duration_s)?;
+/// Parse a `move_arm` goal, every value first, then place its target, or
+/// the refusal: `rejected` for a value the backbone does not take, then the
+/// failure of the lookup.
+fn move_arm_goal(
+    placer: &Placer,
+    d: &move_arm::GoalRequestData,
+) -> std::result::Result<MoveArmGoal, TargetFailure> {
+    let target = TargetFields {
+        frame: placer.frame_of(d.target.frame.as_deref()),
+        timestamp: d.target.timestamp,
+        position: d.target.position,
+        orientation: d.target.orientation,
+    };
+    let fields = arm_move_fields(&d.arm_name, target, d.duration_s)?;
     let tolerance = settle_tolerance_from_wire(
         d.settle_position_tolerance_m,
         d.settle_orientation_tolerance_rad,
-    )?;
-    let timeout = move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?;
+    )
+    .map_err(rejected)?;
+    let timeout =
+        move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s).map_err(rejected)?;
+    let contact = contact_gap_from_wire(d.contact_gap_m).map_err(rejected)?;
     Ok(MoveArmGoal {
-        request,
+        request: placed_request(placer, fields)?,
         settle: Settle { tolerance, timeout },
-        contact: contact_gap_from_wire(d.contact_gap_m)?,
+        contact,
     })
 }
 
@@ -196,10 +251,13 @@ pub async fn run_move_arm_joints(
     }
 }
 
-/// Expose `move_arm` (Cartesian): validate + claim, then hand the goal to the
-/// arm's planner, which plans IK along the path and runs it governed.
+/// Expose `move_arm` (Cartesian): validate, place its target + claim, then
+/// hand the goal to the arm's planner, which plans IK along the path and runs
+/// it governed. The goal carries its target as the decider placed it: the
+/// tree places a target once, when the backbone accepts its goal.
 pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
+    placer: Arc<Placer>,
     goal_txs: PerArm<mpsc::Sender<Goal>, ARMS>,
     move_slots: PerArm<MoveSlot, ARMS>,
     fresh: PerArm<Arc<AtomicBool>, ARMS>,
@@ -207,17 +265,23 @@ pub async fn run_move_arm(
 ) -> Result<()> {
     let mut handle = move_arm::ActionHandle::expose(&runner).await?;
     loop {
+        let accepted_goal = Mutex::new(None);
         let accepted = handle
             .handle_goal_next_request(|req| {
-                let admitted = move_arm_goal(&req.data)
-                    .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
-                    .and_then(|goal| {
-                        let arm = goal.request.arm;
-                        admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)
-                    });
+                let admitted = move_arm_goal(&placer, &req.data).and_then(|goal| {
+                    let arm = goal.request.arm;
+                    admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)?;
+                    Ok(goal)
+                });
                 Ok(match admitted {
-                    Ok(()) => move_arm::GoalDecision::accept(),
-                    Err(f) => move_arm::GoalDecision::refuse(f.kind.into(), f.message),
+                    Ok(goal) => {
+                        *lock_ignoring_poison(&accepted_goal) = Some(goal);
+                        move_arm::GoalDecision::accept()
+                    }
+                    Err(f) => {
+                        let (kind, message) = f.for_member();
+                        move_arm::GoalDecision::refuse(kind, message)
+                    }
                 })
             })
             .await?;
@@ -226,7 +290,9 @@ pub async fn run_move_arm(
             request,
             settle,
             contact,
-        } = move_arm_goal(&ctx.request().data).expect("validated on accept");
+        } = lock_ignoring_poison(&accepted_goal)
+            .take()
+            .expect("the decider keeps the goal it accepts");
         let arm = request.arm;
         if goal_txs[arm]
             .send(Goal::Cartesian {
@@ -255,14 +321,17 @@ pub async fn run_move_arm(
 pub async fn run_check_arm_move(
     runner: Arc<NodeRunner>,
     token: CancellationToken,
+    placer: Arc<Placer>,
     requests: mpsc::Sender<CoordinatorRequest>,
     fresh: PerArm<Arc<AtomicBool>, ARMS>,
     activity: PerArm<LeaderActivity, ARMS>,
 ) {
     serving::serve("check_arm_move", token.cancelled(), || {
         check_arm_move::handle_requests(&runner, |req| {
-            check_plan(&requests, &fresh, &activity, &req.data)
-                .map_err(|f| check_arm_move::Failure::new(f.kind.into(), f.message))
+            check_plan(&placer, &requests, &fresh, &activity, &req.data).map_err(|f| {
+                let (kind, message) = f.for_member();
+                check_arm_move::Failure::new(kind, message)
+            })
         })
     })
     .await;
@@ -271,13 +340,19 @@ pub async fn run_check_arm_move(
 /// The answer to one plan check, or the refusal a `move_arm` goal with these
 /// fields would get.
 fn check_plan(
+    placer: &Placer,
     requests: &mpsc::Sender<CoordinatorRequest>,
     fresh: &PerArm<Arc<AtomicBool>, ARMS>,
     activity: &PerArm<LeaderActivity, ARMS>,
     d: &check_arm_move::RequestData,
-) -> std::result::Result<check_arm_move::Response, Failure> {
-    let request = arm_move_request(&d.arm_name, d.position, d.orientation, d.duration_s)
-        .map_err(|reason| Failure::new(FailureKind::Rejected, reason))?;
+) -> std::result::Result<check_arm_move::Response, TargetFailure> {
+    let target = TargetFields {
+        frame: placer.frame_of(d.target.frame.as_deref()),
+        timestamp: d.target.timestamp,
+        position: d.target.position,
+        orientation: d.target.orientation,
+    };
+    let request = placed_request(placer, arm_move_fields(&d.arm_name, target, d.duration_s)?)?;
     let arm = request.arm;
     check_limb_free(
         fresh[arm].load(Ordering::Acquire),
@@ -305,6 +380,7 @@ fn check_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_core::geometry::GeometryError;
     use robot_description::states;
     use srs_model::TARGET_SLACK;
 
@@ -374,6 +450,69 @@ mod tests {
         assert_eq!(
             joint_move_request(&goal, &limits).unwrap().target[3],
             inside
+        );
+    }
+
+    /// A target in the robot frame at the latest time, as a caller gives one.
+    fn target(position: [f64; 3], orientation: Option<[f64; 4]>) -> TargetFields<'static> {
+        TargetFields {
+            frame: "base_link",
+            timestamp: None,
+            position,
+            orientation,
+        }
+    }
+
+    // A target is parsed before the tree places it: a unit quaternion,
+    // normalized, or none; one whose squared norm lies 0.01 or more from 1, or
+    // with no frame, is refused with `rejected`, the message naming the target
+    // and what to send.
+    #[test]
+    fn a_target_no_contract_takes_is_refused_before_it_is_placed() {
+        let fields = arm_move_fields("left_arm", target([0.3, 0.1, 0.2], None), 1.0)
+            .expect("a position alone");
+        assert_eq!(fields.target.value().orientation(), None);
+        let typed = arm_move_fields(
+            "left_arm",
+            target([0.3, 0.1, 0.2], Some([0.0, 0.0, 0.0, 1.004])),
+            1.0,
+        )
+        .expect("a quaternion within tf2's tolerance");
+        let [_, _, _, w] = typed
+            .target
+            .value()
+            .orientation()
+            .expect("one")
+            .quaternion();
+        assert!((w - 1.0).abs() < 1e-15, "normalized: {w}");
+        let off_unit = arm_move_fields(
+            "left_arm",
+            target([0.3, 0.1, 0.2], Some([0.0, 0.0, 0.0, 1.02])),
+            1.0,
+        )
+        .err()
+        .expect("a target no contract takes");
+        assert_eq!(off_unit.kind, FailureKind::Rejected);
+        assert!(
+            off_unit
+                .message
+                .starts_with("the target: the orientation [0, 0, 0, 1.02] has a squared norm"),
+            "{}",
+            off_unit.message
+        );
+        let nowhere = TargetFields {
+            frame: "",
+            ..target([0.3, 0.1, 0.2], None)
+        };
+        let refused = arm_move_fields("left_arm", nowhere, 1.0)
+            .err()
+            .expect("a target with no frame");
+        assert_eq!(
+            refused,
+            Failure::new(
+                FailureKind::Rejected,
+                format!("the target: {}", GeometryError::NoFrame)
+            )
         );
     }
 

@@ -10,6 +10,14 @@ const CONTROL_RATE_HZ: u32 = 50;
 /// machine.
 const FOLLOWER_STATE_RATE_HZ: u32 = 50;
 
+/// How long the tests' tree keeps each moving transform (s): a stamp older
+/// than this before the newest of its frame has no value.
+pub const CACHE_WINDOW_S: f64 = 10.0;
+
+/// How long a placement waits for the tests' tree (s): long enough for a
+/// transform the test publishes before its goal to reach the tree.
+pub const LOOKUP_TIMEOUT_S: f64 = 1.0;
+
 /// The node's full parameter set (most have no schema default, so every test
 /// passes them explicitly): joints-mode upstream, the validated collision band,
 /// and a permissive EE cap so streamed chases converge fast. The start
@@ -40,5 +48,7 @@ pub fn params() -> peppygen::Parameters {
         start_tolerance_rad: 0.01,
         upstream_mode: "joints".to_string(),
         velocity_filter_cutoff_hz: 15.0,
+        cache_window_s: CACHE_WINDOW_S,
+        lookup_timeout_s: LOOKUP_TIMEOUT_S,
     }
 }

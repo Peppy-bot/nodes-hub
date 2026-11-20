@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use peppygen::NodeRunner;
 use peppylib::runtime::CancellationToken;
@@ -37,6 +37,7 @@ use tracing::{error, info, warn};
 
 use control_core::filters::LowPassFilter;
 use control_core::pacer::Pacer;
+use control_core::robot_tree::RobotTree;
 use robot_description::{ArmId, PerArm};
 use srs_model::ARM_DOF;
 
@@ -118,8 +119,27 @@ pub struct RunConfig {
 }
 
 /// The grasp pose of one arm in the robot frame, from the joints it
-/// measured, or why it has no fresh measurement of them.
-pub type GraspMeasurement = Result<Isometry3<f64>, Unmeasured>;
+/// measured, at the time its follower stamped them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeasuredGrasp {
+    pub pose: Isometry3<f64>,
+    pub timestamp: SystemTime,
+}
+
+/// The [`MeasuredGrasp`] of one arm, or why it has no fresh measurement of
+/// its joints.
+pub type GraspMeasurement = Result<MeasuredGrasp, Unmeasured>;
+
+/// The time of a report that holds every arm: the newest of their
+/// joint-state times, as MoveIt's CurrentStateMonitor stamps the robot state
+/// with its latest joint update.
+pub fn newest_of(times: PerArm<SystemTime, ARMS>) -> SystemTime {
+    times
+        .into_array()
+        .into_iter()
+        .max()
+        .expect("the robot has arms")
+}
 
 /// What the limb_motion services, the posture moves and execute_joint_path
 /// ask of the loop, answered on the reply channel each carries. A reply that
@@ -180,6 +200,7 @@ pub async fn run(
     mut path_checks: PathChecks,
     governor_config: watch::Receiver<GovernorConfig>,
     joint_transforms: JointTransforms,
+    tree: Arc<RobotTree>,
     config: RunConfig,
     token: CancellationToken,
 ) -> peppygen::Result<()> {
@@ -190,7 +211,7 @@ pub async fn run(
         velocity_filter_cutoff_hz,
         upstream_mode,
     } = config;
-    let publishers = Publishers::declare(&runner, joint_transforms).await?;
+    let publishers = Publishers::declare(&runner, joint_transforms, tree).await?;
 
     // Hold each arm's real pose, not a neutral zero: wait for the first measured
     // state from both arms and seed the held setpoints there before publishing.
@@ -963,7 +984,7 @@ fn live_limbs(
     )
 }
 
-/// The joints an arm's move results report after the seed: its latest
+/// The joint state an arm's move results report after the seed: its latest
 /// measurement, or [`Unmeasured::Stale`] for a stale arm, as [`live`]
 /// reads it. The seed gated on every arm's first measurement, so a live
 /// arm always holds one.
@@ -974,26 +995,29 @@ fn seeded_measurement(channels: &ArmChannels, admission: Admission) -> Measureme
     Ok(channels
         .measured
         .borrow()
-        .expect("seed gated on the first state")
-        .positions)
+        .expect("seed gated on the first state"))
 }
 
 /// The grasp pose of each arm after the seed, at the joints of its
-/// [`seeded_measurement`] under `arm_admission`, or why it has none.
+/// [`seeded_measurement`] under `arm_admission` and at their time, or why it
+/// has none.
 fn measured_grasps(
     channels: &PerArm<ArmChannels, ARMS>,
     planners: &mut PerArm<Planner, ARMS>,
     arm_admission: PerArm<Admission, ARMS>,
 ) -> PerArm<GraspMeasurement, ARMS> {
     PerArm::from_fn(|arm| {
-        seeded_measurement(&channels[arm], arm_admission[arm])
-            .map(|q| planners[arm].world_ee_pose(&q))
+        seeded_measurement(&channels[arm], arm_admission[arm]).map(|state| MeasuredGrasp {
+            pose: planners[arm].root_ee_pose(&state.positions),
+            timestamp: state.timestamp,
+        })
     })
 }
 
 /// Gather one whole-robot snapshot for the limb_state readout: every limb's
-/// live measurement, the arms' grasp-point poses FK'd from those joints. Any
-/// stale or missing limb yields `None`: a partial robot is not a snapshot.
+/// live measurement, the arms' grasp-point poses FK'd from those joints, at
+/// the newest of the arms' joint-state times ([`newest_of`]). Any stale or
+/// missing limb yields `None`: a partial robot is not a snapshot.
 fn limb_state_snapshot(
     channels: &PerArm<ArmChannels, ARMS>,
     planners: &mut PerArm<Planner, ARMS>,
@@ -1004,8 +1028,9 @@ fn limb_state_snapshot(
     let (arms, grippers) = (arms.transpose()?, grippers.transpose()?);
     Some(LimbStateSnapshot {
         joints: arms.map(|_, arm| arm.positions),
-        poses: arms.map(|arm, state| planners[arm].world_ee_pose(&state.positions)),
+        poses: arms.map(|arm, state| planners[arm].root_ee_pose(&state.positions)),
         openings: grippers.map(|_, gripper| gripper.fraction),
+        measured_at: newest_of(arms.map(|_, arm| arm.timestamp)),
     })
 }
 
@@ -1034,8 +1059,10 @@ async fn relay_upstream(
                 .send(&m.positions, &m.velocities)
                 .await;
             if upstream_mode == UpstreamMode::Pose {
-                let pose = planners[arm].world_ee_pose(&m.positions);
-                publishers.arm_pose_states[arm].send(&pose).await;
+                let pose = planners[arm].root_ee_pose(&m.positions);
+                publishers.arm_pose_states[arm]
+                    .send(publishers.robot_frame(), m.timestamp, &pose)
+                    .await;
             }
         }
     }
@@ -1193,11 +1220,10 @@ async fn tick_arm(
     // A borrow, not a borrow_and_update: only `admit_arms` marks a
     // delivery seen, so a state that arrived after it judged this arm still
     // counts on the next tick.
-    let measured_q = channels
+    let measured = channels
         .measured
         .borrow()
-        .expect("seed gated on the first state")
-        .positions;
+        .expect("seed gated on the first state");
     // Read out so no watch borrow guard is held across the await below. A
     // leader that has stopped streaming leaves nothing to follow: its last
     // command is dropped and the limb holds its setpoint.
@@ -1208,7 +1234,7 @@ async fn tick_arm(
         .flatten();
     planner
         .tick(
-            measured_q,
+            measured,
             command,
             &mut channels.goals,
             &channels.move_slot,
@@ -1297,8 +1323,8 @@ mod tests {
     use crate::planner::Outcome;
     use crate::test_support::{
         ARMS_WOULD_MEET, BOTH_HELD, OpenGuard, Refusing, claimed_move_slot, distance_to_segment,
-        measured_at_setpoints, path_goal_through, planner_holding, share_reply, test_guard,
-        test_settle,
+        measured_at, measured_at_setpoints, path_goal_through, planner_holding, share_reply,
+        standing_at, test_guard, test_settle,
     };
     use crate::test_support::{LEFT, RIGHT};
 
@@ -1307,6 +1333,7 @@ mod tests {
     use control_core::path_timing::RoundedPath;
 
     use crate::arm_order::ArmOrder;
+    use crate::failure::PathFailure;
     use crate::planner::{PathGuard, ShareReport};
     use crate::types::dual_joints;
     use srs_model::nalgebra::Vector3;
@@ -1478,14 +1505,6 @@ mod tests {
         (channels, measured_tx, goal_tx)
     }
 
-    /// The measured state of an arm at `positions`, standing still.
-    fn standing_at(positions: JointVec) -> Option<ArmState> {
-        Some(ArmState {
-            positions,
-            velocities: [0.0; ARM_DOF],
-        })
-    }
-
     #[tokio::test]
     async fn a_stale_tick_fails_queued_goals_instead_of_parking_them() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
@@ -1525,7 +1544,7 @@ mod tests {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
         let (mut channels, measured_tx, _goal_tx) = claimed_arm_channels();
-        measured_tx.send_replace(standing_at(held));
+        measured_tx.send_replace(Some(standing_at(held)));
         let target = [0.3, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         channels
             .command
@@ -1552,9 +1571,9 @@ mod tests {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
         let (mut channels, measured_tx, _goal_tx) = claimed_arm_channels();
-        measured_tx.send_replace(standing_at(held));
+        measured_tx.send_replace(Some(standing_at(held)));
         assert!(take_arm_delivery(&mut channels.measured), "the first state");
-        measured_tx.send_replace(standing_at(held));
+        measured_tx.send_replace(Some(standing_at(held)));
         tick_arm(&mut channels, &mut planner, Admission::Live, Instant::now()).await;
         assert!(
             take_arm_delivery(&mut channels.measured),
@@ -1570,7 +1589,7 @@ mod tests {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
         let (mut channels, measured_tx, goal_tx) = claimed_arm_channels();
-        measured_tx.send_replace(standing_at(held));
+        measured_tx.send_replace(Some(standing_at(held)));
         let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(1);
         goal_tx
             .send(Goal::posture_share([0.3; ARM_DOF], done_tx))
@@ -1618,7 +1637,7 @@ mod tests {
             (&left_measured, &left_goals),
             (&right_measured, &right_goals),
         ] {
-            measured.send_replace(standing_at(held));
+            measured.send_replace(Some(standing_at(held)));
             goals
                 .send(Goal::posture_share([0.3; ARM_DOF], done_tx.clone()))
                 .await
@@ -1631,7 +1650,7 @@ mod tests {
             tick_arm(arm, planner, Admission::Live, start).await;
         }
         assert!(done_rx.try_recv().is_err(), "both shares are in flight");
-        left_measured.send_replace(standing_at([0.3; ARM_DOF]));
+        left_measured.send_replace(Some(standing_at([0.3; ARM_DOF])));
         let late = start + Duration::from_secs(3600);
         tick_arm(
             &mut channels[LEFT],
@@ -1656,7 +1675,7 @@ mod tests {
         );
 
         let recovered = [0.2, -0.6, 0.1, 1.0, 0.0, 0.0, 0.0];
-        right_measured.send_replace(standing_at(recovered));
+        right_measured.send_replace(Some(standing_at(recovered)));
         let (reply, answer) = oneshot::channel();
         serve_request(
             CoordinatorRequest::MeasureGrasps { reply },
@@ -1670,7 +1689,13 @@ mod tests {
         .await;
         let grasps = answer.await.expect("the loop answers the request");
         assert_eq!(grasps[LEFT], Err(Unmeasured::Stale));
-        assert_eq!(grasps[RIGHT], Ok(planners[RIGHT].world_ee_pose(&recovered)));
+        assert_eq!(
+            grasps[RIGHT],
+            Ok(MeasuredGrasp {
+                pose: planners[RIGHT].root_ee_pose(&recovered),
+                timestamp: measured_at(),
+            })
+        );
     }
 
     /// A stop ends every move in flight, whoever started it, and every goal
@@ -1684,8 +1709,8 @@ mod tests {
         let (right, right_measured, right_goals) = claimed_arm_channels();
         let mut channels = PerArm::new([left, right]);
         let mut planners = PerArm::new([planner_holding(LEFT, held), planner_holding(RIGHT, held)]);
-        left_measured.send_replace(standing_at(held));
-        right_measured.send_replace(standing_at(held));
+        left_measured.send_replace(Some(standing_at(held)));
+        right_measured.send_replace(Some(standing_at(held)));
         let (running_tx, mut running) = mpsc::channel::<Outcome>(1);
         left_goals
             .send(Goal::posture_share([0.3; ARM_DOF], running_tx))
@@ -1755,8 +1780,8 @@ mod tests {
         left.gripper = silent;
         let (_right_gripper, silent) = watch::channel(None);
         right.gripper = silent;
-        left_measured.send_replace(standing_at(held));
-        right_measured.send_replace(standing_at(held));
+        left_measured.send_replace(Some(standing_at(held)));
+        right_measured.send_replace(Some(standing_at(held)));
         let channels = PerArm::new([left, right]);
         let mut planners = PerArm::new([planner_holding(LEFT, held), planner_holding(RIGHT, held)]);
         let (requests_tx, mut requests) = mpsc::channel(1);
@@ -1785,11 +1810,14 @@ mod tests {
     fn a_stale_arm_reports_no_measurement_and_a_live_arm_its_latest() {
         let (channels, measured_tx, _goal_tx) = claimed_arm_channels();
         let latest = [0.1, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        measured_tx.send_replace(standing_at(latest));
-        assert_eq!(seeded_measurement(&channels, Admission::Live), Ok(latest));
+        measured_tx.send_replace(Some(standing_at(latest)));
+        assert_eq!(
+            seeded_measurement(&channels, Admission::Live),
+            Ok(standing_at(latest))
+        );
         assert_eq!(
             seeded_measurement(&channels, Admission::Reanchor),
-            Ok(latest)
+            Ok(standing_at(latest))
         );
         assert_eq!(
             seeded_measurement(&channels, Admission::Stale),
@@ -1800,7 +1828,7 @@ mod tests {
 
     /// Each arm measuring [`BOTH_HELD`].
     fn measuring_held() -> PerArm<Measurement, ARMS> {
-        PerArm::from_fn(|arm| Ok(BOTH_HELD[arm]))
+        PerArm::from_fn(|arm| Ok(standing_at(BOTH_HELD[arm])))
     }
 
     const LIVE: PerArm<Admission, ARMS> = PerArm::new([Admission::Live, Admission::Live]);
@@ -1816,7 +1844,7 @@ mod tests {
         let (channels, followers) = PerArm::from_fn(|arm| {
             let (channels, measured_tx, _goals) = claimed_arm_channels();
             channels.move_slot.release();
-            measured_tx.send_replace(standing_at(BOTH_HELD[arm]));
+            measured_tx.send_replace(Some(standing_at(BOTH_HELD[arm])));
             (channels, measured_tx)
         })
         .unzip();
@@ -2156,7 +2184,7 @@ mod tests {
             assert_eq!(first.arm, stale, "the stale arm's share reports first");
             assert_eq!(
                 first.outcome,
-                Outcome::Failed(stale_failure().labelled(LIMBS.arm_name(stale)))
+                Outcome::Failed(stale_failure().labelled(LIMBS.arm_name(stale)).into())
             );
             let second = done_rx.try_recv().expect("both shares end on this tick");
             assert_eq!(second.arm, live);
@@ -2531,7 +2559,7 @@ mod tests {
             judgment.expect("the path waits for its judgment"),
             GuardAt::disabled(GovState::new(BOTH_HELD, PerArm::new([1.0, 1.0]))),
         );
-        let refused = Failure::new(FailureKind::Unreachable, ARMS_WOULD_MEET);
+        let refused = PathFailure::Unreachable(ARMS_WOULD_MEET.to_string());
         assert_eq!(path_checks.first_verdict().await, Err(refused.clone()));
         path_checks.resume_judged_by_test_guard(&mut planners, &measuring_held(), start);
         let report = done_rx.try_recv().expect("the path ends on this tick");
@@ -2587,10 +2615,10 @@ mod tests {
         let report = done_rx.try_recv().expect("the path ends");
         assert_eq!(
             report.outcome,
-            Outcome::Failed(Failure::new(
+            Outcome::Failed(PathFailure::Failed(Failure::new(
                 FailureKind::AttemptFailed,
                 "the check of the path against the robot's body failed"
-            ))
+            )))
         );
         assert!(!channels[LEFT].move_slot.is_claimed(), "the arm is freed");
         assert!(!path_checks.is_judging(), "no path waits for a judgment");
@@ -2620,7 +2648,7 @@ mod tests {
             let _ = channels[arm].measured.borrow_and_update();
         }
         let silent = start + 2 * STALE_LIMIT;
-        followers[LEFT].send_replace(standing_at(measuring[LEFT]));
+        followers[LEFT].send_replace(Some(standing_at(measuring[LEFT])));
         let frozen = admit_arms(
             &mut liveness,
             &mut cadence,
@@ -2632,7 +2660,7 @@ mod tests {
         assert_eq!(frozen, PerArm::new([Admission::Live, Admission::Stale]));
         let _ = channels[LEFT].measured.borrow_and_update();
         for arm in PerArm::<(), ARMS>::ids() {
-            followers[arm].send_replace(standing_at(measuring[arm]));
+            followers[arm].send_replace(Some(standing_at(measuring[arm])));
         }
         let (requests_tx, mut queued) = mpsc::channel(requests.len().max(1));
         for request in requests {
@@ -2672,7 +2700,7 @@ mod tests {
         let (mut channels, followers, mut planners) = followed_arms();
         let mut recovered = BOTH_HELD[RIGHT];
         recovered[0] += 0.2;
-        let pose = planner_holding(RIGHT, recovered).world_ee_pose(&recovered);
+        let pose = planner_holding(RIGHT, recovered).root_ee_pose(&recovered);
         let target = Isometry3::from_parts(
             (pose.translation.vector + Vector3::new(0.0, 0.0, 0.02)).into(),
             pose.rotation,
@@ -2741,7 +2769,7 @@ mod tests {
             .expect("the check lets the path through");
         let mut moved = BOTH_HELD[LEFT];
         moved[0] += 0.005;
-        let measured = PerArm::new([Ok(moved), Ok(BOTH_HELD[RIGHT])]);
+        let measured = PerArm::new([Ok(standing_at(moved)), Ok(standing_at(BOTH_HELD[RIGHT]))]);
         let mut right = BOTH_HELD[RIGHT];
         right[0] += 0.2;
         planners[RIGHT].seed_from_measured(right);
@@ -2869,7 +2897,7 @@ mod tests {
             .expect("the check lets the path through");
         assert_eq!(probes.try_recv(), Ok(Probed::Opened));
 
-        let measured = start.map(|_, q| Ok(q));
+        let measured = start.map(|_, q| Ok(standing_at(q)));
         path_checks.resume_judged_by_test_guard(&mut planners, &measured, now);
         assert_eq!(
             PerArm::from_fn(|arm| planners[arm].setpoint()),
