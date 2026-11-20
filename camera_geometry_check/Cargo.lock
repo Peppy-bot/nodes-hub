@@ -356,8 +356,10 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "camera_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#3ca079be1f74ed1ea8679cb2d6fc0c46945c4e55"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
 dependencies = [
+ "control_core",
+ "frame_tree",
  "libc",
 ]
 
@@ -366,6 +368,7 @@ name = "camera_geometry_check"
 version = "0.1.0"
 dependencies = [
  "camera_core",
+ "control_core",
  "peppygen",
  "peppylib",
  "tokio",
@@ -542,6 +545,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-xid",
+]
+
+[[package]]
+name = "control_core"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
+dependencies = [
+ "frame_tree",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1044,6 +1058,14 @@ checksum = "e246562084dde8ebbcc943b261c406ce4f68e5032ec28029a251a47d6a295500"
 dependencies = [
  "num",
  "num-bigint",
+]
+
+[[package]]
+name = "frame_tree"
+version = "0.1.0"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
+dependencies = [
+ "thiserror 2.0.21",
 ]
 
 [[package]]
