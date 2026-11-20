@@ -14,17 +14,25 @@ each message into it.
 
 | Parameter | Meaning |
 |---|---|
-| `cache_window_s` | How long the node keeps each moving transform's stamps, counted back from the newest stamp of its child frame: finite and above 0, at least 1 ns. A lookup at a time older than that finds no value. Any other value stops the node at its start, naming the parameter. |
+| `cache_window_s` | How long the node keeps each moving transform's stamps, counted back from the newest stamp of its child frame: finite and above 0, at least 1 ns. A lookup at a time older than that finds no value. Any other value stops the node at its start, naming the parameter. Its default is the `buffer_size` of tf2_ros's buffer server. |
 
 The launcher binds the node to the simulation clock when the robot's tree is
 stamped on it, and leaves it on the wall clock otherwise.
 
 ## A lookup
 
-`lookup_transform` gives where the source frame stands in the target frame, at
-the request's `time` or, with none, at the latest time the chain between them
-holds a value at, and the time the answer holds at. An answer from static
-transforms alone holds at every time and gives no time. A request whose lookup
+`lookup_transform` gives where the source frame stood at `source_timestamp` in
+the target frame as it stands at `target_timestamp`, each absent for the latest
+time the chain between them holds a value at. Where the two times are equal, the
+answer is the lookup at that time. Where they differ, it goes through the root
+of the source frame's chain at `source_timestamp` (odom or map on a mobile base):
+the source frame in that root then, and the root in the target frame at
+`target_timestamp`, as tf2's advanced `lookupTransform` does, so a pose in the
+robot frame stamped before a base move, looked up with no `target_timestamp`,
+names the same place on the floor after it. The answer is a transform record:
+the target frame in `frame`, the source frame in `child_frame`, the place, and
+in `timestamp` the time of the target frame's place, absent for an answer from
+static transforms alone, which holds at every time. A request whose lookup
 fails waits up to its `timeout_s` on the node's clock, the simulation clock in a
 simulation, counted from when the node takes the request, and the node looks again
 at each message the tree takes and a last time when the wait runs out; a `timeout_s`
@@ -35,8 +43,9 @@ that stops answers the request that waits at once, with the lookup as the tree
 stands.
 
 A request is checked first, in this order: an empty `target_frame` or
-`source_frame`, a `time` before the Unix epoch, or a `timeout_s` that is not a
-number from 0 to 1 is `rejected`, naming the value and what to send. A lookup that
+`source_frame`, a `source_timestamp` or a `target_timestamp` before the Unix
+epoch, or a `timeout_s` that is not a number from 0 to 1 is `rejected`, naming
+the value and what to send. A lookup that
 fails gives the failure kind of its first failure, in the order the `transforms`
 contract gives them, and a message naming the cause:
 
@@ -71,13 +80,15 @@ cargo test
 - `src/clock.rs`: the end of a simulation clock's ticks, which raises the node's fault
   and stops it.
 - `src/lookup.rs`: the checks of a request, the failure kind of each failure of a
-  lookup, the time of an answer, and on a simulation clock ticked by hand, a wait that
-  fails once the clock passes its deadline and one a node that stops ends at once.
+  lookup, the record and the time of an answer, and on a simulation clock ticked by
+  hand, a wait that fails once the clock passes its deadline and one a node that stops
+  ends at once.
 - `tests/lookup.rs`: lookups over the wire, on a simulation clock, from a tree of two
   publishers, the initializer and the backbone: at a time between two stamps, at the
   latest time, over static transforms alone and the other way round; each failure kind
   and a request refused with `rejected`, a wait above 1 s among them; a transform from
-  both publishers; and a lookup sent with the message that lets it succeed.
+  both publishers; a lookup sent with the message that lets it succeed; and a frame
+  at one time placed through the root of its chain in a frame at another.
 
 The other waits of a lookup, and the clock going back, are tested in
 `control_core::robot_tree`.

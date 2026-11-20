@@ -2,17 +2,20 @@
 //! arrive, each checked as the contract orders it, `rejected` for a value the member does
 //! not take, then the lookup in the robot's tree, which waits up to the request's timeout_s
 //! on the node's clock, counted from when the server takes the request, for the tree to
-//! answer. A failed lookup gives the failure kind of its first failure, its message naming
-//! the cause.
+//! answer. A lookup places the source frame at source_timestamp in the target frame at
+//! target_timestamp, through the root of the source frame's chain when the two times differ,
+//! as tf2's advanced lookupTransform does. A failed lookup gives the failure kind of its
+//! first failure, its message naming the cause.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::geometry::{lookup_time, report_timestamp};
 use control_core::robot_tree::RobotTree;
 use control_core::serving;
 use control_core::sync::wait_for;
 use control_core::time::wait_from_secs;
-use frame_tree::{Found, FrameName, FrameNameError, LookupError, LookupTime, Stamp};
+use frame_tree::{Found, FrameName, FrameNameError, LookupError, LookupTime};
 use peppygen::NodeRunner;
 use peppygen::exposed_services::transform_lookup::lookup_transform::{
     self, Failure, FailureKind, RequestData, Response,
@@ -26,15 +29,19 @@ const MAX_TIMEOUT_S: f64 = 1.0;
 #[derive(Debug, Clone, PartialEq)]
 struct Lookup {
     target: FrameName,
+    /// The time of the target frame's place.
+    target_time: LookupTime,
     source: FrameName,
-    time: LookupTime,
+    /// The time of the source frame's place.
+    source_time: LookupTime,
     /// How long the lookup waits for the tree to answer it, on the node's clock.
     timeout: Duration,
 }
 
 impl Lookup {
     /// The lookup `request` asks for, or `rejected` naming the first value of it the
-    /// member does not take, in the order target_frame, source_frame, time, timeout_s.
+    /// member does not take, in the order target_frame, source_frame, source_timestamp,
+    /// target_timestamp, timeout_s. An absent timestamp is the latest time.
     fn parse(request: &RequestData) -> Result<Self, Failure> {
         let frame = |field: &str, name: &str| {
             FrameName::parse(name).map_err(|FrameNameError| {
@@ -45,12 +52,11 @@ impl Lookup {
         };
         let target = frame("target_frame", &request.target_frame)?;
         let source = frame("source_frame", &request.source_frame)?;
-        let time = match request.time {
-            None => LookupTime::Latest,
-            Some(time) => {
-                LookupTime::At(Stamp::from_time(time).map_err(|e| rejected(format!("time: {e}")))?)
-            }
+        let time = |field: &str, timestamp| {
+            lookup_time(timestamp).map_err(|e| rejected(format!("{field}: {e}")))
         };
+        let source_time = time("source_timestamp", request.source_timestamp)?;
+        let target_time = time("target_timestamp", request.target_timestamp)?;
         if !(0.0..=MAX_TIMEOUT_S).contains(&request.timeout_s) {
             return Err(rejected(format!(
                 "timeout_s is {} s: send a timeout_s from 0 to {MAX_TIMEOUT_S}",
@@ -61,8 +67,9 @@ impl Lookup {
             .expect("a timeout_s from 0 to 1 is a wait wait_from_secs takes");
         Ok(Self {
             target,
+            target_time,
             source,
-            time,
+            source_time,
             timeout,
         })
     }
@@ -74,22 +81,21 @@ fn rejected(message: String) -> Failure {
 
 /// The failure of a lookup, of the kind of the contract that names it.
 fn failure_of(error: &LookupError) -> Failure {
-    let kind = match error {
-        LookupError::UnknownFrame { .. } => FailureKind::UnknownFrame,
-        LookupError::NoChain { .. } => FailureKind::NoChain,
-        LookupError::Extrapolation { .. } => FailureKind::Extrapolation,
-        LookupError::BrokenTree(_) => FailureKind::BrokenTree,
-    };
+    let kind = FailureKind::parse(error.failure_kind())
+        .expect("lookup_transform names each failure kind of a lookup");
     Failure::new(kind, error.to_string())
 }
 
-/// The answer of a lookup: the place of the source frame in the target frame, and the
-/// time it holds at, none for an answer that holds at every time.
-fn response_of(found: Found) -> Response {
+/// The answer of `lookup`, a transform record: the place of its source frame
+/// (child_frame) in its target frame (frame), stamped with the time of the target frame's
+/// place, with no timestamp for an answer that holds at every time.
+fn response_of(lookup: &Lookup, found: Found) -> Response {
     Response::new(
+        lookup.target.to_string(),
+        lookup.source.to_string(),
+        report_timestamp(found.time),
         found.placement.position(),
         found.placement.orientation(),
-        found.time.map(Stamp::time),
     )
 }
 
@@ -103,16 +109,17 @@ async fn look_up(
 ) -> Result<Found, LookupError> {
     let Lookup {
         target,
+        target_time,
         source,
-        time,
+        source_time,
         timeout,
     } = lookup;
+    let within =
+        |timeout| tree.lookup_within_through(target, *target_time, source, *source_time, timeout);
     tokio::select! {
         biased;
-        () = stopping.cancelled() => {
-            tree.lookup_within(target, source, *time, Duration::ZERO).await
-        }
-        found = tree.lookup_within(target, source, *time, *timeout) => found,
+        () = stopping.cancelled() => within(Duration::ZERO).await,
+        found = within(*timeout) => found,
     }
 }
 
@@ -126,7 +133,7 @@ pub(crate) fn serve(runner: Arc<NodeRunner>, tree: Arc<RobotTree>) {
             lookup_transform::handle_requests(&runner, |request| {
                 let lookup = Lookup::parse(&request.data)?;
                 wait_for(look_up(&tree, &lookup, &token))
-                    .map(response_of)
+                    .map(|found| response_of(&lookup, found))
                     .map_err(|e| failure_of(&e))
             })
         })
@@ -142,7 +149,8 @@ mod tests {
 
     use control_core::node_clock::{NodeClock, TickFeed};
     use frame_tree::{
-        BrokenTree, HeldStamps, MovingMessage, Placement, Publisher, StaticMessage, TransformName,
+        BrokenTree, HeldStamps, MovingMessage, Placement, Publisher, Stamp, StaticMessage,
+        TransformName, TransformRecord,
     };
 
     const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -154,12 +162,25 @@ mod tests {
     /// on, and never for one that ends.
     const TO_END: Duration = Duration::from_secs(1);
 
+    const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+
     fn request() -> RequestData {
         RequestData {
             target_frame: "base_link".into(),
             source_frame: "camera".into(),
-            time: None,
+            source_timestamp: None,
+            target_timestamp: None,
             timeout_s: 0.5,
+        }
+    }
+
+    /// The record of `child` placed in `frame` at `position`, unturned.
+    fn record(frame: &str, child: &str, position: [f64; 3]) -> TransformRecord {
+        TransformRecord {
+            frame: frame.into(),
+            child_frame: child.into(),
+            position,
+            orientation: IDENTITY,
         }
     }
 
@@ -195,10 +216,7 @@ mod tests {
         tree.take_static(
             &publisher("init_inst"),
             &StaticMessage {
-                child_frames: vec!["camera".into()],
-                parent_frames: vec!["arm".into()],
-                positions: vec![0.0, 0.0, 1.0],
-                orientations: vec![0.0, 0.0, 0.0, 1.0],
+                transforms: vec![record("arm", "camera", [0.0, 0.0, 1.0])],
             },
         )
         .expect("taken");
@@ -206,10 +224,7 @@ mod tests {
             &publisher("backbone"),
             &MovingMessage {
                 timestamp: UNIX_EPOCH + Duration::from_secs(20),
-                child_frames: vec!["arm".into()],
-                parent_frames: vec!["base_link".into()],
-                positions: vec![1.0, 0.0, 0.0],
-                orientations: vec![0.0, 0.0, 0.0, 1.0],
+                transforms: vec![record("base_link", "arm", [1.0, 0.0, 0.0])],
                 start_timestamp: UNIX_EPOCH + Duration::from_secs(1),
             },
         )
@@ -226,8 +241,9 @@ mod tests {
     ) -> tokio::task::JoinHandle<Result<Found, LookupError>> {
         let lookup = Lookup {
             target: frame("base_link"),
+            target_time: LookupTime::At(stamp(seconds)),
             source: frame("camera"),
-            time: LookupTime::At(stamp(seconds)),
+            source_time: LookupTime::At(stamp(seconds)),
             timeout: LONGEST_WAIT,
         };
         let tree = tree.clone();
@@ -249,23 +265,26 @@ mod tests {
     }
 
     #[test]
-    fn a_request_parses_into_its_frames_its_time_and_its_wait() {
+    fn a_request_parses_into_its_frames_its_times_and_its_wait() {
         assert_eq!(
             Lookup::parse(&request()),
             Ok(Lookup {
                 target: frame("base_link"),
+                target_time: LookupTime::Latest,
                 source: frame("camera"),
-                time: LookupTime::Latest,
+                source_time: LookupTime::Latest,
                 timeout: Duration::from_millis(500),
             })
         );
         let timed = Lookup::parse(&RequestData {
-            time: Some(UNIX_EPOCH + Duration::from_secs(20)),
+            source_timestamp: Some(UNIX_EPOCH + Duration::from_secs(20)),
+            target_timestamp: Some(UNIX_EPOCH + Duration::from_secs(21)),
             timeout_s: 0.0,
             ..request()
         })
-        .expect("a lookup at a time");
-        assert_eq!(timed.time, LookupTime::At(stamp(20)));
+        .expect("a lookup at two times");
+        assert_eq!(timed.source_time, LookupTime::At(stamp(20)));
+        assert_eq!(timed.target_time, LookupTime::At(stamp(21)));
         assert_eq!(timed.timeout, Duration::ZERO);
         let longest = Lookup::parse(&RequestData {
             timeout_s: 1.0,
@@ -295,14 +314,28 @@ mod tests {
             source.message,
             "source_frame is empty: send the name of a link of the robot's URDF"
         );
-        let before_the_epoch = refusal(RequestData {
-            time: Some(UNIX_EPOCH - Duration::from_secs(1)),
+        let source_before_the_epoch = refusal(RequestData {
+            source_timestamp: Some(UNIX_EPOCH - Duration::from_secs(1)),
+            target_timestamp: Some(UNIX_EPOCH - Duration::from_secs(1)),
             ..request()
         });
         assert!(
-            before_the_epoch.message.starts_with("time: "),
+            source_before_the_epoch
+                .message
+                .starts_with("source_timestamp: "),
             "{}",
-            before_the_epoch.message
+            source_before_the_epoch.message
+        );
+        let target_before_the_epoch = refusal(RequestData {
+            target_timestamp: Some(UNIX_EPOCH - Duration::from_secs(1)),
+            ..request()
+        });
+        assert!(
+            target_before_the_epoch
+                .message
+                .starts_with("target_timestamp: "),
+            "{}",
+            target_before_the_epoch.message
         );
         // 1.0000000004 s rounds to the 1 s a Duration holds, and it lies above 1 all the same.
         for timeout_s in [
@@ -394,16 +427,21 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_holds_at_its_time_or_at_every_time() {
+    fn an_answer_is_a_transform_record_stamped_at_its_time_or_unstamped_for_every_time() {
+        let lookup = Lookup::parse(&request()).expect("a lookup at the latest time");
         let found = |time| Found {
             placement: Placement::IDENTITY,
             time,
         };
-        let timed = response_of(found(Some(stamp(20))));
+        let timed = response_of(&lookup, found(Some(stamp(20))));
+        assert_eq!(
+            (timed.frame.as_str(), timed.child_frame.as_str()),
+            ("base_link", "camera")
+        );
         assert_eq!(timed.position, [0.0; 3]);
-        assert_eq!(timed.orientation, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(timed.orientation, IDENTITY);
         assert_eq!(timed.timestamp, Some(UNIX_EPOCH + Duration::from_secs(20)));
-        assert_eq!(response_of(found(None)).timestamp, None);
+        assert_eq!(response_of(&lookup, found(None)).timestamp, None);
     }
 
     #[tokio::test(start_paused = true)]
