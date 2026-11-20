@@ -256,9 +256,10 @@ class _Run:
         if frame is None:
             raise AlignmentFailed(f"no frame from wrist camera '{camera}' after the move")
         chest_frame = senses.chest.frames.latest().color
-        # Each camera where it stood when its picture was taken.
-        wrist_pose = await senses.camera_pose(camera, float(frame.header.timestamp))
-        chest_pose = await senses.chest.pose_at(float(chest_frame.header.timestamp))
+        # Each camera where the frame its picture names stood when the
+        # picture was taken.
+        wrist_pose = await senses.camera_pose(frame.header)
+        chest_pose = await senses.camera_pose(chest_frame.header)
         measured = self._measured()
         wrist_x, wrist_y = axes_in_picture(wrist_pose.orientation)
         chest_x, chest_y = axes_in_picture(chest_pose.orientation)

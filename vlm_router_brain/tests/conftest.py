@@ -107,15 +107,23 @@ def records_of(caplog, name: str, level: int = logging.INFO) -> Iterator[pytest.
 # brain_core's own tests build them.
 
 @dataclass
+class GraspPoint:
+    """A grasp-point pose of a limb_states message."""
+
+    position: list[float]
+    orientation: list[float]
+
+
+@dataclass
 class LimbStatesMessage:
     """A limb_states message, as the generated module gives it."""
 
     timestamp: float
+    frame: str = "base_link"
     arm_names: list[str] = field(default_factory=list)
     joints_per_arm: list[int] = field(default_factory=list)
     joint_positions: list[float] = field(default_factory=list)
-    positions: list[float] = field(default_factory=list)
-    orientations: list[float] = field(default_factory=list)
+    grasp_points: list[GraspPoint] = field(default_factory=list)
     gripper_names: list[str] = field(default_factory=list)
     gripper_openings: list[float] = field(default_factory=list)
 
@@ -136,19 +144,21 @@ def limb_states_message(timestamp: float, *, left_arm=LEFT_AT_REST, **openings: 
         arm_names=["left_arm", "right_arm"],
         joints_per_arm=[7, 7],
         joint_positions=[0.0] * 14,
-        positions=[*left_position, *right_position],
-        orientations=[*left_orientation, *right_orientation],
+        grasp_points=[GraspPoint(list(left_position), list(left_orientation)), GraspPoint(list(right_position), list(right_orientation))],
         gripper_names=list(openings),
         gripper_openings=list(openings.values()),
     )
 
 
-def rgb_frame(width: int = 16, height: int = 12, *, frame_id: int = 1, align_mode: str = "depth_to_color"):
-    """A video_stream message of the given size, plain grey."""
+def rgb_frame(
+    width: int = 16, height: int = 12, *, capture_index: int = 1, align_mode: str = "depth_to_color", frame: str = "chest_color_optical_frame"
+):
+    """A video_stream message of the given size, plain grey, that names
+    `frame`."""
     return SimpleNamespace(
-        header=SimpleNamespace(timestamp=1.0, frame_id=frame_id, align_mode=align_mode),
+        header=SimpleNamespace(timestamp=1.0, frame=frame, capture_index=capture_index, align_mode=align_mode),
         encoding="rgb8",
         width=width,
         height=height,
-        frame=bytes([128]) * (width * height * 3),
+        data=bytes([128]) * (width * height * 3),
     )

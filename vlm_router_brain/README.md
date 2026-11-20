@@ -77,8 +77,8 @@ knows of it: an unknown id, the held item itself and an item the other
 gripper holds are refused before any move. A place into a target carries the
 held item to 12.5 cm above the target's top (7.5 cm where the backbone has no
 plan that high), lowers it until it rests on the target's floor or on what
-the target holds, opens there and climbs back; `position` and `orientation`
-are not read. A drop above a target carries the same way and opens at that
+the target holds, opens there and climbs back; the goal's `target` is not
+read. A drop above a target carries the same way and opens at that
 height with no descent. Every move goes through the
 backbone that the `limb_motion` slot binds, and the `limb_state` slot gives
 the measured openings and grasp points, so the launcher binds both to the
@@ -90,6 +90,19 @@ of a place, names a contact gap of 2 cm and runs at 5 cm/s: when the fingers
 or the held item meet something on the way down, the backbone ends the move on
 contact and the arm holds where it stands. Every other move names no contact
 check and runs as fast as the joint limits allow.
+
+A `grab_item` that names no item and a `place_item` that names no target item
+take the goal's `target`, which names its frame, or none for the robot frame,
+and its timestamp: the brain places it in the robot frame by the robot's tree
+through `transform_lookup` when it accepts the goal, and refuses the goal with
+the lookup's failure kind (`unknown_frame`, `no_chain`, `extrapolation`,
+`broken_tree`) for a target the tree cannot place, and with `rejected` for one
+no contract takes. A goal that comes before the robot names its robot frame,
+or whose lookup gets no answer, is accepted with its target unplaced, and its
+result fails naming why, such as "the robot's sensors have not been described
+yet". Each move it sends leaves its frame out, for the robot frame, and its
+timestamp, for the latest time, and a `place_item` reports where the jaws
+opened in the robot frame at the time the backbone measured it.
 
 Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
@@ -144,7 +157,8 @@ plan for the new pre-grasp, grasp and lifted points before the move is sent. A
 step over a limit, or one with no plan, or an answer the loop cannot read,
 moves nothing, counts, and the model reads why in its next step. The schema of
 the answer is one flat JSON object with `"strict": false`, the shape every
-route accepts. A model that gives up, runs out of steps or has a move stopped
+route accepts. The clock hours come from where the robot's tree places the
+frame each picture names when the picture was taken. A model that gives up, runs out of steps or has a move stopped
 ends the grab before the descent, so nothing retreats. Each step leaves two
 log lines: the call's route, tokens and latency, and the answer with what came
 of it. The wrist cameras come through the `wrist_cameras` slot, and the
@@ -335,8 +349,8 @@ sequenceDiagram
 | `limbs` | required | Each arm with its gripper, `"left_arm:left_gripper,right_arm:right_gripper"` |
 | `perception_model` | `gemini-robotics-er-2-preview` | A catalog model that serves perception, or `none` |
 | `manipulation_model` | `scripted` | `scripted`, `none`, or a catalog model that serves manipulation, which aligns the scripted grab |
-| `camera_name` | required | The camera the brain looks through, as the robot's `sensor_mounts` names it |
-| `lookup_timeout_s` | required | How long a lookup of a camera's place waits for the robot's transforms of a picture's time (s), from 0 to 1, the longest wait `transform_lookup` takes |
+| `camera_name` | required | The name the camera the brain looks through runs under, which each search's result names |
+| `lookup_timeout_s` | required | How long a lookup in the robot's tree waits for the robot's transforms of its time (s), from 0 to 1, the longest wait `transform_lookup` takes |
 | `wrist_cameras` | `left_arm:wrist_left,right_arm:wrist_right` | Each arm with the instance id of the wrist camera it carries; an arm not named has no wrist camera |
 
 ## Tests
