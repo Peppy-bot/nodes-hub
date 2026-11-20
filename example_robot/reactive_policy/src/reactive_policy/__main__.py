@@ -9,8 +9,15 @@ local behavior.
 A mock in the shape of a small onboard model. It runs no inference; it reports
 which subgoal it is currently servoing on, which is what a reader (or a test)
 needs in order to tell whether the cross-machine pairing is actually
-delivering. The one behavior here that is not scaffolding is the staleness
-watchdog below.
+delivering. The behaviors here that are not scaffolding are the staleness
+watchdog and the frame check below.
+
+The policy holds no tree of the robot's frames. It adopts a subgoal whose
+target gives no frame, which lies in the robot frame, or names the frame of
+its camera's latest picture, the frame deliberative_planner plans in, since
+both read the same camera. It drops a subgoal whose target lies in any other
+frame, as deliberation drops a subgoal the executor cannot place, and logs
+unknown_frame for the first drop of the run.
 """
 
 import asyncio
@@ -38,6 +45,16 @@ HOME_POSITION = [0.0, 0.0, 0.0]
 # planner numbers its subgoals from 1, so 0 can never collide with a real one.
 NO_SUBGOAL = 0
 
+# How the log names the frame of a target that gives none: the deliberation
+# pairing places such a target in the executor's robot frame.
+ROBOT_FRAME = "the robot frame"
+
+
+def frame_of(target: subgoal.MessageTarget) -> str:
+    """The frame `target` lies in, as the log names it: its own frame, or the
+    robot frame when it gives none."""
+    return ROBOT_FRAME if target.frame is None else target.frame
+
 
 class Situation:
     """Everything the control loop knows, shared across this node's tasks.
@@ -51,11 +68,39 @@ class Situation:
         self._subgoal_ttl_s = subgoal_ttl_ms / 1000.0
         self.joint_positions = list(HOME_POSITION)
         self.frames_seen = 0
+        # The frame the camera's latest picture names, None before the first.
+        self.camera_frame: str | None = None
         self._subgoal_id = NO_SUBGOAL
         self._target = None
         self._adopted_at = None
+        self._unknown_frame_logged = False
 
-    def adopt(self, subgoal_id: int, target: list[float]) -> None:
+    def offer(self, subgoal_id: int, target: subgoal.MessageTarget) -> bool:
+        """Adopts the subgoal when the policy can place its target, and says
+        whether it did: a target with no frame lies in the robot frame, and
+        one in `camera_frame` where the camera's picture shows it. A subgoal
+        whose target lies in another frame is dropped, the subgoal in force
+        stays, and the first drop of the run logs unknown_frame."""
+        if target.frame is None or target.frame == self.camera_frame:
+            self._adopt(subgoal_id, target)
+            return True
+        if not self._unknown_frame_logged:
+            self._unknown_frame_logged = True
+            camera = (
+                "which no picture has named yet"
+                if self.camera_frame is None
+                else f"'{self.camera_frame}'"
+            )
+            print(
+                f"[reactive_policy] dropped subgoal {subgoal_id}: unknown_frame: "
+                f"its target lies in '{target.frame}', which this policy cannot "
+                f"place; give a target no frame, for the robot frame, or the frame "
+                f"of the camera's pictures, {camera}. Later drops are not logged.",
+                flush=True,
+            )
+        return False
+
+    def _adopt(self, subgoal_id: int, target: subgoal.MessageTarget) -> None:
         """Takes a subgoal as authoritative, starting its lifetime now.
 
         The lifetime is timed from this moment on this node's own monotonic
@@ -64,10 +109,10 @@ class Situation:
         exactly when it matters most.
         """
         self._subgoal_id = subgoal_id
-        self._target = list(target)
+        self._target = target
         self._adopted_at = time.monotonic()
 
-    def authoritative_subgoal(self) -> tuple[int, list[float]] | None:
+    def authoritative_subgoal(self) -> tuple[int, subgoal.MessageTarget] | None:
         """The `(subgoal_id, target)` in force right now, or None if stale.
 
         This is the whole staleness watchdog. Peppy guarantees a dissolution
@@ -100,6 +145,7 @@ async def track_camera(node_runner: NodeRunner, state: Situation) -> None:
             break
         _producer, message = received
         state.frames_seen += 1
+        state.camera_frame = message.header.frame
         if state.frames_seen == 1:
             print(
                 f"[reactive_policy] first frame from the local camera: "
@@ -128,10 +174,12 @@ async def adopt_subgoals(node_runner: NodeRunner, state: Situation) -> None:
         if received is None:
             break
         _peer, message = received
-        state.adopt(message.subgoal_id, message.target_position)
+        target = message.target
+        if not state.offer(message.subgoal_id, target):
+            continue
         print(
             f"[reactive_policy] adopted subgoal {message.subgoal_id} "
-            f"target={[round(p, 3) for p in message.target_position]} "
+            f"target={[round(p, 3) for p in target.position]} in {frame_of(target)} "
             f"horizon={message.horizon_s}s",
             flush=True,
         )
@@ -201,7 +249,7 @@ async def control_loop(
 
         # Where a real policy would drive the arm toward the target. A mock only
         # has to be honest about which of the two it is servoing on.
-        _ = authoritative[1] if authoritative else HOME_POSITION
+        _ = authoritative[1].position if authoritative else HOME_POSITION
         await asyncio.sleep(interval)
 
 
