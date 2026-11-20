@@ -62,7 +62,6 @@ pub async fn setup(
             depth_image: config.depth_image,
             cloud_interval: config.cloud_interval,
             cloud_stride: config.cloud_stride,
-            camera_name: config.camera_name.clone(),
             lookup_timeout: config.lookup_timeout,
         };
         let tree = if transforms::bound_producers(&runner).is_empty() {
@@ -76,12 +75,22 @@ pub async fn setup(
             follow_tree(&runner, tree.clone()).await?;
             Some(tree)
         };
-        tokio::spawn(follow_depth(runner.clone(), canvas.clone(), settings, tree));
+        tokio::spawn(follow_depth(
+            runner.clone(),
+            canvas.clone(),
+            settings,
+            tree,
+            shared.clone(),
+        ));
     } else {
         info!("the camera link is vacant: no images and no points drawn");
     }
     if get_planning_scene::bound_producer(&runner).is_some() {
-        tokio::spawn(follow_planner_map(runner.clone(), canvas.clone()));
+        tokio::spawn(follow_planner_map(
+            runner.clone(),
+            canvas.clone(),
+            shared.clone(),
+        ));
         tokio::spawn(follow_scene(
             runner,
             canvas,

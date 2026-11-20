@@ -4,9 +4,11 @@
 mod common;
 
 use common::{
-    TIMEOUT, bound, drew_at, every_optional_link_vacant, publish_once_subscribed, right_arm, start,
-    two_arms,
+    GRASP_PATH, ODOM_FRAME, ROBOT_FRAME, TIMEOUT, bound, drew_at, every_optional_link_vacant,
+    hold_the_robot_frame, logged, publish_arms_until_drawn, publish_once_subscribed, right_arm,
+    start, two_arms,
 };
+use peppygen::consumed_topics::limb_state::limb_states;
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::CUBES_NOTE_PATH;
 use rerun_viewer::drawn::Drawn;
@@ -107,6 +109,65 @@ async fn the_joints_take_the_planners_names() -> Result<(), String> {
                         if path == "plots/joints/right_arm" && names == &["openarm_right_joint1"]
                 )
             })
+        })
+        .await?;
+    harness.shutdown().await.map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_in_another_frame_than_the_robot_frame_is_dropped_and_logged()
+-> Result<(), String> {
+    let (harness, mocks, canvas) = start(bound(&["sensor_mounts"], default_parameters())).await?;
+    hold_the_robot_frame(&mocks, &canvas).await?;
+    let mut elsewhere = two_arms();
+    elsewhere.frame = ODOM_FRAME.to_string();
+    elsewhere.grasp_points[1].position = [9.0, 9.0, 9.0];
+    // The publishes share one mock publisher, so their order holds: a snapshot drawn after
+    // it proves the drop before it.
+    mocks
+        .deps
+        .limb_state
+        .limb_states
+        .publish(&elsewhere)
+        .await
+        .map_err(|e| e.to_string())?;
+    publish_arms_until_drawn(&mocks, &canvas, &two_arms()).await?;
+    logged(&["limb_states names the frame", ODOM_FRAME, ROBOT_FRAME]).await?;
+    let Some(Drawn::Frame { pose, .. }) = canvas.at(GRASP_PATH).last().cloned() else {
+        panic!("the grasp point is a frame")
+    };
+    assert_eq!(pose.origin(), [0.3, -0.2, 0.4]);
+    let Some(Drawn::LineStrip { points, .. }) =
+        canvas.at("world/arms/right_arm/trail").last().cloned()
+    else {
+        panic!("the trail is a line strip")
+    };
+    assert!(
+        points.iter().all(|point| point == &[0.3, -0.2, 0.4]),
+        "the dropped snapshot adds no point to the trail: {points:?}"
+    );
+    harness.shutdown().await.map_err(|e| e.to_string())
+}
+
+// With the sensor_mounts link vacant the viewer reads no robot frame: a snapshot is drawn in
+// the frame it names, which limb_state's contract gives as the robot frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_the_sensor_mounts_link_vacant_a_snapshot_is_drawn_in_the_frame_it_names()
+-> Result<(), String> {
+    let (harness, mocks, canvas) = start(every_optional_link_vacant()).await?;
+    let limb_states = &mocks.deps.limb_state.limb_states;
+    let in_odom = limb_states::Message {
+        frame: ODOM_FRAME.to_string(),
+        ..two_arms()
+    };
+    publish_once_subscribed(
+        limb_states.wait_for_subscriber(TIMEOUT),
+        limb_states.publish(&in_odom),
+    )
+    .await?;
+    canvas
+        .wait_until(TIMEOUT, "the grasp point", |drawn| {
+            drew_at(drawn, GRASP_PATH)
         })
         .await?;
     harness.shutdown().await.map_err(|e| e.to_string())

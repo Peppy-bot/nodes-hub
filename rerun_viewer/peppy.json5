@@ -24,11 +24,13 @@
         // viewer draws no links.
         { name: "robot_identity", tag: "v1", link_id: "identity", cardinality: "zero_or_one" },
         // The camera to draw: its frames (camera), its geometry (geometry),
-        // the robot frame and the camera's frame (sensor_mounts), and the
-        // robot's tree of frames, which places the camera at the time of
-        // each depth frame (transforms), bound to every publisher of the
-        // tree. Without camera and geometry, the viewer draws no images and
-        // no points; without sensor_mounts or transforms, no points.
+        // the robot frame (sensor_mounts), and the robot's tree of frames,
+        // which places the frame each depth frame names at that frame's
+        // time (transforms), bound to every publisher of the tree. Without
+        // camera and geometry, the viewer draws no images and no points;
+        // without sensor_mounts or transforms, no points. With sensor_mounts,
+        // the viewer draws the arms, the scene and the voxel map only when
+        // each names the robot frame.
         { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
         { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
         { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
@@ -116,17 +118,14 @@
       // How many past grasp-point positions each arm's trail holds: 1 or
       // more.
       trail_length: { $type: "u32", $default: 100 },
-      // The camera of sensor_mounts that the camera link is, by the name the
-      // robot runs it under.
-      camera_name: { $type: "string", $default: "chest" },
       // How long (s) the viewer keeps each moving transform's past stamps,
       // counted back from its newest: finite and above 0. A depth frame
       // older than that is placed by no lookup.
       cache_window_s: "f64",
       // How long (s) a depth frame waits, on the node's clock, for the tree
-      // to place the camera at its time: finite and 0 or above, 0 for no
-      // wait. A newer depth frame takes the place of one that waits, and
-      // one whose wait runs out draws no points.
+      // to place the frame it names at its time: finite and 0 or above, 0
+      // for no wait. A newer depth frame takes the place of one that waits,
+      // and one whose wait runs out draws no points.
       lookup_timeout_s: "f64",
     },
   },

@@ -1,69 +1,62 @@
 //! The camera over the wire: the color and depth frames become images, and the depth
 //! frames points in the robot frame, through the geometry the camera's services give and
-//! the camera's frame on the robot, which the robot's tree places at each frame's time.
+//! the frame each depth frame names, which the robot's tree places at that frame's time.
 
 mod common;
 
 use std::time::{Duration, SystemTime};
 
-use common::{IDENTITY, TIMEOUT, bound, drew_at, publish_once_subscribed, start};
+use common::{
+    CAMERA_FRAME, IDENTITY, ROBOT_FRAME, TIMEOUT, bound, drew_at, hold_the_robot_frame, logged,
+    publish_once_subscribed, sensor_mounts, start,
+};
+use peppygen::consumed_services::geometry::get_depth_to_color_extrinsics::ResponseDataDepthToColor as DepthToColor;
 use peppygen::consumed_topics::camera::depth_stream::{
     Message as DepthFrame, MessageHeader as DepthHeader,
 };
 use peppygen::consumed_topics::camera::video_stream::{
     Message as ColorFrame, MessageHeader as ColorHeader,
 };
-use peppygen::consumed_topics::transforms::static_transforms::Message as StaticTransforms;
-use peppygen::consumed_topics::transforms::transforms::Message as Transforms;
+use peppygen::consumed_topics::transforms::static_transforms::{
+    Message as StaticTransforms, MessageTransformsItem as StaticTransform,
+};
+use peppygen::consumed_topics::transforms::transforms::{
+    Message as Transforms, MessageTransformsItem as MovingTransform,
+};
 use peppygen::fixtures::harness::Mocks;
 use peppygen::mock::deps::camera::depth_stream_info;
 use peppygen::mock::deps::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
-use peppygen::mock::deps::sensor_mounts::describe_sensors;
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::camera::{COLOR_PATH, DEPTH_PATH, POINTS_PATH};
 use rerun_viewer::drawn::Drawn;
 use rerun_viewer::model::camera::ColorImage;
+use rerun_viewer::testing::FakeCanvas;
 
 const ALIGN: &str = "depth_to_color";
 
-/// The links the points need: the camera, its geometry, its frame on the robot and the
-/// robot's tree.
+/// The links the points need: the camera, its geometry, the robot frame and the robot's
+/// tree.
 const CLOUD_LINKS: [&str; 4] = ["camera", "geometry", "sensor_mounts", "transforms"];
-const ROBOT_FRAME: &str = "base_link";
-const CAMERA_FRAME: &str = "chest_color_optical_frame";
 
-/// A 4 by 3 depth stream with a focal length of 2 pixels and its principal point at
-/// (1.5, 1), half a meter a count, on the color frame; sensor_mounts names the chest
-/// camera's frame, which the tree places.
-fn script_the_camera(mocks: &Mocks) -> Result<(), String> {
-    script_the_geometry(mocks)?;
-    sensor_mounts(mocks)
-        .describe_sensors
-        .enqueue_response(chest_sensor())
-        .map_err(|e| e.to_string())
+/// A 4 by 3 depth stream in the frame `CAMERA_FRAME` with a focal length of 2 pixels and
+/// its principal point at (1.5, 1), half a meter a count, on the color frame; sensor_mounts
+/// names the robot frame.
+async fn script_the_camera(mocks: &Mocks, canvas: &FakeCanvas) -> Result<(), String> {
+    script_the_camera_in(mocks, canvas, CAMERA_FRAME).await
 }
 
-fn sensor_mounts(mocks: &Mocks) -> &peppygen::mock::deps::sensor_mounts::Mock {
-    mocks
-        .deps
-        .sensor_mounts
-        .as_ref()
-        .expect("sensor_mounts is linked")
+/// The camera of `script_the_camera`, its depth stream placed in the frame `frame`.
+async fn script_the_camera_in(
+    mocks: &Mocks,
+    canvas: &FakeCanvas,
+    frame: &str,
+) -> Result<(), String> {
+    script_the_geometry_in(mocks, frame)?;
+    hold_the_robot_frame(mocks, canvas).await
 }
 
-/// The robot's one sensor, the chest camera.
-fn chest_sensor() -> describe_sensors::ResponseData {
-    describe_sensors::ResponseData::new(
-        ROBOT_FRAME.to_string(),
-        vec!["chest".to_string()],
-        vec!["rgbd_camera".to_string()],
-        vec![CAMERA_FRAME.to_string()],
-        vec![String::new()],
-    )
-}
-
-/// The depth stream and its geometry of `script_the_camera`.
-fn script_the_geometry(mocks: &Mocks) -> Result<(), String> {
+/// The depth stream and its geometry of `script_the_camera`, placed in the frame `frame`.
+fn script_the_geometry_in(mocks: &Mocks, frame: &str) -> Result<(), String> {
     let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
     let geometry = mocks
         .deps
@@ -101,8 +94,11 @@ fn script_the_geometry(mocks: &Mocks) -> Result<(), String> {
         .get_depth_to_color_extrinsics
         .enqueue_response(get_depth_to_color_extrinsics::ResponseData::new(
             ALIGN.to_string(),
-            [0.0; 3],
-            IDENTITY,
+            DepthToColor {
+                frame: frame.to_string(),
+                position: [0.0; 3],
+                orientation: IDENTITY,
+            },
         ))
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -124,19 +120,15 @@ async fn publish_fixed(mocks: &Mocks, transforms: &[(&str, &str, [f64; 3])]) -> 
     publish_once_subscribed(
         tree.static_transforms.wait_for_subscriber(TIMEOUT),
         tree.static_transforms.publish(&StaticTransforms {
-            child_frames: transforms
+            transforms: transforms
                 .iter()
-                .map(|(_, child, _)| child.to_string())
+                .map(|&(parent, child, position)| StaticTransform {
+                    frame: parent.to_string(),
+                    child_frame: child.to_string(),
+                    position,
+                    orientation: IDENTITY,
+                })
                 .collect(),
-            parent_frames: transforms
-                .iter()
-                .map(|(parent, _, _)| parent.to_string())
-                .collect(),
-            positions: transforms
-                .iter()
-                .flat_map(|(_, _, position)| *position)
-                .collect(),
-            orientations: transforms.iter().flat_map(|_| IDENTITY).collect(),
         }),
     )
     .await
@@ -149,10 +141,12 @@ async fn publish_arm_at(mocks: &Mocks, seconds: u32, x: f64) -> Result<(), Strin
         tree.transforms.wait_for_subscriber(TIMEOUT),
         tree.transforms.publish(&Transforms {
             timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(seconds)),
-            child_frames: vec!["arm".to_string()],
-            parent_frames: vec![ROBOT_FRAME.to_string()],
-            positions: vec![x, 0.0, 0.0],
-            orientations: IDENTITY.to_vec(),
+            transforms: vec![MovingTransform {
+                frame: ROBOT_FRAME.to_string(),
+                child_frame: "arm".to_string(),
+                position: [x, 0.0, 0.0],
+                orientation: IDENTITY,
+            }],
             start_timestamp: SystemTime::UNIX_EPOCH,
         }),
     )
@@ -167,33 +161,42 @@ fn clouds(drawn: &[Drawn]) -> usize {
         .count()
 }
 
-/// A frame of 4 by 3 samples of 2 counts, 1 m everywhere, taken at 20 s.
+/// A frame of 4 by 3 samples of 2 counts, 1 m everywhere, in `CAMERA_FRAME`, taken at 20 s.
 fn depth_frame() -> DepthFrame {
     depth_frame_at(20)
 }
 
-/// A frame of 4 by 3 samples of 2 counts, 1 m everywhere, taken at `seconds`.
+/// A frame of 4 by 3 samples of 2 counts, 1 m everywhere, in `CAMERA_FRAME`, taken at
+/// `seconds`.
 fn depth_frame_at(seconds: u32) -> DepthFrame {
+    depth_frame_in(CAMERA_FRAME, seconds)
+}
+
+/// A frame of 4 by 3 samples of 2 counts, 1 m everywhere, in the frame `frame`, taken at
+/// `seconds`.
+fn depth_frame_in(frame: &str, seconds: u32) -> DepthFrame {
     DepthFrame {
         header: DepthHeader {
             timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(seconds)),
-            frame_id: seconds,
+            frame: frame.to_string(),
+            capture_index: seconds,
             align_mode: ALIGN.to_string(),
         },
         encoding: "z16".to_string(),
         width: 4,
         height: 3,
-        frame: [2_u16; 12].iter().flat_map(|s| s.to_le_bytes()).collect(),
+        data: [2_u16; 12].iter().flat_map(|s| s.to_le_bytes()).collect(),
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_depth_frame_becomes_an_image_and_points_in_the_robot_frame() -> Result<(), String> {
+async fn a_depth_frame_becomes_an_image_and_points_where_the_tree_places_its_frame()
+-> Result<(), String> {
     let mut parameters = default_parameters();
     parameters.cloud_stride = 2;
     parameters.depth_image = true;
     let (harness, mocks, canvas) = start(bound(&CLOUD_LINKS, parameters)).await?;
-    script_the_camera(&mocks)?;
+    script_the_camera(&mocks, &canvas).await?;
     publish_fixed(&mocks, &[(ROBOT_FRAME, CAMERA_FRAME, [1.0, 0.0, 0.0])]).await?;
     let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
     publish_once_subscribed(
@@ -205,7 +208,7 @@ async fn a_depth_frame_becomes_an_image_and_points_in_the_robot_frame() -> Resul
         .wait_until(TIMEOUT, "the points", |drawn| drew_at(drawn, POINTS_PATH))
         .await?;
     // Pixels (0, 0), (2, 0), (0, 2) and (2, 2) read ((u - 1.5) / 2, (v - 1) / 2, 1) in
-    // the camera, which stands 1 m along the robot's x.
+    // the frame the depth frame names, which the tree stands 1 m along the robot's x.
     let Drawn::Points { points, .. } = &canvas.at(POINTS_PATH)[0] else {
         panic!("points")
     };
@@ -231,7 +234,7 @@ async fn a_depth_frame_becomes_an_image_and_points_in_the_robot_frame() -> Resul
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn by_default_a_depth_frame_becomes_points_and_no_depth_image() -> Result<(), String> {
     let (harness, mocks, canvas) = start(bound(&CLOUD_LINKS, default_parameters())).await?;
-    script_the_camera(&mocks)?;
+    script_the_camera(&mocks, &canvas).await?;
     publish_fixed(&mocks, &[(ROBOT_FRAME, CAMERA_FRAME, [1.0, 0.0, 0.0])]).await?;
     let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
     publish_once_subscribed(
@@ -263,7 +266,7 @@ async fn a_carried_camera_is_placed_where_it_stood_when_each_frame_was_taken() -
     // 1 us between two clouds: each frame makes its own cloud.
     parameters.cloud_rate_hz = 1e6;
     let (harness, mocks, canvas) = start(bound(&CLOUD_LINKS, parameters)).await?;
-    script_the_camera(&mocks)?;
+    script_the_camera(&mocks, &canvas).await?;
     // The camera rides the arm link, which the tree moves.
     publish_fixed(&mocks, &[("arm", CAMERA_FRAME, [0.0; 3])]).await?;
     let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
@@ -286,13 +289,8 @@ async fn a_carried_camera_is_placed_where_it_stood_when_each_frame_was_taken() -
             "the frame at {seconds} s"
         );
     }
-    // The camera's frame is asked once.
-    let mounts = mocks
-        .deps
-        .sensor_mounts
-        .as_ref()
-        .expect("sensor_mounts is linked");
-    assert_eq!(mounts.describe_sensors.captured_count(), 1);
+    // The robot frame is asked once.
+    assert_eq!(sensor_mounts(&mocks).describe_sensors.captured_count(), 1);
     harness.shutdown().await.map_err(|e| e.to_string())
 }
 
@@ -303,7 +301,7 @@ async fn a_newer_frame_takes_the_place_of_one_that_waits() -> Result<(), String>
     parameters.image_rate_hz = 1e6;
     parameters.depth_image = true;
     let (harness, mocks, canvas) = start(bound(&CLOUD_LINKS, parameters)).await?;
-    script_the_geometry(&mocks)?;
+    script_the_camera(&mocks, &canvas).await?;
     publish_fixed(&mocks, &[("arm", CAMERA_FRAME, [0.0; 3])]).await?;
     let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
     publish_once_subscribed(
@@ -311,12 +309,6 @@ async fn a_newer_frame_takes_the_place_of_one_that_waits() -> Result<(), String>
         camera.depth_stream.publish(&depth_frame_at(20)),
     )
     .await?;
-    // The cloud maker has taken the frame of 20 s once it asks for the camera's frame.
-    let asked = sensor_mounts(&mocks)
-        .describe_sensors
-        .next_request(TIMEOUT)
-        .await
-        .map_err(|e| e.to_string())?;
     camera
         .depth_stream
         .publish(&depth_frame_at(21))
@@ -332,13 +324,9 @@ async fn a_newer_frame_takes_the_place_of_one_that_waits() -> Result<(), String>
                 == 2
         })
         .await?;
-    asked
-        .respond(chest_sensor())
-        .await
-        .map_err(|e| e.to_string())?;
-    // The frame of 21 s is in the watch when the camera's frame is answered, so it takes the
-    // place of the frame of 20 s before that frame's lookup starts: the transforms of 20 s
-    // and 21 s then place the frame of 21 s alone.
+    // The frame of 21 s is in the watch before the arm's transforms come, so it takes the
+    // place of the frame of 20 s, which waits for the arm's transform of its time or was
+    // not taken yet: the transforms of 20 s and 21 s then place the frame of 21 s alone.
     publish_arm_at(&mocks, 20, 1.0).await?;
     publish_arm_at(&mocks, 21, 2.0).await?;
     canvas
@@ -353,6 +341,48 @@ async fn a_newer_frame_takes_the_place_of_one_that_waits() -> Result<(), String>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_depth_frame_in_a_frame_the_tree_does_not_hold_draws_no_points_and_logs_unknown_frame()
+-> Result<(), String> {
+    const WRIST_FRAME: &str = "wrist_color_optical_frame";
+    let mut parameters = default_parameters();
+    parameters.lookup_timeout_s = 0.0;
+    let (harness, mocks, canvas) = start(bound(&CLOUD_LINKS, parameters)).await?;
+    script_the_camera_in(&mocks, &canvas, WRIST_FRAME).await?;
+    // The tree holds the chest camera's frame alone.
+    publish_fixed(&mocks, &[(ROBOT_FRAME, CAMERA_FRAME, [1.0, 0.0, 0.0])]).await?;
+    let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
+    publish_once_subscribed(
+        camera.depth_stream.wait_for_subscriber(TIMEOUT),
+        camera
+            .depth_stream
+            .publish(&depth_frame_in(WRIST_FRAME, 20)),
+    )
+    .await?;
+    logged(&["unknown_frame", WRIST_FRAME]).await?;
+    assert!(canvas.at(POINTS_PATH).is_empty());
+    harness.shutdown().await.map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_depth_frame_in_another_frame_than_the_geometry_draws_no_points() -> Result<(), String> {
+    const OTHER_FRAME: &str = "head_color_optical_frame";
+    let (harness, mocks, canvas) = start(bound(&CLOUD_LINKS, default_parameters())).await?;
+    script_the_camera(&mocks, &canvas).await?;
+    publish_fixed(&mocks, &[(ROBOT_FRAME, CAMERA_FRAME, [1.0, 0.0, 0.0])]).await?;
+    let camera = mocks.deps.camera.as_ref().expect("the camera is linked");
+    publish_once_subscribed(
+        camera.depth_stream.wait_for_subscriber(TIMEOUT),
+        camera
+            .depth_stream
+            .publish(&depth_frame_in(OTHER_FRAME, 20)),
+    )
+    .await?;
+    logged(&["the depth frames name the frame", OTHER_FRAME, CAMERA_FRAME]).await?;
+    assert!(canvas.at(POINTS_PATH).is_empty());
+    harness.shutdown().await.map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frame_wider_than_image_max_width_is_drawn_shrunk() -> Result<(), String> {
     let mut parameters = default_parameters();
     parameters.image_max_width = 2;
@@ -363,14 +393,15 @@ async fn a_frame_wider_than_image_max_width_is_drawn_shrunk() -> Result<(), Stri
         camera.video_stream.publish(&ColorFrame {
             header: ColorHeader {
                 timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
-                frame_id: 1,
+                frame: CAMERA_FRAME.to_string(),
+                capture_index: 1,
                 align_mode: ALIGN.to_string(),
             },
             encoding: "rgb8".to_string(),
             // 4 by 2 pixels: the left half 10, the right half 200.
             width: 4,
             height: 2,
-            frame: [[10_u8; 6], [200; 6], [10; 6], [200; 6]].concat(),
+            data: [[10_u8; 6], [200; 6], [10; 6], [200; 6]].concat(),
         }),
     )
     .await?;
@@ -402,13 +433,14 @@ async fn a_bgr8_frame_becomes_an_rgb_image() -> Result<(), String> {
         camera.video_stream.publish(&ColorFrame {
             header: ColorHeader {
                 timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
-                frame_id: 1,
+                frame: CAMERA_FRAME.to_string(),
+                capture_index: 1,
                 align_mode: ALIGN.to_string(),
             },
             encoding: "bgr8".to_string(),
             width: 1,
             height: 1,
-            frame: vec![10, 20, 30],
+            data: vec![10, 20, 30],
         }),
     )
     .await?;

@@ -6,7 +6,7 @@
 
 use std::time::SystemTime;
 
-use camera_core::pose::Pose;
+use frame_tree::Transform;
 
 use crate::canvas::{Canvas, Look, Rgba};
 use crate::model::camera::{ColorImage, DepthImage};
@@ -33,12 +33,12 @@ pub enum Drawn {
     },
     Frame {
         path: String,
-        pose: Pose,
+        pose: Transform,
         axis_length: f32,
     },
     Place {
         path: String,
-        pose: Pose,
+        pose: Transform,
     },
     Shape {
         path: String,
@@ -355,7 +355,7 @@ fn same_numbers(a: &[f64], b: &[f64]) -> bool {
 }
 
 /// Whether the origins and the rotations of two poses are within `SAME_WITHIN`.
-fn same_pose(a: &Pose, b: &Pose) -> bool {
+fn same_pose(a: &Transform, b: &Transform) -> bool {
     same_numbers(&a.origin(), &b.origin())
         && rotation_columns(a)
             .iter()
@@ -394,7 +394,7 @@ impl<T: DrawnCanvas> Canvas for T {
         });
     }
 
-    fn frame(&self, path: &str, pose: &Pose, axis_length: f32) {
+    fn frame(&self, path: &str, pose: &Transform, axis_length: f32) {
         self.take(Drawn::Frame {
             path: path.to_string(),
             pose: *pose,
@@ -402,7 +402,7 @@ impl<T: DrawnCanvas> Canvas for T {
         });
     }
 
-    fn place(&self, path: &str, pose: &Pose) {
+    fn place(&self, path: &str, pose: &Transform) {
         self.take(Drawn::Place {
             path: path.to_string(),
             pose: *pose,
@@ -524,7 +524,7 @@ mod tests {
         let half = std::f64::consts::FRAC_PI_4;
         let turned = Drawn::Place {
             path: "world/robot/link1".to_string(),
-            pose: Pose::new([0.3, 0.0, 0.0], [0.0, 0.0, half.sin(), half.cos()]).unwrap(),
+            pose: Transform::new([0.3, 0.0, 0.0], [0.0, 0.0, half.sin(), half.cos()]).unwrap(),
         };
         assert!(!at.same_as(&turned));
     }

@@ -10,8 +10,6 @@ use control_core::positive_finite::PositiveFinite;
 pub enum PlannerMapError {
     #[error("voxel_size_m is {0}; the side of a cube is a finite number above 0")]
     VoxelSize(f64),
-    #[error("centers has {0} values, not 3 for each cube")]
-    Centers(usize),
     #[error("the center of cube {0} has a coordinate that is not a finite number")]
     NotFinite(usize),
 }
@@ -30,21 +28,17 @@ pub struct PlannerMap {
 }
 
 impl PlannerMap {
-    /// The map that the fields of an occupancy_map message give: `centers` holds three
-    /// coordinates for each cube.
+    /// The map that the fields of an occupancy_map message give: `centers` holds the
+    /// center of each cube.
     pub fn parse(
         at: SystemTime,
         voxel_size_m: f64,
-        centers: &[f64],
+        centers: &[[f64; 3]],
         waiting: &str,
     ) -> Result<Self, PlannerMapError> {
         let voxel_size = PositiveFinite::parse(voxel_size_m)
             .map_err(|_| PlannerMapError::VoxelSize(voxel_size_m))?;
-        let (cubes, rest) = centers.as_chunks::<3>();
-        if !rest.is_empty() {
-            return Err(PlannerMapError::Centers(centers.len()));
-        }
-        let centers = cubes
+        let centers = centers
             .iter()
             .enumerate()
             .map(|(index, center)| {
@@ -69,11 +63,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_three_coordinates_are_the_center_of_one_cube() {
+    fn each_center_is_the_center_of_one_cube() {
         let map = PlannerMap::parse(
             SystemTime::UNIX_EPOCH,
             0.02,
-            &[0.31, 0.01, 0.51, -0.25, 0.5, 1.0],
+            &[[0.31, 0.01, 0.51], [-0.25, 0.5, 1.0]],
             "",
         )
         .expect("a map");
@@ -90,11 +84,7 @@ mod tests {
             Err(PlannerMapError::VoxelSize(0.0))
         );
         assert_eq!(
-            PlannerMap::parse(at, 0.02, &[0.1, 0.2, 0.3, 0.4], ""),
-            Err(PlannerMapError::Centers(4))
-        );
-        assert_eq!(
-            PlannerMap::parse(at, 0.02, &[0.1, 0.2, 0.3, 0.4, f64::INFINITY, 0.6], ""),
+            PlannerMap::parse(at, 0.02, &[[0.1, 0.2, 0.3], [0.4, f64::INFINITY, 0.6]], ""),
             Err(PlannerMapError::NotFinite(1))
         );
     }

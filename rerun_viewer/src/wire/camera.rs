@@ -1,8 +1,8 @@
 //! The camera: its color and depth frames, drawn at most at the image rate, and its depth
-//! frames turned into points at most at the cloud rate. The geometry of the camera and its
-//! frame on the robot are asked when a frame first needs them, and asked again when an ask
-//! fails, so a camera that answers late is drawn once it answers. The robot's tree places
-//! the camera at the time of each frame turned into points.
+//! frames turned into points at most at the cloud rate. The geometry of the camera and the
+//! robot frame are asked when a frame first needs them, and asked again when an ask fails,
+//! so a camera that answers late is drawn once it answers. The robot's tree places the frame
+//! each depth frame names, at that frame's time, in the robot frame.
 
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
@@ -10,14 +10,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
-use camera_core::pose::Pose;
-use camera_core::sensor_mounts::{CameraFrames, DescribedSensors};
+use control_core::geometry::{Pose, Stamped};
 use control_core::latched_log::LatchedLog;
 use control_core::positive_finite::PositiveFinite;
 use control_core::receiving;
 use control_core::robot_tree::RobotTree;
 use control_core::throttle::Throttle;
-use frame_tree::{LookupTime, Stamp};
+use frame_tree::{FrameName, LookupError, LookupTime, Stamp, Transform};
 use peppygen::NodeRunner;
 use peppygen::consumed_services::camera::depth_stream_info;
 use peppygen::consumed_services::geometry::{get_depth_intrinsics, get_depth_to_color_extrinsics};
@@ -29,7 +28,7 @@ use tracing::{error, info};
 use crate::canvas::Canvas;
 use crate::draw::camera::{draw_cloud, draw_color_image, draw_depth_image};
 use crate::model::camera::{ColorImage, DepthCamera, DepthImage, strided_points};
-use crate::wire::{SERVICE_TIMEOUT, sendable, stopped};
+use crate::wire::{SERVICE_TIMEOUT, Shared, sendable, stopped};
 
 /// What the depth follower draws, and how often.
 #[derive(Debug, Clone)]
@@ -39,10 +38,8 @@ pub struct DepthSettings {
     pub depth_image: bool,
     pub cloud_interval: Duration,
     pub cloud_stride: NonZeroU32,
-    /// The camera of sensor_mounts that the camera link is.
-    pub camera_name: String,
-    /// How long a frame turned into points waits for the tree to place the camera at its
-    /// time.
+    /// How long a frame turned into points waits for the tree to place the frame it names
+    /// at its time.
     pub lookup_timeout: Duration,
 }
 
@@ -97,15 +94,15 @@ pub fn parse_depth_camera(
     .map_err(|e| CameraError::Intrinsics(e.to_string()))?;
     let depth_model = DepthModel::parse(&intrinsics.depth_model)
         .map_err(|e| CameraError::Intrinsics(e.to_string()))?;
-    let depth_in_color = Pose::new(
-        extrinsics.depth_to_color_position,
-        extrinsics.depth_to_color_orientation,
-    )
-    .map_err(|e| CameraError::Extrinsics(e.to_string()))?;
+    let depth_to_color = &extrinsics.depth_to_color;
+    let depth_in_color = Pose::parse(depth_to_color.position, depth_to_color.orientation)
+        .and_then(|pose| Stamped::parse(&depth_to_color.frame, None, pose))
+        .map_err(|e| CameraError::Extrinsics(e.to_string()))?;
     Ok(DepthCamera {
         lens,
         depth_model,
-        depth_in_color,
+        frame: depth_in_color.frame().clone(),
+        depth_in_color: depth_in_color.value().transform(),
         align_mode: intrinsics.align_mode.clone(),
     })
 }
@@ -162,7 +159,7 @@ impl ColorFollower {
             &message.encoding,
             message.width,
             message.height,
-            message.frame,
+            message.data,
         ) {
             Ok(image) => {
                 self.unreadable.success();
@@ -176,7 +173,7 @@ impl ColorFollower {
 
 /// Draws the depth frames, at most one each image interval, and their points, at most
 /// once each cloud interval, until the node stops. The points of a frame wait for `tree`
-/// to place the camera at the frame's time, up to the lookup timeout, and a newer frame
+/// to place the frame it names at its time, up to the lookup timeout, and a newer frame
 /// admitted for points takes the place of one that waits. With no tree, or with the
 /// geometry or the sensor_mounts link vacant, the viewer draws no points.
 pub async fn follow_depth(
@@ -184,6 +181,7 @@ pub async fn follow_depth(
     canvas: Arc<dyn Canvas>,
     settings: DepthSettings,
     tree: Option<Arc<RobotTree>>,
+    shared: Arc<Shared>,
 ) {
     let cancelled = stopped(&runner);
     let mut subscription = match sendable(depth_stream::subscribe(&runner)).await {
@@ -204,7 +202,7 @@ pub async fn follow_depth(
                 tree,
                 settings: settings.clone(),
                 camera: None,
-                frames: None,
+                shared,
                 failures: LatchedLog::warn("drawing the depth cloud"),
             };
             tokio::spawn(make_clouds(maker, waiting));
@@ -240,10 +238,12 @@ pub async fn follow_depth(
     .await;
 }
 
-/// A depth frame admitted for points: its image, its alignment and when it was taken.
+/// A depth frame admitted for points: its image, its alignment, the frame it names and when
+/// it was taken.
 struct CloudFrame {
     image: Arc<DepthImage>,
     align_mode: String,
+    frame: String,
     at: SystemTime,
 }
 
@@ -285,7 +285,7 @@ impl DepthFollower {
             &message.encoding,
             message.width,
             message.height,
-            message.frame,
+            message.data,
             depth_unit,
         );
         let image = match parsed {
@@ -305,6 +305,7 @@ impl DepthFollower {
             clouds.send_replace(Some(Arc::new(CloudFrame {
                 image: image.clone(),
                 align_mode: message.header.align_mode,
+                frame: message.header.frame,
                 at,
             })));
         }
@@ -339,9 +340,10 @@ impl DepthFollower {
 }
 
 /// Turns the frames `waiting` hands it into points until the node stops: for each, it
-/// learns what it does not know of the camera, waits for the tree to place the camera at
-/// the frame's time, and draws the points. A newer frame that comes while it waits takes
-/// the place of the one that waits.
+/// learns what it does not know of the camera, waits for the tree to place the frame it
+/// names at its time, and draws the points. A frame whose place the tree does not give is
+/// dropped, the failure logged by its kind as transform_lookup names it. A newer frame that
+/// comes while it waits takes the place of the one that waits.
 async fn make_clouds(mut maker: CloudMaker, mut waiting: watch::Receiver<Option<Arc<CloudFrame>>>) {
     let mut cancelled = std::pin::pin!(stopped(&maker.runner));
     let mut newer: Option<Arc<CloudFrame>> = None;
@@ -400,13 +402,25 @@ async fn make_clouds(mut maker: CloudMaker, mut waiting: watch::Receiver<Option<
                 &frames.camera_frame,
                 time,
                 maker.settings.lookup_timeout,
-            ) => placed.map_err(|e| e.to_string()),
+            ) => placed.map_err(|e| failure_of(&e)),
         };
         match placed.and_then(|found| maker.draw(&frame, &found.placement)) {
             Ok(()) => maker.failures.success(),
             Err(reason) => maker.failures.failure(reason),
         }
     }
+}
+
+/// The failure of a lookup, by its kind as transform_lookup names it.
+fn failure_of(error: &LookupError) -> String {
+    format!("{}: {error}", error.failure_kind())
+}
+
+/// The frames a depth frame's points are placed between: the frame it names, the camera's,
+/// in the robot frame.
+struct CloudFrames {
+    robot_frame: FrameName,
+    camera_frame: FrameName,
 }
 
 /// What the cloud maker has learned of the camera so far.
@@ -416,45 +430,60 @@ struct CloudMaker {
     tree: Arc<RobotTree>,
     settings: DepthSettings,
     camera: Option<DepthCamera>,
-    /// The robot frame and the camera's frame: asked once, and again after a failed ask.
-    frames: Option<CameraFrames>,
+    /// What the followers share, the robot frame among it.
+    shared: Arc<Shared>,
     failures: LatchedLog,
 }
 
 impl CloudMaker {
-    /// The robot frame and the camera's frame, asking first what it does not know of the
-    /// camera for `frame`: its geometry, when not known yet or when the frames changed
-    /// their alignment or their size, and its frames.
-    async fn learn(&mut self, frame: &CloudFrame) -> Result<CameraFrames, String> {
+    /// The frames `depth`'s points are placed between, asking first what it does not know of
+    /// the camera: its geometry, when not known yet or when the frames changed their
+    /// alignment, their size or the frame they name; refused while the robot frame is
+    /// unknown.
+    async fn learn(&mut self, depth: &CloudFrame) -> Result<CloudFrames, String> {
         let stale = self.camera.as_ref().is_none_or(|camera| {
-            camera.align_mode != frame.align_mode || !camera.fits(&frame.image)
+            camera.align_mode != depth.align_mode
+                || !camera.fits(&depth.image)
+                || camera.frame.as_str() != depth.frame
         });
         if stale {
             let asked = self.ask_depth_camera().await?;
-            if asked.align_mode != frame.align_mode {
+            if asked.align_mode != depth.align_mode {
                 return Err(format!(
                     "the depth frames carry align_mode {:?}, the geometry describes {:?}",
-                    frame.align_mode, asked.align_mode
+                    depth.align_mode, asked.align_mode
+                ));
+            }
+            if asked.frame.as_str() != depth.frame {
+                return Err(format!(
+                    "the depth frames name the frame {:?}, get_depth_to_color_extrinsics places \
+                     the depth stream in {:?}",
+                    depth.frame,
+                    asked.frame.as_str()
                 ));
             }
             self.camera = Some(asked);
         }
-        if let Some(frames) = &self.frames {
-            return Ok(frames.clone());
-        }
-        let frames = self.ask_camera_frames().await?;
-        self.frames = Some(frames.clone());
-        Ok(frames)
+        let camera_frame = self
+            .camera
+            .as_ref()
+            .map(|camera| camera.frame.clone())
+            .ok_or("the camera's geometry is not known")?;
+        let robot_frame = self.shared.robot_frame(&self.runner)?;
+        Ok(CloudFrames {
+            robot_frame,
+            camera_frame,
+        })
     }
 
-    /// Draws the points of `frame`, the camera's color optical frame standing at
-    /// `placement` in the robot frame.
+    /// Draws the points of `frame`, the frame it names standing at `placement` in the
+    /// robot frame.
     fn draw(&self, frame: &CloudFrame, placement: &frame_tree::Placement) -> Result<(), String> {
         let camera = self
             .camera
             .as_ref()
             .ok_or("the camera's geometry is not known")?;
-        let color_in_robot = Pose::new(placement.position(), placement.orientation())
+        let color_in_robot = Transform::new(placement.position(), placement.orientation())
             .map_err(|e| format!("the camera's place in the robot frame: {e}"))?;
         let depth_in_robot = camera.depth_in_robot(&color_in_robot);
         let points = strided_points(
@@ -487,28 +516,6 @@ impl CloudMaker {
         .map_err(|e| format!("get_depth_to_color_extrinsics: {e}"))?;
         parse_depth_camera(&intrinsics.data, &extrinsics.data).map_err(|e| e.to_string())
     }
-
-    async fn ask_camera_frames(&self) -> Result<CameraFrames, String> {
-        let mounts = describe_sensors::bound_producer(&self.runner)
-            .ok_or("the sensor_mounts link is vacant")?;
-        let sensors = sendable(describe_sensors::poll(
-            &self.runner,
-            mounts,
-            SERVICE_TIMEOUT,
-        ))
-        .await
-        .map_err(|e| format!("describe_sensors: {e}"))?;
-        let sensors = &sensors.data;
-        let described = DescribedSensors {
-            robot_frame: &sensors.robot_frame,
-            sensor_names: &sensors.sensor_names,
-            sensor_kinds: &sensors.sensor_kinds,
-            sensor_frames: &sensors.sensor_frames,
-            carried_by: &sensors.carried_by,
-        };
-        CameraFrames::of(&described, &self.settings.camera_name)
-            .map_err(|e| format!("describe_sensors: {e}"))
-    }
 }
 
 #[cfg(test)]
@@ -535,16 +542,20 @@ pub(crate) mod tests {
     pub(crate) fn extrinsics() -> get_depth_to_color_extrinsics::ResponseData {
         get_depth_to_color_extrinsics::ResponseData {
             align_mode: "depth_to_color".to_string(),
-            depth_to_color_position: [0.0; 3],
-            depth_to_color_orientation: [0.0, 0.0, 0.0, 1.0],
+            depth_to_color: get_depth_to_color_extrinsics::ResponseDataDepthToColor {
+                frame: "chest_color_optical_frame".to_string(),
+                position: [0.0; 3],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            },
         }
     }
 
     #[test]
-    fn the_geometry_makes_the_depth_camera() {
+    fn the_geometry_makes_the_depth_camera_in_the_frame_the_extrinsics_name() {
         let camera = parse_depth_camera(&intrinsics(), &extrinsics()).expect("valid");
         assert_eq!(camera.lens.width(), 4);
         assert_eq!(camera.depth_model, DepthModel::Z);
+        assert_eq!(camera.frame.as_str(), "chest_color_optical_frame");
         assert_eq!(camera.align_mode, "depth_to_color");
     }
 
@@ -569,9 +580,15 @@ pub(crate) mod tests {
             Err(CameraError::Intrinsics(_))
         ));
         let mut long = extrinsics();
-        long.depth_to_color_orientation = [0.0, 0.0, 0.0, 2.0];
+        long.depth_to_color.orientation = [0.0, 0.0, 0.0, 2.0];
         assert!(matches!(
             parse_depth_camera(&intrinsics(), &long),
+            Err(CameraError::Extrinsics(_))
+        ));
+        let mut unframed = extrinsics();
+        unframed.depth_to_color.frame.clear();
+        assert!(matches!(
+            parse_depth_camera(&intrinsics(), &unframed),
             Err(CameraError::Extrinsics(_))
         ));
     }

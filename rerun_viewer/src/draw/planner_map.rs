@@ -42,7 +42,7 @@ mod tests {
     use crate::drawn::Drawn;
     use crate::testing::FakeCanvas;
 
-    fn map(centers: &[f64], waiting: &str) -> PlannerMap {
+    fn map(centers: &[[f64; 3]], waiting: &str) -> PlannerMap {
         let at = SystemTime::UNIX_EPOCH + Duration::from_secs(4);
         PlannerMap::parse(at, 0.02, centers, waiting).expect("a map")
     }
@@ -50,7 +50,7 @@ mod tests {
     #[test]
     fn the_cubes_take_the_side_of_the_map_at_the_time_it_was_read() {
         let canvas = FakeCanvas::default();
-        draw_planner_map(&canvas, &map(&[0.31, 0.01, 0.51], ""));
+        draw_planner_map(&canvas, &map(&[[0.31, 0.01, 0.51]], ""));
         let drawn = canvas.drawn();
         assert!(
             matches!(drawn[0], Drawn::Time(at) if at == SystemTime::UNIX_EPOCH + Duration::from_secs(4))

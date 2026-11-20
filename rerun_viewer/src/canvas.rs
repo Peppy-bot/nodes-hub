@@ -12,8 +12,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use camera_core::pose::Pose;
 use control_core::latched_log::LatchedLog;
+use frame_tree::Transform;
 use rerun::blueprint::components::PanelState;
 use rerun::blueprint::{
     Blueprint, BlueprintActivation, BlueprintPanel, ContainerLike, Horizontal, SelectionPanel,
@@ -71,9 +71,9 @@ pub trait Canvas: Send + Sync {
     /// One line of a log.
     fn log_line(&self, path: &str, line: &str);
     /// Places the entity at `pose` and draws its axes, each `axis_length` long.
-    fn frame(&self, path: &str, pose: &Pose, axis_length: f32);
+    fn frame(&self, path: &str, pose: &Transform, axis_length: f32);
     /// Places the entity at `pose`, and draws nothing there.
-    fn place(&self, path: &str, pose: &Pose);
+    fn place(&self, path: &str, pose: &Transform);
     /// Places the entity at the shape's pose and draws the shape there.
     fn shape(&self, path: &str, shape: &PlacedShape, look: Look);
     /// Draws the shape as `shape` does, for the whole recording, whatever the time: a
@@ -445,7 +445,7 @@ fn fill_mode(look: Look) -> FillMode {
 }
 
 /// The transform that places an entity at `pose`.
-fn transform_of(pose: &Pose) -> Transform3D {
+fn transform_of(pose: &Transform) -> Transform3D {
     let columns = rotation_columns(pose).map(|column| column.map(|c| c as f32));
     let origin = pose.origin().map(|c| c as f32);
     Transform3D::from_translation_mat3x3(origin, columns)
@@ -491,14 +491,14 @@ impl Canvas for RerunCanvas {
         self.log(path, &TextLog::new(line));
     }
 
-    fn frame(&self, path: &str, pose: &Pose, axis_length: f32) {
+    fn frame(&self, path: &str, pose: &Transform, axis_length: f32) {
         // One row for both: half the messages of two.
         let placed: [&dyn AsComponents; 2] =
             [&transform_of(pose), &TransformAxes3D::new(axis_length)];
         self.log(path, &placed);
     }
 
-    fn place(&self, path: &str, pose: &Pose) {
+    fn place(&self, path: &str, pose: &Transform) {
         self.log(path, &transform_of(pose));
     }
 
