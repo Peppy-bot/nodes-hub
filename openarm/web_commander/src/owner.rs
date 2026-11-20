@@ -16,10 +16,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use control_core::geometry::Pose;
 use peppygen::NodeRunner;
 use peppylib::runtime::CancellationToken;
 use robot_description::{ArmId, PerArm};
-use srs_model::nalgebra::{Quaternion, UnitQuaternion};
 use srs_model::{ARM_DOF, JointVec};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{MissedTickBehavior, interval};
@@ -109,7 +109,6 @@ pub enum Feedback {
 
 /// A discrete arm move, resolved to what the goal task needs. A move that preempts an
 /// in-flight one is stashed as one of these until the old goal reports done.
-#[derive(Clone, Copy)]
 enum ArmGoal {
     Joints(move_arm_joints::Goal),
     Pose {
@@ -357,13 +356,16 @@ impl Owner {
                     self.status(arm, Limb::Arm, "gesture playing, not firing");
                     return;
                 }
-                if !position.iter().all(|v| v.is_finite()) {
-                    self.status(arm, Limb::Arm, "invalid position, not firing");
-                    return;
-                }
-                let Some(rotation) = unit_quat_from_wire(orientation) else {
-                    self.status(arm, Limb::Arm, "invalid orientation, not firing");
-                    return;
+                let target = match Pose::parse(position, orientation) {
+                    Ok(target) => target,
+                    Err(refusal) => {
+                        self.status(
+                            arm,
+                            Limb::Arm,
+                            &format!("invalid pose, not firing: {refusal}"),
+                        );
+                        return;
+                    }
                 };
                 let seed = self.state.arms[arm].joints;
                 // Preview the pose as joints (seeded from the current target) so both
@@ -372,7 +374,12 @@ impl Owner {
                 // tolerances and can serve poses only approximately reachable, so its
                 // decision is the refusal that matters. Without a solution the preview
                 // holds the current joints, since there is no configuration to show.
-                let target_joints = match self.models.solve_ik(arm, position, rotation, &seed) {
+                let target_joints = match self.models.solve_ik(
+                    arm,
+                    target.position().position(),
+                    target.orientation().into(),
+                    &seed,
+                ) {
                     Some(mut solved) => {
                         clamp_to_limits(&mut solved, arm);
                         solved
@@ -386,15 +393,13 @@ impl Owner {
                         return;
                     }
                 };
-                // Send the backbone the normalized quaternion, not the raw wire values.
-                let orientation = [rotation.i, rotation.j, rotation.k, rotation.w];
                 self.fire_or_queue(
                     arm,
                     ArmGoal::Pose {
                         goal: move_arm::Goal {
                             arm,
-                            position,
-                            orientation,
+                            robot_frame: self.models.robot_frame().to_owned(),
+                            target,
                             duration_s,
                             settle_position_tolerance_m,
                             settle_orientation_tolerance_rad,
@@ -748,9 +753,9 @@ impl Owner {
         self.status(arm, Limb::Arm, &format!("firing {action}"));
     }
 
-    // World-frame end-effector position (x, y, z) of a joint target.
+    // Robot-frame end-effector position (x, y, z) of a joint target.
     fn ee_position(&self, arm: ArmId, joints: &JointVec) -> [f64; 3] {
-        let p = self.models.ee_pose_world(arm, joints);
+        let p = self.models.ee_pose_root(arm, joints);
         [p[0], p[1], p[2]]
     }
 
@@ -883,14 +888,6 @@ fn start_gesture(
         },
     });
     Ok(format!("gesture '{label}': lead-in"))
-}
-
-/// A unit quaternion from the wire `[x, y, z, w]`, or `None` if it is non-finite or too
-/// near zero to normalize. A degenerate orientation would normalize to NaN and poison
-/// the IK solve, so the pose move rejects it here.
-fn unit_quat_from_wire(q: [f64; 4]) -> Option<UnitQuaternion<f64>> {
-    let quat = Quaternion::new(q[3], q[0], q[1], q[2]);
-    (quat.norm() > 1e-6).then(|| UnitQuaternion::from_quaternion(quat))
 }
 
 // Reset on operator disconnect: drop the streaming deadman for every arm (each stream's

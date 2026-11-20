@@ -244,7 +244,7 @@ pub(crate) enum Command {
         arm: ArmId,
         joints: JointVec,
     },
-    // Fire the backbone's planned Cartesian move_arm to a composed world-frame pose
+    // Fire the backbone's planned Cartesian move_arm to a composed robot-frame pose
     // (Actions-mode Execute): a governed straight-line move, not a jog. Refused
     // while the arm streams, like fire_arm.
     FireArmPose {

@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use control_core::minimum_jerk::{QUINTIC_PEAK_VELOCITY, blend};
 use robot_description::{ArmId, PerArm};
-use srs_model::nalgebra::{Quaternion, UnitQuaternion};
 use srs_model::{ARM_DOF, JointVec};
 
 use crate::pose::ArmModels;
@@ -58,7 +57,7 @@ struct Keyframe {
     gripper: Option<f64>,
 }
 
-/// A parametric Cartesian curve for one arm: world-frame offsets (m) from the
+/// A parametric Cartesian curve for one arm: robot-frame offsets (m) from the
 /// arm's anchor as a function of progress `s` in [0, 1].
 type Curve = fn(f64) -> [f64; 3];
 
@@ -480,10 +479,8 @@ fn bake_cartesian(
     let ready = models.ready(arm);
     let anchor_pos = anchor_position(models, arm);
     // Hold the ready orientation across the whole trace: only the position
-    // draws (fixed world aims proved unreachable across these curves; the
-    // wrist pitch limit is tight).
-    let q4 = models.ee_quat_world(arm, &ready);
-    let rotation = UnitQuaternion::from_quaternion(Quaternion::new(q4[3], q4[0], q4[1], q4[2]));
+    // draws.
+    let rotation = models.ee_rotation_root(arm, &ready);
 
     let (n, at) = grid(clock_s);
     let mut prev = ready;
@@ -498,7 +495,7 @@ fn bake_cartesian(
             let q = models.solve_ik(arm, p, rotation, &prev).unwrap_or_else(|| {
                 panic!("gesture '{name}' {arm_name}: unreachable curve point {p:?} at sample {k}")
             });
-            let ee = models.ee_pose_world(arm, &q);
+            let ee = models.ee_pose_root(arm, &q);
             let err = crate::pose::dist3([ee[0], ee[1], ee[2]], p);
             assert!(
                 err < CURVE_TRACK_TOL_M,
@@ -518,7 +515,7 @@ fn bake_cartesian(
 
 /// Curve offsets anchor on the arm's own ready end-effector position.
 fn anchor_position(models: &ArmModels, arm: ArmId) -> [f64; 3] {
-    let p = models.ee_pose_world(arm, &models.ready(arm));
+    let p = models.ee_pose_root(arm, &models.ready(arm));
     [p[0], p[1], p[2]]
 }
 
@@ -984,8 +981,8 @@ mod tests {
                 // Adjacent samples stay close in task space too: no Cartesian
                 // teleports between grid points.
                 for w in track.joints.windows(2) {
-                    let a = m.ee_pose_world(arm, &w[0]);
-                    let b = m.ee_pose_world(arm, &w[1]);
+                    let a = m.ee_pose_root(arm, &w[0]);
+                    let b = m.ee_pose_root(arm, &w[1]);
                     let d = crate::pose::dist3([a[0], a[1], a[2]], [b[0], b[1], b[2]]);
                     assert!(
                         d < 0.01,
@@ -1033,7 +1030,7 @@ mod tests {
             };
             let mut min_gap = f64::INFINITY;
             for (ql, qr) in l.joints.iter().zip(r.joints.iter()) {
-                let (pl, pr) = (m.ee_pose_world(LEFT, ql), m.ee_pose_world(RIGHT, qr));
+                let (pl, pr) = (m.ee_pose_root(LEFT, ql), m.ee_pose_root(RIGHT, qr));
                 let d = crate::pose::dist3([pl[0], pl[1], pl[2]], [pr[0], pr[1], pr[2]]);
                 min_gap = min_gap.min(d);
             }

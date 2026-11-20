@@ -116,14 +116,14 @@
     align-items: center; margin: 10px 0 4px; font-variant-numeric: tabular-nums;
   }
 
-  /* Section labels: "pose · joints" over the joint sliders, "pose · world" over the
-     world-frame controls. The x/y/z rows reuse the joint slider layout above. */
+  /* Section labels: "pose · joints" over the joint sliders, "pose · robot frame" over
+     the robot-frame controls. The x/y/z rows reuse the joint slider layout above. */
   .pose-head {
     margin: 16px 0 8px; font: 600 11px/1 'Inter Tight', sans-serif;
     letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-50);
   }
 
-  /* World-orientation arcball: drag the sphere to aim the hand (spin about the in-plane
+  /* Robot-frame orientation arcball: drag the sphere to aim the hand (spin about the in-plane
      axes) and drag near the rim to roll about the view axis. The bright triad is the
      target orientation, the faint one is measured; z (blue) is the gripper approach. */
   .arcball { display: flex; flex-direction: column; align-items: center; gap: 5px; margin: 14px 0 2px; }
@@ -365,7 +365,7 @@ const GRIPPER_MAX = 1;
 // joint on both hardware generations, so all rows align and the grayed ends mark
 // each joint's own limits.
 const JOINT_AXIS = 200 * PI / 180;
-// World-frame position controls: x/y/z sliders bound to indices 0..2 of the arm view's
+// Robot-frame position controls: x/y/z sliders bound to indices 0..2 of the arm view's
 // `pose`/`pose_feedback`. They read the pose of the joint target, and in actions mode
 // they compose the pose a move_arm Execute fires. That pose is the gripper's grasp
 // point (between the pads), not the wrist it mounts on, so dialling an object's
@@ -509,7 +509,7 @@ function build_arm(arm) {
     <div class="panel-head"><span>${arm}</span><span class="badge" id="${arm}_badge">idle</span></div>
     <div class="pose-head">pose · joints</div>
     <div id="${arm}_joints"></div>
-    <div class="pose-head">pose · world</div>
+    <div class="pose-head">pose · robot frame</div>
     <div id="${arm}_pos"></div>
     <div id="${arm}_orient"></div>
     <div class="actions knobs" id="${arm}_knobs" style="display:none">
@@ -545,7 +545,7 @@ function build_arm(arm) {
   }
   const pos = $(`${arm}_pos`);
   for (const ax of POS_AXES) {
-    // Placeholder axis; apply_snapshot sets the cross-arm world axis and each
+    // Placeholder axis; apply_snapshot sets the cross-arm robot-frame axis and each
     // axis's reachable band from pos_bounds.
     pos.appendChild(slider_row(`${arm}_p${ax.i}`, ax.label, -1, 1.2, 0.002,
       `on_pose_input('${arm}', 'position', ${ax.i})`));
@@ -555,7 +555,7 @@ function build_arm(arm) {
 
 // A joint-style slider row: name, full-width track with a measured caret over the
 // limit readouts, then the commanded and measured numeric columns. Shared by the
-// joints and the world-frame x/y/z so all read exactly the same.
+// joints and the robot-frame x/y/z so all read exactly the same.
 // Sub-elements derive their ids from the slider's: `_ghost` (measured caret),
 // `_lo`/`_hi` (limit labels, filled by set_reachable), `_t` (target), `_f` (measured).
 function slider_row(id, name, min, max, step, oninput) {
@@ -703,10 +703,10 @@ function throttled(key, send) {
 }
 
 // --- Quaternion helpers ([x, y, z, w]) and the arcball ---------------------------
-// World -> camera rotation: the operator faces the robot's front, so screen x = world
-// +Y, screen y (up) = world +Z, screen z (toward viewer) = world +X. As a quaternion
+// Robot frame -> camera rotation: the operator faces the robot's front, so screen x =
+// robot +Y, screen y (up) = robot +Z, screen z (toward viewer) = robot +X. As a quaternion
 // that is [0.5, 0.5, 0.5, -0.5]. The arcball works entirely in this camera frame (drags
-// are view-space rotations) and converts to/from world only at the wire.
+// are view-space rotations) and converts to/from the robot frame only at the wire.
 const VQ = [0.5, 0.5, 0.5, -0.5];
 
 function qmul(a, b) {
@@ -1082,7 +1082,7 @@ function apply_snapshot(snap) {
   const viewing = uiMode === 'gestures';
   const composing = uiMode === 'actions';
   document.body.classList.toggle('actions-mode', composing);
-  // Shared world-position axis across the arms: every x/y/z track spans it, so
+  // Shared robot-frame position axis across the arms: every x/y/z track spans it, so
   // the rows align; each arm's reachable band is grayed per axis below.
   const posBounds = snap.arms.flatMap(entry => entry.arm.pos_bounds);
   const posMin = Math.min(...posBounds.map(b => b[0]));
@@ -1129,7 +1129,7 @@ function apply_snapshot(snap) {
       place_caret(`${arm}_j${i}`, a.feedback ? a.feedback[i] : null, -JOINT_AXIS, JOINT_AXIS);
     }
 
-    // World position: the x/y/z sliders mirror the FK of the joint target, with the
+    // Robot-frame position: the x/y/z sliders mirror the FK of the joint target, with the
     // measured value marked, unless the operator composes a pose in actions. Skip a
     // control being edited.
     for (const ax of POS_AXES) {

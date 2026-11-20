@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use control_core::geometry::Pose;
 use peppygen::NodeRunner;
 use peppygen::consumed_actions::limb_motion::move_arm as limb_motion_move_arm;
 use peppylib::runtime::CancellationToken;
@@ -21,15 +22,14 @@ use crate::robot;
 
 limb_goal_handle!(move_arm);
 
-/// One discrete pose move, as fired at the backbone: the arm, the world-frame target
-/// (position m, orientation quaternion `[x, y, z, w]`), the requested duration
-/// (0 = fastest safe), and the settle tolerances (m, rad) and timeout (s) the
-/// move completes under.
-#[derive(Clone, Copy)]
+/// One discrete pose move, as fired at the backbone: the arm, the target grasp-point
+/// pose in `robot_frame`, the frame the panel's arm models give their poses in, the
+/// requested duration (0 = fastest safe), and the settle tolerances (m, rad) and
+/// timeout (s) the move completes under.
 pub struct Goal {
     pub arm: ArmId,
-    pub position: [f64; 3],
-    pub orientation: [f64; 4],
+    pub robot_frame: String,
+    pub target: Pose,
     pub duration_s: f64,
     pub settle_position_tolerance_m: f64,
     pub settle_orientation_tolerance_rad: f64,
@@ -61,8 +61,8 @@ async fn run(
 ) {
     let Goal {
         arm,
-        position,
-        orientation,
+        robot_frame,
+        target,
         duration_s,
         settle_position_tolerance_m,
         settle_orientation_tolerance_rad,
@@ -73,12 +73,11 @@ async fn run(
         return finalize(&feedback, arm, false, "shutting down; move dropped").await;
     }
     let label = robot::LIMBS.arm_name(arm);
-    info!(arm = label, ?position, ?orientation, "fire move_arm");
+    info!(arm = label, frame = robot_frame, ?target, "fire move_arm");
 
     let goal = limb_motion_move_arm::GoalRequest {
         arm_name: label.to_string(),
-        position,
-        orientation: Some(orientation),
+        target: target_record(&robot_frame, target),
         duration_s,
         settle_position_tolerance_m,
         settle_orientation_tolerance_rad,
@@ -142,6 +141,21 @@ async fn run(
     finalize(&feedback, arm, success, summary).await;
 }
 
+/// `target` as limb_motion's move_arm takes a pose_stamped: in `robot_frame` with no
+/// timestamp, at the latest time, which the backbone places where the robot frame stands
+/// when it accepts the goal.
+fn target_record(
+    robot_frame: &str,
+    target: Pose,
+) -> limb_motion_move_arm::LimbMotionMoveArmActionGoalTarget {
+    limb_motion_move_arm::LimbMotionMoveArmActionGoalTarget {
+        frame: Some(robot_frame.to_owned()),
+        timestamp: None,
+        position: target.position().position(),
+        orientation: Some(target.orientation().quaternion()),
+    }
+}
+
 // Report the move outcome to the owner, which clears the in-flight slot and writes the
 // status line; a dropped channel means the owner is gone (shutdown), so ignore it.
 async fn finalize(
@@ -158,4 +172,21 @@ async fn finalize(
         warn!(arm = label, %summary, "move_arm done");
     }
     let _ = feedback.send(Feedback::ArmGoalDone { arm, summary }).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A target goes out in the robot frame with no timestamp, at the latest time, its
+    // position as typed and its orientation as the parse normalized it.
+    #[test]
+    fn a_target_goes_out_in_the_robot_frame_at_the_latest_time() {
+        let target = Pose::parse([0.3, -0.2, 0.5], [0.0, 0.0, 0.0, 1.004]).expect("a pose");
+        let record = target_record("base_link", target);
+        assert_eq!(record.frame.as_deref(), Some("base_link"));
+        assert_eq!(record.timestamp, None);
+        assert_eq!(record.position, [0.3, -0.2, 0.5]);
+        assert_eq!(record.orientation, Some([0.0, 0.0, 0.0, 1.0]));
+    }
 }

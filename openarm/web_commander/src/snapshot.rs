@@ -212,16 +212,16 @@ struct ArmView {
     // The arm's home posture, the SRDF's; the browser's Home Pose button fires
     // these joints.
     home: JointVec,
-    // World-frame x/y/z reachable bounds [[min, max]; 3]; the browser bounds its
+    // Robot-frame x/y/z reachable bounds [[min, max]; 3]; the browser bounds its
     // position sliders with these (per model, from the arm's FK envelope).
     pos_bounds: [[f64; 2]; 3],
-    // World-frame end-effector pose [x, y, z, roll, pitch, yaw] of the joint target
+    // Robot-frame end-effector pose [x, y, z, roll, pitch, yaw] of the joint target
     // (FK), so moving a joint updates the panel's pose fields.
     pose: Pose,
     // Same for the measured joints, `null` until the first state arrives; the panel
     // shows it beside the target pose the way it does per-joint feedback.
     pose_feedback: Option<Pose>,
-    // World-frame end-effector orientation as a quaternion [x, y, z, w] for the target
+    // Robot-frame end-effector orientation as a quaternion [x, y, z, w] for the target
     // (FK of the joint target) and the measured pose. The arcball composes on these,
     // so orientation never round-trips through euler on the wire.
     orientation: [f64; 4],
@@ -513,10 +513,10 @@ fn arm_view(a: &ArmTarget, arm: ArmId, models: &ArmModels) -> ArmView {
         ready: models.ready(arm),
         home: models.home(arm),
         pos_bounds: models.pos_bounds(arm),
-        pose: models.ee_pose_world(arm, &a.joints),
-        pose_feedback: a.last_feedback.map(|fb| models.ee_pose_world(arm, &fb)),
-        orientation: models.ee_quat_world(arm, &a.joints),
-        orientation_feedback: a.last_feedback.map(|fb| models.ee_quat_world(arm, &fb)),
+        pose: models.ee_pose_root(arm, &a.joints),
+        pose_feedback: a.last_feedback.map(|fb| models.ee_pose_root(arm, &fb)),
+        orientation: models.ee_quat_root(arm, &a.joints),
+        orientation_feedback: a.last_feedback.map(|fb| models.ee_quat_root(arm, &fb)),
     }
 }
 

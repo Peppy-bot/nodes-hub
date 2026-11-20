@@ -5,13 +5,15 @@
 //! vector stays the single source of truth: a pose is a display and composition
 //! lens, never stored state, and a pose move is the backbone's move_arm action.
 //!
-//! Poses are in the world frame (matching the backbone's move_arm action) and
-//! orientation is exposed as intrinsic-XYZ roll/pitch/yaw via nalgebra's
-//! `euler_angles` round-trip for display; the arcball composes orientation on
-//! quaternions, so no euler component is ever interpolated.
+//! Poses are in the robot frame, the root link of the robot's description, the
+//! frame a pose move names to the backbone. Orientation is exposed as
+//! intrinsic-XYZ roll/pitch/yaw via nalgebra's `euler_angles` round-trip for
+//! display; the arcball composes orientation on quaternions, so no euler
+//! component is ever interpolated.
 
 use std::sync::{Arc, Mutex};
 
+use control_core::geometry::pose_arrays;
 use control_core::sync::lock_ignoring_poison;
 use robot_description::{ArmId, Driven, PerArm, RobotDescription, states};
 use srs_model::nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
@@ -19,12 +21,13 @@ use srs_model::{ARM_DOF, Arm, ArmAnglePolicy, JointVec};
 
 use crate::robot::ARMS;
 
-/// A world-frame end-effector pose as `[x, y, z, roll, pitch, yaw]` (metres,
+/// A robot-frame end-effector pose as `[x, y, z, roll, pitch, yaw]` (metres,
 /// radians): the form the panel edits and displays.
 pub type Pose = [f64; 6];
 
 /// Each arm's model (FK/IK/limits) behind a mutex, plus each arm's URDF joint
-/// velocity limits and its ready and home postures.
+/// velocity limits and its ready and home postures, and the robot frame their
+/// poses are in.
 ///
 /// Each lock is held only for a single synchronous kinematics call and never
 /// across an `.await`. The owner task is the sole caller, so the locks are
@@ -34,11 +37,12 @@ pub type Pose = [f64; 6];
 pub struct ArmModels {
     arms: PerArm<Arc<Mutex<Arm>>, ARMS>,
     velocity_limits: PerArm<JointVec, ARMS>,
-    // World-frame x/y/z reachable bounds per arm, from the FK envelope (computed once
+    // Robot-frame x/y/z reachable bounds per arm, from the FK envelope (computed once
     // at construction); the panel sizes its position sliders to these.
     bounds: PerArm<[[f64; 2]; 3], ARMS>,
     ready: PerArm<JointVec, ARMS>,
     home: PerArm<JointVec, ARMS>,
+    robot_frame: String,
 }
 
 impl ArmModels {
@@ -47,7 +51,7 @@ impl ArmModels {
     /// chain, its limits and its grasp point), so the panel solves against the identical
     /// chain the backbone governs. Joint velocity limits come from the same URDF: the
     /// budget the gesture bake asserts its trajectories against. The ready and home
-    /// postures are the SRDF's.
+    /// postures are the SRDF's. The robot frame is the description's root link.
     pub fn from_driven(driven: &Driven<ARM_DOF, ARMS>) -> Self {
         let description = driven.description();
         let mut arms = PerArm::from_fn(|arm| build_arm(description, arm));
@@ -58,26 +62,41 @@ impl ArmModels {
             bounds,
             ready: postures(driven, states::READY),
             home: postures(driven, states::HOME),
+            robot_frame: description.root_link().to_owned(),
         }
     }
 
-    /// World-frame end-effector pose of `joints` for `arm`.
-    pub fn ee_pose_world(&self, arm: ArmId, joints: &JointVec) -> Pose {
-        let model = lock_ignoring_poison(self.get(arm));
-        let base = model.at(joints).ee_pose();
-        decompose(&model.world_pose(&base))
+    /// The robot frame, the root link of the robot's description: the frame of
+    /// every pose the arm models give and take.
+    pub fn robot_frame(&self) -> &str {
+        &self.robot_frame
     }
 
-    /// World-frame end-effector orientation of `joints` as a quaternion `[x, y, z, w]`,
+    /// Robot-frame end-effector pose of `joints` for `arm`.
+    pub fn ee_pose_root(&self, arm: ArmId, joints: &JointVec) -> Pose {
+        decompose(&self.ee_isometry(arm, joints))
+    }
+
+    /// Robot-frame end-effector orientation of `joints` as a quaternion `[x, y, z, w]`,
     /// for the panel's arcball (which composes orientation on quaternions, never euler).
-    pub fn ee_quat_world(&self, arm: ArmId, joints: &JointVec) -> [f64; 4] {
-        let model = lock_ignoring_poison(self.get(arm));
-        let base = model.at(joints).ee_pose();
-        let q = model.world_pose(&base).rotation;
-        [q.i, q.j, q.k, q.w]
+    pub fn ee_quat_root(&self, arm: ArmId, joints: &JointVec) -> [f64; 4] {
+        pose_arrays(&self.ee_isometry(arm, joints)).1
     }
 
-    /// Solve inverse kinematics for a world-frame end-effector pose (position in
+    /// Robot-frame end-effector orientation of `joints` for `arm`, as the IK solve
+    /// takes one.
+    pub fn ee_rotation_root(&self, arm: ArmId, joints: &JointVec) -> UnitQuaternion<f64> {
+        self.ee_isometry(arm, joints).rotation
+    }
+
+    /// The end effector's pose at `joints` for `arm`, in the robot frame.
+    fn ee_isometry(&self, arm: ArmId, joints: &JointVec) -> Isometry3<f64> {
+        let model = lock_ignoring_poison(self.get(arm));
+        let base = model.at(joints).ee_pose();
+        model.root_pose(&base)
+    }
+
+    /// Solve inverse kinematics for a robot-frame end-effector pose (position in
     /// metres, orientation as a unit quaternion), seeded from `seed` so the branch
     /// nearest the current configuration is chosen. `None` when the pose is
     /// unreachable or admits no in-limit solution. Used to preview an Actions-mode
@@ -91,11 +110,11 @@ impl ArmModels {
         seed: &JointVec,
     ) -> Option<JointVec> {
         let model = lock_ignoring_poison(self.get(arm));
-        let world = Isometry3::from_parts(
+        let target = Isometry3::from_parts(
             Translation3::new(position[0], position[1], position[2]),
             rotation,
         );
-        let base_target = model.base_pose(&world);
+        let base_target = model.base_pose(&target);
         model
             .solve_ik(&base_target, ArmAnglePolicy::FromSeed, seed)
             .map(|s| s.q)
@@ -111,7 +130,7 @@ impl ArmModels {
         &self.velocity_limits[arm]
     }
 
-    /// World-frame x/y/z reachable bounds `[[min, max]; 3]` for `arm`, so the panel
+    /// Robot-frame x/y/z reachable bounds `[[min, max]; 3]` for `arm`, so the panel
     /// sizes its position sliders to the arm's actual reach (correct per model).
     pub fn pos_bounds(&self, arm: ArmId) -> [[f64; 2]; 3] {
         self.bounds[arm]
@@ -271,12 +290,12 @@ fn decompose(pose: &Isometry3<f64>) -> Pose {
     [t.x, t.y, t.z, roll, pitch, yaw]
 }
 
-/// Euclidean distance (m) between two world-frame points.
+/// Euclidean distance (m) between two robot-frame points.
 pub fn dist3(a: [f64; 3], b: [f64; 3]) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
 }
 
-/// How far each world axis can be driven: `[[min, max]; 3]` (x, y, z) over every
+/// How far each robot-frame axis can be driven: `[[min, max]; 3]` (x, y, z) over every
 /// in-limit configuration, so each bound is the best case for that axis with the
 /// other two free. Runs once per arm at construction to size the panel's position
 /// sliders to the model's arms.
@@ -305,7 +324,7 @@ fn workspace_aabb(arm: &mut Arm) -> [[f64; 2]; 3] {
             ranges[j].0 + t * (ranges[j].1 - ranges[j].0)
         });
         let base = arm.at(&q).ee_pose();
-        let p = arm.world_pose(&base).translation.vector;
+        let p = arm.root_pose(&base).translation.vector;
         for k in 0..3 {
             for (d, sign) in [1.0_f64, -1.0].into_iter().enumerate() {
                 if sign * p[k] > best[k][d].0 {
@@ -321,7 +340,7 @@ fn workspace_aabb(arm: &mut Arm) -> [[f64; 2]; 3] {
     })
 }
 
-/// Push `q` along the joints that move world axis `axis` in `sign`'s direction,
+/// Push `q` along the joints that move robot-frame axis `axis` in `sign`'s direction,
 /// clamped into `limits`, and return the extreme reached. Backtracks the step
 /// whenever it overshoots, so it converges rather than oscillating at a bound.
 fn ascend(
@@ -335,12 +354,12 @@ fn ascend(
     // finer than the slider it sizes; the floor ends the walk.
     const STEP_FLOOR_RAD: f64 = 1e-4;
     const MAX_ITERS: usize = 200;
-    let world_from_base = arm.base_from_world().inverse().rotation;
+    let root_from_base = arm.base_from_root().inverse().rotation;
     let mut q = start;
     let mut step = 0.2_f64;
     let value = |arm: &mut Arm, q: &JointVec| {
         let base = arm.at(q).ee_pose();
-        sign * arm.world_pose(&base).translation.vector[axis]
+        sign * arm.root_pose(&base).translation.vector[axis]
     };
     let mut current = value(arm, &q);
     for _ in 0..MAX_ITERS {
@@ -351,7 +370,7 @@ fn ascend(
         let gradient: JointVec = std::array::from_fn(|j| {
             let column = jacobian.column(j);
             let linear = Vector3::new(column[0], column[1], column[2]);
-            sign * (world_from_base * linear)[axis]
+            sign * (root_from_base * linear)[axis]
         });
         let norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
         if norm < f64::EPSILON {
@@ -407,7 +426,7 @@ mod tests {
                     let t = (GOLDEN[i] * (step + 1) as f64).fract();
                     limits[i][0] + t * (limits[i][1] - limits[i][0])
                 });
-                let p = m.ee_pose_world(arm, &q);
+                let p = m.ee_pose_root(arm, &q);
                 for k in 0..3 {
                     assert!(
                         p[k] >= bounds[k][0] && p[k] <= bounds[k][1],
@@ -429,7 +448,7 @@ mod tests {
                 assert!(lo < hi, "bound [{lo}, {hi}] must be non-empty");
             }
             // A known-reachable pose, the arm's home posture, sits inside.
-            let home = m.ee_pose_world(arm, &m.home(arm));
+            let home = m.ee_pose_root(arm, &m.home(arm));
             for k in 0..3 {
                 assert!(
                     b[k][0] <= home[k] && home[k] <= b[k][1],
@@ -448,7 +467,7 @@ mod tests {
         // back to it.
         let m = models();
         let q = [0.3, 0.1, 0.2, 0.8, 0.3, 0.2, 0.15];
-        let p = m.ee_pose_world(LEFT, &q);
+        let p = m.ee_pose_root(LEFT, &q);
         let rotation = UnitQuaternion::from_euler_angles(p[3], p[4], p[5]);
         let solved = m
             .solve_ik(LEFT, [p[0], p[1], p[2]], rotation, &q)
