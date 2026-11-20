@@ -241,7 +241,7 @@ async fn record_seconds(node_runner: &Arc<NodeRunner>, fps: u8, seconds: u32) ->
         };
         match received {
             Ok(Some((_producer, message))) => {
-                frames.push(message.frame);
+                frames.push(message.data);
                 println!("  Frame {}/{}", frame_num + 1, frame_count);
             }
             Ok(None) => break,
