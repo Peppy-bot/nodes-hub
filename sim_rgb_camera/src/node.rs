@@ -1,8 +1,9 @@
-//! The relay loops and their assembly: frames forward to the contract
-//! surface, the stream descriptions feed the info service, the camera
-//! geometry feeds get_color_intrinsics, the camera controls and the profile
-//! forward to the simulation's camera response model under the camera's name,
-//! which is this relay's name in its copy, and `setup` wires them together.
+//! The relay loops and their assembly: pictures forward to the contract
+//! surface, each in the camera's frame that sensor_mounts gives, the
+//! stream descriptions feed the info service, the camera geometry feeds
+//! get_color_intrinsics, the camera controls and the profile forward to the
+//! simulation's camera response model under the camera's name, which is this
+//! relay's name in its copy, and `setup` wires them together.
 
 use std::future::Future;
 use std::ops::ControlFlow;
@@ -12,7 +13,10 @@ use std::sync::{Arc, Mutex};
 use camera_core::geometry::{NO_DEPTH_STREAM_MESSAGE, pinhole_is_valid};
 use camera_core::relay::{
     CONTROL_TIMEOUT, NO_GEOMETRY_MESSAGE, NO_RESPONSE_MODEL_MESSAGE, TransportFailure, Unanswered,
-    camera_name, timestamp_is_valid,
+};
+use camera_core::sensor_mounts::{
+    CAMERA, DESCRIBE_SENSORS_TIMEOUT, DescribedSensors, MountedSensor, check_relayed_frame,
+    read_sensor,
 };
 use control_core::latched_log::LatchedLog;
 use control_core::receiving::receive;
@@ -23,6 +27,7 @@ use peppygen::consumed_services::control::{
     describe_camera, reset_camera as control_reset_camera, set_camera_brightness,
     set_camera_contrast, set_camera_exposure, set_camera_gain, set_camera_white_balance,
 };
+use peppygen::consumed_services::sensor_mounts::describe_sensors;
 use peppygen::emitted_topics::camera::video_stream as camera_video;
 use peppygen::exposed_services::camera::{
     set_brightness, set_contrast, set_exposure, set_gain, set_white_balance, video_stream_info,
@@ -84,10 +89,9 @@ fn unanswered_of(error: &peppygen::Error, refusal: Option<(&'static str, String)
 /// with its kind and its message: the members of sim_camera_control and the
 /// members this relay exposes declare the kinds of peppy alone, so a kind of
 /// the one is a kind of the other. A vacant control slot gives `rejected`,
-/// as a model gives for a control it does not model; a relay that names no
-/// camera gives `precondition_failed`; a model that does not answer in time
-/// gives `timeout`; a model that is not there gives `resource_unavailable`;
-/// any other failure gives `attempt_failed`.
+/// as a model gives for a control it does not model; a model that does not
+/// answer in time gives `timeout`; a model that is not there gives
+/// `resource_unavailable`; any other failure gives `attempt_failed`.
 macro_rules! relayed_failure {
     ($service:ident, $unanswered:expr) => {
         match $unanswered {
@@ -105,9 +109,6 @@ macro_rules! relayed_failure {
                 $service::FailureKind::Rejected,
                 NO_RESPONSE_MODEL_MESSAGE,
             ),
-            Unanswered::NoCamera(message) => {
-                $service::Failure::new($service::FailureKind::PreconditionFailed, message)
-            }
             Unanswered::Transport {
                 failure: TransportFailure::TimedOut,
                 message,
@@ -128,9 +129,9 @@ macro_rules! relayed_failure {
 /// shared by every forwarding service task.
 struct ControlRoute {
     runner: Arc<NodeRunner>,
-    /// The camera every forwarded request names, worked out once: the copy
-    /// and the instance id are fixed for the life of the node.
-    camera: std::result::Result<String, String>,
+    /// The camera every forwarded request names: this relay's name in its
+    /// copy.
+    camera: String,
     /// The run of forwarded calls failing in transport. The first failure of
     /// the run is logged and the rest are suppressed until a call reaches the
     /// model, so a caller retrying against a simulation that is gone leaves
@@ -139,8 +140,7 @@ struct ControlRoute {
 }
 
 impl ControlRoute {
-    fn new(runner: Arc<NodeRunner>) -> Self {
-        let camera = camera_name(runner.copy(), runner.processor().bound_instance_id());
+    fn new(runner: Arc<NodeRunner>, camera: String) -> Self {
         Self {
             runner,
             camera,
@@ -153,11 +153,11 @@ impl ControlRoute {
     /// model's answer relays verbatim. `refusal_of` reads the model's error
     /// reply in the error of a poll that failed: its kind, by its wire name,
     /// and its message. Every way the call gets no answer is an `Err` that
-    /// says why: the vacant slot first, then a relay whose id names no
-    /// camera, both fixed for the life of the node; then the model's error
-    /// reply or the transport. The pairing is no condition here: the model
-    /// tells the relay's robot by the pair the relay holds, so a relay
-    /// holding none gets the model's own error reply, relayed like any other.
+    /// says why: the vacant slot first, fixed for the life of the node; then
+    /// the model's error reply or the transport. The pairing is no condition
+    /// here: the model tells the relay's robot by the pair the relay holds,
+    /// so a relay holding none gets the model's own error reply, relayed like
+    /// any other.
     fn forward<T, Fut>(
         &self,
         bound: Option<&ProducerRef>,
@@ -170,8 +170,7 @@ impl ControlRoute {
         let Some(target) = bound else {
             return Err(Unanswered::NoModel);
         };
-        let camera = self.camera.clone().map_err(Unanswered::NoCamera)?;
-        match wait_for(call(camera, target.clone())) {
+        match wait_for(call(self.camera.clone(), target.clone())) {
             Ok(answer) => {
                 self.transport_failures.success();
                 Ok(answer)
@@ -197,8 +196,10 @@ impl ControlRoute {
     }
 }
 
-/// Forward the simulation's frames to the contract video_stream.
-async fn relay_frames(runner: Arc<NodeRunner>, token: CancellationToken) {
+/// Forward the simulation's pictures to the contract video_stream, each in the
+/// frame the simulation names, which is `camera`'s frame; a picture in another
+/// frame is dropped, and the first of a run of them logged.
+async fn relay_frames(runner: Arc<NodeRunner>, camera: MountedSensor, token: CancellationToken) {
     let mut sub = match simulation_video::subscribe(&runner).await {
         Ok(s) => s,
         Err(e) => return error!("simulation video_stream subscribe: {e}"),
@@ -208,33 +209,29 @@ async fn relay_frames(runner: Arc<NodeRunner>, token: CancellationToken) {
         Err(e) => return error!("declare video_stream publisher: {e}"),
     };
     let publish_failures = LatchedLog::warn("video_stream publish");
-    let invalid_timestamps = ReportOnce::default();
+    let foreign_frames = LatchedLog::warn("relaying video_stream");
     let mut first = true;
     receive(
         "simulation video_stream",
         token.cancelled(),
         async move || sub.next().await,
         async move |(_, msg)| {
-            if !timestamp_is_valid(msg.header.timestamp) {
-                if invalid_timestamps.first_of_run() {
-                    warn!(
-                        "dropping frames with invalid timestamps, suppressing repeats (first {:?})",
-                        msg.header.timestamp
-                    );
-                }
+            if let Err(mismatch) = check_relayed_frame(&msg.header.frame, &camera) {
+                foreign_frames.failure(mismatch);
                 return ControlFlow::Continue(());
             }
-            invalid_timestamps.clear();
+            foreign_frames.success();
             let header = camera_video::MessageHeader {
                 timestamp: msg.header.timestamp,
-                frame_id: msg.header.frame_id,
+                frame: msg.header.frame,
+                capture_index: msg.header.capture_index,
             };
             let result = match camera_video::build_message(
                 header,
                 msg.encoding,
                 msg.width,
                 msg.height,
-                msg.frame,
+                msg.data,
             ) {
                 Ok(payload) => publisher.publish(payload).await.map_err(|e| e.to_string()),
                 Err(e) => Err(e.to_string()),
@@ -461,17 +458,43 @@ macro_rules! spawn_forwarding_control {
     };
 }
 
-/// The node's entry point: the exact closure `NodeBuilder::run` used to get,
-/// named so the test harness can boot the node in-process.
+/// The node's entry point, which the binary and the test harness boot. It
+/// reads the camera it relays first, and relays and serves nothing before: a
+/// relay whose instance id names no camera in its copy, or whose name
+/// sensor_mounts gives no camera's frame, fails its start.
 pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<()> {
     let token = node_runner.cancellation_token().clone();
     let description: SharedDescription = Arc::new(Mutex::new(StreamDescription::default()));
     let geometry: SharedGeometry = Arc::new(Mutex::new(None));
-    let route = Arc::new(ControlRoute::new(node_runner.clone()));
-    match &route.camera {
-        Ok(camera) => info!("this relay is camera '{camera}'"),
-        Err(unnamed) => warn!("every forwarded call gets an error reply: {unnamed}"),
-    }
+    let asker = node_runner.clone();
+    let mounts = describe_sensors::bound_producer(&node_runner).clone();
+    let Some(camera) = read_sensor(
+        CAMERA,
+        node_runner.copy(),
+        node_runner.processor().bound_instance_id(),
+        Some(async move || {
+            describe_sensors::poll(&asker, &mounts, DESCRIBE_SENSORS_TIMEOUT)
+                .await
+                .map(|answer| DescribedSensors {
+                    sensor_names: answer.data.sensor_names,
+                    sensor_kinds: answer.data.sensor_kinds,
+                    sensor_frames: answer.data.sensor_frames,
+                    carried_by: answer.data.carried_by,
+                })
+        }),
+        node_runner.cancellation_token().cancelled(),
+    )
+    .await
+    .map_err(|refusal| peppygen::Error::Node(refusal.into()))?
+    else {
+        info!("stopped before sensor_mounts answered");
+        return Ok(());
+    };
+    info!(
+        "this relay is camera '{}', whose pictures name frame '{}'",
+        camera.name, camera.frame
+    );
+    let route = Arc::new(ControlRoute::new(node_runner.clone(), camera.name.clone()));
     if describe_camera::bound_producer(&node_runner).is_some() {
         info!("camera response model linked: controls forward to the simulation");
     } else {
@@ -519,7 +542,7 @@ pub async fn setup(_params: Parameters, node_runner: Arc<NodeRunner>) -> Result<
     spawn_forwarding_control!(route, get_camera_profile => describe_camera, [], profile_json);
     spawn_forwarding_control!(route, reset_camera => control_reset_camera, []);
 
-    let frames = tokio::spawn(relay_frames(node_runner.clone(), token.clone()));
+    let frames = tokio::spawn(relay_frames(node_runner.clone(), camera, token.clone()));
     let info = tokio::spawn(track_stream_info(
         node_runner.clone(),
         description,
@@ -656,15 +679,6 @@ mod tests {
         assert_eq!(
             relayed(Unanswered::NoModel),
             ("rejected", NO_RESPONSE_MODEL_MESSAGE.to_owned())
-        );
-        assert_eq!(
-            relayed(Unanswered::NoCamera(
-                "this relay names no camera".to_owned()
-            )),
-            (
-                "precondition_failed",
-                "this relay names no camera".to_owned()
-            )
         );
         assert!(!Unanswered::NoModel.in_transport());
     }
