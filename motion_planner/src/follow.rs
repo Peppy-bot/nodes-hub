@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use control_core::robot_tree::{RobotTree, follow_moving, follow_static};
-use frame_tree::{MovingMessage, Publisher, StaticMessage};
+use frame_tree::{MovingMessage, Publisher, StaticMessage, TransformRecord};
 use peppygen::consumed_topics::transforms::{static_transforms, transforms};
 use peppygen::{NodeRunner, ProducerRef};
 
@@ -53,24 +53,35 @@ fn publisher_of(producer: ProducerRef) -> Publisher {
     }
 }
 
+/// The transform records of a message's `transforms`, field for field: each topic's
+/// generated item is a type of its own.
+macro_rules! transform_records {
+    ($items:expr) => {
+        $items
+            .into_iter()
+            .map(|item| TransformRecord {
+                frame: item.frame,
+                child_frame: item.child_frame,
+                position: item.position,
+                orientation: item.orientation,
+            })
+            .collect()
+    };
+}
+
 /// A message of transforms as the tree takes it, field for field.
 fn moving_message(message: transforms::Message) -> MovingMessage {
     MovingMessage {
         timestamp: message.timestamp,
-        child_frames: message.child_frames,
-        parent_frames: message.parent_frames,
-        positions: message.positions,
-        orientations: message.orientations,
+        transforms: transform_records!(message.transforms),
         start_timestamp: message.start_timestamp,
     }
 }
 
-/// A message of static_transforms as the tree takes it, field for field.
+/// A message of static_transforms as the tree takes it: its transforms, each holding at
+/// every time, so the message holds no timestamp.
 fn static_message(message: static_transforms::Message) -> StaticMessage {
     StaticMessage {
-        child_frames: message.child_frames,
-        parent_frames: message.parent_frames,
-        positions: message.positions,
-        orientations: message.orientations,
+        transforms: transform_records!(message.transforms),
     }
 }

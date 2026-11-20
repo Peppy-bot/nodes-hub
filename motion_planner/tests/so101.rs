@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use chain_kinematics::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use chain_kinematics::{Chain, ChainSpec, JointSelection};
+use control_core::geometry::pose_arrays;
 use motion_planner::request::{Named, Planner, Refiner};
-use motion_planning_core::pose_parts;
 use peppygen::Parameters;
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path::GoalWaypointsItem;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
@@ -49,6 +49,11 @@ static SO101: LazyLock<RobotDescription> = LazyLock::new(|| {
 
 /// The joints of SO-101's one arm.
 const ARM_DOF: usize = 5;
+
+/// SO-101's robot frame, the root link of its description.
+fn robot_frame() -> String {
+    SO101.root_link().to_string()
+}
 
 /// SO-101's one arm.
 fn arm() -> &'static robot_description::Arm {
@@ -108,7 +113,7 @@ fn chain() -> Chain<ARM_DOF> {
 }
 
 fn tool_pose(q: &[f64; ARM_DOF]) -> Isometry3<f64> {
-    chain().world_ee_pose(q)
+    chain().root_ee_pose(q)
 }
 
 fn tool_point(q: &[f64; ARM_DOF]) -> [f64; 3] {
@@ -158,8 +163,13 @@ async fn started_at(q: &[f64; ARM_DOF]) -> peppygen::Result<(Harness, Mocks)> {
             arm_names: vec![arm().name.clone()],
             joints_per_arm: vec![ARM_DOF as u32],
             joint_positions: q.to_vec(),
-            positions: vec![0.0; 3],
-            orientations: vec![0.0, 0.0, 0.0, 1.0],
+            frame: robot_frame(),
+            grasp_points: vec![
+                peppygen::consumed_topics::limb_state::limb_states::MessageGraspPointsItem {
+                    position: [0.0; 3],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
             gripper_names: vec![arm().gripper.name.clone()],
             gripper_openings: vec![0.0],
         })
@@ -231,7 +241,7 @@ fn joints_at(q: &[f64; ARM_DOF]) -> GoalRequestData {
             .zip(q)
             .map(|(joint, position)| GoalGoalJointConstraintsItem {
                 joint_name: joint.to_string(),
-                position: *position,
+                joint_position: *position,
                 tolerance_above: 0.01,
                 tolerance_below: 0.01,
             })
@@ -245,6 +255,8 @@ fn joints_at(q: &[f64; ARM_DOF]) -> GoalRequestData {
 fn position_constraint(position: [f64; 3]) -> GoalGoalPositionConstraintsItem {
     GoalGoalPositionConstraintsItem {
         link_name: arm().grasp_link.clone(),
+        frame: Some(robot_frame()),
+        timestamp: None,
         position,
         tolerance_m: POSITION_TOLERANCE_M,
     }
@@ -255,12 +267,14 @@ fn position_constraint(position: [f64; 3]) -> GoalGoalPositionConstraintsItem {
 fn turned_goal(turn_rad: f64, tolerance_rad: f64, free_axis: &str) -> GoalRequestData {
     let pose = tool_pose(&REACHED);
     let turned = pose.rotation * UnitQuaternion::from_axis_angle(&Vector3::x_axis(), turn_rad);
-    let (_, orientation) = pose_parts(&Isometry3::from_parts(pose.translation, turned));
+    let (_, orientation) = pose_arrays(&Isometry3::from_parts(pose.translation, turned));
     goal_of(
         Vec::new(),
         vec![position_constraint(tool_point(&REACHED))],
         vec![GoalGoalOrientationConstraintsItem {
             link_name: arm().grasp_link.clone(),
+            frame: Some(robot_frame()),
+            timestamp: None,
             orientation,
             tolerance_rad,
             free_axis: free_axis.to_string(),
@@ -276,16 +290,18 @@ async fn enter_box(harness: &Harness, id: &str, center: [f64; 3], side_m: f64) {
             objects: vec![Object {
                 id: id.to_string(),
                 operation: "add".to_string(),
-                position: center,
-                orientation: [0.0, 0.0, 0.0, 1.0],
-                shapes: vec![Shape {
+                frame: Some(robot_frame()),
+                timestamp: None,
+                position: Some(center),
+                orientation: Some([0.0, 0.0, 0.0, 1.0]),
+                shapes: Some(vec![Shape {
                     kind: "box".to_string(),
                     dimensions: vec![side_m; 3],
                     mesh_vertices: Vec::new(),
                     mesh_triangles: Vec::new(),
                     position: [0.0; 3],
                     orientation: [0.0, 0.0, 0.0, 1.0],
-                }],
+                }]),
             }],
         },
         TIMEOUT,
@@ -486,9 +502,11 @@ async fn fraction_along(harness: &Harness, by: [f64; 3]) -> f64 {
         arm_name: arm().name.clone(),
         start_joint_positions: Vec::new(),
         link_name: arm().grasp_link.clone(),
+        frame: Some(robot_frame()),
+        timestamp: None,
         waypoints: vec![GoalWaypointsItem {
             position: (pose.translation.vector + Vector3::from(by)).into(),
-            orientation: pose_parts(&pose).1,
+            orientation: pose_arrays(&pose).1,
         }],
         avoid_collisions: true,
     };

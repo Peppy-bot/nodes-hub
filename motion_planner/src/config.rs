@@ -31,7 +31,9 @@ pub struct Config {
     /// How long the robot's tree keeps each moving transform's stamps, counted back from
     /// the newest stamp of its child frame.
     pub cache_window: Duration,
-    /// How long a depth frame waits for the robot's tree to place the camera at its stamp.
+    /// How long a goal, a request or an object waits for the robot's tree to place it at its
+    /// timestamp with a publisher of the tree bound, and a depth frame for the tree to place the
+    /// camera at its stamp.
     pub lookup_timeout: Duration,
     pub goal_samples: NonZeroUsize,
     pub max_iterations: NonZeroU64,

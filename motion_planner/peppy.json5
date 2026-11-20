@@ -1,5 +1,5 @@
 // motion_planner: plans joint paths for the arms, one or together, of the robot its
-// initializer's robot_identity names, around what the robot's perception camera sees and the
+// initializer's robot_identity names, around what the robot's depth camera sees and the
 // objects of its planning scene. It keeps a voxel map of the camera's depth
 // frames in the robot frame, the robot and the scene's objects cut out of each
 // frame where they stood, and plans with OMPL, keeping a clearance from the
@@ -17,7 +17,7 @@
     tag: "v1",
     description: [
       "Plans joint paths for the robot's arms, one or together, around what the robot's depth camera has seen and the objects of its planning scene, keeping the arms apart, and checks joint paths from other sources the same way. It moves nothing: a caller runs a path with limb_motion's execute_joint_path.",
-      "It implements motion_planning. It keeps a voxel map of the perception camera's depth frames, the robot and the planning scene's objects cut out of each frame, and plans with OMPL, each state keeping a clearance from the map, the objects and between the pairs of the robot's own links its self-collision model checks. It holds the planning scene: the collision objects, the objects attached to an arm's grasp link, and the pairs allowed to touch. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, and the camera from workspace, sensor_mounts, transforms, camera and geometry, the robot's tree placing the camera at the time of each depth frame; without a camera, a plan keeps clear of the scene's objects and the robot's own body alone.",
+      "It implements motion_planning. It keeps a voxel map of the depth camera's frames, the robot and the planning scene's objects cut out of each frame, and plans with OMPL, each state keeping a clearance from the map, the objects and between the pairs of the robot's own links its self-collision model checks. It holds the planning scene: the collision objects, the objects attached to an arm's grasp link, and the pairs allowed to touch. It reads the robot's model from its initializer's robot_identity, the arms' measured joint positions from limb_state, the robot's tree from transforms, which places each goal, each request and each object at its timestamp and each depth frame by the frame its header names at its time, and the camera from camera and geometry; without a camera, a plan keeps clear of the scene's objects and the robot's own body alone.",
     ],
     implements: [
       { name: "motion_planning", tag: "v1", link_id: "motion_planning" },
@@ -33,20 +33,19 @@
         // plan, and the map cuts the robot out of each depth frame at the
         // positions it stood at when the frame was taken.
         { name: "limb_state", tag: "v1", link_id: "limb_state" },
-        // The perception camera: which camera it is (workspace), its frame
-        // and the robot frame (sensor_mounts), the robot's tree of frames,
-        // which places the camera at the time of each depth frame, bound to
-        // every publisher of the tree (transforms), its depth frames (camera)
-        // and its geometry (geometry). With camera and geometry bound, the map
-        // reads the camera, and workspace, sensor_mounts and transforms are
-        // bound too. With camera and geometry vacant, the map stays empty and
-        // plans and checks keep the clearance from the robot's own body
-        // alone, whether the others are bound or not, as on a robot without a
-        // camera rig. Any other binding refuses every plan and check, the
-        // message naming the slots to bind or leave vacant.
-        { name: "workspace", tag: "v1", link_id: "workspace", cardinality: "zero_or_one" },
-        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
+        // The robot's tree of frames, bound to every publisher of the tree:
+        // it places each goal, request and object at its timestamp, and each
+        // depth frame by the frame its header names at its time. Vacant, the
+        // tree is empty and takes the robot frame alone: a value in any other
+        // frame is refused with unknown_frame at once.
         { name: "transforms", tag: "v1", link_id: "transforms", cardinality: "zero_or_more" },
+        // The depth camera: its depth frames (camera) and its geometry
+        // (geometry). With camera and geometry bound, the map reads the camera,
+        // and transforms is bound too. With camera and geometry vacant, the map
+        // stays empty and plans and checks keep the clearance from the robot's
+        // own body alone, as on a robot without a camera rig. Any other
+        // binding refuses every plan and check, the message naming the slots
+        // to bind or leave vacant.
         { name: "rgbd_camera", tag: "v1", link_id: "camera", cardinality: "zero_or_one" },
         { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
       ],
@@ -72,8 +71,6 @@
       consumes: [
         { link_id: "identity", name: "get_identity" },
         { link_id: "identity", name: "get_description" },
-        { link_id: "workspace", name: "describe_workspace" },
-        { link_id: "sensor_mounts", name: "describe_sensors" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
         { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
         { link_id: "camera", name: "depth_stream_info" },
@@ -132,12 +129,20 @@
       max_update_rate_hz: "f64",
       // How long (s) the planner keeps each moving transform of the robot's
       // tree, counted back from the newest stamp of its child frame: finite
-      // and above 0. A depth frame older than that is placed by no lookup.
-      cache_window_s: "f64",
-      // How long (s) a depth frame waits, on the planner's clock, for the
-      // robot's tree to place the camera at its stamp: finite and 0 or
-      // above, 0 for no wait. A newer depth frame takes the place of one
-      // that waits, and one whose wait runs out is skipped.
+      // and above 0. A goal, a request, an object or a depth frame older
+      // than that is placed by no lookup. The default is tf2's default cache
+      // time (BUFFER_CORE_DEFAULT_CACHE_TIME), which MoveIt's planning scene
+      // monitor keeps.
+      cache_window_s: { $type: "f64", $default: 10.0 },
+      // How long (s) a goal, a request or an object waits, on the planner's
+      // clock, for the robot's tree to place it at its timestamp, and a
+      // depth frame for the tree to place the camera at its stamp: finite
+      // and 0 or above, 0 for no wait. A goal, a request or an object whose
+      // wait runs out is refused with the lookup's failure kind; a newer
+      // depth frame takes the place of one that waits, and one whose wait
+      // runs out is skipped. With transforms vacant no publisher fills the
+      // tree, and nothing waits: a value in a frame other than the robot
+      // frame is refused with unknown_frame at once.
       lookup_timeout_s: "f64",
       // How many times a second occupancy_map publishes the map: above 0.
       occupancy_map_rate_hz: { $type: "f64", $default: 1.0 },

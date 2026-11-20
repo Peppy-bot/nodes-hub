@@ -1,4 +1,4 @@
-//! motion_planner: keeps a voxel map of what the perception camera sees and plans the
+//! motion_planner: keeps a voxel map of what the depth camera sees and plans the
 //! robot's arm paths on it. See README.md.
 
 use control_core::fault::Fault;

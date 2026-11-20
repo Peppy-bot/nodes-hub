@@ -1,6 +1,6 @@
 # motion_planner
 
-Plans joint paths for the arms of a robot, one or together, around what its perception camera sees
+Plans joint paths for the arms of a robot, one or together, around what its depth camera sees
 and the objects of its planning scene. The node keeps a voxel map of the camera's depth
 frames in the robot frame and a planning scene of collision objects, objects attached to
 an arm's grasp link and pairs allowed to touch, as MoveIt's planning scene holds them; it
@@ -13,13 +13,13 @@ limb_motion's `execute_joint_path`, passing every arm of the answer and each arm
 
 ```text
  backbone: limb_states ---------> joint history ---+--> cut-out of the robot
- backbone: workspace                  (2 s)        |    and of the objects
- initializer: sensor_mounts; tree: transforms      |
-   --> camera pose at each frame's stamp           |
+ tree: transforms                     (2 s)        |    and of the objects
+   --> the frame each depth frame names, at its stamp
  camera:   depth_stream, geometry --> depth points +--> voxel map (robot frame)
  apply_collision_objects, apply_attached_collision_object,  |
  set_allowed_collision --> planning scene ------------------+
                                                           |
+ tree: transforms --> each goal, request and object, at its timestamp
  plan_joint_path --> start --> OMPL, goal samples (IK) -----> rounded path check
  plan_cartesian_path --> start --> a step at a time (IK) ---> rounded path check
  check_joint_path --> start, waypoints ----------------------> rounded path check
@@ -92,21 +92,24 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
 
 ## The map
 
-- `workspace.describe_workspace` names the perception camera, and
-  `sensor_mounts.describe_sensors` names its color optical frame in the robot's tree and
-  the robot frame, which is the root link of the robot's description. The node holds the
-  robot's tree from the `transforms` and `static_transforms` of every publisher bound to
-  its `transforms` slot, each moving transform's stamps within `cache_window_s`, and
-  places the camera at the stamp of each depth frame by a lookup in it: the camera's
-  depth optical frame stands where the lookup puts its color frame, moved by the
-  camera's own `get_depth_to_color_extrinsics`. A camera on the body and one an arm
-  carries are placed alike. The depth frames, the lens and the depth model come from the
-  camera the launcher binds to the `camera` and `geometry` slots.
+- The node holds the robot's tree from the `transforms` and `static_transforms` of every
+  publisher bound to its `transforms` slot, each moving transform's stamps within
+  `cache_window_s`, and places each depth frame by the frame its header names, the
+  camera's color optical frame, at the frame's stamp, as Nav2's costmap layers and
+  MoveIt's octomap updater place a cloud by the frame of its header: the camera's depth
+  optical frame stands where the lookup puts that frame in the robot frame, the root link
+  of the robot's description, moved by the camera's own
+  `get_depth_to_color_extrinsics`. A camera on the body and one an arm carries are placed
+  alike. The depth frames, the lens and the depth model come from the camera the launcher
+  binds to the `camera` and `geometry` slots. A frame whose header names another frame
+  than the one `get_depth_to_color_extrinsics` gives, or another alignment than the
+  geometry describes, is skipped, and the camera is asked to describe itself again.
 - A frame waits up to `lookup_timeout_s` on the planner's clock, the simulation clock in
-  a simulation, for the tree to place the camera at its stamp, as tf2's message filter
+  a simulation, for the tree to place its frame at its stamp, as tf2's message filter
   holds a message; a newer frame that arrives while it waits takes its place, and a frame
-  whose wait runs out is skipped, the refusal of a plan or a check naming the lookup's
-  failure. A clock that goes back drops the stamps of every moving transform of the
+  whose wait runs out is skipped and logged with the lookup's failure kind, such as
+  `unknown_frame` for a frame the tree does not hold, the refusal of a plan or a check
+  naming it. A clock that goes back drops the stamps of every moving transform of the
   tree. The end of the ticks of the planner's simulation clock ends the node with an
   error for its restart policy.
 - A depth frame clears the space along each ray up to its point and marks the voxel
@@ -122,10 +125,12 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   robot filter). So is each shape of the planning scene's objects, by the same two
   numbers and the same rule: within `padding_offset_m` of the shape scaled about its
   center, a mesh's the center of its bounds; an object an arm holds stands where its
-  grasp link stood at the frame's stamp. A point inside the grown pieces or shapes is
-  the robot or an object seen: its voxel takes the lowest log-odds and reads free, as
-  MoveIt sets its model cells, though another point of the same frame ends in it, and
-  its ray clears the space before it.
+  grasp link stood at the frame's stamp, and every other object where it stood in the
+  robot frame at that stamp, placed from the root of its frame's chain, where the node
+  holds it (a frame whose objects the tree cannot place then is skipped). A point inside
+  the grown pieces or shapes is the robot or an object seen: its voxel takes the lowest
+  log-odds and reads free, as MoveIt sets its model cells, though another point of the
+  same frame ends in it, and its ray clears the space before it.
 - Adding, moving or attaching an object clears every voxel it intersects where it then
   stands: a call of `apply_collision_objects` clears where it leaves each object it adds
   or moves, and nothing for one it then removes.
@@ -160,22 +165,72 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   the camera took at or before the newest joint positions measured at the clear marks
   nothing, however late it arrives.
 - The camera slots bind as one: with `camera` and `geometry` bound, the map reads the
-  camera, and `workspace`, `sensor_mounts` and `transforms` are bound too. With `camera`
-  and `geometry` vacant the map stays empty, whether the others are bound or not, as on
-  a robot without a camera rig: plans and checks keep the clearance from the objects and
+  camera, and `transforms` is bound too. With `camera` and `geometry` vacant the map
+  stays empty, whether `transforms` is bound or not, as on a robot without a camera rig: plans and checks keep the clearance from the objects and
   the robot's own body, and answer no `map_stamp`. Any other binding leaves the map
   waiting on a camera it cannot read, and every plan and check is refused, the message
   naming the slots to bind or leave vacant.
 - While the map holds no frame, a refused plan or check names what the map waits on:
   the camera's description and the call that failed or the answer that gives no lens
-  or depth model, a frame skipped and why, or a fault in the robot's description, which
-  ends the asking: no perception camera named, no sensor of sensor_mounts by that name,
-  one that is no camera, or a robot frame other than the description's root link.
+  or depth model, or a frame skipped and why.
 - `occupancy_map` publishes the map `occupancy_map_rate_hz` times a second, whether or
-  not it changed: the center of each occupied voxel in the robot frame, the side of the
-  voxels, and, while the map holds no frame of a camera it reads, what it waits on, each
-  message stamped when the node read the map, on its clock. A read waits on a frame's
-  intake, which holds the map.
+  not it changed: the center of each occupied voxel in `frame`, the robot frame, the side
+  of the voxels, and, while the map holds no frame of a camera it reads, what it waits on,
+  each message at `timestamp`, the time of the robot frame's newest place in the robot's
+  tree when the node read the map, or, where no moving transform places the robot frame,
+  the time the node read it on its clock. A read waits on a frame's intake, which holds the
+  map.
+
+## Frames
+
+Each record of a goal or a request names its frame and its timestamp: each constraint, a
+Cartesian path's waypoints and each collision object. A record that names no frame lies in
+the robot frame. The node places it by the robot's tree at its timestamp, or at the latest
+time for a record that leaves it out, waiting up to `lookup_timeout_s`, as `control_core`'s
+`RobotTree::place` does: a record at a time is placed where its frame stood then, through the
+root of its frame's chain, so a pose in the robot frame read before a base move names the
+same place on the floor after it, as Nav2 places a goal at its stamp. A record the tree cannot place is refused with the lookup's
+failure kind, `unknown_frame`, `no_chain`, `extrapolation` or `broken_tree`, its message
+naming the cause as `transform_lookup`'s does, before anything is planned. With `transforms`
+vacant no publisher fills the tree, and a lookup does not wait: a record in the robot frame
+is placed at once, and one in any other frame is refused with `unknown_frame` at once, its
+message saying to give the goal or the object in the robot frame or leave frame out, or to
+bind `transforms`.
+
+A constraint in a link of an arm the plan moves, or in a link fixed to one, is held against
+that link at each state, as MoveIt holds a constraint whose frame is a link of the robot
+(moveit2 2.15.2, kinematic_constraint.cpp, `mobile_frame_`): a goal constraint is met where
+the link stands in the path's last state, and a path orientation where it stands in each
+state (`motion_planning_core`'s `Reference`). The goal sampling draws a goal in such a
+frame where the state the sample has reached puts the frame, and decides it where the
+configuration it finds puts it, as MoveIt's `IKConstraintSampler` draws at its reference
+state and validates at the found state. A plan of both arms holds the arms' joints in the
+robot's order, and `motion_planning_core` samples an arm after each arm in whose frames its
+goal lies, as MoveIt's `OrderSamplers` orders the samplers of a group's arms
+(union_constraint_sampler.cpp). A path orientation of an arm the plan
+leaves where it starts, in a frame of an arm the plan moves, is held at each state against
+where that frame stands, the standing arm's link where its start puts it, as MoveIt judges a
+constraint on a link outside its planning group with every joint outside the group at the
+start state's (moveit_planners/ompl state_validity_checker.cpp:58, :102-107).
+
+The waypoints of a Cartesian path in a link of its arm are placed where that link stands at
+the path's start, as MoveIt's Cartesian path places a target in its link's frame; in any
+other frame the tree places them.
+
+An orientation whose squared norm lies 0.01 or more from 1, the tolerance of tf2's buffer, is
+refused with `rejected` by `control_core`'s one parse, which normalizes each orientation it
+takes. A Cartesian path's waypoints share one frame and one time, and one lookup of the tree
+places them all.
+
+The node plans in the robot frame. A plan's and a Cartesian path's grasp-point poses are in
+`frame`, the robot frame; they follow from the joint positions alone, so the result holds no
+timestamp.
+`get_planning_scene` answers the objects no link carries in `frame`, the robot frame, placed
+there at the latest time, at `timestamp`, the time of the robot frame's place in the tree's
+answer that placed them (the oldest of the answers, for objects in several roots), or of the
+robot frame's newest place in the tree where the scene holds no such object, or, where no
+moving transform places the robot frame, the time the node read the scene on its clock; and
+each attached object in `frame`, the link that carries it.
 
 ## A plan
 
@@ -203,13 +258,14 @@ A pose `move_arm` refuses for its orientation plans here, with the slack named i
   sample sets out from the last goal found, from the start for the first, through
   motion_planning_core's port of MoveIt's KDL inverse kinematics, and each attempt keeps
   up to `goal_samples` goals within its time. A sample of both arms samples each arm in
-  turn, as MoveIt's `UnionConstraintSampler` samples a group, each arm's configurations
-  checked with the left arm at its sampled joints and the right arm at the last goal's,
-  from the start for the first: the whole state from a start that keeps
-  `min_clearance_m`, as MoveIt checks it; from a start nearer than that, which the plan
-  starts from as the start rule says, the left arm's turn its pairs without the right
-  arm, and the right arm's turn its pairs with the left, so an arm that starts nearer
-  than the clearance holds back no goal.
+  turn, in `motion_planning_core`'s order (the section on frames), as MoveIt's
+  `UnionConstraintSampler` samples a group, each arm's configurations checked with the
+  arm sampled first at its sampled joints and the other arm at the last goal's, from the
+  start for the first: the whole state from a start that keeps `min_clearance_m`, as
+  MoveIt checks it; from a start nearer than that, which the plan starts from as the
+  start rule says, the first arm's turn its pairs without the other arm, and the second
+  arm's turn its pairs with the first, so an arm that starts nearer than the clearance
+  holds back no goal.
 - Every state of the path keeps `min_clearance_m` from the map, from the planning
   scene's objects, and between each pair of the robot's own links that the self-collision
   model checks; so does the path `execute_joint_path` runs from the plan's start, its
@@ -339,7 +395,8 @@ as `motion_planning_core::cartesian_path` computes them after MoveIt's
   measured.
 - `link_name` is its grasp link or a link fixed to it. Any other link, an inner link or a
   finger, is refused with `rejected`, the message naming the grasp link. So are no `waypoints`
-  and a pose that is no pose (`pose_from_parts`).
+  and a pose that `control_core`'s parse refuses. The waypoints are in `frame`, the robot frame
+  when it is left out, at `timestamp`, placed as the section on frames says.
 - With `avoid_collisions` true the path keeps clear of the snapshot its admission took, as a
   plan does: refused with `precondition_failed` before the camera's depth frame, a start in
   contact fails with `start_in_collision`, and `map_stamp` is the frame's stamp. With it false,
@@ -374,7 +431,11 @@ more than `start_tolerance_rad`, or a fault on the run from the start, leaves 0.
 `reason` names the fault and how near the path comes. A walk of a run or of an arc
 starts only within 10 s of the request, and a check with a walk left at 10 s fails with
 `timeout`, the message saying to send a path of fewer waypoints: under the 15 s the
-robot's MCP endpoint waits on `check_joint_path`.
+robot's MCP endpoint waits on `check_joint_path`. A check whose objects the robot's tree
+cannot place in the robot frame is refused with the failure kind of the placement, the
+message naming the objects by their ids and the cause: `unknown_frame`, `no_chain`,
+`extrapolation` or `broken_tree` for a lookup, and `rejected` for a place past the finite
+numbers.
 
 A plan's refusals come at the goal's admission, before the node takes the goal; its
 failures come after.
@@ -389,27 +450,40 @@ serves its four members on the scene as it stands:
 
 - `apply_collision_objects` applies its objects in order, all or none, and an empty list
   changes nothing. "add" places an object of boxes, spheres, cylinders and closed
-  meshes, posed in the robot frame, in place of one of the same id, whose allowed pairs
-  it keeps; "move" reads the id and the pose; "remove" reads the id and drops every pair
-  that names the object.
+  meshes, each shape posed relative to the object, in place of one of the same id, whose
+  allowed pairs it keeps; "move" reads the id and the pose; "remove" reads the id alone and
+  drops every pair that names the object. A field an operation does not read may be left
+  out, and is not checked. The robot's tree places each object's pose in the
+  root of its frame's chain at its timestamp, the frame that holds still across a move of
+  the robot (odom or map on a mobile base, the robot frame on a fixed one), and the node
+  holds it there, as MoveIt holds a collision object in its planning frame; each plan,
+  Cartesian path, check, attach and `get_planning_scene` places it in the robot frame at the
+  latest time, and each depth frame at the frame's stamp, the objects of one root by one
+  answer of the tree. With `transforms` vacant the tree holds no transform, and an object
+  in the robot frame stands in the robot frame, the root of its own chain, while one in any
+  other frame is refused with `unknown_frame` at once; with `transforms` bound, an object in
+  the robot frame waits for the tree to place the robot frame, as an object in any other
+  frame does.
 - `apply_attached_collision_object` attaches an object to an arm's grasp link where both
   stand, the link where the arms' last measured joint positions put it, with touch links
   it may touch besides that link; a detach, which reads the id alone, leaves the object
-  in the scene where it stands. Its allowed pairs stay through both.
+  in the scene where it stands, held from then on in the root of the robot frame's chain.
+  Its allowed pairs stay through both.
 - `set_allowed_collision` lets an object, attached or not, touch links of the robot,
   other objects, or `"occupancy_map"`, the voxel map, or stops it. To set a held item
   down on a table, a caller pairs the item with the table, and the table with the
   gripper's links too where they come nearer to it than `clearance_m`: the table is an
   object, which every link keeps that clearance from.
-- `get_planning_scene` answers the objects no link carries and the attached objects,
-  posed in their grasp links' frames, each list in the order of the ids; each allowed
+- `get_planning_scene` answers the objects no link carries, in the robot frame, and the
+  attached objects, each in its grasp link's frame, each list in the order of the ids; each allowed
   pair once, its names in order, the pairs in the order of their names; `clearance_m`,
   which is `min_clearance_m`; and `voxel_size_m`.
 
 | Refusal | When |
 |---|---|
-| `rejected` | An object's id is empty, or names a link or `"occupancy_map"`; an add has no shape, or a shape that cannot be built, an open mesh among them; an add or a move has a pose whose position is not finite or whose orientation is no unit quaternion; "move" or "remove" names an unknown object; an operation names an attached object; an operation is none of the member's; an attach names an object the scene does not hold, a link that is no arm's grasp link, a touch link that is no link of the robot, an object's id among them, or an attached object; a detach names an object the scene does not hold or one no link carries; `set_allowed_collision`'s `name` is no object of the scene, or `other_names` holds a name that is no link, no object and not `"occupancy_map"`, or the object itself. The message names what to send, and the call changes nothing. |
+| `rejected` | An object's id is empty, or names a link or `"occupancy_map"`; an add has no shape, its shapes left out or empty, or a shape that cannot be built, an open mesh among them; an add or a move has no position or orientation, a pose whose position is not finite or whose orientation has a squared norm 0.01 or more from 1, an empty frame, or a pose the tree places past the finite numbers; "move" or "remove" names an unknown object; the tree places an object the scene holds past the finite numbers for an attach or for `get_planning_scene`; an operation names an attached object; an operation is none of the member's; an attach names an object the scene does not hold, a link that is no arm's grasp link, a touch link that is no link of the robot, an object's id among them, or an attached object; a detach names an object the scene does not hold or one no link carries; `set_allowed_collision`'s `name` is no object of the scene, or `other_names` holds a name that is no link, no object and not `"occupancy_map"`, or the object itself. The message names what to send, and the call changes nothing. |
 | `precondition_failed` | An attach before the arms' joint positions are measured. |
+| `unknown_frame`, `no_chain`, `extrapolation`, `broken_tree` | The robot's tree cannot place an object of `apply_collision_objects` at its timestamp, a held object in the robot frame for an attach or for `get_planning_scene`, or a detached object in the root of the robot frame's chain; the message names the objects by their ids, then the cause. |
 
 Where the scene departs from MoveIt, each a choice a caller sees, against moveit2 2.15.2
 (`PlanningScene`, `moveit_core/planning_scene/src/planning_scene.cpp`, unless named) and
@@ -535,7 +609,8 @@ sampling, which departs too, is in "The robot".
 
 | Refusal or failure | When |
 |---|---|
-| `rejected` | The request names no arm, an arm twice, an arm, joint or link the named arms do not have, a name twice in one list of constraints, or a number outside its range; an arm's constraints mix joint and pose constraints, or its position and orientation constraints name more than one of its links; or a check's arms hold different numbers of waypoints. The message names what to send. |
+| `rejected` | The request names no arm, an arm twice, an arm, joint or link the named arms do not have, a name twice in one list of constraints, or a number outside its range; a record names an empty frame, or an orientation whose squared norm lies 0.01 or more from 1, or the tree places it past the finite numbers; an arm's constraints mix joint and pose constraints, or its position and orientation constraints name more than one of its links; or a check's arms hold different numbers of waypoints. The message names what to send. |
+| `unknown_frame`, `no_chain`, `extrapolation`, `broken_tree` | The robot's tree cannot place a constraint or a waypoint at its timestamp, or an object of the planning scene in the robot frame; the message names the cause, after the objects by their ids for objects of the planning scene. |
 | `precondition_failed` | The camera is linked and the map has taken in no depth frame since the node started or the map was cleared, the message naming what the map waits on; or no joint positions have been measured; or a plan's start lies outside a joint limit by more than `start_tolerance_rad`, the message naming the joint. |
 | `start_in_collision` | A plan's start touches the map, an object of the planning scene or the robot's own body, or stands nearer than `min_clearance_m` to the map or an object no arm holds; the message names the pair, how far apart it stands, and what to do. |
 | `unreachable` | No configuration meets the goal before the goal sampling ends (once the samples since the last goal found reach 1000 less the goals found so far, as MoveIt's `max_goal_sampling_attempts` bounds the samples its sampling function makes before it returns a goal, counting from the goals OMPL has taken) or within the time allowed, the message naming in a plan of both arms the first arm that met its goal in no sample; or every configuration, or state of both arms, that the goal sampling tried comes nearer than the plan's clearance, which the message names with the pair that the one falling short least falls short against: two links, a link or a carried object and the map or an object, a carried object and a link, or two objects the two arms carry. The message says so when the deadline ended the sampling, and that more time may find a goal. |
@@ -550,11 +625,12 @@ See `peppy.json5` for the commented list. Every parameter but `occupancy_map_rat
 `d_safe_m`, so the backbone's guard does not slow the arm on a planned path. A
 parameter outside its range stops the node with a message that names it.
 
-The node reads `identity` (`robot_identity:v1`) and `sensor_mounts` from the robot's
-initializer, `limb_state` and `workspace` from the backbone, `transforms` from every
-publisher of the robot's tree (the initializer and the backbone), and `camera`
-(`rgbd_camera:v1`) and `geometry` (`camera_geometry:v1`) from the perception camera. The
-camera slots are optional, and bind as the map section says.
+The node reads `identity` (`robot_identity:v1`) from the robot's initializer, `limb_state`
+from the backbone, `transforms` from every publisher of the robot's tree (the initializer
+and the backbone), and `camera` (`rgbd_camera:v1`) and `geometry` (`camera_geometry:v1`)
+from the depth camera. The camera slots are optional, and bind as the map section says.
+Without a publisher bound to `transforms`, the tree is empty and places the robot frame
+alone, and a value in any other frame is refused with `unknown_frame` at once.
 
 ## Build, run, test
 

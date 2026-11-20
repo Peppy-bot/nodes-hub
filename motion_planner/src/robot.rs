@@ -674,8 +674,8 @@ pub(crate) mod tests {
                     .with_tool_link(&from.grasp_link)
                     .expect("the grasp link is the arm's tool");
             let bent = [0.3, 0.2, -0.4, 1.1, 0.5, -0.3, 0.7];
-            let planned = arm.geometry.chain().world_ee_pose(&bent);
-            let reported = closed_form.world_ee_pose(&bent);
+            let planned = arm.geometry.chain().root_ee_pose(&bent);
+            let reported = closed_form.root_ee_pose(&bent);
             assert!(
                 (planned.translation.vector - reported.translation.vector).norm() < 1e-12
                     && planned.rotation.angle_to(&reported.rotation) < 1e-12,

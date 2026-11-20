@@ -7,23 +7,32 @@
 //! mesh around the arm is a collision and an open mesh is refused; get_planning_scene
 //! gives exactly what was set, a replacing add, a move, an attach and a detach keep the
 //! pairs and a remove drops those that name the object; fields an operation does not read
-//! are not checked; every refusal comes with rejected, or with precondition_failed before
-//! the arms are measured, and changes nothing; an object clears the map where it is added
-//! or moved to, and the depth points inside an object or an attached item mark nothing;
-//! and the depth points within padding_offset_m of an object mark nothing, those beyond
-//! it mark the map.
+//! are not checked; an object that names no frame lies in the robot frame; with transforms
+//! vacant no member waits on a lookup of the tree, an object in the robot frame taken and a
+//! value in another frame refused with unknown_frame at once; every
+//! refusal comes with rejected, or with precondition_failed before the arms are measured, and
+//! changes nothing; an object clears the map where it is added or moved to, and the depth
+//! points inside an object or an attached item mark nothing; and the depth points within
+//! padding_offset_m of an object mark nothing, those beyond it mark the map.
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chain_kinematics::nalgebra::{Isometry3, Point3, Translation3, UnitQuaternion, Vector3};
 use collision_geometry::chain::RiderBody;
-use motion_planning_core::{pose_from_parts, pose_parts};
+use control_core::geometry::pose_arrays;
+use motion_planning_core::pose_from_parts;
+use peppygen::Parameters;
+use peppygen::exposed_actions::motion_planning::plan_joint_path::GoalGoalPositionConstraintsItem;
 use peppygen::exposed_services::motion_planning::apply_collision_objects::{
-    ApplyCollisionObjectsObjectsItem as Object, ApplyCollisionObjectsObjectsItemShapesItem as Shape,
+    ApplyCollisionObjectsObjectsItem as Object,
+    ApplyCollisionObjectsObjectsItemShapesItem as Shape,
+    ApplyCollisionObjectsObjectsItemShapesItemMeshVerticesItem as Vertex,
 };
-use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::FailureKind;
+use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
+    FailureKind, GoalRequestData,
+};
 use peppygen::fixtures::exposed_services::motion_planning::{
     apply_attached_collision_object, apply_collision_objects, check_joint_path, get_planning_scene,
     set_allowed_collision,
@@ -32,10 +41,10 @@ use peppygen::fixtures::harness::{Harness, Mocks};
 
 use common::{
     ARM_DOF, CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT, OPENARM_V2, OWN_BODY_WAY_OUT, RIGHT, Solid,
-    TIMEOUT, arms, at_ms, check, left_path, looking_at, over_the_table, parameters, plan, plan_to,
-    planned_waypoints, publish_arms, render, right_ready, start, start_with_camera,
-    start_without_camera, table_across, take_frame, under_the_table, vacant_camera_rig,
-    wait_for_the_arms,
+    TIMEOUT, arms, at_ms, check, left_path, left_ready, looking_at, over_the_table, parameters,
+    plan, plan_to, planned_waypoints, publish_arms, render, right_ready, robot_frame, start,
+    start_with_camera, start_without_camera, start_without_camera_with, table_across, take_frame,
+    under_the_table, vacant_camera_rig, wait_for_the_arms,
 };
 
 /// The left arm's grasp link.
@@ -43,7 +52,7 @@ const GRASP_LINK: &str = "openarm_left_tcp";
 
 /// The pose of the left arm's grasp link with the arm at `q`.
 fn grasp_pose(q: &[f64; ARM_DOF]) -> Isometry3<f64> {
-    OPENARM_V2.arms[LEFT].geometry.chain().world_ee_pose(q)
+    OPENARM_V2.arms[LEFT].geometry.chain().root_ee_pose(q)
 }
 
 /// The left gripper's links, which a held item may touch.
@@ -53,7 +62,7 @@ fn gripper_links() -> Vec<String> {
 
 /// A primitive of `kind` and `dimensions` at `pose` in its object's frame.
 fn primitive(kind: &str, dimensions: &[f64], pose: &Isometry3<f64>) -> Shape {
-    let (position, orientation) = pose_parts(pose);
+    let (position, orientation) = pose_arrays(pose);
     Shape {
         kind: kind.to_string(),
         dimensions: dimensions.to_vec(),
@@ -69,7 +78,10 @@ fn mesh(vertices: &[[f64; 3]], triangles: &[[u32; 3]]) -> Shape {
     Shape {
         kind: "mesh".to_string(),
         dimensions: Vec::new(),
-        mesh_vertices: vertices.iter().flatten().copied().collect(),
+        mesh_vertices: vertices
+            .iter()
+            .map(|&position| Vertex { position })
+            .collect(),
         mesh_triangles: triangles.iter().flatten().copied().collect(),
         position: [0.0; 3],
         orientation: [0.0, 0.0, 0.0, 1.0],
@@ -100,22 +112,38 @@ fn cube_mesh(side: f64) -> Shape {
     mesh(&corners, &triangles)
 }
 
-/// An entry of apply_collision_objects: `operation` on the object `id` at `pose`, of
-/// `shapes`.
-fn object(operation: &str, id: &str, pose: &Isometry3<f64>, shapes: Vec<Shape>) -> Object {
-    let (position, orientation) = pose_parts(pose);
+/// An entry of apply_collision_objects: `operation` on the object `id`, every other field
+/// left out.
+fn entry(operation: &str, id: &str) -> Object {
     Object {
         id: id.to_string(),
         operation: operation.to_string(),
-        position,
-        orientation,
-        shapes,
+        frame: None,
+        timestamp: None,
+        position: None,
+        orientation: None,
+        shapes: None,
+    }
+}
+
+/// The entry of `operation` that places the object `id` at `pose` in the robot frame at the
+/// latest time.
+fn placing(operation: &str, id: &str, pose: &Isometry3<f64>) -> Object {
+    let (position, orientation) = pose_arrays(pose);
+    Object {
+        frame: Some(robot_frame()),
+        position: Some(position),
+        orientation: Some(orientation),
+        ..entry(operation, id)
     }
 }
 
 /// The add of the object `id` at `pose`, of `shapes`.
 fn add(id: &str, pose: &Isometry3<f64>, shapes: Vec<Shape>) -> Object {
-    object("add", id, pose, shapes)
+    Object {
+        shapes: Some(shapes),
+        ..placing("add", id, pose)
+    }
 }
 
 /// The add of the box `solid` as the object `id`.
@@ -131,12 +159,12 @@ fn add_solid(id: &str, (low, high): Solid) -> Object {
 
 /// The move of the object `id` to `pose`.
 fn move_to(id: &str, pose: &Isometry3<f64>) -> Object {
-    object("move", id, pose, Vec::new())
+    placing("move", id, pose)
 }
 
 /// The removal of the object `id`.
 fn remove(id: &str) -> Object {
-    object("remove", id, &Isometry3::identity(), Vec::new())
+    entry("remove", id)
 }
 
 /// A poll's answer: taken, or the failure the node replied with.
@@ -351,7 +379,7 @@ fn left_gripper(q: &[f64; ARM_DOF]) -> Gripper {
         .expect("the left arm's fingers")
         .into_iter()
         .map(|finger| {
-            let pose = to_grasp * posed.link_pose_world(finger.segment) * finger.offset;
+            let pose = to_grasp * posed.link_pose_root(finger.segment) * finger.offset;
             let RiderBody::Part(part) = finger.body else {
                 panic!("a finger is a part of the robot");
             };
@@ -563,7 +591,7 @@ async fn a_held_item_keeps_clear_of_the_other_arm_and_the_body() -> peppygen::Re
     let grasp = grasp_pose(&under_the_table());
     let mut model = OPENARM_V2.own.model.clone();
     let bodies = model
-        .world_pieces(&[under_the_table(), right_ready()])
+        .pieces_in_root(&[under_the_table(), right_ready()])
         .expect("the bodies where the arms stand");
     let center_of = |body: &str| {
         let (_, pieces) = bodies
@@ -898,7 +926,16 @@ async fn the_scene_gives_exactly_what_was_set() -> peppygen::Result<()> {
         .await
         .expect("allowed again from the other name");
 
+    let asked_at = SystemTime::now();
     let answer = scene(&harness).await;
+    // The objects stand in the robot frame, which no moving transform places on OpenArm, so
+    // the answer holds at every time: it gives the time the node read the scene.
+    assert_eq!(answer.frame, robot_frame());
+    assert!(
+        (asked_at..=SystemTime::now()).contains(&answer.timestamp),
+        "{:?} after {asked_at:?}",
+        answer.timestamp
+    );
     assert_eq!(answer.clearance_m, parameters().min_clearance_m);
     assert_eq!(answer.voxel_size_m, parameters().voxel_size_m);
     let ids: Vec<&str> = answer.objects.iter().map(|o| o.id.as_str()).collect();
@@ -912,23 +949,31 @@ async fn the_scene_gives_exactly_what_was_set() -> peppygen::Result<()> {
         assert_pose(
             got.position,
             got.orientation,
-            &pose_from_parts(sent.position, sent.orientation).expect("a pose"),
+            &pose_from_parts(
+                sent.position,
+                sent.orientation
+                    .as_slice()
+                    .try_into()
+                    .expect("four entries"),
+            )
+            .expect("a pose"),
         );
     }
     let cube = &answer.objects[0];
     let sent = cube_mesh(0.1);
+    let answered: Vec<[f64; 3]> = (cube.shapes[0].mesh_vertices.iter())
+        .map(|v| v.position)
+        .collect();
+    let sent_vertices: Vec<[f64; 3]> = sent.mesh_vertices.iter().map(|v| v.position).collect();
     assert_eq!(
-        (
-            &cube.shapes[0].mesh_vertices,
-            &cube.shapes[0].mesh_triangles
-        ),
-        (&sent.mesh_vertices, &sent.mesh_triangles)
+        (answered, &cube.shapes[0].mesh_triangles),
+        (sent_vertices, &sent.mesh_triangles)
     );
     let [item] = answer.attached_objects.as_slice() else {
         panic!("one attached object: {:?}", answer.attached_objects);
     };
     assert_eq!(
-        (item.id.as_str(), item.link_name.as_str()),
+        (item.id.as_str(), item.frame.as_str()),
         ("item", GRASP_LINK)
     );
     let mut touch_links = item.touch_links.clone();
@@ -1022,7 +1067,8 @@ async fn served(harness: &Harness) {
 // is rejected: a batch whose second entry moves an unknown object, which applies
 // neither entry; an empty id, and an id that names a link of an arm or of the body, or
 // the voxel map; an add of no shape, of a shape of the wrong dimensions, or at an
-// orientation that is no unit quaternion; an operation neither member has; a remove of
+// orientation that is no unit quaternion; an add or a move with no position or orientation,
+// and an add with no shapes; an operation neither member has; a remove of
 // an unknown object; an add, a move or a remove of an attached object; an attach to a
 // link that is no grasp link, with a touch link the robot does not have, or of an
 // attached object; a detach of an object no link carries, or of an unknown one; and a
@@ -1053,8 +1099,10 @@ async fn every_refusal_comes_with_its_kind_and_changes_nothing() -> peppygen::Re
         .await
         .expect("the item is attached once the arms are measured");
 
-    let mut unit_less = add("block", &here, block());
-    unit_less.orientation = [0.0, 0.0, 0.0, 2.0];
+    let unit_less = Object {
+        orientation: Some([0.0, 0.0, 0.0, 2.0]),
+        ..add("block", &here, block())
+    };
     let attached = "\"item\" is attached to openarm_left_tcp; detach it first";
     let batches = [
         (
@@ -1085,10 +1133,37 @@ async fn every_refusal_comes_with_its_kind_and_changes_nothing() -> peppygen::Re
             )],
             "shapes[0]: a sphere has 1 dimensions",
         ),
-        (vec![unit_less], "an orientation is a unit quaternion"),
         (
-            vec![object("rotate", "block", &here, block())],
-            "operation is \"rotate\"",
+            vec![unit_less],
+            "objects[0] (\"block\"): the orientation [0, 0, 0, 2] has a squared norm of 4, 0.01 or \
+             more from 1",
+        ),
+        (
+            vec![Object {
+                position: None,
+                orientation: None,
+                ..add("block", &here, block())
+            }],
+            "objects[0] (\"block\"): \"add\" reads position and orientation: send position \
+             and orientation",
+        ),
+        (
+            vec![Object {
+                position: None,
+                ..move_to("block", &here)
+            }],
+            "\"move\" reads position and orientation: send position",
+        ),
+        (
+            vec![Object {
+                shapes: None,
+                ..add("block", &here, block())
+            }],
+            "\"add\" reads shapes: send one or more",
+        ),
+        (
+            vec![entry("rotate", "block")],
+            "operation is \"rotate\"; it is \"add\", \"move\" or \"remove\"",
         ),
         (vec![remove("nothing")], "no object of the scene is named"),
         (vec![add("", &here, block())], "an object's id is empty"),
@@ -1131,7 +1206,7 @@ async fn every_refusal_comes_with_its_kind_and_changes_nothing() -> peppygen::Re
         ),
         (
             attachment(&harness, "grab", "loose", GRASP_LINK, &[]).await,
-            "operation is \"grab\"",
+            "operation is \"grab\"; it is \"attach\" or \"detach\"",
         ),
     ];
     for (answer, says) in attachments {
@@ -1197,8 +1272,10 @@ async fn fields_an_operation_does_not_read_are_not_checked() -> peppygen::Result
     apply(&harness, vec![add("item", &here, block)])
         .await
         .expect("added");
-    let mut unbuilt = move_to("item", &here);
-    unbuilt.shapes = vec![primitive("sphere", &[], &Isometry3::identity())];
+    let unbuilt = Object {
+        shapes: Some(vec![primitive("sphere", &[], &Isometry3::identity())]),
+        ..move_to("item", &here)
+    };
     apply(&harness, vec![unbuilt])
         .await
         .expect("a move reads no shapes");
@@ -1212,8 +1289,10 @@ async fn fields_an_operation_does_not_read_are_not_checked() -> peppygen::Result
     )
     .await
     .expect("a detach reads no link and no touch links");
-    let mut unit_less = remove("item");
-    unit_less.orientation = [0.0; 4];
+    let unit_less = Object {
+        orientation: Some([0.0; 4]),
+        ..remove("item")
+    };
     apply(&harness, vec![unit_less])
         .await
         .expect("a remove reads no pose");
@@ -1221,6 +1300,107 @@ async fn fields_an_operation_does_not_read_are_not_checked() -> peppygen::Result
     assert!(
         answer.objects.is_empty() && answer.attached_objects.is_empty(),
         "{answer:?}"
+    );
+    harness.shutdown().await
+}
+
+// An add and a move that name no frame take their poses in the robot frame:
+// get_planning_scene answers the object where each put it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_object_that_names_no_frame_lies_in_the_robot_frame() -> peppygen::Result<()> {
+    let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
+    let unnamed = |object: Object| Object {
+        frame: None,
+        ..object
+    };
+    let block = vec![primitive("box", &[0.05; 3], &Isometry3::identity())];
+    let placements = [
+        add("item", &Isometry3::translation(0.6, 0.0, 0.4), block),
+        move_to("item", &Isometry3::translation(0.6, 0.1, 0.4)),
+    ];
+    for placing in placements {
+        let expected = placing.position;
+        apply(&harness, vec![unnamed(placing)])
+            .await
+            .expect("applied");
+        let answer = scene(&harness).await;
+        let [item] = answer.objects.as_slice() else {
+            panic!("one object: {answer:?}");
+        };
+        assert_eq!(Some(item.position), expected);
+    }
+    harness.shutdown().await
+}
+
+// With transforms vacant the robot frame is the root of its own chain: an add, a move, an
+// attach and a detach of an object in the robot frame each answer at once, and an object and a
+// goal in odom are refused with unknown_frame at once, though a lookup of a bound tree waits
+// lookup_timeout_s, here twice the time a call is given to answer. Each refusal says to give
+// the record in the robot frame or bind transforms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_transforms_vacant_no_member_waits_on_a_lookup() -> peppygen::Result<()> {
+    let waits_past_an_answer = Parameters {
+        lookup_timeout_s: 2.0 * TIMEOUT.as_secs_f64(),
+        ..parameters()
+    };
+    let (harness, _mocks) =
+        start_without_camera_with(waits_past_an_answer, &arms(left_ready(), right_ready())).await?;
+    let block = vec![primitive("box", &[0.05; 3], &Isometry3::identity())];
+    apply(
+        &harness,
+        vec![add("item", &Isometry3::translation(0.6, 0.0, 0.4), block)],
+    )
+    .await
+    .expect("added");
+    apply(
+        &harness,
+        vec![move_to("item", &Isometry3::translation(0.6, 0.1, 0.4))],
+    )
+    .await
+    .expect("moved");
+    attach(&harness, "item", &[]).await.expect("attached");
+    detach(&harness, "item").await.expect("detached");
+
+    let in_odom = Object {
+        frame: Some("odom".to_string()),
+        ..add(
+            "elsewhere",
+            &Isometry3::translation(0.6, 0.0, 0.4),
+            vec![primitive("box", &[0.05; 3], &Isometry3::identity())],
+        )
+    };
+    let object = apply(&harness, vec![in_odom])
+        .await
+        .expect_err("an object in odom");
+    assert_eq!(
+        object.kind,
+        apply_collision_objects::FailureKind::UnknownFrame,
+        "{object}"
+    );
+    assert_eq!(
+        object.message,
+        "transforms is vacant: give the object in the robot frame or leave frame out, or bind \
+         transforms"
+    );
+    let goal = GoalRequestData {
+        goal_joint_constraints: Vec::new(),
+        goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
+            link_name: GRASP_LINK.to_string(),
+            frame: Some("odom".to_string()),
+            timestamp: None,
+            position: [0.4, 0.0, 0.3],
+            tolerance_m: 0.01,
+        }],
+        ..plan_to(&left_ready())
+    };
+    let Err(Ended::Refused(refused)) = plan(&harness, &goal).await else {
+        panic!("a goal in odom is refused at admission");
+    };
+    assert_eq!(refused.kind, FailureKind::UnknownFrame, "{refused}");
+    assert_eq!(
+        refused.message,
+        "transforms is vacant: give the goal in the robot frame or leave frame out, or bind \
+         transforms"
     );
     harness.shutdown().await
 }

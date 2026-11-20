@@ -49,7 +49,7 @@ impl<const N: usize, const K: usize> OwnBody<N, K> {
     }
 
     /// The self model of a plan of every arm, a state of `D` joints holding each arm's in
-    /// turn, over `copies` copies of the model.
+    /// the model's order, over `copies` copies of the model.
     pub fn of_every_arm<const D: usize>(&self, copies: NonZeroUsize) -> EveryArm<N, K, D> {
         EveryArm::new(&self.model, copies)
     }
@@ -57,7 +57,7 @@ impl<const N: usize, const K: usize> OwnBody<N, K> {
     /// Each piece of the robot with its arms at `standing`, by the name of its link.
     pub fn standing_pieces(&mut self, standing: &ArmJoints<N, K>) -> Vec<(&str, Placed<'_>)> {
         self.model
-            .world_pieces(&standing.into_array())
+            .pieces_in_root(&standing.into_array())
             .expect("the history holds finite joint positions")
             .into_iter()
             .flat_map(|(link, pieces)| pieces.into_iter().map(move |piece| (link, piece)))

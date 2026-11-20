@@ -12,31 +12,32 @@
 mod parameters;
 
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chain_kinematics::nalgebra::{
     Isometry3, Matrix3, Point3, Rotation3, Translation3, UnitQuaternion, Vector3,
 };
 use collision_geometry::chain::{BodyMask, Padding, PlacedMask, RiderBody};
 use control_core::fault::Fault;
+use control_core::geometry::pose_arrays;
 use motion_planner::history::ArmJoints;
 use motion_planner::request::{Named, Planner, Refiner};
 use motion_planner::robot::{RobotModel, model};
 use peppygen::Parameters;
+use peppygen::consumed_services::geometry::get_depth_to_color_extrinsics;
 use peppygen::consumed_services::identity::get_description::ResponseDataMeshesItem;
 use peppygen::consumed_topics::camera::depth_stream::{Message as DepthFrame, MessageHeader};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
     GoalArmsItem, GoalGoalJointConstraintsItem,
 };
+use peppygen::fixtures::emitted_topics::motion_planning::occupancy_map::Message;
 use peppygen::fixtures::exposed_actions::motion_planning::plan_joint_path::{
     Failure, GoalRequestData, ResultData, ResultOutcome, send_goal,
 };
 use peppygen::fixtures::exposed_services::motion_planning::check_joint_path;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::identity::get_description;
-use peppygen::mock::deps::{
-    camera, geometry, identity, limb_state, sensor_mounts, transforms, workspace,
-};
+use peppygen::mock::deps::{camera, geometry, identity, limb_state, transforms};
 use robot_description::{ArmId, PerArm};
 
 /// Bounds every wait on the node, past the longest a plan takes. Generous: the
@@ -53,9 +54,6 @@ pub const DEPTH_UNIT: f32 = 0.001;
 const NEAREST_M: f64 = 0.2;
 const FARTHEST_M: f64 = 1.8;
 const STEP_M: f64 = 0.004;
-
-/// The name the robot gives its perception camera.
-pub const CAMERA: &str = "chest";
 
 pub use parameters::parameters;
 
@@ -169,7 +167,7 @@ pub fn render(
                     .expect("the arm's fingers")
                     .into_iter()
                     .map(move |finger| {
-                        let hand = posed.link_pose_world(finger.segment);
+                        let hand = posed.link_pose_root(finger.segment);
                         let RiderBody::Part(part) = finger.body else {
                             panic!("a finger is a part of the robot");
                         };
@@ -264,7 +262,7 @@ pub fn along(from: &[f64; ARM_DOF], to: &[f64; ARM_DOF], t: f64) -> [f64; ARM_DO
 /// table, and the share of the motion at which the grasp point crosses its top.
 pub fn table_across(under: &[f64; ARM_DOF], over: &[f64; ARM_DOF]) -> (Solid, f64) {
     let left = OPENARM_V2.arms[LEFT].geometry.chain();
-    let hand = |q: &[f64; ARM_DOF]| left.world_ee_pose(q).translation.vector;
+    let hand = |q: &[f64; ARM_DOF]| left.root_ee_pose(q).translation.vector;
     let (low, high) = (hand(under).z, hand(over).z);
     assert!(high - low > 0.15, "the hand rises from {low} to {high}");
     let height = low + (high - low) * 0.4;
@@ -330,16 +328,15 @@ pub async fn start_without_camera_with(
 }
 
 /// `start_without_camera` with only the camera and geometry slots vacant, as on a robot
-/// without a camera rig whose initializer answers sensor_mounts and workspace and
-/// publishes the robot's tree.
+/// without a camera rig whose initializer publishes the robot's tree.
 pub async fn start_without_the_rig(
     arms: &ArmJoints<ARM_DOF, ARMS>,
 ) -> peppygen::Result<(Harness, Mocks)> {
     start_vacant(vacant_camera(), arms).await
 }
 
-/// The harness's configuration with the camera and geometry slots vacant, and workspace,
-/// sensor_mounts and transforms bound.
+/// The harness's configuration with the camera and geometry slots vacant, and transforms
+/// bound.
 pub fn vacant_camera() -> Config {
     Config {
         camera_vacant: true,
@@ -349,7 +346,7 @@ pub fn vacant_camera() -> Config {
 }
 
 /// The harness's configuration with the node's parameters `params` and every slot of the
-/// perception camera bound, its transforms slot to one publisher of the robot's tree.
+/// depth camera bound, its transforms slot to one publisher of the robot's tree.
 pub fn camera_rig(params: Parameters) -> Config {
     Config {
         parameters: Some(params),
@@ -358,12 +355,10 @@ pub fn camera_rig(params: Parameters) -> Config {
     }
 }
 
-/// The harness's configuration with every slot of the perception camera vacant: camera,
-/// geometry, workspace, sensor_mounts and transforms.
+/// The harness's configuration with every slot of the depth camera vacant: camera,
+/// geometry and transforms.
 pub fn vacant_camera_rig() -> Config {
     Config {
-        workspace_vacant: true,
-        sensor_mounts_vacant: true,
         transforms_instances: 0,
         ..vacant_camera()
     }
@@ -477,6 +472,26 @@ pub async fn wait_for_the_arms(
     panic!("the arms' joint positions never arrived");
 }
 
+/// The next message of occupancy_map that `wanted` holds of. The timeout only bounds a
+/// test that fails.
+pub async fn next_map_where(harness: &mut Harness, wanted: impl Fn(&Message) -> bool) -> Message {
+    let subscription = &mut harness.emitted.motion_planning_occupancy_map;
+    tokio::time::timeout(TIMEOUT, async {
+        loop {
+            let message = subscription
+                .next()
+                .await
+                .expect("a message of occupancy_map")
+                .expect("the harness's session is open");
+            if wanted(&message) {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("the message within the timeout")
+}
+
 /// The refusal of a check of the left arm standing still, once its message holds `text`.
 pub async fn refused_naming(harness: &Harness, text: &str) -> check_joint_path::Failure {
     let still = left_path(&[], &[left_ready()]);
@@ -498,10 +513,9 @@ pub async fn refused_naming(harness: &Harness, text: &str) -> check_joint_path::
 /// The alignment the camera's frames and geometry carry unless a test names another.
 pub const ALIGNED: &str = "depth_to_color";
 
-/// The node over the harness, with the perception camera at `camera` linked: the
-/// camera's description, its frames `ALIGNED`, is scripted, the robot's tree holds the
-/// camera's frame fixed at `camera` in the robot frame, and the node subscribes to its
-/// depth frames.
+/// The node over the harness, with the depth camera at `camera` linked: the camera's
+/// description, its frames `ALIGNED`, is scripted, the robot's tree holds the camera's
+/// frame fixed at `camera` in the robot frame, and the node subscribes to its depth frames.
 pub async fn start_with_camera(camera: &Isometry3<f64>) -> peppygen::Result<(Harness, Mocks)> {
     let (harness, mocks) = start(camera_rig(parameters())).await?;
     describe_camera(&mocks, ALIGNED)?;
@@ -528,42 +542,26 @@ pub async fn start_with_camera(camera: &Isometry3<f64>) -> peppygen::Result<(Har
 }
 
 /// The robot frame of OpenArm v2: the root link of its URDF.
-pub const ROBOT_FRAME: &str = "world";
+pub fn robot_frame() -> String {
+    OPENARM_V2.frame.to_string()
+}
 
-/// The perception camera's color optical frame in OpenArm v2's tree.
+/// The depth camera's color optical frame in OpenArm v2's tree, which its pictures name.
 pub const CAMERA_FRAME: &str = "chest_optical_frame";
 
-/// Scripts one description of the perception camera, its geometry describing
-/// `align_mode`: the answer to each call the node makes once to describe it.
+/// Scripts one description of the depth camera, its geometry describing `align_mode`: the
+/// answer to each call the node makes once to describe it.
 pub fn describe_camera(mocks: &Mocks, align_mode: &str) -> peppygen::Result<()> {
-    let workspace = mocks
-        .deps
-        .workspace
-        .as_ref()
-        .expect("the workspace slot is linked");
-    workspace
-        .describe_workspace
-        .enqueue_response(workspace::describe_workspace::ResponseData {
-            perception_camera: CAMERA.to_string(),
-            workable: true,
-            area: 0.0,
-            rectangle: None,
-            reach: None,
-            view: None,
-        })?;
-    mocks
-        .deps
-        .sensor_mounts
-        .as_ref()
-        .expect("the sensor_mounts slot is linked")
-        .describe_sensors
-        .enqueue_response(sensor_mounts::describe_sensors::ResponseData {
-            robot_frame: ROBOT_FRAME.to_string(),
-            sensor_names: vec![CAMERA.to_string()],
-            sensor_kinds: vec!["rgbd_camera".to_string()],
-            sensor_frames: vec![CAMERA_FRAME.to_string()],
-            carried_by: vec![String::new()],
-        })?;
+    describe_camera_with_depth_turned(mocks, align_mode, [0.0, 0.0, 0.0, 1.0])
+}
+
+/// `describe_camera`, its geometry placing the depth optical frame at the color one's origin,
+/// turned by `orientation`, [x, y, z, w].
+pub fn describe_camera_with_depth_turned(
+    mocks: &Mocks,
+    align_mode: &str,
+    orientation: [f64; 4],
+) -> peppygen::Result<()> {
     let lens = mocks
         .deps
         .geometry
@@ -587,8 +585,11 @@ pub fn describe_camera(mocks: &Mocks, align_mode: &str) -> peppygen::Result<()> 
     lens.get_depth_to_color_extrinsics.enqueue_response(
         geometry::get_depth_to_color_extrinsics::ResponseData {
             align_mode: align_mode.to_string(),
-            depth_to_color_position: [0.0; 3],
-            depth_to_color_orientation: [0.0, 0.0, 0.0, 1.0],
+            depth_to_color: get_depth_to_color_extrinsics::ResponseDataDepthToColor {
+                frame: CAMERA_FRAME.to_string(),
+                position: [0.0; 3],
+                orientation,
+            },
         },
     )?;
     mocks
@@ -615,25 +616,65 @@ pub fn tree_publisher(mocks: &Mocks) -> &transforms::Mock {
         .expect("the transforms slot is bound")
 }
 
-/// The positions and orientations of a message of the tree that places a frame at `pose`.
-fn placement_arrays(pose: &Isometry3<f64>) -> (Vec<f64>, Vec<f64>) {
-    let rotation = pose.rotation;
-    (
-        pose.translation.vector.iter().copied().collect(),
-        vec![rotation.i, rotation.j, rotation.k, rotation.w],
-    )
+/// The rotation of `orientation`, a unit quaternion [x, y, z, w] of an answer, as control_core
+/// parses and converts it.
+pub fn rotation_of(orientation: [f64; 4]) -> UnitQuaternion<f64> {
+    control_core::geometry::UnitQuaternion::parse(orientation)
+        .expect("an answer's orientation is a unit quaternion")
+        .into()
+}
+
+/// Publishes the frame `child` fixed at `pose` in `frame`, on static_transforms.
+pub async fn fix_frame(
+    mocks: &Mocks,
+    frame: &str,
+    child: &str,
+    pose: &Isometry3<f64>,
+) -> peppygen::Result<()> {
+    let (position, orientation) = pose_arrays(pose);
+    tree_publisher(mocks)
+        .static_transforms
+        .publish(&transforms::static_transforms::Message {
+            transforms: vec![
+                peppygen::consumed_topics::transforms::static_transforms::MessageTransformsItem {
+                    frame: frame.to_string(),
+                    child_frame: child.to_string(),
+                    position,
+                    orientation,
+                },
+            ],
+        })
+        .await
 }
 
 /// Publishes the camera's frame fixed at `camera` in the robot frame, on static_transforms.
 pub async fn fix_the_camera(mocks: &Mocks, camera: &Isometry3<f64>) -> peppygen::Result<()> {
-    let (positions, orientations) = placement_arrays(camera);
+    fix_frame(mocks, &robot_frame(), CAMERA_FRAME, camera).await
+}
+
+/// Publishes the frame `child` at `pose` in `frame` measured at `at`, on transforms, as a
+/// publisher of the tree that moves it does.
+pub async fn move_frame(
+    mocks: &Mocks,
+    at: SystemTime,
+    frame: &str,
+    child: &str,
+    pose: &Isometry3<f64>,
+) -> peppygen::Result<()> {
+    let (position, orientation) = pose_arrays(pose);
     tree_publisher(mocks)
-        .static_transforms
-        .publish(&transforms::static_transforms::Message {
-            child_frames: vec![CAMERA_FRAME.to_string()],
-            parent_frames: vec![ROBOT_FRAME.to_string()],
-            positions,
-            orientations,
+        .transforms
+        .publish(&transforms::transforms::Message {
+            timestamp: at,
+            transforms: vec![
+                peppygen::consumed_topics::transforms::transforms::MessageTransformsItem {
+                    frame: frame.to_string(),
+                    child_frame: child.to_string(),
+                    position,
+                    orientation,
+                },
+            ],
+            start_timestamp: UNIX_EPOCH + Duration::from_secs(1),
         })
         .await
 }
@@ -645,18 +686,7 @@ pub async fn move_the_camera(
     at: SystemTime,
     camera: &Isometry3<f64>,
 ) -> peppygen::Result<()> {
-    let (positions, orientations) = placement_arrays(camera);
-    tree_publisher(mocks)
-        .transforms
-        .publish(&transforms::transforms::Message {
-            timestamp: at,
-            child_frames: vec![CAMERA_FRAME.to_string()],
-            parent_frames: vec![ROBOT_FRAME.to_string()],
-            positions,
-            orientations,
-            start_timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        })
-        .await
+    move_frame(mocks, at, &robot_frame(), CAMERA_FRAME, camera).await
 }
 
 /// Publishes the arms at `arms` measured at `at`, both grippers open.
@@ -685,8 +715,21 @@ pub async fn publish_arms_with_grippers_at(
             arm_names: BOTH.map(|arm| OPENARM_V2.arms[arm].name.clone()).to_vec(),
             joints_per_arm: vec![ARM_DOF as u32; ARMS],
             joint_positions: [rest(LEFT), rest(RIGHT)].concat(),
-            positions: vec![0.0; 3 * ARMS],
-            orientations: [[0.0, 0.0, 0.0, 1.0]; ARMS].concat(),
+            frame: robot_frame(),
+            grasp_points: BOTH
+                .map(|arm| {
+                    let (position, orientation) = pose_arrays(
+                        &OPENARM_V2.arms[arm]
+                            .geometry
+                            .chain()
+                            .root_ee_pose(&arms[arm]),
+                    );
+                    peppygen::consumed_topics::limb_state::limb_states::MessageGraspPointsItem {
+                        position,
+                        orientation,
+                    }
+                })
+                .to_vec(),
             gripper_names: BOTH
                 .map(|arm| OPENARM_V2.arms[arm].gripper_name.clone())
                 .to_vec(),
@@ -712,13 +755,14 @@ pub async fn publish_frame(
         .publish(&DepthFrame {
             header: MessageHeader {
                 timestamp: at,
-                frame_id: 0,
+                frame: CAMERA_FRAME.to_string(),
+                capture_index: 0,
                 align_mode: align_mode.to_string(),
             },
             encoding: "z16".to_string(),
             width: WIDTH,
             height: HEIGHT,
-            frame: depth_frame(render),
+            data: depth_frame(render),
         })
         .await
 }
@@ -742,7 +786,7 @@ pub fn plan_from(start: &[f64], q: &[f64; ARM_DOF]) -> GoalRequestData {
             .zip(q)
             .map(|(name, &position)| GoalGoalJointConstraintsItem {
                 joint_name: name.clone(),
-                position,
+                joint_position: position,
                 tolerance_above: 0.01,
                 tolerance_below: 0.01,
             })

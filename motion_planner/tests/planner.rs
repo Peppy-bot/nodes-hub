@@ -1,5 +1,5 @@
 //! The node over the generated harness, as a caller sees motion_planning: plans and
-//! checks wait for the perception camera's first depth frame and for the next after the
+//! checks wait for the depth camera's first depth frame and for the next after the
 //! map is cleared; the arms' own points mark nothing while they move; a check passes a
 //! planned path and stops before a table the camera sees; a frame of an alignment the
 //! camera's geometry does not describe asks the camera again; a goal holds any link of the
@@ -12,7 +12,8 @@
 
 mod common;
 
-use chain_kinematics::nalgebra::{Point3, Quaternion, UnitQuaternion, Vector3};
+use chain_kinematics::nalgebra::{Isometry3, Point3, UnitQuaternion, Vector3};
+use control_core::geometry::pose_arrays;
 use motion_planner::node::NO_DEPTH_FRAME;
 use motion_planner::request::{MAX_PLANNING_TIME_S, Named, Planner, Refiner};
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
@@ -32,10 +33,10 @@ use common::{
     ARM_DOF, BOTH, CLEAR_OR_ALLOW_WAY_OUT, Ended, LEFT, OPENARM_V2, RIGHT, TIMEOUT, along, arms,
     at_ms, camera_rig, check, describe_camera, facing_the_robot, left_elbow, left_path, left_ready,
     over_the_table, parameters, plan, plan_from, plan_to, planned_waypoints, posture, posture_of,
-    publish_arms, publish_arms_with_grippers_at, render, right_ready, start, start_described,
-    start_identified_as, start_with_camera, start_without_camera, start_without_camera_with,
-    start_without_the_rig, take_frame, take_frame_aligned, under_a_seen_table, under_the_table,
-    vacant_camera_rig, wait_for_the_arms,
+    publish_arms, publish_arms_with_grippers_at, render, right_ready, robot_frame, rotation_of,
+    start, start_described, start_identified_as, start_with_camera, start_without_camera,
+    start_without_camera_with, start_without_the_rig, take_frame, take_frame_aligned,
+    under_a_seen_table, under_the_table, vacant_camera_rig, wait_for_the_arms,
 };
 
 /// How near the forearm ends to a pose a plan holds it at: meters, and radians.
@@ -96,12 +97,9 @@ async fn a_plan_or_a_check_waits_for_a_depth_frame() -> peppygen::Result<()> {
     let chain = OPENARM_V2.arms[LEFT].geometry.chain();
     for waypoint in &arm.waypoints {
         let q: [f64; ARM_DOF] = waypoint.joint_positions.as_slice().try_into().expect("7");
-        let pose = chain.world_ee_pose(&q);
-        let rotation = pose.rotation;
-        assert_eq!(waypoint.position, <[f64; 3]>::from(pose.translation.vector));
         assert_eq!(
-            waypoint.orientation,
-            [rotation.i, rotation.j, rotation.k, rotation.w]
+            (waypoint.position, waypoint.orientation),
+            pose_arrays(&chain.root_ee_pose(&q))
         );
     }
 
@@ -300,7 +298,7 @@ fn named_axis(name: &str) -> Vector3<f64> {
 fn grasp_axes(side: ArmId) -> (Vector3<f64>, Vector3<f64>) {
     let chain = OPENARM_V2.arms[side].geometry.chain();
     let q = posture(side, states::READY);
-    let grasp = chain.world_ee_pose(&q);
+    let grasp = chain.root_ee_pose(&q);
     let posed = chain.at(&q);
     let joints: Vec<Vector3<f64>> = OPENARM_V2
         .own
@@ -308,8 +306,8 @@ fn grasp_axes(side: ArmId) -> (Vector3<f64>, Vector3<f64>) {
         .expect("the arm's fingers")
         .into_iter()
         .map(|finger| {
-            let world = posed.link_pose_world(finger.segment) * finger.offset;
-            (grasp.inverse() * Point3::from(world.translation.vector)).coords
+            let in_root = posed.link_pose_root(finger.segment) * finger.offset;
+            (grasp.inverse() * Point3::from(in_root.translation.vector)).coords
         })
         .collect();
     let [a, b] = joints.as_slice() else {
@@ -560,20 +558,24 @@ async fn a_plan_holds_a_link_of_the_arm() -> peppygen::Result<()> {
             .geometry
             .chain()
             .at(q)
-            .link_pose_world(3)
+            .link_pose_root(3)
     };
     let target = forearm(&left_elbow(1.3));
-    let rotation = target.rotation;
+    let (position, orientation) = pose_arrays(&target);
     let goal = GoalRequestData {
         goal_joint_constraints: Vec::new(),
         goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
             link_name: "openarm_left_link4".to_string(),
-            position: target.translation.vector.into(),
+            frame: Some(robot_frame()),
+            timestamp: None,
+            position,
             tolerance_m: FOREARM_POSITION_M,
         }],
         goal_orientation_constraints: vec![GoalGoalOrientationConstraintsItem {
             link_name: "openarm_left_link4".to_string(),
-            orientation: [rotation.i, rotation.j, rotation.k, rotation.w],
+            frame: Some(robot_frame()),
+            timestamp: None,
+            orientation,
             tolerance_rad: FOREARM_ORIENTATION_RAD,
             free_axis: "none".to_string(),
         }],
@@ -599,18 +601,23 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
     let reached = OPENARM_V2.arms[LEFT]
         .geometry
         .chain()
-        .world_ee_pose(&left_elbow(1.3));
+        .root_ee_pose(&left_elbow(1.3));
     let turned = reached.rotation * UnitQuaternion::from_axis_angle(&Vector3::z_axis(), 1.0);
+    let (position, orientation) = pose_arrays(&Isometry3::from_parts(reached.translation, turned));
     let goal = GoalRequestData {
         goal_joint_constraints: Vec::new(),
         goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
             link_name: "openarm_left_tcp".to_string(),
-            position: reached.translation.vector.into(),
+            frame: Some(robot_frame()),
+            timestamp: None,
+            position,
             tolerance_m: GRASP_POSITION_M,
         }],
         goal_orientation_constraints: vec![GoalGoalOrientationConstraintsItem {
             link_name: "openarm_left_tcp".to_string(),
-            orientation: [turned.i, turned.j, turned.k, turned.w],
+            frame: Some(robot_frame()),
+            timestamp: None,
+            orientation,
             tolerance_rad: APPROACH_AXIS_RAD,
             free_axis: "z".to_string(),
         }],
@@ -618,8 +625,7 @@ async fn a_plan_holds_the_grasp_point_free_about_its_approach_axis() -> peppygen
     };
     let planned = plan(&harness, &goal).await.expect("a path");
     let last = planned.arms[0].waypoints.last().expect("a waypoint");
-    let [x, y, z, w] = last.orientation;
-    let ended = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+    let ended = rotation_of(last.orientation);
     let approach = |rotation: &UnitQuaternion<f64>| rotation * Vector3::z();
     let off_axis = approach(&ended).angle(&approach(&turned));
     let off_position = (Vector3::from(last.position) - reached.translation.vector).norm();
@@ -639,14 +645,12 @@ fn holding_the_left_hand(
     q: &[f64; ARM_DOF],
     free_axis: &str,
 ) -> GoalPathOrientationConstraintsItem {
-    let rotation = OPENARM_V2.arms[LEFT]
-        .geometry
-        .chain()
-        .world_ee_pose(q)
-        .rotation;
+    let (_, orientation) = pose_arrays(&OPENARM_V2.arms[LEFT].geometry.chain().root_ee_pose(q));
     GoalPathOrientationConstraintsItem {
         link_name: "openarm_left_tcp".to_string(),
-        orientation: [rotation.i, rotation.j, rotation.k, rotation.w],
+        frame: Some(robot_frame()),
+        timestamp: None,
+        orientation,
         tolerance_rad: PATH_TOLERANCE_RAD,
         free_axis: free_axis.to_string(),
     }
@@ -658,13 +662,15 @@ fn holding_the_left_hand(
 async fn a_plan_holds_a_path_orientation_at_each_waypoint() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
     let chain = OPENARM_V2.arms[LEFT].geometry.chain();
-    let from = chain.world_ee_pose(&left_ready());
+    let from = chain.root_ee_pose(&left_ready());
     let position = from.translation.vector + Vector3::new(0.0, -0.05, 0.05);
     for free_axis in ["none", "z"] {
         let goal = GoalRequestData {
             goal_joint_constraints: Vec::new(),
             goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
                 link_name: "openarm_left_tcp".to_string(),
+                frame: Some(robot_frame()),
+                timestamp: None,
                 position: position.into(),
                 tolerance_m: GRASP_POSITION_M,
             }],
@@ -674,8 +680,7 @@ async fn a_plan_holds_a_path_orientation_at_each_waypoint() -> peppygen::Result<
         let planned = plan(&harness, &goal).await.expect("a path");
         let axis = Vector3::z();
         for waypoint in &planned.arms[0].waypoints {
-            let [x, y, z, w] = waypoint.orientation;
-            let turned = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+            let turned = rotation_of(waypoint.orientation);
             let error = if free_axis == "none" {
                 from.rotation.angle_to(&turned)
             } else {
@@ -723,7 +728,7 @@ async fn a_start_or_a_goal_that_breaks_a_path_orientation_fails_with_no_path()
                 .map(|(name, &position)| {
                     peppygen::exposed_actions::motion_planning::plan_joint_path::GoalGoalJointConstraintsItem {
                         joint_name: name.clone(),
-                        position,
+                        joint_position: position,
                         tolerance_above: 0.01,
                         tolerance_below: 0.01,
                     }
@@ -756,10 +761,11 @@ async fn a_start_or_a_goal_that_breaks_a_path_orientation_fails_with_no_path()
 /// A grasp point 5 m before the robot, out of either arm's reach.
 const OUT_OF_REACH: [f64; 3] = [5.0, 0.0, 1.0];
 
-// A cancel of a plan that nothing else ends before it arrives ends the goal cancelled:
-// the plan's goal sampling searches for a grasp point out of reach, which no search
-// meets, until its 1000 samples or its deadline, the longest a plan may take. The stop
-// the cancel sets ends the plan itself (`node::tests::a_set_stop_ends_the_plan_stopped`).
+// A cancel of a plan that nothing else ends before it arrives ends the goal cancelled, its
+// empty result in the robot frame: the plan's goal sampling searches for a grasp point out of
+// reach, which no search meets, until its 1000 samples or its deadline, the longest a plan may
+// take. The stop the cancel sets ends the plan itself
+// (`node::tests::a_set_stop_ends_the_plan_stopped`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
     let (harness, _mocks) =
@@ -769,6 +775,8 @@ async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
         goal_joint_constraints: Vec::new(),
         goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
             link_name: "openarm_left_tcp".to_string(),
+            frame: Some(robot_frame()),
+            timestamp: None,
             position: OUT_OF_REACH,
             tolerance_m: GRASP_POSITION_M,
         }],
@@ -777,16 +785,15 @@ async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
     let handle = send_goal(&harness, &long, peppygen::DEFAULT_FEEDBACK_BOUND, TIMEOUT).await?;
     assert!(handle.accepted, "{:?}", handle.refusal);
     assert_eq!(handle.cancel_goal(TIMEOUT).await?, CancelState::Signalled);
-    let outcome = handle.get_result(TIMEOUT).await?.outcome;
-    assert!(
-        matches!(outcome, ResultOutcome::Cancelled { .. }),
-        "{outcome:?}"
-    );
+    match handle.get_result(TIMEOUT).await?.outcome {
+        ResultOutcome::Cancelled { data, .. } => assert_eq!(data.frame, robot_frame()),
+        outcome => panic!("a cancelled goal, not {outcome:?}"),
+    }
     harness.shutdown().await
 }
 
-// With the four camera slots vacant, as on a robot without a camera, the map stays empty
-// and a plan answers its path with no map stamp at once.
+// With the camera slots vacant, as on a robot without a camera, the map stays empty and a
+// plan answers its path with no map stamp at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_robot_without_a_camera_plans_without_a_map() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
@@ -794,8 +801,8 @@ async fn a_robot_without_a_camera_plans_without_a_map() -> peppygen::Result<()> 
     harness.shutdown().await
 }
 
-// With the camera and geometry vacant and workspace, sensor_mounts and transforms bound,
-// as on OpenArm without its camera rig, the map stays empty too.
+// With the camera and geometry vacant and transforms bound, as on OpenArm without its
+// camera rig, the map stays empty too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_robot_without_its_camera_rig_plans_without_a_map() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_the_rig(&arms(left_ready(), right_ready())).await?;
@@ -839,8 +846,8 @@ async fn each_planner_and_refiner_answers_a_path_to_the_goal() -> peppygen::Resu
                     .iter()
                     .zip(&end)
                     .all(|(goal, &at)| {
-                        goal.position - goal.tolerance_below <= at
-                            && at <= goal.position + goal.tolerance_above
+                        goal.joint_position - goal.tolerance_below <= at
+                            && at <= goal.joint_position + goal.tolerance_above
                     }),
                 "{planner:?} and {refiner:?} end at {end:?}"
             );
@@ -849,20 +856,20 @@ async fn each_planner_and_refiner_answers_a_path_to_the_goal() -> peppygen::Resu
     harness.shutdown().await
 }
 
-// With the camera and geometry bound and sensor_mounts vacant, the map cannot place the
+// With the camera and geometry bound and transforms vacant, the map cannot place the
 // camera: every check and plan is refused, the message naming the slots to bind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_camera_without_its_sensor_mounts_refuses_every_plan_and_check() -> peppygen::Result<()> {
+async fn a_camera_without_the_robots_tree_refuses_every_plan_and_check() -> peppygen::Result<()> {
     let config = Config {
-        sensor_mounts_vacant: true,
+        transforms_instances: 0,
         ..camera_rig(parameters())
     };
     let (harness, mocks) = start(config).await?;
     publish_arms(&mocks, at_ms(0), &arms(left_ready(), right_ready())).await?;
     let reason = format!(
-        "{NO_DEPTH_FRAME}: the launcher binds the planner's camera, geometry, workspace and \
-         transforms and leaves its sensor_mounts vacant; bind camera, geometry, workspace, \
-         sensor_mounts and transforms, or leave camera and geometry vacant"
+        "{NO_DEPTH_FRAME}: the launcher binds the planner's camera and geometry and leaves its \
+         transforms vacant; bind camera, geometry and transforms, or leave camera and geometry \
+         vacant"
     );
     let failure = check(&harness, &left_path(&left_ready(), &[left_elbow(1.3)]))
         .await
@@ -905,11 +912,13 @@ async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
     let mut missing = plan_to(&goal);
     missing.goal_joint_constraints[0].joint_name = "openarm_left_joint8".to_string();
     let mut beyond = plan_to(&goal);
-    beyond.goal_joint_constraints[3].position = 3.0;
+    beyond.goal_joint_constraints[3].joint_position = 3.0;
     let skewed = GoalRequestData {
         goal_joint_constraints: Vec::new(),
         goal_orientation_constraints: vec![GoalGoalOrientationConstraintsItem {
             link_name: "openarm_left_tcp".to_string(),
+            frame: Some(robot_frame()),
+            timestamp: None,
             orientation: [0.0, 0.0, 0.0, 1.1],
             tolerance_rad: 0.1,
             free_axis: "none".to_string(),

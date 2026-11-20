@@ -8,6 +8,7 @@
 mod common;
 
 use chain_kinematics::nalgebra::{Isometry3, Translation3, Vector3};
+use control_core::geometry::pose_arrays;
 use motion_planner::node::NO_DEPTH_FRAME;
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path::GoalWaypointsItem;
 use peppygen::fixtures::exposed_actions::motion_planning::plan_cartesian_path::{
@@ -18,7 +19,8 @@ use peppygen::fixtures::harness::Harness;
 use common::{
     ARM_DOF, CLEAR_OR_ALLOW_WAY_OUT, LEFT, OPENARM_V2, Solid, TIMEOUT, along, arms, at_ms,
     facing_the_robot, left_ready, looking_at, over_the_table, publish_arms, render, right_ready,
-    start_with_camera, start_without_camera, take_frame, under_a_seen_table, under_the_table,
+    robot_frame, start_with_camera, start_without_camera, take_frame, under_a_seen_table,
+    under_the_table,
 };
 
 /// A path of the left arm's grasp point from where it stands through `poses`.
@@ -27,16 +29,16 @@ fn path_through(poses: &[Isometry3<f64>], avoid_collisions: bool) -> GoalRequest
         arm_name: "left_arm".to_string(),
         start_joint_positions: Vec::new(),
         link_name: "openarm_left_tcp".to_string(),
+        frame: Some(robot_frame()),
+        timestamp: None,
         waypoints: poses
             .iter()
-            .map(|pose| GoalWaypointsItem {
-                position: pose.translation.vector.into(),
-                orientation: [
-                    pose.rotation.i,
-                    pose.rotation.j,
-                    pose.rotation.k,
-                    pose.rotation.w,
-                ],
+            .map(|pose| {
+                let (position, orientation) = pose_arrays(pose);
+                GoalWaypointsItem {
+                    position,
+                    orientation,
+                }
             })
             .collect(),
         avoid_collisions,
@@ -45,7 +47,7 @@ fn path_through(poses: &[Isometry3<f64>], avoid_collisions: bool) -> GoalRequest
 
 /// The grasp point's pose with the left arm at `q`.
 fn hand(q: &[f64; ARM_DOF]) -> Isometry3<f64> {
-    OPENARM_V2.arms[LEFT].geometry.chain().world_ee_pose(q)
+    OPENARM_V2.arms[LEFT].geometry.chain().root_ee_pose(q)
 }
 
 /// `pose` moved `m` along z, its orientation kept.
@@ -118,12 +120,9 @@ async fn a_path_that_checks_collisions_waits_for_a_depth_frame_and_one_that_does
     assert_eq!(unchecked.start_joint_positions, left_ready().to_vec());
     for waypoint in &unchecked.waypoints {
         let q: [f64; ARM_DOF] = waypoint.joint_positions.as_slice().try_into().expect("7");
-        let pose = hand(&q);
-        assert_eq!(waypoint.position, <[f64; 3]>::from(pose.translation.vector));
-        let rotation = pose.rotation;
         assert_eq!(
-            waypoint.orientation,
-            [rotation.i, rotation.j, rotation.k, rotation.w]
+            (waypoint.position, waypoint.orientation),
+            pose_arrays(&hand(&q))
         );
     }
 
@@ -258,7 +257,7 @@ async fn a_start_inside_the_clearance_fails_unless_collisions_go_unchecked() -> 
 /// to arrive on any host.
 const MANY_LINES: usize = 20_000;
 
-// A cancel of a path of many lines ends the goal cancelled.
+// A cancel of a path of many lines ends the goal cancelled, its empty result in the robot frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
@@ -276,17 +275,17 @@ async fn a_cancel_ends_the_goal_cancelled() -> peppygen::Result<()> {
     .await?;
     assert!(handle.accepted, "{:?}", handle.refusal);
     assert_eq!(handle.cancel_goal(TIMEOUT).await?, CancelState::Signalled);
-    let outcome = handle.get_result(TIMEOUT).await?.outcome;
-    assert!(
-        matches!(outcome, ResultOutcome::Cancelled { .. }),
-        "{outcome:?}"
-    );
+    match handle.get_result(TIMEOUT).await?.outcome {
+        ResultOutcome::Cancelled { data, .. } => assert_eq!(data.frame, robot_frame()),
+        outcome => panic!("a cancelled goal, not {outcome:?}"),
+    }
     harness.shutdown().await
 }
 
 // Every refusal comes at a goal's admission: rejected for a link that is not fixed to the grasp
-// link and for no pose to pass through, and precondition_failed for a start outside a joint
-// limit by more than the start tolerance.
+// link and for no pose to pass through, precondition_failed for a start outside a joint limit
+// by more than the start tolerance, and unknown_frame for a path in odom with transforms
+// vacant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
     let (harness, _mocks) = start_without_camera(&arms(left_ready(), right_ready())).await?;
@@ -306,5 +305,18 @@ async fn every_refusal_comes_before_acceptance() -> peppygen::Result<()> {
     };
     let refused = refusal(&harness, &from_outside).await;
     assert_eq!(refused.kind, FailureKind::PreconditionFailed, "{refused}");
+    let in_odom = GoalRequestData {
+        frame: Some("odom".to_string()),
+        ..path_through(&[hand(&left_ready())], true)
+    };
+    let refused = refusal(&harness, &in_odom).await;
+    assert_eq!(
+        (refused.kind, refused.message.as_str()),
+        (
+            FailureKind::UnknownFrame,
+            "transforms is vacant: give the goal in the robot frame or leave frame out, or bind \
+             transforms"
+        )
+    );
     harness.shutdown().await
 }
