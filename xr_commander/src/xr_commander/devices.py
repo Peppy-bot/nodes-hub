@@ -13,8 +13,9 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Protocol
 
+from control_core_py.geometry import Pose
+
 from xr_commander.bus import REAL_CLOCK, Clock
-from xr_commander.frames import Pose
 
 
 class Hand(StrEnum):
@@ -151,7 +152,7 @@ def _pressed(buttons: list, index: int) -> bool:
 def _parse_pose(pose_data: dict) -> Pose:
     position = pose_data["position"]
     orientation = pose_data["orientation"]
-    return Pose.from_xyz_quat(
+    return Pose.parse(
         [position["x"], position["y"], position["z"]],
         [orientation["x"], orientation["y"], orientation["z"], orientation["w"]],
     )

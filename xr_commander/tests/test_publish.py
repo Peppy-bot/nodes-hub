@@ -3,8 +3,9 @@ import contextlib
 import time
 from types import SimpleNamespace
 
-import numpy as np
+import peppygen.clock
 import pytest
+from control_core_py.geometry import Stamped
 from peppygen.paired_topics.left_arm import pose_setpoints as left_arm_pose_setpoints
 from peppygen.paired_topics.left_gripper import (
     gripper_setpoints as left_gripper_setpoints,
@@ -17,6 +18,7 @@ from peppygen.paired_topics.right_gripper import (
 
 from tests.helpers import (
     POSE,
+    ROBOT_FRAME,
     FakeCalls,
     FakeStops,
     FakeToken,
@@ -29,6 +31,8 @@ from tests.helpers import (
     eventually,
     following_fleet,
     peer_of,
+    pose_at,
+    reported,
     robots_of,
     running,
     running_drain,
@@ -37,22 +41,22 @@ from tests.helpers import (
 )
 from xr_commander import publish
 from xr_commander.bus import REAL_CLOCK, FlashNote
-from xr_commander.clutch import HandClutch
+from xr_commander.clutch import HandClutch, Setpoint
 from xr_commander.devices import (
     HandSample,
     XrFrame,
 )
 from xr_commander.drive import Driver, HandState
 from xr_commander.fleet import Timing
-from xr_commander.frames import Pose
 
 
 def test_a_measured_pose_is_kept_per_peer_and_goes_stale_rather_than_lying():
     holder = publish.MeasuredPoses()
+    measured = reported(POSE)
     assert holder.fresh("alpha", 10.0) is None
     assert holder.fresh(None, 10.0) is None
-    holder.set("alpha", POSE)
-    assert holder.fresh("alpha", 10.0) is POSE
+    holder.set("alpha", measured)
+    assert holder.fresh("alpha", 10.0) is measured
     assert holder.fresh("bravo", 10.0) is None
     assert holder.fresh("alpha", 10.0, now_monotonic=time.monotonic() + 60.0) is None
 
@@ -171,7 +175,7 @@ async def test_the_pose_stream_engages_once_the_follower_reports():
         session = ScriptedHeadset()
         session.press(right=(False, False, True))
         measured = publish.MeasuredPoses()
-        measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
+        measured.set(peer_of(h, right_arm_pose_setpoints), reported(POSE))
         async with running(
             lambda token: publish.stream_pose(
                 h.node_runner,
@@ -188,11 +192,16 @@ async def test_the_pose_stream_engages_once_the_follower_reports():
                 token=token,
             )
         ):
+            before_s = peppygen.clock.now_ns() / 1e9
             message = await asyncio.wait_for(
                 h.mocks.pairings.right_arm[0].pose_setpoints.next(), 10.0
             )
+            after_s = peppygen.clock.now_ns() / 1e9
         # The engage tick commands the measured pose: a no-op that starts the
-        # stream.
+        # stream. It names the frame the follower measures in, at the time of
+        # its tick on the instance's clock.
+        assert message.frame == ROBOT_FRAME
+        assert before_s <= message.timestamp <= after_s
         assert message.position == [0.0, 0.0, 0.0]
         assert message.orientation == [0.0, 0.0, 0.0, 1.0]
 
@@ -235,8 +244,8 @@ async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone()
             mock.pose_setpoints for mock in h.mocks.pairings.right_arm
         )
         measured = publish.MeasuredPoses()
-        measured.set(peers["alpha"], POSE)
-        measured.set(peers["bravo"], Pose(np.array([0.5, 0.0, 0.0]), POSE.orientation))
+        measured.set(peers["alpha"], reported(POSE))
+        measured.set(peers["bravo"], reported(pose_at((0.5, 0.0, 0.0))))
         session = MovableSession()
         settings = default_settings(command_rate_hz=200)
         session.press(right=(False, False, True))
@@ -258,7 +267,7 @@ async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone()
         ):
             # Alpha, paired first, is driven: hand moved 0.3 away.
             await asyncio.wait_for(alpha_wire.next(), 10.0)
-            session.hand_pose = Pose(np.array([0.3, 0.0, 0.0]), POSE.orientation)
+            session.hand_pose = pose_at((0.3, 0.0, 0.0))
             session.press(right=(False, False, True))
             while (await asyncio.wait_for(alpha_wire.next(), 10.0)).position[0] < 0.29:
                 pass
@@ -287,7 +296,7 @@ async def test_a_grip_held_across_a_robot_change_leaves_the_new_gripper_alone():
         )
         measured = publish.MeasuredPoses()
         for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
-            measured.set(peer, POSE)
+            measured.set(peer, reported(POSE))
         session = ScriptedHeadset()
         session.press(right=(False, False, True))
         settings = default_settings()
@@ -361,7 +370,7 @@ async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
         # Measured stays fresh throughout: only the headset link dies.
         async def keep_measured_fresh():
             while not token.is_cancelled():
-                measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
+                measured.set(peer_of(h, right_arm_pose_setpoints), reported(POSE))
                 await asyncio.sleep(0.01)
 
         refresher = asyncio.create_task(keep_measured_fresh())
@@ -440,7 +449,7 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
         driver = scripted_driver("backbone_inst")
         session = MovableSession()
         measured = publish.MeasuredPoses()
-        measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
+        measured.set(peer_of(h, right_arm_pose_setpoints), reported(POSE))
         settings = default_settings(command_rate_hz=200)
         token = FakeToken()
 
@@ -466,7 +475,7 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
             await asyncio.wait_for(subscription.next(), 10.0)
             # Drive the hand well away from the measured pose, and wait until
             # that displaced target is the one on the wire.
-            driven = Pose(np.array([0.3, 0.0, 0.0]), POSE.orientation)
+            driven = pose_at((0.3, 0.0, 0.0))
             session.hand_pose = driven
             session.press(right=(False, False, True))
             deadline = time.monotonic() + 10.0
@@ -542,6 +551,7 @@ async def test_drain_pose_states_keeps_the_holder_at_the_newest_measured_pose():
             await h.mocks.pairings.right_arm[0].pose_states.publish(
                 right_arm_pose_states.Message(
                     timestamp=1.0,
+                    frame=ROBOT_FRAME,
                     position=[0.1, 0.2, 0.3],
                     orientation=[0.0, 0.0, 0.0, 1.0],
                 )
@@ -552,6 +562,7 @@ async def test_drain_pose_states_keeps_the_holder_at_the_newest_measured_pose():
             await h.mocks.pairings.right_arm[0].pose_states.publish(
                 right_arm_pose_states.Message(
                     timestamp=2.0,
+                    frame=ROBOT_FRAME,
                     position=[0.4, 0.5, 0.6],
                     orientation=[0.0, 0.0, 0.0, 1.0],
                 )
@@ -559,9 +570,13 @@ async def test_drain_pose_states_keeps_the_holder_at_the_newest_measured_pose():
             await eventually(
                 lambda: (
                     (pose := holder.fresh(peer, 10.0)) is not None
-                    and pose.position[0] == 0.4
+                    and pose.value.position.position[0] == 0.4
                 ),
                 message="the newest pose",
+            )
+            # The measured pose keeps the frame and the time of its report.
+            assert holder.fresh(peer, 10.0) == Stamped(
+                ROBOT_FRAME, 2.0, pose_at((0.4, 0.5, 0.6))
             )
 
 
@@ -569,8 +584,19 @@ def test_drain_pose_states_survives_garbage():
     # Kept on a stub: every decodable wire message builds a Pose (the schema
     # carries float lists), so the unusable-pose latch is reachable only
     # through a hand-built message the generated modules cannot produce.
-    good = SimpleNamespace(position=[0.1, 0.2, 0.3], orientation=[0, 0, 0, 1])
-    bad = SimpleNamespace(position=None, orientation=None)
+    good = SimpleNamespace(
+        timestamp=1.0,
+        frame=ROBOT_FRAME,
+        position=[0.1, 0.2, 0.3],
+        orientation=[0, 0, 0, 1],
+    )
+    bad = SimpleNamespace(
+        timestamp=1.0, frame=ROBOT_FRAME, position=None, orientation=None
+    )
+    # A pose that names no frame places nowhere.
+    frameless = SimpleNamespace(
+        timestamp=1.0, frame="", position=[0.9, 0.0, 0.0], orientation=[0, 0, 0, 1]
+    )
     # The peer is the key the holder files the pose under.
     producer = "backbone_inst"
     holder = publish.MeasuredPoses()
@@ -580,7 +606,7 @@ def test_drain_pose_states_survives_garbage():
         drain = asyncio.create_task(
             publish.drain_pose_states(
                 None,
-                StubTopic([(producer, bad), (producer, good)]),
+                StubTopic([(producer, bad), (producer, good), (producer, frameless)]),
                 holder,
                 "right",
                 token,
@@ -593,7 +619,8 @@ def test_drain_pose_states_survives_garbage():
     asyncio.run(run())
     pose = holder.fresh(producer, 10.0)
     assert pose is not None
-    assert pose.position[0] == 0.1
+    assert pose.frame == ROBOT_FRAME
+    assert pose.value.position.position[0] == 0.1
 
 
 # Fast enough that the burst's message floor never sets the hold length.
@@ -601,11 +628,11 @@ FAST_TICK_S = 0.001
 
 
 class TestReleaseHold:
-    def make_pose(self):
-        return Pose(
-            position=np.array([0.1, 0.2, 0.3]),
-            orientation=np.array([0.0, 0.0, 0.0, 1.0]),
-        )
+    # Where the clutch drives the arm, and where the follower measures it.
+    TARGET = Setpoint(ROBOT_FRAME, pose_at((0.1, 0.2, 0.3)))
+    MEASURED = reported(pose_at((0.4, 0.5, 0.6)))
+    # The burst's setpoint: the measured pose in its frame.
+    HELD = Setpoint(ROBOT_FRAME, pose_at((0.4, 0.5, 0.6)))
 
     def drive(self, hold, target, now_s):
         return hold.step(target=target, measured_ee=None, now_s=now_s)
@@ -615,42 +642,40 @@ class TestReleaseHold:
 
     def test_a_driving_tick_streams_the_clutch_target_itself(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        target = self.make_pose()
-        assert self.drive(hold, target, 10.0) is target
+        assert self.drive(hold, self.TARGET, 10.0) is self.TARGET
 
     def test_release_after_driving_streams_the_measured_pose_for_the_hold(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        measured = self.make_pose()
-        self.drive(hold, self.make_pose(), 9.9)
-        assert self.release(hold, measured, 10.0) is measured
-        assert self.release(hold, measured, 10.2) is measured
-        assert self.release(hold, measured, 10.26) is None
+        self.drive(hold, self.TARGET, 9.9)
+        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
+        assert self.release(hold, self.MEASURED, 10.2) == self.HELD
+        assert self.release(hold, self.MEASURED, 10.26) is None
 
     def test_release_without_prior_driving_stays_silent(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        assert self.release(hold, self.make_pose(), 10.0) is None
+        assert self.release(hold, self.MEASURED, 10.0) is None
 
     def test_release_with_stale_measured_stays_silent(self):
         # Nothing truthful to freeze on: the follower's pose is unknown.
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        self.drive(hold, self.make_pose(), 9.9)
+        self.drive(hold, self.TARGET, 9.9)
         assert self.release(hold, None, 10.0) is None
         # And the edge is consumed: a pose arriving later does not revive it.
-        assert self.release(hold, self.make_pose(), 10.1) is None
+        assert self.release(hold, self.MEASURED, 10.1) is None
 
     def test_redriving_voids_the_pending_burst(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        measured = self.make_pose()
-        target = self.make_pose()
-        self.drive(hold, target, 9.9)
-        assert self.release(hold, measured, 10.0) is measured
-        self.drive(hold, target, 10.05)
-        assert self.release(hold, measured, 10.1) is measured, "a fresh edge re-arms"
+        self.drive(hold, self.TARGET, 9.9)
+        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
+        self.drive(hold, self.TARGET, 10.05)
+        assert self.release(hold, self.MEASURED, 10.1) == self.HELD, (
+            "a fresh edge re-arms"
+        )
         # Mid-burst re-engage then release again: the burst restarts from now.
-        self.drive(hold, target, 10.15)
-        assert self.release(hold, measured, 10.2) is measured
-        assert self.release(hold, measured, 10.44) is measured
-        assert self.release(hold, measured, 10.46) is None
+        self.drive(hold, self.TARGET, 10.15)
+        assert self.release(hold, self.MEASURED, 10.2) == self.HELD
+        assert self.release(hold, self.MEASURED, 10.44) == self.HELD
+        assert self.release(hold, self.MEASURED, 10.46) is None
 
     def test_a_voided_burst_cannot_resume_from_the_stale_pose(self):
         # Re-engaging must void the pending burst, not just re-arm it. If the
@@ -658,10 +683,9 @@ class TestReleaseHold:
         # to freeze on, so the stream must be silent rather than resuming the
         # earlier burst's now-stale pose.
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        measured = self.make_pose()
-        self.drive(hold, self.make_pose(), 9.9)
-        assert self.release(hold, measured, 10.0) is measured
-        self.drive(hold, self.make_pose(), 10.05)
+        self.drive(hold, self.TARGET, 9.9)
+        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
+        self.drive(hold, self.TARGET, 10.05)
         assert self.release(hold, None, 10.1) is None, (
             "the voided burst resumed streaming a pose the robot may have left"
         )
@@ -670,20 +694,18 @@ class TestReleaseHold:
         # The window is half-open: the expiry instant itself is silence, so a
         # tick landing exactly on it cannot double the burst's stated length.
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        measured = self.make_pose()
-        self.drive(hold, self.make_pose(), 9.9)
-        assert self.release(hold, measured, 10.0) is measured
-        assert self.release(hold, measured, 10.25) is None
+        self.drive(hold, self.TARGET, 9.9)
+        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
+        assert self.release(hold, self.MEASURED, 10.25) is None
 
     def test_a_slow_command_rate_still_gets_a_burst_not_one_message(self):
         # At 4 Hz the 0.25 s window would carry a single sample, which is the
         # one thing a burst exists to avoid depending on.
         slow_tick_s = 0.25
         hold = publish.ReleaseHold(slow_tick_s, hold_s=0.25)
-        measured = self.make_pose()
-        self.drive(hold, self.make_pose(), 9.9)
+        self.drive(hold, self.TARGET, 9.9)
         held = [
-            self.release(hold, measured, 10.0 + tick * slow_tick_s) is measured
+            self.release(hold, self.MEASURED, 10.0 + tick * slow_tick_s) == self.HELD
             for tick in range(publish.RELEASE_HOLD_MESSAGES)
         ]
         assert all(held), "the burst shrank to fewer messages than its floor"
@@ -782,7 +804,7 @@ async def test_a_squeeze_with_no_pair_or_no_fresh_pose_takes_nothing():
             await step(5)
             assert log == []
             # The arm reports: the right hand's squeeze takes the robot.
-            measured.set(peer_of(h, right_arm_pose_setpoints), POSE)
+            measured.set(peer_of(h, right_arm_pose_setpoints), reported(POSE))
             await step(2)
             assert log == [("take", "backbone_inst"), ("stop", "backbone_inst")]
 
@@ -836,7 +858,7 @@ async def test_a_change_of_robot_in_the_release_burst_releases_the_robot_left_be
 
             async def report():
                 for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
-                    measured.set(peer, POSE)
+                    measured.set(peer, reported(POSE))
                 await step()
 
             await report()
@@ -882,7 +904,7 @@ async def a_take_interrupted_by(change) -> tuple[list, Driver]:
         assert robots.choose("alpha")
         measured = publish.MeasuredPoses(clock)
         for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
-            measured.set(peer, POSE)
+            measured.set(peer, reported(POSE))
         session = ScriptedHeadset(clock)
         session.press(right=(False, False, True))
         async with parked(

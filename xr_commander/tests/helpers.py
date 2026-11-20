@@ -8,6 +8,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import peppygen.clock
+from control_core_py.geometry import Pose, Quaternion, Stamped
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from peppygen.consumed_actions.fleet import changes, lease
@@ -21,40 +22,73 @@ from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
 from xr_commander.drive import Driver, HandState
 from xr_commander.fleet import Fleet, FleetView, Following, Holder, Timing
-from xr_commander import frames
-from xr_commander.frames import Pose
 from xr_commander.panel import HandSource
 from xr_commander.publish import MeasuredPoses
 from xr_commander.robots import PairedRobots
 
-IDENTITY = np.array([0.0, 0.0, 0.0, 1.0])
+IDENTITY = (0.0, 0.0, 0.0, 1.0)
+X = (1.0, 0.0, 0.0)
+Y = (0.0, 1.0, 0.0)
+Z = (0.0, 0.0, 1.0)
 
 
-def quat_from_axis_angle(axis: np.ndarray, angle: float) -> np.ndarray:
-    """Rotation of `angle` about `axis`; degenerate axis or zero angle is identity."""
-    axis = np.asarray(axis, dtype=np.float64)
-    norm = float(np.linalg.norm(axis))
-    if norm < frames._EPS or angle == 0.0:
-        return np.array([0.0, 0.0, 0.0, 1.0])
-    half = 0.5 * angle
-    return np.concatenate([(axis / norm) * math.sin(half), [math.cos(half)]])
+def quat_from_axis_angle(axis, angle: float) -> Quaternion:
+    """The turn of `angle` (rad) about the unit vector `axis`, [x, y, z, w]."""
+    s = math.sin(0.5 * angle)
+    return (axis[0] * s, axis[1] * s, axis[2] * s, math.cos(0.5 * angle))
+
+
+def pose_at(position, orientation=IDENTITY) -> Pose:
+    """The pose at `position` (m) turned by `orientation`, [x, y, z, w]."""
+    return Pose.parse(position, orientation)
+
+
+# The camera frame a picture of the tests names.
+CAMERA_FRAME = "camera_color_optical_frame"
 
 
 def frame_message(width=1, height=1, encoding="bgr8", data=None):
     if data is None:
         data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
     return color_video_stream.Message(
-        header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
+        header=color_video_stream.MessageHeader(
+            timestamp=0.0, frame=CAMERA_FRAME, capture_index=0
+        ),
         encoding=encoding,
         width=width,
         height=height,
-        frame=data,
+        data=data,
     )
 
 
-X = np.array([1.0, 0.0, 0.0])
-Y = np.array([0.0, 1.0, 0.0])
-POSE = Pose(np.zeros(3), IDENTITY)
+POSE = pose_at((0.0, 0.0, 0.0))
+# The follower's robot frame, an arm's base_link, as its pose_states name it,
+# and the time of its reports.
+ROBOT_FRAME = "base_link"
+REPORTED_AT_S = 1.0
+# Another frame a follower can report its end-effector in: the robot frame of
+# a mobile base.
+OTHER_FRAME = "base_footprint"
+
+
+def reported(pose: Pose, frame: str = ROBOT_FRAME) -> Stamped[Pose]:
+    """`pose` as the follower reports it on pose_states."""
+    return Stamped(frame, REPORTED_AT_S, pose)
+
+
+def posture_done(module):
+    """A posture result as a robot sends it. The commander reads only how the
+    goal ended, thus the arm pose in it is a fixed value."""
+    return module.ResultResponseData(
+        frame=ROBOT_FRAME,
+        timestamp=REPORTED_AT_S,
+        arm_names=["right_arm"],
+        grasp_points=[
+            module.ResultResponseDataGraspPointsItem(
+                position=[0.3, -0.2, 0.3], orientation=[0.0, 0.0, 0.0, 1.0]
+            )
+        ],
+    )
 
 
 def squeezing_hand():
@@ -111,10 +145,10 @@ def source(
 ):
     measured = MeasuredPoses()
     if fresh:
-        measured.set(PEER, POSE)
+        measured.set(PEER, reported(POSE))
     clutch = HandClutch(1.0)
     if engaged:
-        clutch.step(squeezing=True, hand=POSE, measured_ee=POSE)
+        clutch.step(squeezing=True, hand=POSE, measured_ee=reported(POSE))
     gripper = arm_bound if gripper_bound is None else gripper_bound
     return HandSource(
         handedness=handedness,

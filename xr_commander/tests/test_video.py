@@ -295,17 +295,6 @@ async def test_the_panels_follow_the_choice_and_the_arms_as_they_pair():
         )
 
 
-def bgr_message(width=1, height=1):
-    data = np.zeros((height, width, 3), dtype=np.uint8).tobytes()
-    return color_video_stream.Message(
-        header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
-        encoding="bgr8",
-        width=width,
-        height=height,
-        frame=data,
-    )
-
-
 # No robot chosen and none pairing an arm: the harness's cameras are
 # outside any copy, which every robot shows.
 NO_ROBOTS = robots_choosing(None)
@@ -329,16 +318,10 @@ async def test_an_undecodable_frame_is_dropped_and_logged_once(capsys):
                 health,
             )
         ):
-            bad = color_video_stream.Message(
-                header=color_video_stream.MessageHeader(timestamp=0.0, frame_id=0),
-                encoding="z16",
-                width=1,
-                height=1,
-                frame=b"xx",
-            )
+            bad = frame_message(encoding="z16", data=b"xx")
             await camera.video_stream.publish(bad)
             await camera.video_stream.publish(bad)
-            await camera.video_stream.publish(bgr_message())
+            await camera.video_stream.publish(frame_message())
             # Per-producer order holds, so the landed good frame proves both
             # bad ones were already processed.
             await eventually(lambda: "chest" in health, message="the good frame")
@@ -374,9 +357,9 @@ async def test_one_instance_id_on_two_core_nodes_is_two_producers(capsys):
     cameras = StubCameras(
         [
             (here.producer, bad),
-            (there.producer, bgr_message()),
+            (there.producer, frame_message()),
             (here.producer, bad),
-            (wrist.producer, bgr_message()),
+            (wrist.producer, frame_message()),
         ],
         here,
         there,
@@ -615,7 +598,7 @@ async def test_a_frame_decoded_across_a_robot_change_is_dropped(monkeypatch):
                 h.node_runner, color_video_stream, panels, robots, token, "test"
             )
         ):
-            await camera.video_stream.publish(bgr_message())
+            await camera.video_stream.publish(frame_message())
             await asyncio.wait_for(decoding.wait(), 10.0)
             chosen[0] = "bravo"
             switched.set()

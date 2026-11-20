@@ -209,6 +209,11 @@ wheels = [
 ]
 
 [[package]]
+name = "control-core-py"
+version = "0.1.0"
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py#0680f96af2b8c0c6f8a286b929388fedde6a41be" }
+
+[[package]]
 name = "cryptography"
 version = "50.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1116,6 +1121,7 @@ name = "xr-commander"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "control-core-py" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "numpy" },
@@ -1134,6 +1140,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py" },
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.110" },
     { name = "numpy", specifier = ">=1.26" },
