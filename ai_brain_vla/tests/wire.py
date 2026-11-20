@@ -15,6 +15,8 @@ from peppygen.exposed_actions.item_manipulation import grab_item as grab_action
 from peppygen.fixtures.exposed_services.item_manipulation import get_state as get_state_fx
 
 WAIT = 10.0
+# The robot frame the harness's robot names.
+ROBOT_FRAME = "base_link"
 # Snapshots published before the brain holds the first one; each one is a
 # get_state round trip.
 ATTEMPTS = 1000
@@ -61,8 +63,11 @@ def limbs_at(limbs: FakeLimbs) -> limb_states.Message:
     """A limb_states snapshot of the OpenArm, two arms of seven joints, as
     `limbs` stand."""
     return limb_states.Message(
-        timestamp=limbs.stamp, arm_names=["left_arm", "right_arm"], joints_per_arm=[7, 7], joint_positions=[0.0] * 14,
-        positions=[*limbs.left_position, 0.4, -0.2, 0.9], orientations=[*limbs.left_orientation, 0.0, 1.0, 0.0, 0.0],
+        timestamp=limbs.stamp, frame=ROBOT_FRAME, arm_names=["left_arm", "right_arm"], joints_per_arm=[7, 7], joint_positions=[0.0] * 14,
+        grasp_points=[
+            limb_states.MessageGraspPointsItem(position=limbs.left_position, orientation=limbs.left_orientation),
+            limb_states.MessageGraspPointsItem(position=[0.4, -0.2, 0.9], orientation=[0.0, 1.0, 0.0, 0.0]),
+        ],
         gripper_names=["left_gripper", "right_gripper"], gripper_openings=[limbs.left_opening, 1.0],
     )
 
@@ -74,8 +79,22 @@ async def publish_limbs(h) -> None:
     await topic.publish(limbs_at(limbs_of(h)))
 
 
+def target(position, orientation=None, frame=ROBOT_FRAME, timestamp=None, record=grab_action.GoalRequestDataTarget):
+    """A goal's target, a `record` of grab_item's by default: `position` in
+    `frame`, the robot frame when none, at `timestamp`, the latest time when
+    none, with `orientation`, or none."""
+    return record(
+        frame=frame, timestamp=timestamp, position=list(position), orientation=None if orientation is None else list(orientation)
+    )
+
+
+# The target a goal that names its item by id sends, which is not read: a
+# zero position with no frame, no timestamp and no orientation.
+UNREAD_TARGET = target([0.0, 0.0, 0.0], frame=None)
+
+
 def grab_by_pose(position, orientation=None) -> grab_action.GoalRequestData:
-    return grab_action.GoalRequestData(gripper_name="left_gripper", item_id="", position=list(position), orientation=orientation, max_effort=0.0)
+    return grab_action.GoalRequestData(gripper_name="left_gripper", item_id="", target=target(position, orientation), max_effort=0.0)
 
 
 def plan(h, *answers: bool) -> None:
@@ -104,21 +123,23 @@ async def accepted_move(h):
     return pending.request, await pending.accept()
 
 
-async def land_move(h) -> move_arm.GoalRequest:
-    """The next move_arm goal, landed on its target: limb_states shows the
-    left grasp point there before the goal completes."""
+async def land_move(h) -> move_arm.GoalRequestTarget:
+    """The target of the next move_arm goal, which leaves its frame out,
+    for the robot frame, and its timestamp, for the latest time, landed on:
+    limb_states shows the left grasp point there before the goal completes."""
     request, active = await accepted_move(h)
     assert request.arm_name == "left_arm", request.arm_name
+    goal = request.target
+    assert (goal.frame, goal.timestamp) == (None, None), (goal.frame, goal.timestamp)
     limbs = limbs_of(h)
-    limbs.left_position, limbs.left_orientation = list(request.position), list(request.orientation)
+    limbs.left_position, limbs.left_orientation = list(goal.position), list(goal.orientation)
     limbs.stamp += 1.0
     await publish_limbs(h)
-    await active.complete(
-        move_arm.ResultResponseData(
-            final_position=request.position, final_orientation=request.orientation, ended_on_contact=False, action_time=1.0
-        )
+    final_pose = move_arm.ResultResponseDataFinalPose(
+        frame=ROBOT_FRAME, timestamp=limbs.stamp, position=goal.position, orientation=goal.orientation
     )
-    return request
+    await active.complete(move_arm.ResultResponseData(final_pose=final_pose, ended_on_contact=False, action_time=1.0))
+    return goal
 
 
 async def accepted_grip(h):
