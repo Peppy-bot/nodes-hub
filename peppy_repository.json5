@@ -6,6 +6,11 @@
         path: "ai_brain_vla/peppy.json5"
       }
     },
+    botshare_backbone: {
+      v1: {
+        path: "botshare/backbone/peppy.json5"
+      }
+    },
     camera_geometry_check: {
       v1: {
         path: "camera_geometry_check/peppy.json5"
