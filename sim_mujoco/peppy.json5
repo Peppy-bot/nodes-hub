@@ -100,7 +100,7 @@
       // system picks and logs the address it took, so two engines on a host
       // both come up.
       viewer_host: { $type: "string", $default: "0.0.0.0" },
-      viewer_port: { $type: "u16", $default: 8080 },
+      viewer_port: { $type: "u16", $default: 23818 },
       // Render and stream the cameras of the standing robot's model on the
       // camera slots, each on the pair of its own relay. Required: the
       // launcher states whether cameras are rendered.

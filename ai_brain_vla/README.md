@@ -326,7 +326,7 @@ loopback, the framework's beside these two: the robots at `http://127.0.0.1:8900
 (`brain.scan_items`, `brain.identify_item`, `brain.grab_item`, the cameras, the
 moves) and the world at `http://127.0.0.1:8902/simulation/v1/mcp`
 (`scene.spawn_object`, `scene.remove_object`, `scene.get_assets_list`). The
-viewer is at `https://127.0.0.1:8080` (self-signed certificate). The first
+viewer is at `https://127.0.0.1:23817` (self-signed certificate). The first
 launch builds the brain's container, about ten minutes, and the brain's first
 load on the machine then downloads the weights, as long as the link takes for
 7 GB. At every start the brain loads its models in the background for about a
