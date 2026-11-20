@@ -1,0 +1,14 @@
+Bootstrap: docker
+From: peppybot/python-uv-base:latest
+
+# The image CI runs this suite in (.github/scripts/ci_containers.py derives it
+# from the From: line and the %post below). Not the node's own image: the
+# suites drive the commander against a fake scene provider.
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    # uv resolves control_core_py as a git dependency; the base image has no git.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*

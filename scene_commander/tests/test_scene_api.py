@@ -7,6 +7,7 @@ import importlib.util
 import ipaddress
 import json
 import logging
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,13 +47,26 @@ _LOAD = {"asset_id": _FACTORY, "scale": 1.0}
 _LOAD_SUMMARY = f"load_scene(asset_id={_FACTORY}, scale=1.0)"
 # What the commander answers for a load that succeeded.
 _LOAD_DONE = f"{_LOAD_SUMMARY} done"
-_ROBOTS = [
-    {"robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "attached": True},
-    {"robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "yaw": 1.25, "attached": True},
-]
-
 # A snapshot's capture time, as the generated binding decodes it: epoch seconds.
 _CAPTURED = 1_757_944_800.25
+# The frame of every value the simulation reports and takes.
+_WORLD = "world"
+# The robots the simulation lists, each facing as its orientation turns about +z.
+_ROBOTS = [
+    {
+        "robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "orientation": [0.0, 0.0, 0.0, 1.0],
+        "attached": True,
+    },
+    {
+        "robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "orientation": [0.0, 0.0, 1.0, 0.0],
+        "attached": True,
+    },
+]
+# The same robots as the page lists them, each facing its yaw.
+_LISTED_ROBOTS = [
+    {"robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "attached": True},
+    {"robot": "bravo", "model": "openarm_v1", "position": [0.0, -1.5, 0.0], "yaw": math.pi, "attached": True},
+]
 # The simulation instance serving the scene, its lighting, its daylight and
 # its materials.
 _SIMULATION = ("alpha", "alpha_isaac")
@@ -126,14 +140,15 @@ class Status(enum.IntEnum):
 
 
 class FailureKind(str, enum.Enum):
-    """The failure kinds of a member whose contract declares none of its
-    own, as the generated FailureKind names them."""
+    """The failure kinds of peppy, and unknown_frame, which each member that
+    takes a value in world lists, as the generated FailureKind names them."""
 
     ATTEMPT_FAILED = "attempt_failed"
     TIMEOUT = "timeout"
     PRECONDITION_FAILED = "precondition_failed"
     RESOURCE_UNAVAILABLE = "resource_unavailable"
     REJECTED = "rejected"
+    UNKNOWN_FRAME = "unknown_frame"
 
 
 class FailureError(RuntimeError):
@@ -401,6 +416,7 @@ class FakeService(ModuleType):
         self.answers = []
         self.requests = []
         self.Request = lambda **fields: SimpleNamespace(**fields)
+        self.RequestTarget = lambda **fields: SimpleNamespace(**fields)
         self.Failure = Failure
         self.FailureKind = FailureKind
 
@@ -445,6 +461,7 @@ class FakeAction(ModuleType):
         self.ResultStatus = Status
         self.CancelState = CancelState
         self.GoalRequest = lambda **fields: SimpleNamespace(**fields)
+        self.GoalRequestTarget = lambda **fields: SimpleNamespace(**fields)
         # Every goal request fired, and the admission timeout of each.
         self.goals = []
         self.admissions = []
@@ -488,7 +505,9 @@ class FakeAction(ModuleType):
 def commander(monkeypatch):
     services = _link("simulation", ["get_assets_list", "get_robots_list"], producers=["producer"])
     services.get_assets_list.answers = [_catalogue(_SCENE)]
-    services.get_robots_list.answers = [SimpleNamespace(robots=[SimpleNamespace(**robot) for robot in _ROBOTS])]
+    services.get_robots_list.answers = [SimpleNamespace(
+        frame=_WORLD, timestamp=_CAPTURED, robots=[SimpleNamespace(**robot) for robot in _ROBOTS],
+    )]
     objects = _link("objects", ["get_object_states"], producers=["producer"])
     objects.get_object_states.answers = [_snapshot()]
     # The optional links start vacant; a test binds what its launch has.
@@ -627,8 +646,24 @@ def _record(object_id, asset_id, physics, mass, scale, position, orientation, li
     )
 
 
+def _in_world(**value):
+    """A target as the commander sends it: in world, at the latest time, so
+    with no timestamp."""
+    return SimpleNamespace(frame=_WORLD, timestamp=None, **value)
+
+
+def _turn(yaw):
+    """The orientation that turns by `yaw` (rad) about +z, as the contract
+    writes it: [0, 0, sin(yaw/2), cos(yaw/2)]."""
+    return [0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2)]
+
+
+# The orientation of an object as authored, and of a robot facing +x.
+_IDENTITY = [0.0, 0.0, 0.0, 1.0]
+
+
 def _snapshot(*records):
-    return SimpleNamespace(timestamp=_CAPTURED, objects=list(records))
+    return SimpleNamespace(frame=_WORLD, timestamp=_CAPTURED, objects=list(records))
 
 
 def _no_object_state(kind=FailureKind.PRECONDITION_FAILED, message=_NOT_READY):
@@ -830,7 +865,7 @@ def test_an_empty_scene_is_a_snapshot_with_no_objects_and_its_capture_time(comma
     caplog.set_level(logging.INFO)
 
     assert _call(commander, lambda client: _get(client, "/api/objects")) == (
-        200, {"success": True, "objects": [], "count": 0, "timestamp": _CAPTURED},
+        200, {"success": True, "objects": [], "count": 0, "frame": _WORLD, "timestamp": _CAPTURED},
     )
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
@@ -854,7 +889,7 @@ def test_objects_answer_503_with_the_provider_reason_while_it_has_no_object_stat
     # the page reads its kind with its reason.
     assert first == (503, {"success": False, "message": f"{kind.value}: {reason}"})
     assert second == first
-    assert third == (200, {"success": True, "objects": [], "count": 0, "timestamp": _CAPTURED})
+    assert third == (200, {"success": True, "objects": [], "count": 0, "frame": _WORLD, "timestamp": _CAPTURED})
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"Scene provider has no object state: {kind.value}: {reason}", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
@@ -893,6 +928,7 @@ def test_object_records_reach_the_page_with_every_field_as_spawned(commander):
     assert body == {
         "success": True,
         "count": 3,
+        "frame": _WORLD,
         "timestamp": _CAPTURED,
         "objects": [
             {
@@ -1008,8 +1044,8 @@ def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     spawn = commander.actions.spawn_object
     spawn.result = _completed(object_id="obj_42", name="red_block")
     done = (
-        "spawn_object(asset_id=props/blocks/red_block, position=[0.5, 0.0, 0.8], yaw=0.0, physics=dynamic, "
-        "mass=0.2) done"
+        "spawn_object(asset_id=props/blocks/red_block, frame=world, position=[0.5, 0.0, 0.8], "
+        "orientation=[0.0, 0.0, 0.0, 1.0], physics=dynamic, mass=0.2) done"
     )
 
     status, _, lines = _call(commander, lambda client: _stream(client, "/api/objects/spawn", {
@@ -1019,10 +1055,10 @@ def test_spawn_object_reports_the_minted_object_id(commander, caplog):
     assert (status, lines) == (
         200, [{"goal": "1"}, {"success": True, "message": done, "object_id": "obj_42", "name": "red_block"}],
     )
-    # A spawn naming no yaw stands as authored; the panel turns an object by
-    # its yaw alone and names no orientation.
+    # A spawn naming no yaw stands as authored, turned by a yaw of 0; the
+    # panel turns an object by its yaw alone.
     assert spawn.goals == [SimpleNamespace(
-        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
+        asset_id="props/blocks/red_block", target=_in_world(position=[0.5, 0.0, 0.8], orientation=_IDENTITY), scale=1.0,
         physics="dynamic", mass=0.2, name=None, feeder=None, snap_to=None,
     )]
     assert _node_log(commander, caplog) == [(logging.INFO, done, None)]
@@ -1034,19 +1070,37 @@ def test_a_move_names_its_position_alone(commander):
     }))
 
     assert status == 200
-    # The panel turns nothing and snaps nothing to a belt end.
+    # The panel turns nothing: no orientation keeps the object's own.
+    # It snaps nothing to a belt end.
     assert commander.actions.move_object.goals == [SimpleNamespace(
-        object_id="obj_1", position=[1.0, 0.0, 0.0], orientation=None, snap_to=None,
+        object_id="obj_1", target=_in_world(position=[1.0, 0.0, 0.0], orientation=None), snap_to=None,
     )]
 
 
-def test_a_spawn_carries_the_yaw_it_names(commander):
-    status, _, _ = _call(commander, lambda client: _stream(client, "/api/objects/spawn", {
-        "asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "yaw": -1.5,
+def test_a_push_names_its_force_in_world(commander):
+    status, _ = _call(commander, lambda client: _post(client, "/api/objects/force", {
+        "object_id": "obj_1", "force": [0, 0, 20], "duration_s": 0.25,
     }))
 
     assert status == 200
-    assert commander.actions.spawn_object.goals[-1].yaw == -1.5
+    assert commander.actions.apply_force.goals == [SimpleNamespace(
+        object_id="obj_1", frame=_WORLD, timestamp=None, force=[0.0, 0.0, 20.0], duration_s=0.25,
+    )]
+
+
+# Headings (rad) a person types in the panel, and the ids of their cases.
+_YAWS = [0.0, -1.5, 1.25, math.pi]
+_YAW_IDS = ["facing-x", "clockwise", "counterclockwise", "half-turn"]
+
+
+@pytest.mark.parametrize("yaw", _YAWS, ids=_YAW_IDS)
+def test_a_spawn_is_turned_about_z_by_the_yaw_it_names(commander, yaw):
+    status, _, _ = _call(commander, lambda client: _stream(client, "/api/objects/spawn", {
+        "asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "yaw": yaw,
+    }))
+
+    assert status == 200
+    assert commander.actions.spawn_object.goals[-1].target == _in_world(position=[1.0, 0.0, 0.0], orientation=_turn(yaw))
 
 
 def test_a_spawn_naming_only_its_asset_and_position_takes_the_defaults(commander):
@@ -1056,7 +1110,7 @@ def test_a_spawn_naming_only_its_asset_and_position_takes_the_defaults(commander
 
     assert status == 200
     assert commander.actions.spawn_object.goals == [SimpleNamespace(
-        asset_id="props/furniture/desk", position=[1.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
+        asset_id="props/furniture/desk", target=_in_world(position=[1.0, 0.0, 0.0], orientation=_IDENTITY), scale=1.0,
         physics="none", mass=0.1, name=None, feeder=None, snap_to=None,
     )]
 
@@ -1265,23 +1319,34 @@ def test_the_robot_listing_names_what_the_scene_stands(commander):
     status, body = _call(commander, lambda client: _get(client, "/api/robots"))
 
     assert status == 200
-    assert body["success"] is True
-    assert body["count"] == 2
-    assert [robot["robot"] for robot in body["robots"]] == ["alpha", "bravo"]
-    # Each stands where the simulation lists it, facing the way it lists.
-    assert body["robots"] == _ROBOTS
+    # Each stands where the simulation lists it, facing the yaw of its
+    # orientation, in the frame and at the time of the listing.
+    assert body == {
+        "success": True, "robots": _LISTED_ROBOTS, "count": 2, "frame": _WORLD, "timestamp": _CAPTURED,
+    }
 
 
-def test_a_move_carries_the_robot_it_addresses_and_the_way_it_faces(commander):
+@pytest.mark.parametrize("yaw", _YAWS, ids=_YAW_IDS)
+def test_a_listed_robot_faces_the_yaw_its_orientation_turns_about_z(commander, yaw):
+    commander.services.get_robots_list.answers = [SimpleNamespace(frame=_WORLD, timestamp=_CAPTURED, robots=[
+        SimpleNamespace(**{**_ROBOTS[0], "orientation": _turn(yaw)}),
+    ])]
+
+    _, body = _call(commander, lambda client: _get(client, "/api/robots"))
+
+    assert body["robots"][0]["yaw"] == pytest.approx(yaw, abs=1e-12)
+
+
+@pytest.mark.parametrize("yaw", _YAWS, ids=_YAW_IDS)
+def test_a_move_carries_the_robot_it_addresses_and_the_way_it_faces(commander, yaw):
     status, _ = _call(commander, lambda client: _post(
-        client, "/api/robot/move", {"robot": "bravo_init_inst", "position": [1.0, -1.5, 0.0], "yaw": 1.25}
+        client, "/api/robot/move", {"robot": "bravo_init_inst", "position": [1.0, -1.5, 0.0], "yaw": yaw}
     ))
 
     assert status == 200
-    goal = commander.actions.move_robot.goals[-1]
-    assert goal.robot == "bravo_init_inst"
-    assert goal.position == [1.0, -1.5, 0.0]
-    assert goal.yaw == 1.25
+    assert commander.actions.move_robot.goals == [
+        SimpleNamespace(robot="bravo_init_inst", target=_in_world(position=[1.0, -1.5, 0.0], orientation=_turn(yaw))),
+    ]
 
 
 def test_a_move_naming_no_robot_is_refused_before_the_simulation(commander):
@@ -1327,7 +1392,9 @@ def _cancelled_by_its_caller(name):
 
 
 _SPAWN = {"asset_id": "props/furniture/desk", "position": [1.0, 0.0, 0.0], "physics": "static"}
-_SPAWN_SUMMARY = "spawn_object(asset_id=props/furniture/desk, position=[1.0, 0.0, 0.0], yaw=0.0, physics=static, mass=0.1)"
+# Where the commander spawns the desk, as its log lines name a target.
+_DESK_TARGET = "frame=world, position=[1.0, 0.0, 0.0], orientation=[0.0, 0.0, 0.0, 1.0]"
+_SPAWN_SUMMARY = f"spawn_object(asset_id=props/furniture/desk, {_DESK_TARGET}, physics=static, mass=0.1)"
 # The goals followed by their progress: the action, its route, a payload and
 # the summary its log lines open with.
 _FOLLOWED = [
@@ -2166,7 +2233,7 @@ def test_spawns_in_flight_together_are_each_followed_and_cancelled_by_their_own_
 
     assert cancelled == (200, {"success": True, "message": "the simulator answered the cancel of spawn_object: SIGNALLED"})
     assert (desk_goal.cancels, block_goal.cancels) == ([], [10.0])
-    desk_done = "spawn_object(asset_id=props/furniture/desk, position=[1.0, 0.0, 0.0], yaw=0.0, physics=none, mass=0.1) done"
+    desk_done = f"spawn_object(asset_id=props/furniture/desk, {_DESK_TARGET}, physics=none, mass=0.1) done"
     assert desk_answer[2] == [
         {"goal": "1"}, {"success": True, "message": desk_done, "object_id": "obj_1", "name": "desk"},
     ]
@@ -2177,18 +2244,20 @@ def test_spawns_in_flight_together_are_each_followed_and_cancelled_by_their_own_
 
 
 _MOVE_ROBOT = {"robot": "alpha", "position": [0, 0, 0], "yaw": 0}
-_MOVE_ROBOT_SUMMARY = "move_robot(robot=alpha, position=[0.0, 0.0, 0.0], yaw=0.0)"
+_MOVE_ROBOT_SUMMARY = (
+    "move_robot(robot=alpha, frame=world, position=[0.0, 0.0, 0.0], orientation=[0.0, 0.0, 0.0, 1.0])"
+)
 # The actions that report no progress: each is bounded as a whole goal.
 _WHOLE_GOALS = [
     ("clear_scene", "/api/scene/clear", {}, "clear_scene()"),
     (
         "move_object", "/api/objects/move", {"object_id": "obj_1", "position": [1, 0, 0]},
-        "move_object(object_id=obj_1, position=[1.0, 0.0, 0.0])",
+        "move_object(object_id=obj_1, frame=world, position=[1.0, 0.0, 0.0])",
     ),
     ("remove_object", "/api/objects/remove", {"object_id": "obj_1"}, "remove_object(object_id=obj_1)"),
     (
         "apply_force", "/api/objects/force", {"object_id": "obj_1", "force": [0, 0, 20]},
-        "apply_force(object_id=obj_1, force=[0.0, 0.0, 20.0], duration_s=0.5)",
+        "apply_force(object_id=obj_1, frame=world, force=[0.0, 0.0, 20.0], duration_s=0.5)",
     ),
     ("move_robot", "/api/robot/move", _MOVE_ROBOT, _MOVE_ROBOT_SUMMARY),
 ]
@@ -2296,6 +2365,29 @@ def test_a_refused_action_without_progress_answers_400_with_the_kind_and_the_rea
     )
     assert clear.handles[0].result_waits == []
     assert _node_log(commander, caplog) == [(logging.WARNING, f"POST /api/scene/clear failed: {message}", None)]
+
+
+# What a simulation answers a value it is sent in a frame other than world.
+_NOT_WORLD = "the frame odom is not world, the one frame of the simulation: send world"
+
+
+@pytest.mark.parametrize(("name", "path", "payload"), [
+    ("spawn_object", "/api/objects/spawn", _SPAWN),
+    ("move_object", "/api/objects/move", {"object_id": "obj_1", "position": [1, 0, 0]}),
+    ("apply_force", "/api/objects/force", {"object_id": "obj_1", "force": [0, 0, 20]}),
+    ("move_robot", "/api/robot/move", _MOVE_ROBOT),
+], ids=["spawn_object", "move_object", "apply_force", "move_robot"])
+def test_a_goal_refused_with_unknown_frame_answers_400_with_the_kind_and_the_reason(
+    commander, caplog, name, path, payload,
+):
+    caplog.set_level(logging.INFO)
+    getattr(commander.actions, name).refusal = Failure(FailureKind.UNKNOWN_FRAME, _NOT_WORLD)
+    message = f"{name} was refused: unknown_frame: {_NOT_WORLD}"
+
+    assert _call(commander, lambda client: _post(client, path, payload)) == (
+        400, {"success": False, "message": message},
+    )
+    assert _node_log(commander, caplog) == [(logging.WARNING, f"POST {path} failed: {message}", None)]
 
 
 @pytest.mark.parametrize(("end", "answer"), [
@@ -2426,46 +2518,57 @@ def test_a_panel_read_whose_error_reply_is_no_wait_is_a_server_error_with_its_ki
     ]
 
 
-@pytest.mark.parametrize(("route", "payload", "sent", "answer", "summary"), [
+def _current_in_world(**value):
+    """A setter's current record: in world, at the simulated instant of the call."""
+    return {"frame": _WORLD, "timestamp": _CAPTURED, **value}
+
+
+@pytest.mark.parametrize(("route", "payload", "sent", "answer", "current", "summary"), [
     (
         "intensity", {"light_id": "lamp", "value": 1200},
         SimpleNamespace(light_id="lamp", value=1200.0),
         _set(current_value=1200.0),
+        {"current_value": 1200.0},
         "set_light_intensity(light_id=lamp, value=1200.0)",
     ),
     (
         "color", {"light_id": "lamp", "color": [1, 0.9, 0.8]},
         SimpleNamespace(light_id="lamp", color=[1.0, 0.9, 0.8]),
         _set(current_color=[1.0, 0.9, 0.8]),
+        {"current_color": [1.0, 0.9, 0.8]},
         "set_light_color(light_id=lamp, color=[1.0, 0.9, 0.8])",
     ),
     (
         "position", {"light_id": "lamp", "position": [1, 2, 3]},
-        SimpleNamespace(light_id="lamp", position=[1.0, 2.0, 3.0]),
-        _set(current_position=[1.0, 2.0, 3.0]),
-        "set_light_position(light_id=lamp, position=[1.0, 2.0, 3.0])",
+        SimpleNamespace(light_id="lamp", target=_in_world(position=[1.0, 2.0, 3.0])),
+        _set(current=SimpleNamespace(**_current_in_world(position=[1.0, 2.0, 3.0]))),
+        {"current": _current_in_world(position=[1.0, 2.0, 3.0])},
+        "set_light_position(light_id=lamp, frame=world, position=[1.0, 2.0, 3.0])",
     ),
     (
         "direction", {"light_id": "lamp", "direction": [0, 0, -1]},
-        SimpleNamespace(light_id="lamp", direction=[0.0, 0.0, -1.0]),
-        _set(current_direction=[0.0, 0.0, -1.0]),
-        "set_light_direction(light_id=lamp, direction=[0.0, 0.0, -1.0])",
+        SimpleNamespace(light_id="lamp", target=_in_world(direction=[0.0, 0.0, -1.0])),
+        _set(current=SimpleNamespace(**_current_in_world(direction=[0.0, 0.0, -1.0]))),
+        {"current": _current_in_world(direction=[0.0, 0.0, -1.0])},
+        "set_light_direction(light_id=lamp, frame=world, direction=[0.0, 0.0, -1.0])",
     ),
     (
         "cone", {"light_id": "lamp", "inner_angle": 0.2, "outer_angle": 0.5},
         SimpleNamespace(light_id="lamp", inner_angle=0.2, outer_angle=0.5),
         _set(current_inner_angle=0.2, current_outer_angle=0.5),
+        {"current_inner_angle": 0.2, "current_outer_angle": 0.5},
         "set_light_cone(light_id=lamp, inner_angle=0.2, outer_angle=0.5)",
     ),
     (
         "orientation", {"light_id": "environment", "orientation": [0, 0, 0, 1]},
-        SimpleNamespace(light_id="environment", orientation=[0.0, 0.0, 0.0, 1.0]),
-        _set(current_orientation=[0.0, 0.0, 0.0, 1.0]),
-        "set_light_orientation(light_id=environment, orientation=[0.0, 0.0, 0.0, 1.0])",
+        SimpleNamespace(light_id="environment", target=_in_world(orientation=[0.0, 0.0, 0.0, 1.0])),
+        _set(current=SimpleNamespace(**_current_in_world(orientation=[0.0, 0.0, 0.0, 1.0]))),
+        {"current": _current_in_world(orientation=[0.0, 0.0, 0.0, 1.0])},
+        "set_light_orientation(light_id=environment, frame=world, orientation=[0.0, 0.0, 0.0, 1.0])",
     ),
 ], ids=["intensity", "color", "position", "direction", "cone", "orientation"])
 def test_a_light_setter_posts_the_request_and_answers_the_effective_value(
-    commander, caplog, route, payload, sent, answer, summary,
+    commander, caplog, route, payload, sent, answer, current, summary,
 ):
     caplog.set_level(logging.INFO)
     commander.bind_lighting()
@@ -2474,7 +2577,6 @@ def test_a_light_setter_posts_the_request_and_answers_the_effective_value(
 
     status, body = _call(commander, lambda client: _post(client, f"/api/lighting/{route}", payload))
 
-    current = vars(answer)
     assert (status, body) == (200, {"success": True, "message": f"{summary} done", **current})
     assert service.requests == [(FakeProducer(*_SIMULATION), sent)]
     assert _node_log(commander, caplog) == [(logging.INFO, f"{summary} done", None)]
@@ -2521,6 +2623,26 @@ def test_a_refused_setter_answers_400_with_the_kind_and_the_reason(commander, ca
         ),
         (logging.WARNING, f"POST /api/lighting/reset failed: precondition_failed: {_NO_SCENE}", None),
     ]
+
+
+@pytest.mark.parametrize(("route", "payload"), [
+    ("position", {"light_id": "lamp", "position": [1, 2, 3]}),
+    ("direction", {"light_id": "lamp", "direction": [0, 0, -1]}),
+    ("orientation", {"light_id": "environment", "orientation": [0, 0, 0, 1]}),
+], ids=["position", "direction", "orientation"])
+def test_a_light_setter_refused_with_unknown_frame_answers_400_with_the_kind_and_the_reason(
+    commander, caplog, route, payload,
+):
+    caplog.set_level(logging.INFO)
+    commander.bind_lighting()
+    getattr(commander.lighting, f"set_light_{route}").answers = [Failure(FailureKind.UNKNOWN_FRAME, _NOT_WORLD)]
+    path = f"/api/lighting/{route}"
+    message = f"unknown_frame: {_NOT_WORLD}"
+
+    assert _call(commander, lambda client: _post(client, path, payload)) == (
+        400, {"success": False, "message": message},
+    )
+    assert _node_log(commander, caplog) == [(logging.WARNING, f"POST {path} failed: {message}", None)]
 
 
 @pytest.mark.parametrize(("path", "payload", "message"), [

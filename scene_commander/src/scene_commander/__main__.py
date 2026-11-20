@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 import peppylib
 from aiohttp import web
+from control_core_py.geometry import WORLD, quaternion_of_yaw, yaw_of_quaternion
 
 from peppygen import NodeBuilder, NodeRunner
 
@@ -209,10 +210,16 @@ async def _fetch_assets(node_runner: NodeRunner) -> list[dict]:
     return json.loads(response.data.assets_json)
 
 
+def _stamp(data) -> dict:
+    """The frame and the capture time of a report's poses."""
+
+    return {"frame": data.frame, "timestamp": data.timestamp}
+
+
 async def _fetch_objects(node_runner: NodeRunner) -> dict:
-    """The provider's object state snapshot: its capture time and records.
-    Every error reply of get_object_states says that the provider has no
-    snapshot to give."""
+    """The provider's object state snapshot: its frame, its capture time and
+    its records. Every error reply of get_object_states says that the
+    provider has no snapshot to give."""
 
     producer = get_object_states.bound_producer(node_runner)
 
@@ -229,14 +236,16 @@ async def _fetch_objects(node_runner: NodeRunner) -> dict:
     data = response.data
 
     return {
-        "timestamp": data.timestamp,
+        **_stamp(data),
         "objects": [_object_record(record) for record in data.objects],
     }
 
 
-async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
-    """The robots the scene stands. An error reply raises the typed failure
-    of get_robots_list, which names its kind."""
+async def _fetch_robots(node_runner: NodeRunner) -> dict:
+    """The robots the scene stands, with the frame and the capture time of
+    their poses. Each faces the yaw of its orientation, a turn about +z
+    alone. An error reply raises the typed failure of get_robots_list,
+    which names its kind."""
 
     producer = get_robots_list.bound_producer(node_runner)
 
@@ -246,16 +255,21 @@ async def _fetch_robots(node_runner: NodeRunner) -> list[dict]:
         timeout=SERVICE_TIMEOUT_S,
     )
 
-    return [
-        {
-            "robot": robot.robot,
-            "model": robot.model,
-            "position": list(robot.position),
-            "yaw": robot.yaw,
-            "attached": robot.attached,
-        }
-        for robot in response.data.robots
-    ]
+    data = response.data
+
+    return {
+        **_stamp(data),
+        "robots": [
+            {
+                "robot": robot.robot,
+                "model": robot.model,
+                "position": list(robot.position),
+                "yaw": yaw_of_quaternion(robot.orientation),
+                "attached": robot.attached,
+            }
+            for robot in data.robots
+        ],
+    }
 
 
 def _object_record(record) -> dict:
@@ -362,10 +376,25 @@ def _endpoint_name(module: ModuleType) -> str:
     return module.__name__.rsplit(".", 1)[-1]
 
 
-def _summary(name: str, fields: dict) -> str:
-    """What a call asked, as its log lines open with it."""
+def _named(field: str, value) -> list[tuple[str, object]]:
+    """One field of a call as its log lines name it: a target, a value in a
+    frame at a time, by the fields it holds."""
 
-    return f"{name}({', '.join(f'{key}={value}' for key, value in fields.items())})"
+    return list(vars(value).items()) if field == "target" else [(field, value)]
+
+
+def _summary(name: str, fields: dict) -> str:
+    """What a call asked, as its log lines open with it: each field it
+    gives, and none it leaves out (None)."""
+
+    named = (
+        f"{key}={shown}"
+        for field, value in fields.items()
+        for key, shown in _named(field, value)
+        if shown is not None
+    )
+
+    return f"{name}({', '.join(named)})"
 
 
 def _done(summary: str) -> str:
@@ -410,9 +439,15 @@ async def _call_service(service, node_runner: NodeRunner, producer, request=None
 
 
 def _current(data) -> dict:
-    """The effective values a setter reports: its current_* fields."""
+    """The effective values a setter reports: its current_* fields, or its
+    current record, a value in a frame at a time."""
 
-    return {key: value for key, value in vars(data).items() if key.startswith("current_")}
+    values = vars(data)
+
+    if "current" in values:
+        return {"current": dict(vars(values["current"]))}
+
+    return {key: value for key, value in values.items() if key.startswith("current_")}
 
 
 async def _fetch_json(service, node_runner: NodeRunner, producer, field: str) -> dict:
@@ -804,11 +839,24 @@ async def _fire_spawn_object(node_runner: NodeRunner, request) -> _Goal:
         node_runner,
         request,
         asset_id=request.asset_id,
-        position=request.position,
-        yaw=request.yaw,
+        target=request.target,
         physics=request.physics,
         mass=request.mass,
     )
+
+
+def _in_world(record, **fields):
+    """`record` holding `fields` in world at the latest time: it names world
+    and gives no timestamp."""
+
+    return record(frame=WORLD, timestamp=None, **fields)
+
+
+def _orientation_of_yaw(yaw: float) -> list[float]:
+    """The orientation that turns by `yaw` (rad) about +z, which the panel
+    takes as a heading."""
+
+    return list(quaternion_of_yaw(yaw))
 
 
 async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
@@ -817,7 +865,8 @@ async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
     if len(force) != 3:
         raise ValueError("force must contain exactly 3 values")
 
-    request = apply_force.GoalRequest(
+    request = _in_world(
+        apply_force.GoalRequest,
         object_id=str(payload["object_id"]),
         force=force,
         duration_s=float(payload.get("duration_s", 0.5)),
@@ -828,18 +877,23 @@ async def _action_apply_force(node_runner: NodeRunner, payload: dict) -> dict:
         node_runner,
         request,
         object_id=request.object_id,
+        frame=request.frame,
+        timestamp=request.timestamp,
         force=force,
         duration_s=request.duration_s,
     )
 
 
 async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
-    # The panel moves an object to a position, without turning it or
-    # snapping it to a belt end.
+    # The panel moves an object to a position and snaps it to no belt end;
+    # no orientation keeps the one the object has.
     request = move_object.GoalRequest(
         object_id=str(payload["object_id"]),
-        position=[float(value) for value in payload["position"]],
-        orientation=None,
+        target=_in_world(
+            move_object.GoalRequestTarget,
+            position=[float(value) for value in payload["position"]],
+            orientation=None,
+        ),
         snap_to=None,
     )
 
@@ -848,7 +902,7 @@ async def _action_move_object(node_runner: NodeRunner, payload: dict) -> dict:
         node_runner,
         request,
         object_id=request.object_id,
-        position=request.position,
+        target=request.target,
     )
 
 
@@ -864,15 +918,18 @@ async def _action_remove_object(node_runner: NodeRunner, object_id: str) -> dict
 async def _action_move_robot(
     node_runner: NodeRunner, robot: str, position: list[float], yaw: float
 ) -> dict:
-    position = [float(value) for value in position]
+    target = _in_world(
+        move_robot.GoalRequestTarget,
+        position=[float(value) for value in position],
+        orientation=_orientation_of_yaw(yaw),
+    )
 
     return await _run_action(
         move_robot,
         node_runner,
-        move_robot.GoalRequest(robot=robot, position=position, yaw=yaw),
+        move_robot.GoalRequest(robot=robot, target=target),
         robot=robot,
-        position=position,
-        yaw=yaw,
+        target=target,
     )
 
 
@@ -1124,11 +1181,13 @@ def _spawn_request(payload: dict):
 
     return spawn_object.GoalRequest(
         asset_id=_name(payload, "asset_id"),
-        position=_vector(payload, "position", 3),
-        yaw=_optional(_number, payload, "yaw", 0.0),
         # The panel turns an object by its yaw alone, at its position, and
         # snaps it to no belt end.
-        orientation=None,
+        target=_in_world(
+            spawn_object.GoalRequestTarget,
+            position=_vector(payload, "position", 3),
+            orientation=_orientation_of_yaw(_optional(_number, payload, "yaw", 0.0)),
+        ),
         scale=_optional(_number, payload, "scale", 1.0),
         physics=_optional(_physics, payload, "physics", "none"),
         mass=_optional(_number, payload, "mass", 0.1),
@@ -1160,6 +1219,15 @@ def _vector3(payload: dict, key: str) -> list[float]:
 
 def _vector4(payload: dict, key: str) -> list[float]:
     return _vector(payload, key, 4)
+
+
+def _stamped(
+    setter: ModuleType, field: str, parse: Callable[[dict, str], list[float]]
+) -> Callable[[dict, str], object]:
+    """The parser of a setter's `target` record: the value the page posts in
+    `field`, in world at the latest time."""
+
+    return lambda payload, _: _in_world(setter.RequestTarget, **{field: parse(payload, field)})
 
 
 def _text(payload: dict, key: str) -> str:
@@ -1249,10 +1317,12 @@ _PANELS = (
         setters={
             "intensity": (set_light_intensity, {"value": _number}),
             "color": (set_light_color, {"color": _vector3}),
-            "position": (set_light_position, {"position": _vector3}),
-            "direction": (set_light_direction, {"direction": _vector3}),
+            "position": (set_light_position, {"target": _stamped(set_light_position, "position", _vector3)}),
+            "direction": (set_light_direction, {"target": _stamped(set_light_direction, "direction", _vector3)}),
             "cone": (set_light_cone, {"inner_angle": _number, "outer_angle": _number}),
-            "orientation": (set_light_orientation, {"orientation": _vector4}),
+            "orientation": (
+                set_light_orientation, {"target": _stamped(set_light_orientation, "orientation", _vector4)}
+            ),
         },
         reset=reset_lighting,
         watch=_LIGHTING,
@@ -1365,6 +1435,7 @@ async def _api_objects(request: web.Request) -> web.Response:
             "success": True,
             "objects": objects,
             "count": len(objects),
+            "frame": snapshot["frame"],
             "timestamp": snapshot["timestamp"],
         }
     )
@@ -1483,13 +1554,21 @@ async def _api_remove_object(request: web.Request) -> web.Response:
 
 async def _api_robots(request: web.Request) -> web.Response:
     try:
-        robots = await _fetch_robots(request.app[_NODE_RUNNER])
+        listing = await _fetch_robots(request.app[_NODE_RUNNER])
 
     except Exception as exc:
         return _json_error(request, exc, status=500)
 
+    robots = listing["robots"]
+
     return web.json_response(
-        {"success": True, "robots": robots, "count": len(robots)}
+        {
+            "success": True,
+            "robots": robots,
+            "count": len(robots),
+            "frame": listing["frame"],
+            "timestamp": listing["timestamp"],
+        }
     )
 
 
@@ -2490,7 +2569,7 @@ async function refreshObjects() {
         objectList = data.objects || [];
 
         el("objectCount").textContent =
-            `${objectList.length} objects`;
+            `${objectList.length} objects, positions in ${data.frame}`;
 
         renderObjects();
     }
@@ -2799,7 +2878,7 @@ async function refreshRobots() {
         selectRobot();
 
         el("robotCount").textContent =
-            `${robotList.length} robots standing`;
+            `${robotList.length} robots standing, positions in ${data.frame}`;
     }
     catch (err) {
         status(err.message, true);

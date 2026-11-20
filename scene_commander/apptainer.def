@@ -16,6 +16,10 @@ From: peppybot/python-uv-base:latest
 %post
     set -eux
     export DEBIAN_FRONTEND=noninteractive
+    # uv resolves control_core_py as a git dependency; the base image has no git.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*
 
     # Keep the managed Python installation outside $HOME because
     # Apptainer may mount the runtime user's home over the image's.
@@ -23,7 +27,8 @@ From: peppybot/python-uv-base:latest
 
     cd /opt/scene_commander
     uv python install
-    uv sync --no-editable --no-dev
+    # --locked builds the committed lockfile, and fails the build on a stale one.
+    uv sync --locked --no-editable --no-dev
 
 %runscript
     cd /opt/scene_commander

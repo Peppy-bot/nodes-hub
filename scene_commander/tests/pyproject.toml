@@ -4,10 +4,14 @@
 name = "scene-commander-tests"
 version = "0.1.0"
 description = "Tests for the scene commander HTTP API and its Peppy calls"
-requires-python = ">=3.11,<3.12"
+# The interpreter the node itself requires.
+requires-python = ">=3.12,<3.14"
 dependencies = [
     # What the API is built on; the node pins no version either.
     "aiohttp",
+    # The geometry the commander turns a yaw into an orientation with, and an
+    # orientation into a yaw.
+    "control_core_py",
     # What the endpoint tests read the node's peppy.json5 with, so the runner
     # they announce on refuses a label the manifest does not declare.
     "pyjson5==2.0.1",
@@ -18,6 +22,9 @@ dev = ["pytest>=8"]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py" }
 
 [tool.pytest.ini_options]
 # The commander's own modules, imported from the source tree.

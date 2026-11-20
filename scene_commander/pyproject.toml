@@ -5,6 +5,7 @@ description = "Peppy web scene commander for simulations with scene control"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "aiohttp",
+    "control_core_py",
     "pycapnp",
 ]
 
@@ -14,3 +15,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/scene_commander"]
+
+[tool.uv.sources]
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py" }
