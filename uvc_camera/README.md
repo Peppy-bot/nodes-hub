@@ -32,10 +32,20 @@ relay instead, which renders the robot's actual views through this same
 The `rgb_camera:v1` members sit under `link_id: "camera"`, and the
 `camera_geometry:v1` members of `uvc_camera_linux` under `link_id: "geometry"`.
 
-- **Emits** `video_stream`: frame data plus encoding and dimensions. The header
-  carries a `frame_id` (a wrapping counter) and `timestamp`, sampled when the
-  driver hands the frame over rather than after conversion, so consumers can age
-  samples on capture time.
+- **Emits** `video_stream`: picture `data` plus encoding and dimensions. The
+  header carries the camera's `frame`, a `capture_index` (a wrapping counter)
+  and `timestamp`, sampled when the driver hands the frame over rather than
+  after conversion, so consumers can age samples on capture time.
+- **Consumes** `describe_sensors` of `sensor_mounts:v1` under
+  `link_id: "sensor_mounts"`, an optional link. Bound to the robot that carries
+  the camera, whose `robot_identity` implementer serves `sensor_mounts`
+  (`--link sensor_mounts@init_inst`), it is asked at the node's start, until it
+  answers, for the frame of the camera of the name the instance runs under (its
+  instance id in its copy), and the node names that frame in every picture; it
+  streams nothing before the answer, and its start fails when the answer lists
+  no camera of that name. Vacant, for a camera that no robot carries
+  (`--vacant-link 'sensor_mounts=<why>'`), every picture names the name the
+  instance runs under, a frame no robot's tree holds.
 - **Exposes** `video_stream_info`, `set_exposure`, `set_white_balance`,
   `set_gain`, `set_brightness`, `set_contrast`. `video_stream_info` reports the
   driver-negotiated stream (geometry and effective rate), not the requested one.

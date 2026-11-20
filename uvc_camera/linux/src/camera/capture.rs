@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 
 use crate::camera::v4l_device::{CameraDevice, ControlHandle, StreamDescription, clock_now};
 use crate::pipeline;
-use crate::types::{CameraConfig, Error, FrameId, Result};
+use crate::types::{CameraConfig, CaptureIndex, Error, Frame, Result};
 
 /// Pause after a failed frame before trying the next one.
 const FRAME_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -106,6 +106,8 @@ impl PublishWindow {
 /// boundary. The device fd itself is shareable, which is what the
 /// [`ControlHandle`] hands to services.
 ///
+/// Each picture names `camera_frame`, the frame sensor_mounts gives the camera.
+///
 /// Returns two receivers:
 /// - the open outcome: on success, the negotiated [`StreamDescription`] plus a
 ///   [`ControlHandle`], so services report and act on the camera as it actually
@@ -115,6 +117,7 @@ impl PublishWindow {
 ///   hook so device teardown is bounded by the shutdown grace window.
 pub fn spawn_capture_loop(
     config: CameraConfig,
+    camera_frame: String,
     node_runner: Arc<peppygen::NodeRunner>,
     cancel_token: CancellationToken,
 ) -> (
@@ -136,9 +139,14 @@ pub fn spawn_capture_loop(
             // what reporting the failure is meant to prevent.
             let _cancel_on_exit = CancelOnExit(cancel_token.clone());
 
-            if let Err(e) =
-                run_camera_capture_loop(camera, &config, &node_runner, &runtime, &cancel_token)
-            {
+            if let Err(e) = run_camera_capture_loop(
+                camera,
+                &config,
+                &camera_frame,
+                &node_runner,
+                &runtime,
+                &cancel_token,
+            ) {
                 tracing::error!("camera capture loop failed: {e}");
             }
         }
@@ -194,6 +202,7 @@ fn open_camera(
 fn run_camera_capture_loop(
     mut camera: CameraDevice,
     config: &CameraConfig,
+    camera_frame: &str,
     node_runner: &Arc<peppygen::NodeRunner>,
     runtime: &tokio::runtime::Handle,
     cancel_token: &CancellationToken,
@@ -206,7 +215,7 @@ fn run_camera_capture_loop(
         config.resolution.height(),
     );
 
-    let mut frame_id = FrameId::default();
+    let mut capture_index = CaptureIndex::default();
     let mut last_log_time = Instant::now();
 
     // Declare the publisher once; every publish below is then lock-free.
@@ -226,14 +235,10 @@ fn run_camera_capture_loop(
         // `build_message` is pure, so this keeps serialization off the messenger.
         let prepared = camera
             .capture_frame()
-            .and_then(|raw| pipeline::process_frame(raw, frame_id, topic_encoding))
+            .and_then(|raw| pipeline::process_frame(raw, capture_index, topic_encoding))
             .and_then(|frame| {
-                let header = MessageHeader {
-                    timestamp: frame.captured_at(),
-                    frame_id: frame.frame_id().as_u32(),
-                };
                 video_stream::build_message(
-                    header,
+                    picture_header(&frame, camera_frame),
                     frame.encoding().to_string(),
                     frame.width(),
                     frame.height(),
@@ -272,11 +277,11 @@ fn run_camera_capture_loop(
         }
 
         if last_log_time.elapsed() >= STATUS_LOG_INTERVAL {
-            tracing::info!("emitted frame {}", frame_id.as_u32());
+            tracing::info!("emitted frame {}", capture_index.as_u32());
             last_log_time = Instant::now();
         }
 
-        frame_id = frame_id.next();
+        capture_index = capture_index.next();
 
         if !block_until_unless_cancelled(next_frame_time, || cancel_token.is_cancelled()) {
             break;
@@ -287,6 +292,16 @@ fn run_camera_capture_loop(
 
     tracing::info!("shutdown requested, stopping camera capture loop");
     Ok(())
+}
+
+/// The header of `frame`'s picture: the camera's frame, the capture time and the capture
+/// index.
+fn picture_header(frame: &Frame, camera_frame: &str) -> MessageHeader {
+    MessageHeader {
+        timestamp: frame.captured_at(),
+        frame: camera_frame.to_owned(),
+        capture_index: frame.capture_index().as_u32(),
+    }
 }
 
 /// Advance the frame deadline by one period, accumulating to avoid drift.
@@ -323,6 +338,23 @@ mod tests {
         // license ~600 unthrottled frames; clamping caps the catch-up at one.
         let now = deadline + Duration::from_secs(60);
         assert_eq!(advance_frame_deadline(deadline, period, now), now);
+    }
+
+    #[test]
+    fn each_picture_names_the_camera_frame_and_its_capture_index() {
+        let captured_at = std::time::UNIX_EPOCH + Duration::from_secs(1_780_000_000);
+        let frame = Frame::from_capture(
+            vec![0; 2 * 2 * 3],
+            2,
+            2,
+            captured_at,
+            camera_core::encoding::ColorEncoding::Rgb8,
+        )
+        .with_capture_index(CaptureIndex::new(7));
+        let header = picture_header(&frame, "wrist_left_color_optical_frame");
+        assert_eq!(header.frame, "wrist_left_color_optical_frame");
+        assert_eq!(header.capture_index, 7);
+        assert_eq!(header.timestamp, captured_at);
     }
 
     #[test]

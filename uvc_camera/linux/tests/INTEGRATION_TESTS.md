@@ -166,8 +166,18 @@ ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 \
 # In another terminal, view the stream
 ffplay /dev/video10
 
-# Or capture with your node
-cargo run
+# Or capture with your node, run under a name with no robot, so each picture
+# names that name, chest
+peppy node run uvc_camera_linux:v1 --instance-id chest \
+  --vacant-link 'sensor_mounts=no robot carries this camera' \
+  device_path=/dev/video10 video.frame_rate=30 video.resolution.width=640 \
+  video.resolution.height=480 video.camera_encoding=rgb8 video.topic_encoding=rgb8
+
+# Or bound to the robot whose sensor_mounts places the camera, so each picture
+# names the frame sensor_mounts gives chest
+peppy node run uvc_camera_linux:v1 --instance-id chest --link sensor_mounts@init_inst \
+  device_path=/dev/video10 video.frame_rate=30 video.resolution.width=640 \
+  video.resolution.height=480 video.camera_encoding=rgb8 video.topic_encoding=rgb8
 ```
 
 ## Alternative: Docker Testing

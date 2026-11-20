@@ -104,7 +104,7 @@ fn test_capture_color_bars() {
 #[ignore = "Requires v4l2loopback setup"]
 fn test_camera_device_end_to_end() {
     use uvc_camera_linux::pipeline::process_frame;
-    use uvc_camera_linux::types::FrameId;
+    use uvc_camera_linux::types::CaptureIndex;
 
     let Some(vcam) = virtual_camera(VirtualCamera::new(10, 640, 480, 30)) else {
         return;
@@ -113,12 +113,12 @@ fn test_camera_device_end_to_end() {
     let mut camera = open_camera();
 
     let raw = camera.capture_frame().expect("Should capture a frame");
-    let frame =
-        process_frame(raw, FrameId::new(1), ColorEncoding::Bgr8).expect("Should convert to BGR8");
+    let frame = process_frame(raw, CaptureIndex::new(1), ColorEncoding::Bgr8)
+        .expect("Should convert to BGR8");
     assert_eq!(frame.encoding(), ColorEncoding::Bgr8);
     assert_eq!(frame.width(), 640);
     assert_eq!(frame.height(), 480);
-    assert_eq!(frame.frame_id(), FrameId::new(1));
+    assert_eq!(frame.capture_index(), CaptureIndex::new(1));
 
     drop(camera);
     drop(vcam);
