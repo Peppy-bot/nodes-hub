@@ -6,8 +6,8 @@ build-backend = "hatchling.build"
 name = "uvc_camera_python_mock"
 version = "0.1.0"
 description = "uvc_camera_python_mock peppy node"
-requires-python = ">=3.11,<3.14"
-dependencies = ["peppygen", "peppylib", "av"]
+requires-python = ">=3.12,<3.14"
+dependencies = ["peppygen", "peppylib", "camera_core_py", "av"]
 
 [project.scripts]
 uvc_camera_python_mock = "uvc_camera_python_mock.__main__:main"
@@ -26,3 +26,6 @@ pythonpath = ["src"]
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
+# The shared libs live in the public-peppy-libs repository, followed on its
+# default branch like the Rust nodes' camera_core.
+camera_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "camera_core_py" }
