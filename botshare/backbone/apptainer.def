@@ -1,0 +1,14 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base:latest
+
+%files
+    . /opt/botshare_backbone
+
+%post
+    set -eux
+    cd /opt/botshare_backbone
+    cargo build --release
+
+%runscript
+    cd /opt/botshare_backbone
+    exec ./target/release/botshare_backbone "$@"
