@@ -205,6 +205,7 @@ async def _node_setup(params, node_runner) -> list:
         loop,
         io,
         world,
+        robots,
     )
 
     await scene_actions.start()

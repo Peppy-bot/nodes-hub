@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Object state of the objects spawned through scene_manipulation, read on
-Isaac's main thread.
+"""Object state of the objects spawned through scene_manipulation and of the
+robots standing in the scene, read on Isaac's main thread.
 
-A snapshot is one capture of every spawned object, stamped on the timeline
-the joint states use: the object_states stream publishes it on the state
-tick and get_object_states answers it until the next capture.
+A snapshot is one capture of every spawned object and every standing robot,
+stamped on the timeline the joint states use: the object_states stream
+publishes it on the state tick and get_object_states answers it until the
+next capture. A robot of this engine stands fixed to the world at its
+placement, the pose of its robot frame, so its record is that placement and
+zero velocities.
 
 Engine reads live in three small functions below. A dynamic object's pose
 and velocities come from PhysX through a tensor rigid-body view: the USD
@@ -61,12 +64,58 @@ class ObjectRecord:
 
 
 @dataclass(frozen=True)
+class RobotRecord:
+    """One standing robot in a snapshot: the name it stands under, its model,
+    and the world pose of its robot frame, the root link of its description
+    (orientation a unit quaternion x, y, z, w), with its world-axis
+    velocities there."""
+
+    robot: str
+    model: str
+    position: tuple[float, float, float]
+    orientation: tuple[float, float, float, float]
+    linear_velocity: tuple[float, float, float]
+    angular_velocity: tuple[float, float, float]
+
+    @staticmethod
+    def fixed(
+        robot: str,
+        model: str,
+        position: tuple[float, float, float],
+        orientation: tuple[float, float, float, float],
+    ) -> RobotRecord:
+        """The record of a robot whose robot frame is fixed to the world at
+        `position` and `orientation`: zero velocities, as object_state:v1
+        states for such a robot."""
+        return RobotRecord(
+            robot=robot,
+            model=model,
+            position=position,
+            orientation=orientation,
+            linear_velocity=_AT_REST,
+            angular_velocity=_AT_REST,
+        )
+
+    def fields(self) -> dict:
+        """The record as the generated object_state item types take it."""
+        return {
+            "robot": self.robot,
+            "model": self.model,
+            "position": list(self.position),
+            "orientation": list(self.orientation),
+            "linear_velocity": list(self.linear_velocity),
+            "angular_velocity": list(self.angular_velocity),
+        }
+
+
+@dataclass(frozen=True)
 class ObjectStateSnapshot:
-    """Every spawned object at one capture, in world, and the simulated
-    instant of that capture."""
+    """Every spawned object and every standing robot at one capture, in
+    world, and the simulated instant of that capture."""
 
     timestamp_s: float
     objects: tuple[ObjectRecord, ...]
+    robots: tuple[RobotRecord, ...]
 
     def record_of(self, object_id: str) -> ObjectRecord | None:
         """The record of the object `object_id`, or None when the capture

@@ -260,7 +260,11 @@ def scene_manipulation(scene, monkeypatch):
 
     world = Mock(spec=["robots"])
     world.robots.return_value = []
-    io = module.SceneActionIO(object(), Mock(), SimpleNamespace(capture_timestamp_s=lambda: 10.0), world)
+    robots = Mock(spec=["standing"])
+    robots.standing.return_value = {}
+    io = module.SceneActionIO(
+        object(), Mock(), SimpleNamespace(capture_timestamp_s=lambda: 10.0), world, robots
+    )
     io._object_reader = StageReader(scene.stage)
     io.set_assets(_PROPS)
     scene.launcher._scene_actions = io
