@@ -8,6 +8,7 @@
     tag: "v1",
     description: [
       "A Stereolabs ZED stereo camera (ZED, ZED Mini, ZED 2/2i over USB3) as an RGB-D camera, without the ZED SDK. It needs the camera on USB3 on its host, and outbound network access: at startup it fetches the factory calibration of the unit from https://calib.stereolabs.com/.",
+      "Each picture names in its header's frame the camera's frame, read once at its start: with the sensor_mounts link bound to the robot that carries the camera, whose robot_identity implementer serves it, the frame that sensor_mounts' describe_sensors gives for the name the camera runs under; with the link vacant, for a camera that no robot carries, that name, a frame no robot's tree holds. get_depth_to_color_extrinsics names the same frame.",
       "video_stream is the rectified left eye; depth_stream (z16, millimetres) is computed in that same frame, so the pair is always color-aligned and align_mode is depth_to_color. The device runs auto exposure; there is no manual exposure control.",
       "The same calibration answers camera_geometry: the colour stream is the rectified left eye, so its pinhole model has no distortion; the depth stream is that same view resized by depth.downscale, so its model is the colour one rescaled, and the depth-to-colour transform is the identity.",
     ],
@@ -15,6 +16,16 @@
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
       { name: "camera_geometry", tag: "v1", link_id: "geometry" },
     ],
+    depends_on: {
+      contracts: [
+        // The robot that carries this camera, whose robot_identity implementer
+        // serves sensor_mounts: describe_sensors gives the frame the camera
+        // names in each picture, read once at its start by the name it runs
+        // under. Vacant for a camera that no robot carries, whose pictures
+        // name the name it runs under.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
+      ],
+    },
     labels: [
       "zed",
       "stereo",
@@ -41,6 +52,9 @@
         { link_id: "geometry", name: "get_color_intrinsics" },
         { link_id: "geometry", name: "get_depth_intrinsics" },
         { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
+      ],
+      consumes: [
+        { link_id: "sensor_mounts", name: "describe_sensors" },
       ],
     },
   },

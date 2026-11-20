@@ -311,7 +311,7 @@ def shrink_to_width(frame: np.ndarray, max_width: int) -> np.ndarray:
 
 def _decode_and_shrink(message, view_max_width: int) -> np.ndarray:
     return shrink_to_width(
-        decode_to_bgr(message.encoding, message.width, message.height, message.frame),
+        decode_to_bgr(message.encoding, message.width, message.height, message.data),
         view_max_width,
     )
 

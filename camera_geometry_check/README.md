@@ -38,10 +38,12 @@ what the device says about itself:
 | `realsense_d4xx` | `rs-enumerate-devices -c`, and the node's `calibration:` log line at startup | Unaligned (`align_mode` `none`): colour and depth `fx fy cx cy` equal the SDK's `fx fy ppx ppy` for the opened profiles, and `t` equals the depth-to-colour translation. With `depth_to_color` the depth answer equals the colour one and `t`, `q` are the identity. |
 | `zed_camera` | the node's `geometry:` log line at startup, and the unit's factory file from `https://calib.stereolabs.com/?SN=<serial>` | The colour answer equals the rectified left projection the node logs. It is close to, not equal to, the factory `[LEFT_CAM_*]` values: rectification moves them. The depth answer is the colour one through the downscale: `fx / downscale`, `(cx + 0.5) / downscale - 0.5`. |
 
-The `checks` line must read `true` four times: the colour size equals
+The `checks` line must read `true` five times: the colour size equals
 `video_stream_info`, the depth size equals the depth frame, the answer's `align_mode`
-equals the frame header's, and both depth answers name the same mode. A check reads
-`not answered` when an answer it needs is an error reply.
+equals the frame header's, both depth answers name the same mode, and the extrinsics
+name the frame the frame header names: the camera's frame from sensor_mounts, or the name the
+camera runs under where no robot carries it. A check reads `not answered` when an answer it
+needs is an error reply.
 
 ## Check 2: one point against a tape measure
 

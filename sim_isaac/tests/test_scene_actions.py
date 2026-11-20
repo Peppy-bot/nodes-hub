@@ -1,10 +1,12 @@
 """The scene_manipulation and object_state provider: what get_assets_list and
 get_asset answer before and after discovery, the kind template among them,
 what load_scene and clear_scene do to spawned objects, what get_object_states
-answers: an error reply until a capture, then the latest capture under its own
-stamp, every completed edit included, what get_object answers for one object
-of that capture, what a load_scene or spawn_object goal reports on its
-feedback, and the failure kind of each goal refused when it arrives, each
+answers: an error reply until a capture, then the latest capture in world
+under its own stamp, every completed edit included, what get_object answers
+for one object of that capture, what get_robots_list answers, how a goal's
+target, force and timestamp reach the stage, what a load_scene or
+spawn_object goal reports on its feedback, and the failure kind of each goal
+refused when it arrives, a goal in a frame other than world and each
 load_template goal among them, of each goal whose command fails, and of each
 error reply."""
 
@@ -22,8 +24,11 @@ from unittest.mock import Mock, call
 
 import pyjson5
 import pytest
+from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion
+from sim_robot_core.world import UnknownFrame, base_target, in_world
 
 from _scene_actions import scene_actions_module
+from _world import refusal_of
 from runtime_fakes import CANCEL_REASONS
 
 
@@ -53,6 +58,22 @@ def _object_request(object_id):
     return _request(object_id=object_id)
 
 
+def _target(position, orientation=None, frame="world", timestamp=None):
+    """A goal's target as the generated code hands it over: a pose in
+    `frame`, world for None, at `timestamp`, the latest time for None, its
+    orientation None for none."""
+    return SimpleNamespace(
+        frame=frame,
+        timestamp=timestamp,
+        position=list(position),
+        orientation=None if orientation is None else list(orientation),
+    )
+
+
+# A quarter turn about +z, as a unit quaternion [x, y, z, w].
+_QUARTER_TURN = [0.0, 0.0, 2 ** -0.5, 2 ** -0.5]
+
+
 class _Robot(SimpleNamespace):
     """A robot as world.py reports it: the name it stands under, its model,
     and where."""
@@ -62,35 +83,46 @@ class _Robot(SimpleNamespace):
 
 
 class _World:
-    """The stage's robots, as SceneActionIO reads them."""
+    """The stage's robots, as SceneActionIO reads them, and each move it
+    hands the stage, as the robot's name and its target."""
 
     def __init__(self, robots):
         self._robots = list(robots)
+        self.moved = []
 
     def robots(self):
         return list(self._robots)
 
+    def move(self, name, target):
+        self.moved.append((name, target))
+
 
 def _world(*robots):
-    """The stage's robots, each as (instance, model, position, yaw)."""
+    """The stage's robots, each as (instance, model, position, orientation),
+    the pose of its base in world."""
     return _World(
         _Robot(
             instance=instance,
             model=model,
-            placement=SimpleNamespace(position=position, yaw=yaw),
+            placement=Pose.parse(position, orientation),
         )
-        for instance, model, position, yaw in robots
+        for instance, model, position, orientation in robots
     )
 
 
 class FakeStamps:
-    """SimTopicIO's capture stamp; None while the engine cannot stamp yet."""
+    """SimTopicIO's stamps: a capture's, None while the engine cannot stamp
+    yet, and the robots' placements'."""
 
     def __init__(self):
         self.now_s = 10.0
+        self.placements_s = 10.0
 
     def capture_timestamp_s(self):
         return self.now_s
+
+    def placement_timestamp_s(self):
+        return self.placements_s
 
 
 class FakeReader:
@@ -122,7 +154,7 @@ def provider(monkeypatch):
     module = scene_actions_module(monkeypatch, "_scene_actions_under_test")
 
     stamps = FakeStamps()
-    world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0))
+    world = _world(("alpha", "openarm_v2", (0.0, 0.0, 0.0), IDENTITY))
     io = module.SceneActionIO(object(), Mock(), stamps, world)
     # The stage by object_id: where the launcher put each object.
     stage = {}
@@ -283,7 +315,7 @@ def test_the_inventory_lists_every_spawned_object_with_its_category_and_pose(pro
 
     response = provider.io._handle_get_objects_list(_objects_request())
 
-    assert response.timestamp == 10.0
+    assert (response.frame, response.timestamp) == ("world", 10.0)
     assert [vars(item) for item in response.objects] == [
         {
             "object_id": red, "name": "red_block", "asset_id": "props/blocks/red_block", "category": "Blocks",
@@ -361,10 +393,9 @@ def test_the_inventory_and_one_object_give_the_asked_name_as_the_capture_holds_i
 def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(provider):
     provider.io.set_assets(_CATALOGUE)
     _spawn(provider)
-    result = provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": "props/blocks/blue_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.5,
-        "physics": "static", "mass": 0.2,
-    })
+    result = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(
+        asset_id="props/blocks/blue_block", scale=1.5, physics="static", mass=0.2,
+    ))
     blue = result["object_id"]
     provider.stage[blue] = [1.0, 2.0, 3.0]
     provider.io.capture_object_states()
@@ -372,7 +403,8 @@ def test_one_object_answers_its_pose_and_scale_with_no_landmark_and_no_state(pro
     response = provider.io._handle_get_object(_object_request(blue))
 
     assert vars(response) == {
-        "timestamp": 10.0, "object_id": blue, "name": "blue_block", "asset_id": "props/blocks/blue_block",
+        "frame": "world", "timestamp": 10.0, "object_id": blue, "name": "blue_block",
+        "asset_id": "props/blocks/blue_block",
         "position": [1.0, 2.0, 3.0], "orientation": [0.0, 0.0, 0.0, 1.0], "scale": 1.5,
         **_NO_LANDMARK_AND_NO_STATE,
     }
@@ -421,10 +453,10 @@ def test_the_loaded_scene_is_named_after_a_load_and_empty_after_a_clear(provider
 
 
 def _spawn_request(**fields):
-    """A spawn goal's payload, a red block at one place, with `fields` over
-    it."""
+    """A spawn goal's payload, a red block at one place in world turned as
+    authored, with `fields` over it."""
     return {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0, "scale": 1.0,
+        "asset_id": "props/blocks/red_block", "target": _target([0.5, 0.0, 0.8]), "scale": 1.0,
         "physics": "dynamic", "mass": 0.1, **fields,
     }
 
@@ -491,20 +523,23 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
     assert _spawned_ids(provider) == [object_id]
 
 
-def test_the_listing_names_every_robot_the_stage_stands(provider):
-    listed = provider.io._handle_get_robots(None).robots
+def test_the_listing_names_every_robot_the_stage_stands_in_world_as_of_now(provider):
+    provider.stamps.placements_s = 12.5
 
-    assert len(listed) == 1
-    assert (listed[0].robot, listed[0].model) == ("alpha", "openarm_v2")
-    assert listed[0].position == [0.0, 0.0, 0.0]
-    assert listed[0].yaw == 0.0
-    assert listed[0].attached
+    response = provider.io._handle_get_robots(None)
+
+    assert (response.frame, response.timestamp) == ("world", 12.5)
+    (listed,) = response.robots
+    assert vars(listed) == {
+        "robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "orientation": [0.0, 0.0, 0.0, 1.0],
+        "attached": True,
+    }
 
 
 def test_the_listing_follows_the_robots_that_join(provider):
     provider.io._world = _world(
-        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0),
-        ("bravo", "openarm_v1", (0.0, -1.5, 0.0), 1.25),
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), IDENTITY),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0), _QUARTER_TURN),
     )
 
     listed = provider.io._handle_get_robots(None).robots
@@ -514,74 +549,78 @@ def test_the_listing_follows_the_robots_that_join(provider):
     assert listed[1].model == "openarm_v1"
     assert listed[1].position == [0.0, -1.5, 0.0]
     # Each faces the way it was placed.
-    assert [r.yaw for r in listed] == [0.0, 1.25]
+    assert listed[0].orientation == list(IDENTITY)
+    assert listed[1].orientation == pytest.approx(_QUARTER_TURN)
 
 
-def test_moving_a_robot_by_name_moves_that_robot_to_face_the_yaw_it_names(provider):
+def test_moving_a_robot_by_name_hands_the_stage_that_robot_and_its_target(provider):
     provider.io._world = _world(
-        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), 0.0),
-        ("bravo", "openarm_v1", (0.0, -1.5, 0.0), 1.25),
+        ("alpha", "openarm_v2", (0.0, 0.0, 0.0), IDENTITY),
+        ("bravo", "openarm_v1", (0.0, -1.5, 0.0), _QUARTER_TURN),
     )
 
-    result = provider.io._execute(
-        provider.launcher, "move_robot", {"robot": "bravo", "position": [1.0, -2.0, 0.0], "yaw": -0.5}
+    turned = provider.io._execute(
+        provider.launcher, "move_robot", {"robot": "bravo", "target": _target([1.0, -2.0, 0.0], [0.0, 0.0, 1.0, 0.0])}
     )
+    kept = provider.io._execute(provider.launcher, "move_robot", {"robot": "alpha", "target": _target([2.0, 0.0, 0.0])})
 
-    assert result == {}
-    assert provider.launcher.mock_calls == [
-        call._runtime_move_robot_root({"robot": "bravo", "position": [1.0, -2.0, 0.0], "yaw": -0.5})
+    assert (turned, kept) == ({}, {})
+    assert provider.io._world.moved == [
+        ("bravo", PoseTarget(Point((1.0, -2.0, 0.0)), UnitQuaternion((0.0, 0.0, 1.0, 0.0)))),
+        # A target with no orientation keeps the heading the base has, which
+        # the stage holds.
+        ("alpha", PoseTarget(Point((2.0, 0.0, 0.0)), None)),
     ]
+    assert provider.launcher.mock_calls == []
 
 
 def test_a_robot_the_stage_does_not_stand_is_refused_before_the_stage(provider):
     refused = _refused(
         provider,
         lambda: provider.io._execute(
-            provider.launcher, "move_robot", {"robot": "ghost", "position": [1.0, 0.0, 0.0], "yaw": 0.0}
+            provider.launcher, "move_robot", {"robot": "ghost", "target": _target([1.0, 0.0, 0.0])}
         ),
         "resource_unavailable",
     )
 
     assert "no robot stands as 'ghost'" in refused
 
-    assert provider.launcher.mock_calls == []
+    assert provider.io._world.moved == []
 
 
-@pytest.mark.parametrize("yaw", [float("nan"), float("inf"), float("-inf")])
-def test_a_move_to_a_yaw_that_is_no_number_is_refused_before_the_stage(provider, yaw):
+@pytest.mark.parametrize("orientation", [
+    [2 ** -0.5, 0.0, 0.0, 2 ** -0.5], [0.0, 0.1, 0.0, 0.995], [float("nan"), 0.0, 0.0, 1.0],
+], ids=["about_x", "tilted", "not_a_number"])
+def test_a_robot_move_to_a_heading_that_is_no_turn_about_z_is_refused_before_the_stage(provider, orientation):
     refused = _refused(
         provider,
         lambda: provider.io._execute(
-            provider.launcher, "move_robot", {"robot": "alpha", "position": [1.0, 0.0, 0.0], "yaw": yaw}
+            provider.launcher, "move_robot", {"robot": "alpha", "target": _target([1.0, 0.0, 0.0], orientation)}
         ),
         "rejected",
     )
 
-    assert refused == "yaw must be a finite number of radians"
+    assert refused == refusal_of(lambda: base_target("world", None, [1.0, 0.0, 0.0], orientation))
+    assert provider.io._world.moved == []
 
-    assert provider.launcher.mock_calls == []
 
-
-def test_a_spawn_reaches_the_stage_with_the_yaw_it_names(provider):
+def test_a_spawn_with_no_orientation_reaches_the_stage_as_authored(provider):
     provider.io.set_assets(_CATALOGUE)
 
-    result = provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 1.5, "scale": 1.0,
-        "physics": "static", "mass": 0.1,
-    })
+    result = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(physics="static"))
 
     (spawned,) = provider.launcher._runtime_spawn_isaac_asset.call_args.args
-    assert (spawned["name"], spawned["position"], spawned["yaw"]) == (result["object_id"], [0.5, 0.0, 0.8], 1.5)
-    assert "orientation" not in spawned
+    assert (spawned["name"], spawned["position"], spawned["orientation"]) == (
+        result["object_id"], [0.5, 0.0, 0.8], [0.0, 0.0, 0.0, 1.0],
+    )
 
 
-def test_a_spawn_with_an_orientation_reaches_the_stage_normalised(provider):
+def test_a_spawn_with_an_orientation_reaches_the_stage_normalized(provider):
     provider.io.set_assets(_CATALOGUE)
 
-    result = provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 1.5,
-        "orientation": [0.0, 0.0, 0.0, 1.0005], "scale": 1.0, "physics": "static", "mass": 0.1,
-    })
+    result = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(
+        target=_target([0.5, 0.0, 0.8], [0.0, 0.0, 0.0, 1.0005]), physics="static",
+    ))
 
     (spawned,) = provider.launcher._runtime_spawn_isaac_asset.call_args.args
     assert spawned["name"] == result["object_id"]
@@ -589,23 +628,22 @@ def test_a_spawn_with_an_orientation_reaches_the_stage_normalised(provider):
 
 
 @pytest.mark.parametrize("orientation", [
-    [0.0, 0.0, 0.0, 2.0], [float("nan"), 0.0, 0.0, 1.0], [0.0, 0.0, 1.0],
-])
-def test_an_orientation_that_is_no_unit_quaternion_is_refused_on_spawn_and_move(provider, orientation):
+    [0.0, 0.0, 0.0, 2.0], [0.0, 0.0, 0.0, 1.0051], [float("nan"), 0.0, 0.0, 1.0], [0.0, 0.0, 1.0],
+], ids=["far_from_unit", "past_the_tolerance", "not_a_number", "three_entries"])
+def test_an_orientation_the_shared_parse_refuses_is_refused_on_spawn_and_move(provider, orientation):
     provider.io.set_assets(_CATALOGUE)
     object_id = _spawn(provider)
     provider.launcher.reset_mock()
+    target = _target([0.5, 0.0, 0.8], orientation)
 
-    on_spawn = _refused(provider, lambda: provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": 0.0,
-        "orientation": orientation, "scale": 1.0, "physics": "static", "mass": 0.1,
-    }), "rejected")
-    on_move = _refused(provider, lambda: provider.io._execute(provider.launcher, "move_object", {
-        "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": orientation,
-    }), "rejected")
+    on_spawn = _refused(provider, lambda: provider.io._execute(
+        provider.launcher, "spawn_object", _spawn_request(target=target, physics="static"),
+    ), "rejected")
+    on_move = _refused(provider, lambda: provider.io._execute(
+        provider.launcher, "move_object", {"object_id": object_id, "target": target},
+    ), "rejected")
 
-    assert on_spawn.startswith("orientation must")
-    assert on_move.startswith("orientation must")
+    assert on_spawn == on_move == refusal_of(lambda: PoseTarget.parse(target.position, target.orientation))
 
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == [object_id]
@@ -619,16 +657,35 @@ def test_a_snap_is_refused_on_spawn_and_move_before_the_stage(provider):
     provider.launcher.reset_mock()
     snap = SimpleNamespace(object_id=object_id, landmark="outlet", own_landmark="inlet")
 
-    on_spawn = _refused(provider, lambda: provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.0, 0.0, 0.0], "yaw": 0.0, "scale": 1.0,
-        "physics": "static", "mass": 0.1, "snap_to": snap,
-    }), "rejected")
+    on_spawn = _refused(provider, lambda: provider.io._execute(
+        provider.launcher, "spawn_object", _spawn_request(physics="static", snap_to=snap),
+    ), "rejected")
     on_move = _refused(provider, lambda: provider.io._execute(provider.launcher, "move_object", {
-        "object_id": object_id, "position": [0.0, 0.0, 0.0], "snap_to": snap,
+        "object_id": object_id, "target": _target([0.0, 0.0, 0.0]), "snap_to": snap,
     }), "rejected")
 
-    assert "keeps no landmark of an object, so it places nothing by a snap" in on_spawn
-    assert "keeps no landmark of an object, so it places nothing by a snap" in on_move
+    assert on_spawn == on_move == (
+        "this simulation keeps no landmark of an object, so it places nothing by a snap: give the goal a target "
+        "instead of snap_to"
+    )
+
+    assert provider.launcher.mock_calls == []
+    assert _spawned_ids(provider) == [object_id]
+
+
+def test_a_spawn_and_a_move_with_neither_target_nor_snap_are_refused_before_the_stage(provider):
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+    provider.launcher.reset_mock()
+
+    on_spawn = _refused(provider, lambda: provider.io._execute(
+        provider.launcher, "spawn_object", _spawn_request(physics="static", target=None, snap_to=None),
+    ), "rejected")
+    on_move = _refused(provider, lambda: provider.io._execute(provider.launcher, "move_object", {
+        "object_id": object_id, "target": None, "snap_to": None,
+    }), "rejected")
+
+    assert on_spawn == on_move == "the goal gives neither target nor snap_to: give the goal a target"
 
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == [object_id]
@@ -640,7 +697,7 @@ def test_a_move_carries_its_orientation_to_the_stage_and_keeps_it_otherwise(prov
     provider.launcher.reset_mock()
 
     result = provider.io._execute(provider.launcher, "move_object", {
-        "object_id": object_id, "position": [1.0, 0.0, 0.8], "orientation": [0.0, 0.0, 1.0, 0.0],
+        "object_id": object_id, "target": _target([1.0, 0.0, 0.8], [0.0, 0.0, 1.0, 0.0]),
     })
     assert result == {}
     assert provider.launcher.mock_calls == [
@@ -648,21 +705,46 @@ def test_a_move_carries_its_orientation_to_the_stage_and_keeps_it_otherwise(prov
     ]
 
     provider.launcher.reset_mock()
-    provider.io._execute(provider.launcher, "move_object", {"object_id": object_id, "position": [2.0, 0.0, 0.8]})
+    provider.io._execute(provider.launcher, "move_object", {"object_id": object_id, "target": _target([2.0, 0.0, 0.8])})
     assert provider.launcher.mock_calls == [call._runtime_move_object({"name": object_id, "position": [2.0, 0.0, 0.8]})]
 
 
-@pytest.mark.parametrize("yaw", [float("nan"), float("inf"), float("-inf")])
-def test_a_spawn_at_a_yaw_that_is_no_number_is_refused_and_mints_nothing(provider, yaw):
+def test_a_goals_frame_and_timestamp_place_its_value_in_world_at_any_time(provider):
+    """world does not move, so a target stamped at any time stands where one
+    with no timestamp, at the latest time, does, a target that names no
+    frame stands in world, and a force at any time pushes as one at the
+    latest time."""
     provider.io.set_assets(_CATALOGUE)
 
-    refused = _refused(provider, lambda: provider.io._execute(provider.launcher, "spawn_object", {
-        "asset_id": "props/blocks/red_block", "position": [0.5, 0.0, 0.8], "yaw": yaw, "scale": 1.0,
-        "physics": "static", "mass": 0.1,
-    }), "rejected")
+    for target in (
+        _target([0.5, 0.0, 0.8]),
+        _target([0.5, 0.0, 0.8], timestamp=12.5),
+        _target([0.5, 0.0, 0.8], frame=None),
+    ):
+        provider.io._execute(provider.launcher, "spawn_object", _spawn_request(target=target))
+    object_id = _spawn(provider)
+    provider.io._execute(provider.launcher, "apply_force", {
+        "object_id": object_id, "frame": "world", "timestamp": 12.5, "force": [1.0, 0.0, 0.0], "duration_s": 0.5,
+    })
 
-    assert refused == "yaw must be a finite number of radians"
+    at_latest, at_a_time, in_no_frame, _ = provider.launcher._runtime_spawn_isaac_asset.call_args_list
+    spawned = [call.args[0] for call in (at_latest, at_a_time, in_no_frame)]
+    assert [spawn["position"] for spawn in spawned] == [[0.5, 0.0, 0.8]] * 3
+    assert spawned[0]["orientation"] == spawned[1]["orientation"] == spawned[2]["orientation"]
+    provider.launcher._runtime_apply_force.assert_called_once_with(
+        {"name": object_id, "force": [1.0, 0.0, 0.0], "duration_s": 0.5}
+    )
 
+
+@pytest.mark.parametrize("timestamp", [-1.0, float("nan")], ids=["before_the_epoch", "not_a_number"])
+def test_a_timestamp_the_shared_parse_refuses_is_refused_and_spawns_nothing(provider, timestamp):
+    provider.io.set_assets(_CATALOGUE)
+
+    refused = _refused(provider, lambda: provider.io._execute(
+        provider.launcher, "spawn_object", _spawn_request(target=_target([0.5, 0.0, 0.8], timestamp=timestamp)),
+    ), "rejected")
+
+    assert refused == refusal_of(lambda: in_world("world", timestamp, None))
     assert provider.launcher.mock_calls == []
     assert _spawned_ids(provider) == []
 
@@ -785,11 +867,11 @@ def test_object_state_is_unavailable_with_a_reason_until_a_stamped_capture(provi
     assert provider.reader.reads == 0
 
 
-def test_the_first_frame_answers_an_empty_scene_before_any_stream_tick(provider):
+def test_the_first_frame_answers_an_empty_scene_in_world_before_any_stream_tick(provider):
     provider.io.process_pending(provider.launcher)
 
     response = provider.io._handle_get_object_states(None)
-    assert (response.timestamp, response.objects) == (10.0, [])
+    assert (response.frame, response.timestamp, response.objects) == ("world", 10.0, [])
     assert provider.launcher.mock_calls == []
 
     # A snapshot exists, so later frames with nothing queued leave it alone.
@@ -806,10 +888,9 @@ def test_records_carry_what_each_object_was_spawned_with_in_spawn_order(provider
     ]
     object_ids = []
     for index, (asset_id, physics, mass, scale) in enumerate(spawned):
-        result = provider.io._execute(provider.launcher, "spawn_object", {
-            "asset_id": asset_id, "position": [float(index), 0.0, 0.8], "yaw": 0.0, "scale": scale,
-            "physics": physics, "mass": mass,
-        })
+        result = provider.io._execute(provider.launcher, "spawn_object", _spawn_request(
+            asset_id=asset_id, target=_target([float(index), 0.0, 0.8]), scale=scale, physics=physics, mass=mass,
+        ))
         object_ids.append(result["object_id"])
 
     provider.io.capture_object_states()
@@ -864,7 +945,7 @@ def test_a_read_once_an_edit_completes_observes_it(provider):
     assert response.timestamp == 11.0
 
     provider.stamps.now_s = 12.0
-    moved = _submit(provider, "move_object", {"object_id": object_id, "position": [0.2, 0.3, 0.9]})
+    moved = _submit(provider, "move_object", {"object_id": object_id, "target": _target([0.2, 0.3, 0.9])})
     removed = _submit(provider, "remove_object", {"object_id": object_id})
     provider.io.process_pending(provider.launcher)
     ((_, after_move),) = moved
@@ -1028,8 +1109,8 @@ _LOAD = SimpleNamespace(
 _SPAWN = SimpleNamespace(
     action="spawn_object", build="_runtime_spawn_isaac_asset",
     request=SimpleNamespace(
-        asset_id="props/blocks/red_block", position=[0.5, 0.0, 0.8], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=0.1, name=None, feeder=None, snap_to=None,
+        asset_id="props/blocks/red_block", target=_target([0.5, 0.0, 0.8]), scale=1.0, physics="dynamic",
+        mass=0.1, name=None, feeder=None, snap_to=None,
     ),
     result=["object_id", "name"],
 )
@@ -1185,28 +1266,26 @@ def _refusal(decision):
      ("rejected", "Unknown asset_id: scene/missing")),
     ("load_scene", SimpleNamespace(asset_id="scene/full_warehouse", scale=0.0),
      ("rejected", "scale must be a finite number greater than zero")),
-    ("spawn_object", SimpleNamespace(
-        asset_id="scene/full_warehouse", position=[0.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=0.1, snap_to=None,
-    ), ("rejected", "Asset is not an object: scene/full_warehouse")),
-    ("spawn_object", SimpleNamespace(
-        asset_id="props/blocks/red_block", position=[float("nan"), 0.0, 0.0], yaw=0.0, orientation=None,
-        scale=1.0, physics="dynamic", mass=0.1, snap_to=None,
-    ), ("rejected", "position must contain exactly 3 finite values [x, y, z]")),
-    ("spawn_object", SimpleNamespace(
-        asset_id="props/blocks/red_block", position=[0.0, 0.0, 0.0], yaw=0.0, orientation=None, scale=1.0,
-        physics="dynamic", mass=float("nan"), snap_to=None,
-    ), ("rejected", "mass must be a finite number greater than zero")),
-    ("move_object", SimpleNamespace(object_id="obj_missing", position=[0.0, 0.0, 0.0], orientation=None,
-                                    snap_to=None), ("rejected", "Unknown object_id: obj_missing")),
-    ("remove_object", SimpleNamespace(object_id="obj_missing"), ("rejected", "Unknown object_id: obj_missing")),
-    ("apply_force", SimpleNamespace(object_id="obj_missing", force=[1.0, 0.0, 0.0], duration_s=0.5),
+    ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "asset_id": "scene/full_warehouse"}),
+     ("rejected", "Asset is not an object: scene/full_warehouse")),
+    ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "target": _target([float("nan"), 0.0, 0.0])}),
+     ("rejected", refusal_of(lambda: Point.parse([float("nan"), 0.0, 0.0])))),
+    ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "mass": float("nan")}),
+     ("rejected", "mass must be a finite number greater than zero")),
+    ("move_object", SimpleNamespace(object_id="obj_missing", target=_target([0.0, 0.0, 0.0]), snap_to=None),
      ("rejected", "Unknown object_id: obj_missing")),
+    ("remove_object", SimpleNamespace(object_id="obj_missing"), ("rejected", "Unknown object_id: obj_missing")),
+    ("apply_force", SimpleNamespace(
+        object_id="obj_missing", frame="world", timestamp=None, force=[1.0, 0.0, 0.0], duration_s=0.5,
+    ), ("rejected", "Unknown object_id: obj_missing")),
+    ("apply_force", SimpleNamespace(
+        object_id="obj_missing", frame="world", timestamp=None, force=[float("inf"), 0.0, 0.0], duration_s=0.5,
+    ), ("rejected", "force must contain exactly 3 finite values [Fx, Fy, Fz]")),
     ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "name": "Crate"}),
      ("rejected", "object name 'Crate' is not a name: lowercase letters, digits and _")),
     ("spawn_object", SimpleNamespace(**{**vars(_SPAWN.request), "feeder": "Hopper-1"}),
      ("rejected", "feeder 'Hopper-1' is not a name: lowercase letters, digits and _")),
-    ("move_robot", SimpleNamespace(robot="ghost", position=[0.0, 0.0, 0.0], yaw=0.0),
+    ("move_robot", SimpleNamespace(robot="ghost", target=_target([0.0, 0.0, 0.0])),
      ("resource_unavailable", "no robot stands as 'ghost' in this simulation, which stands alpha")),
 ])
 def test_a_goal_whose_command_the_stage_cannot_take_is_refused_when_it_arrives(
@@ -1223,6 +1302,46 @@ def test_a_goal_whose_command_the_stage_cannot_take_is_refused_when_it_arrives(
 
     assert [_refusal(decision) for decision in handle.decisions] == [refusal]
     assert events == []
+
+
+@pytest.mark.parametrize("frame", ["base_link", "odom"])
+def test_a_goal_in_a_frame_other_than_world_is_refused_with_unknown_frame_before_the_scene_changes(
+    provider, frame
+):
+    """world is the one frame of the simulation: a spawn, a move of an
+    object, a push and a move of a robot that each name another frame are
+    refused with `unknown_frame` when they arrive, naming the frame and
+    saying to send world, and nothing is minted, moved or pushed."""
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+    provider.launcher.reset_mock()
+    events = []
+    provider.io._pending = _Commands(events)
+    goals = {
+        "spawn_object": SimpleNamespace(**{**vars(_SPAWN.request), "target": _target([1.0, 0.0, 0.8], frame=frame)}),
+        "move_object": SimpleNamespace(object_id=object_id, target=_target([1.0, 0.0, 0.8], frame=frame), snap_to=None),
+        "apply_force": SimpleNamespace(
+            object_id=object_id, frame=frame, timestamp=None, force=[1.0, 0.0, 0.0], duration_s=0.5,
+        ),
+        "move_robot": SimpleNamespace(robot="alpha", target=_target([1.0, 0.0, 0.0], frame=frame)),
+    }
+
+    refusals = {
+        action: [_refusal(decision) for decision in _serve_goals(
+            provider, action, _Goal(request, events), run_commands=False,
+        ).decisions]
+        for action, request in goals.items()
+    }
+
+    unknown = refusal_of(lambda: in_world(frame, None, None), UnknownFrame)
+    assert frame in unknown and "world" in unknown
+    assert refusals == {action: [("unknown_frame", unknown)] for action in goals}
+    assert events == []
+    assert provider.launcher.mock_calls == []
+    assert provider.io._world.moved == []
+    assert [(record.object_id, record.position) for record in provider.io.capture_object_states().objects] == [
+        (object_id, (0.5, 0.0, 0.8)),
+    ]
 
 
 def test_a_goal_that_arrives_before_the_catalogue_is_refused_until_it_is_discovered(provider):
@@ -1291,7 +1410,10 @@ def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the
     provider.io.set_assets(_CATALOGUE)
     object_id = _spawn(provider)
     events = []
-    push = _Goal(SimpleNamespace(object_id=object_id, force=[1.0, 0.0, 0.0], duration_s=0.5), events)
+    push = _Goal(
+        SimpleNamespace(object_id=object_id, frame="world", timestamp=None, force=[1.0, 0.0, 0.0], duration_s=0.5),
+        events,
+    )
     assert provider.io._decide(provider.module.apply_force, "apply_force", push.request()).refusal is None
     provider.io._execute(provider.launcher, "remove_object", {"object_id": object_id})
 
@@ -1340,7 +1462,7 @@ def test_a_move_of_a_robot_that_left_before_its_command_ran_fails_with_resource_
     stage before the move's command reaches the main thread: the check there
     finds no robot, and the goal fails with the kind of its refusal."""
     events = []
-    move = _Goal(SimpleNamespace(robot="alpha", position=[1.0, 0.0, 0.0], yaw=0.0), events)
+    move = _Goal(SimpleNamespace(robot="alpha", target=_target([1.0, 0.0, 0.0])), events)
     assert provider.io._decide(provider.module.move_robot, "move_robot", move.request()).refusal is None
     provider.io._world = _world()
 
@@ -1355,7 +1477,7 @@ def test_a_move_of_a_robot_that_left_before_its_command_ran_fails_with_resource_
     assert events == [
         ("failed", "resource_unavailable", "no robot stands as 'alpha' in this simulation, which stands none")
     ]
-    provider.launcher._runtime_move_robot_root.assert_not_called()
+    assert provider.io._world.moved == []
 
 
 def test_a_command_isaac_does_not_carry_out_fails_its_goal_with_attempt_failed(provider):

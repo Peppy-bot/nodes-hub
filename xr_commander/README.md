@@ -30,10 +30,15 @@ side and bind them in a launcher. No code here changes.
 
 Both pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
 `robot/gripper_link.json5`). On the wire: positions are metres, orientations
-are unit quaternions `[x, y, z, w]` (scalar last), and both directions of
-`pose_link` speak the follower's world frame. A gripper opening is a fraction
-of full travel, 0 closed to 1 fully open; `max_effort` 0 means the follower's
-configured ceiling.
+are unit quaternions `[x, y, z, w]` (scalar last), each `pose_states` message
+names the follower's robot frame in `frame`, and each setpoint names the frame
+of the measured pose its hand anchored on, and in `timestamp` the time of its
+tick on the instance's clock, the clock of transforms, so a follower drops by
+its age a setpoint that a stall held back.
+A measured pose in another frame than that anchor re-anchors the hand on the
+arm where it is measured, as a measured pose that jumps does. A gripper opening
+is a fraction of full travel, 0 closed to 1 fully open; `max_effort` 0 means
+the follower's configured ceiling.
 
 Every slot is optional. A robot is named by the copy its backbone runs in,
 or, outside any copy, by its backbone's instance id. The headset drives only

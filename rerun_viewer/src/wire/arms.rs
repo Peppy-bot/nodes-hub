@@ -28,10 +28,8 @@ pub enum SnapshotError {
     JointCounts { arms: usize, got: usize },
     #[error("joint_positions has {got} values, joints_per_arm adds up to {expected}")]
     JointPositions { expected: usize, got: usize },
-    #[error("positions has {got} values, 3 for each of {arms} arms is {}", 3 * arms)]
-    Positions { arms: usize, got: usize },
-    #[error("orientations has {got} values, 4 for each of {arms} arms is {}", 4 * arms)]
-    Orientations { arms: usize, got: usize },
+    #[error("grasp_points has {got} poses for {arms} arms")]
+    GraspPoints { arms: usize, got: usize },
     #[error("gripper_openings has {got} values for {grippers} grippers")]
     Grippers { grippers: usize, got: usize },
     #[error("the grasp point of {arm}: {reason}")]
@@ -54,18 +52,10 @@ pub fn parse_limb_states(message: &limb_states::Message) -> Result<ArmsSnapshot,
             got: message.joint_positions.len(),
         });
     }
-    let (positions, rest) = message.positions.as_chunks::<3>();
-    if positions.len() != arms || !rest.is_empty() {
-        return Err(SnapshotError::Positions {
+    if message.grasp_points.len() != arms {
+        return Err(SnapshotError::GraspPoints {
             arms,
-            got: message.positions.len(),
-        });
-    }
-    let (orientations, rest) = message.orientations.as_chunks::<4>();
-    if orientations.len() != arms || !rest.is_empty() {
-        return Err(SnapshotError::Orientations {
-            arms,
-            got: message.orientations.len(),
+            got: message.grasp_points.len(),
         });
     }
     let grippers = message.gripper_names.len();
@@ -80,7 +70,8 @@ pub fn parse_limb_states(message: &limb_states::Message) -> Result<ArmsSnapshot,
     for (index, name) in message.arm_names.iter().enumerate() {
         let (own, rest) = joints.split_at(message.joints_per_arm[index] as usize);
         joints = rest;
-        let grasp = Placement::parse(positions[index], orientations[index]).map_err(|e| {
+        let point = &message.grasp_points[index];
+        let grasp = Placement::parse(point.position, point.orientation).map_err(|e| {
             SnapshotError::Grasp {
                 arm: name.clone(),
                 reason: e.to_string(),
@@ -109,8 +100,9 @@ pub fn parse_limb_states(message: &limb_states::Message) -> Result<ArmsSnapshot,
 }
 
 /// Draws the snapshots of limb_states, at most one each `draw_interval`, until the node
-/// stops; each snapshot adds its point to the trails, drawn or not. With the planner
-/// linked, the joints are plotted once the planner has named them.
+/// stops; each snapshot in the robot frame adds its point to the trails, drawn or not, and
+/// one in another frame is dropped, the first of a run logged. With the planner linked,
+/// the joints are plotted once the planner has named them.
 pub async fn follow_arms(
     runner: Arc<NodeRunner>,
     canvas: Arc<dyn Canvas>,
@@ -127,9 +119,10 @@ pub async fn follow_arms(
             return;
         }
     };
+    let other_frames = LatchedLog::warn("drawing limb_states");
     let mut follower = ArmsFollower {
         canvas,
-        shared,
+        shared: shared.clone(),
         planner_linked,
         trails: Trails::new(trail_length),
         throttle: Throttle::new(draw_interval),
@@ -141,7 +134,14 @@ pub async fn follow_arms(
         cancelled,
         async move || subscription.next().await,
         async move |(_producer, message)| {
-            follower.on_snapshot(&message, Instant::now());
+            let held = shared.hold_to_robot_frame(&runner, "limb_states", &message.frame);
+            match held {
+                Ok(()) => {
+                    other_frames.success();
+                    follower.on_snapshot(&message, Instant::now());
+                }
+                Err(reason) => other_frames.failure(reason),
+            }
             ControlFlow::Continue(())
         },
     )
@@ -214,11 +214,20 @@ pub(crate) mod tests {
     pub(crate) fn two_arms() -> limb_states::Message {
         limb_states::Message {
             timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+            frame: "base_link".to_string(),
             arm_names: vec!["left_arm".to_string(), "right_arm".to_string()],
             joints_per_arm: vec![2, 1],
             joint_positions: vec![0.1, 0.2, 0.3],
-            positions: vec![0.3, 0.2, 0.4, 0.3, -0.2, 0.4],
-            orientations: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            grasp_points: vec![
+                limb_states::MessageGraspPointsItem {
+                    position: [0.3, 0.2, 0.4],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                },
+                limb_states::MessageGraspPointsItem {
+                    position: [0.3, -0.2, 0.4],
+                    orientation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
             gripper_names: vec!["right_gripper".to_string()],
             gripper_openings: vec![0.5],
         }
@@ -227,7 +236,7 @@ pub(crate) mod tests {
     /// Two arms as `two_arms`, the right one's grasp point at `x`.
     fn right_arm_at(x: f64) -> limb_states::Message {
         let mut message = two_arms();
-        message.positions[3] = x;
+        message.grasp_points[1].position[0] = x;
         message
     }
 
@@ -302,16 +311,10 @@ pub(crate) mod tests {
             })
         );
         let mut message = two_arms();
-        message.positions.pop();
+        message.grasp_points.pop();
         assert_eq!(
             parse_limb_states(&message),
-            Err(SnapshotError::Positions { arms: 2, got: 5 })
-        );
-        let mut message = two_arms();
-        message.orientations.push(0.0);
-        assert_eq!(
-            parse_limb_states(&message),
-            Err(SnapshotError::Orientations { arms: 2, got: 9 })
+            Err(SnapshotError::GraspPoints { arms: 2, got: 1 })
         );
         let mut message = two_arms();
         message.gripper_openings.clear();
@@ -323,7 +326,7 @@ pub(crate) mod tests {
             })
         );
         let mut message = two_arms();
-        message.orientations[3] = 2.0;
+        message.grasp_points[0].orientation[3] = 2.0;
         assert!(matches!(
             parse_limb_states(&message),
             Err(SnapshotError::Grasp { arm, .. }) if arm == "left_arm"

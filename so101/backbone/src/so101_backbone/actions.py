@@ -26,6 +26,12 @@ A joint path or a pose move is planned in its drive, from where the arm
 stands, and the planning may fail the goal: a joint path then runs none of
 its path, its arm held, once its expected start is met, at its measured
 joints, moved inside its joint limits where it stood past one.
+A move_arm goal and a check_arm_move request name their target in a frame at
+a time: once every value is parsed, the target is placed in the robot frame
+by the robot's tree (placement.py), and one the tree cannot place is refused
+with the failure kind of the lookup before the arm is claimed. A result
+gives each grasp-point pose in the robot frame, at the capture time of the
+measured joints it is the pose of.
 """
 
 from __future__ import annotations
@@ -37,9 +43,10 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
+from control_core_py.geometry import GeometryError, PoseTarget, Stamped
 from control_core_py.runtime import Latch, log
 from path_timing_py import JointTrajectory, distinct_joint_waypoints
-from peppygen.exposed_actions.limb_motion import execute_joint_path
+from peppygen.exposed_actions.limb_motion import execute_joint_path, move_arm
 
 from so101_backbone.coordinator import (
     FOLLOWER_SILENT,
@@ -55,8 +62,9 @@ from so101_backbone.coordinator import (
 )
 from so101_backbone.failures import FailureKind, Refusal
 from so101_backbone.limits import JointLimits
-from so101_backbone.model import ARM
+from so101_backbone.model import ARM, ROBOT_FRAME, frame_of
 from so101_backbone.params import Config
+from so101_backbone.placement import Placer
 
 # Backoff after a failed goal delivery, so a persistently broken action
 # transport logs once and retries at a human pace instead of spinning the
@@ -67,9 +75,6 @@ _GOAL_RETRY_S = 1.0
 # number of seconds from 0 to 60, and on the time a joint path or a pose move
 # takes. The posture moves share it.
 MAX_REQUESTED_DURATION_S = 60.0
-
-# A quaternion of a smaller norm has no direction to normalize.
-_QUATERNION_MIN_NORM = 1e-6
 
 # The opening of a closed gripper.
 _CLOSED_OPENING = 0.0
@@ -216,12 +221,26 @@ class _PathStart:
 
 @dataclass(frozen=True)
 class PoseGoal:
-    """A goal to plan: the fields move_arm and check_arm_move share. An orientation of
-    None asks for the position alone."""
+    """A goal to plan: the fields move_arm and check_arm_move share, the target
+    placed in the robot frame. An orientation of None asks for the position
+    alone."""
 
     position: tuple[float, ...]
     orientation: tuple[float, ...] | None
     duration_s: float
+
+
+@dataclass(frozen=True)
+class _PoseFields:
+    """The fields of a move_arm goal parsed off the wire, its target in its
+    frame at its time, before the tree places it."""
+
+    target: Stamped[PoseTarget]
+    duration_s: float
+    position_tolerance_m: float
+    orientation_tolerance_rad: float
+    settle_timeout_s: float
+    contact_gap_m: float
 
 
 @dataclass(frozen=True)
@@ -401,10 +420,21 @@ async def serve_action(
 
 
 class ActionLayer:
-    def __init__(self, coordinator: Coordinator, config: Config, limits: JointLimits):
+    def __init__(
+        self,
+        coordinator: Coordinator,
+        config: Config,
+        limits: JointLimits,
+        placer: Placer,
+        now_s: Callable[[], float],
+    ):
         self._coordinator = coordinator
         self._config = config
         self._limits = limits
+        self._placer = placer
+        # The node's clock, which stamps a reported pose that no measurement
+        # gives a capture time.
+        self._now_s = now_s
         self._effort_unsupported = Latch()
 
     # -------------------------------------------------------------- admission
@@ -623,32 +653,20 @@ class ActionLayer:
             self._coordinator.release_gripper()
             raise
 
-    def _admit_pose_move(
-        self,
-        position,
-        orientation,
-        duration_s: float,
-        settle_position_tolerance_m: float,
-        settle_orientation_tolerance_rad: float,
-        settle_timeout_s: float,
-        contact_gap_m: float,
-    ) -> PoseMove:
-        """Validate and claim the arm; the verified IK solve runs in the
-        drive task so a hard pose never stalls the event loop inside the
-        goal decide callback, failing the accepted goal when no solution
-        exists."""
-        # Parsed before the claim: a refusal past this point would strand
-        # the arm slot and teleop with it.
-        move = _pose_move(
-            _pose_goal(position, orientation, duration_s),
-            settle_position_tolerance_m,
-            settle_orientation_tolerance_rad,
-            settle_timeout_s,
-            contact_gap_m,
-            self._coordinator.stop_count,
-        )
+    def _admit_pose_move(self, fields: _PoseFields, goal: PoseGoal) -> PoseMove:
+        """Claim the arm for the goal of `fields`, its target placed as `goal`;
+        the verified IK solve runs in the drive task so a hard pose never
+        stalls the event loop inside the goal decide callback, failing the
+        accepted goal when no solution exists."""
+        move = _pose_move(goal, fields, self._coordinator.stop_count)
         self._claim_free_arm()
         return move
+
+    async def _placed_goal(self, target: Stamped[PoseTarget], duration_s: float) -> PoseGoal:
+        """The goal of `target`, placed in the robot frame by the robot's tree,
+        or Refusal with the failure kind of the lookup."""
+        placed = await self._placer.place(target, "the target")
+        return _goal_of(placed.value, duration_s)
 
     def _free_arm_anchor(self) -> tuple[float, ...]:
         """Where a move of the arm starts from. Raises Refusal, in the order
@@ -786,21 +804,19 @@ class ActionLayer:
         return decide
 
     def decide_pose(self, module, pending: PendingSlot):
-        def decide(request):
-            def admit():
-                d = request.data
-                _require_arm_name(d.arm_name)
-                return self._admit_pose_move(
-                    tuple(d.position),
-                    d.orientation,
-                    d.duration_s,
-                    d.settle_position_tolerance_m,
-                    d.settle_orientation_tolerance_rad,
-                    d.settle_timeout_s,
-                    d.contact_gap_m,
-                )
+        """The decide of move_arm: every value parsed, then the target placed
+        by the robot's tree, then the arm claimed; a refusal of any step
+        refuses the goal, and a placement that fails claims nothing."""
 
-            return self._decide(module, admit, pending)
+        async def decide(request):
+            d = request.data
+            try:
+                _require_arm_name(d.arm_name)
+                fields = _pose_fields(d)
+                goal = await self._placed_goal(fields.target, fields.duration_s)
+            except Exception as e:
+                return _refused(module, e)
+            return self._decide(module, lambda: self._admit_pose_move(fields, goal), pending)
 
         return decide
 
@@ -818,14 +834,8 @@ class ActionLayer:
     def _decide(self, module, admit, pending: PendingSlot):
         try:
             plan = admit()
-        except Refusal as e:
-            return module.GoalDecision.refuse(e.kind, str(e))
         except Exception as e:
-            # No admission failure may escape into the generated server loop.
-            log(f"goal admission failed unexpectedly: {e!r}")
-            return module.GoalDecision.refuse(
-                FailureKind.ATTEMPT_FAILED, f"admission failed: {e!r}"
-            )
+            return _refused(module, e)
         pending.plan = plan
         return module.GoalDecision.accept()
 
@@ -931,18 +941,19 @@ class ActionLayer:
             lambda start: results(self._standing_joints(start.held), False, 0.0),
         )
 
-    async def drive_posture(self, ctx, plan: ArmPlan, kinematics) -> None:
+    async def drive_posture(self, ctx, plan: ArmPlan, kinematics, grasp_point) -> None:
         """Wait until the plan ends, a cancel comes or a stop comes. Then end
         the goal; a completed or cancelled goal gives the grasp pose of the
-        arm, from the joints that the follower measures at that time (see
+        arm, from the joints that the follower measures at that time, as a
+        `grasp_point`, the item type of the posture's result (see
         _measured_grasp_pose)."""
 
         def results(_action_time):
-            return self._measured_grasp_pose(kinematics)
+            return self._measured_grasp_pose(kinematics, grasp_point)
 
         await self._drive_arm_plan(ctx, plan, results)
 
-    async def drive_home(self, ctx, move: HomeMove, kinematics) -> None:
+    async def drive_home(self, ctx, move: HomeMove, kinematics, grasp_point) -> None:
         """Close the gripper of `move` (see _close_for_home), then plan the
         arm move to home and run it, as _drive_arm_move does. The arm moves
         only once the close completed, where the jaws stand, closed or on an
@@ -954,7 +965,7 @@ class ActionLayer:
         time. Every end releases the arm."""
 
         def grasp_pose(*_unused):
-            return self._measured_grasp_pose(kinematics)
+            return self._measured_grasp_pose(kinematics, grasp_point)
 
         async def plan_from(anchor):
             return self._move_within_ceiling(anchor, move.target, move.duration_s, move.settle)
@@ -1113,20 +1124,21 @@ class ActionLayer:
     async def check_arm_move(
         self,
         arm_name: str,
-        position,
-        orientation,
+        target,
         duration_s: float,
         solver,
     ) -> PlanCheck:
         """Whether a move_arm goal with these fields has a plan from
         where the arm is, without moving, the reason being the words of the
-        goal's failure. Raises Refusal with the kind and
-        the message of the goal's refusal, in the same order as a goal: a
-        field that move_arm does not take, no fresh follower state, a leader
-        streaming the arm, an arm goal in flight; and with `attempt_failed`
-        when the solve raises."""
+        goal's failure, its target placed as the goal's is placed. Raises
+        Refusal with the kind and the message of the goal's refusal, in the
+        same order as a goal: a field that move_arm does not take, a target
+        the tree cannot place, no fresh follower state, a leader streaming
+        the arm, an arm goal in flight; and with `attempt_failed` when the
+        solve raises."""
         _require_arm_name(arm_name)
-        goal = _pose_goal(position, orientation, duration_s)
+        stamped = _stamped_target(target)
+        goal = await self._placed_goal(stamped, _require_duration(duration_s, "duration_s"))
         seed = self._free_arm_anchor()
         try:
             profile = await self._plan_pose(solver, seed, goal)
@@ -1158,8 +1170,7 @@ class ActionLayer:
             return await self._plan_pose(solver, anchor, move.goal)
 
         def results(joints, ended_on_contact, action_time):
-            position, orientation = kinematics.forward_kinematics(joints)
-            return list(position), list(orientation), ended_on_contact, action_time
+            return self._final_pose(kinematics, joints), ended_on_contact, action_time
 
         await self._drive_arm_move(
             ctx,
@@ -1169,7 +1180,7 @@ class ActionLayer:
             self._coordinator.arm_anchor,
             plan_from,
             results,
-            lambda _anchor: (*self._standing_pose(kinematics), False, 0.0),
+            lambda _anchor: (self._standing_pose(kinematics), False, 0.0),
         )
 
     async def drive_gripper(self, ctx, plan: GripperPlan) -> None:
@@ -1193,28 +1204,52 @@ class ActionLayer:
             return measured
         return plan.last_sample(time.monotonic())
 
-    def _measured_grasp_pose(self, kinematics) -> tuple[list[str], list[float], list[float]]:
-        """The pose fields of a posture result: (arm_names, positions,
-        orientations). The pose is the forward kinematics of the measured
-        joints. A posture result gives only a measured pose. Thus, when the
-        follower state is stale, the three arrays are empty."""
+    def _measured_grasp_pose(self, kinematics, grasp_point) -> tuple[str, float, list[str], list]:
+        """The pose fields of a posture result: (frame, timestamp, arm_names,
+        grasp_points), each grasp point a `grasp_point`, the item type of the
+        posture's result. The pose is the forward kinematics of the measured
+        joints, in the robot frame at their capture time. A posture result
+        gives only a measured pose. Thus, when the follower state is stale,
+        arm_names and grasp_points are empty and the timestamp is the node's
+        clock now, the time of the check that found no fresh pose."""
         measured = self._coordinator.fresh_measured_joints()
         if measured is None:
-            return [], [], []
+            return ROBOT_FRAME, self._now_s(), [], []
         position, orientation = kinematics.forward_kinematics(measured)
-        return [ARM.name], list(position), list(orientation)
+        timestamp = self._coordinator.measured_joints.wire_timestamp_s
+        point = grasp_point(position=list(position), orientation=list(orientation))
+        return ROBOT_FRAME, timestamp, [ARM.name], [point]
 
-    def _standing_pose(self, kinematics) -> tuple[list[float], list[float]]:
+    def _final_pose(self, kinematics, joints: tuple[float, ...]) -> move_arm.ResultFinalPose:
+        """The grasp-point pose of `joints`, the joints a move_arm result
+        reports (see _final_arm_positions and _standing_pose), in the robot
+        frame: at the capture time of the fresh measured joints when they are
+        `joints`, else at the node's clock now, the time the backbone holds the
+        arm commanded at them."""
+        position, orientation = kinematics.forward_kinematics(joints)
+        measured = self._coordinator.fresh_measured_joints()
+        timestamp = (
+            self._coordinator.measured_joints.wire_timestamp_s
+            if measured is not None and tuple(measured) == tuple(joints)
+            else self._now_s()
+        )
+        return move_arm.ResultFinalPose(
+            frame=ROBOT_FRAME,
+            timestamp=timestamp,
+            position=list(position),
+            orientation=list(orientation),
+        )
+
+    def _standing_pose(self, kinematics) -> move_arm.ResultFinalPose:
         """Where the grasp point stands with no plan installed, as a move
-        that never ran reports it: the forward kinematics of the fresh
-        measured joints, else of the joints commanded last, else no pose."""
+        that never ran reports it: the pose of the fresh measured joints,
+        else of the joints commanded last, else no pose (_no_pose)."""
         joints = self._coordinator.fresh_measured_joints()
         if joints is None:
             joints = self._coordinator.commanded_arm
         if joints is None:
-            return _no_pose()
-        position, orientation = kinematics.forward_kinematics(joints)
-        return list(position), list(orientation)
+            return _no_pose(self._now_s())
+        return self._final_pose(kinematics, joints)
 
     def _standing_joints(self, anchor: tuple[float, ...]) -> tuple[float, ...]:
         """Where the arm stands with no plan installed, as a move that never
@@ -1236,52 +1271,72 @@ class ActionLayer:
         return plan.frozen
 
 
-def _pose_goal(position, orientation, duration_s: float) -> PoseGoal:
-    """The goal these wire fields name, with a named orientation normalized, or
-    Refusal: a pose that is no pose, or a duration out of its bound."""
-    if not all(math.isfinite(v) for v in (*position, *(orientation or ()))):
-        raise Refusal(FailureKind.REJECTED, "goal pose has non-finite values")
+def _stamped_target(target) -> Stamped[PoseTarget]:
+    """The target of a move_arm goal or a check_arm_move request, in its frame
+    or, with none, in the robot frame, at its time, its orientation
+    normalized, or Refusal with `rejected` saying what to send: a value that
+    is not finite, an orientation of other than four entries or whose squared
+    norm lies 0.01 or more from 1, or an empty frame."""
+    try:
+        value = PoseTarget.parse(target.position, target.orientation)
+        return Stamped.parse(frame_of(target.frame), target.timestamp, value)
+    except GeometryError as e:
+        raise Refusal(FailureKind.REJECTED, f"the target: {e}") from None
+
+
+def _goal_of(target: PoseTarget, duration_s: float) -> PoseGoal:
+    """The goal of `target`, placed in the robot frame, taking `duration_s`."""
     return PoseGoal(
-        position=tuple(position),
-        orientation=None if orientation is None else _normalized(orientation),
-        duration_s=_require_duration(duration_s, "duration_s"),
+        position=target.position.position,
+        orientation=None if target.orientation is None else target.orientation.quaternion,
+        duration_s=duration_s,
     )
 
 
-def _normalized(orientation) -> tuple[float, ...]:
-    """`orientation` at unit length, or Refusal for one too short to normalize."""
-    norm = math.sqrt(sum(q * q for q in orientation))
-    if norm <= _QUATERNION_MIN_NORM:
-        raise Refusal(FailureKind.REJECTED, "goal pose has an unnormalizable orientation")
-    return tuple(q / norm for q in orientation)
+def _pose_fields(d) -> _PoseFields:
+    """The fields of the move_arm goal `d`, or Refusal with `rejected`: a
+    target no contract takes, a duration or a timeout out of its bound, a
+    tolerance that is no bar, or a contact gap that is no gap."""
+    return _PoseFields(
+        target=_stamped_target(d.target),
+        duration_s=_require_duration(d.duration_s, "duration_s"),
+        position_tolerance_m=_require_tolerance(
+            d.settle_position_tolerance_m, "settle_position_tolerance_m"
+        ),
+        orientation_tolerance_rad=_require_tolerance(
+            d.settle_orientation_tolerance_rad, "settle_orientation_tolerance_rad"
+        ),
+        settle_timeout_s=_require_duration(d.settle_timeout_s, "settle_timeout_s"),
+        contact_gap_m=_require_contact_gap(d.contact_gap_m),
+    )
 
 
-def _pose_move(
-    goal: PoseGoal,
-    position_tolerance_m: float,
-    orientation_tolerance_rad: float,
-    settle_timeout_s: float,
-    contact_gap_m: float,
-    stops_before: int,
-) -> PoseMove:
-    """The move_arm goal `goal` settles into, admitted at stop count
-    `stops_before`, or Refusal: a tolerance that is no bar, a timeout out of
-    its bound, or a contact gap that is no gap."""
+def _pose_move(goal: PoseGoal, fields: _PoseFields, stops_before: int) -> PoseMove:
+    """The move_arm goal `goal`, its target placed, settling as `fields`
+    asks, admitted at stop count `stops_before`."""
     settle = PoseSettle(
         position=goal.position,
         orientation=goal.orientation,
-        position_tolerance_m=_require_tolerance(position_tolerance_m, "settle_position_tolerance_m"),
-        orientation_tolerance_rad=_require_tolerance(
-            orientation_tolerance_rad, "settle_orientation_tolerance_rad"
-        ),
-        timeout_s=_require_duration(settle_timeout_s, "settle_timeout_s"),
+        position_tolerance_m=fields.position_tolerance_m,
+        orientation_tolerance_rad=fields.orientation_tolerance_rad,
+        timeout_s=fields.settle_timeout_s,
     )
     return PoseMove(
         goal=goal,
         settle=settle,
-        contact_gap_m=_require_contact_gap(contact_gap_m),
+        contact_gap_m=fields.contact_gap_m,
         stops_before=stops_before,
     )
+
+
+def _refused(module, error: Exception):
+    """The refusal of a goal of `module` for `error`: a Refusal with its kind
+    and reason, and any other error with `attempt_failed`, since no admission
+    failure may escape into the generated server loop."""
+    if isinstance(error, Refusal):
+        return module.GoalDecision.refuse(error.kind, str(error))
+    log(f"goal admission failed unexpectedly: {error!r}")
+    return module.GoalDecision.refuse(FailureKind.ATTEMPT_FAILED, f"admission failed: {error!r}")
 
 
 def _the_arm_entry(
@@ -1454,11 +1509,13 @@ def _settled(plan: GripperPlan) -> bool:
     return plan.completed_on is not None and plan.still_moving_after_s is None
 
 
-def _no_pose() -> tuple[list[float], list[float]]:
-    """The final-pose fields of a move that never ran with neither fresh
-    measured joints nor a commanded setpoint to place the arm. Fresh lists
-    per call, since they are handed to the generated completion API."""
-    return [0.0] * 3, [0.0, 0.0, 0.0, 1.0]
+def _no_pose(now_s: float) -> move_arm.ResultFinalPose:
+    """The final pose of a move that never ran with neither fresh measured
+    joints nor a commanded setpoint to place the arm: the origin of the robot
+    frame, at `now_s`, the time of the check that found no pose."""
+    return move_arm.ResultFinalPose(
+        frame=ROBOT_FRAME, timestamp=now_s, position=[0.0] * 3, orientation=[0.0, 0.0, 0.0, 1.0]
+    )
 
 
 async def _end_goal(ctx, end: _PlanEnd, results: Callable[[], tuple]) -> None:

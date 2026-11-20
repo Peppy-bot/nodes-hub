@@ -22,8 +22,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use control_core::geometry::pose_arrays;
 use peppygen::exposed_actions::limb_motion::execute_joint_path::{
     GoalArmsItem, GoalArmsItemWaypointsItem,
+};
+use peppygen::exposed_actions::limb_motion::move_arm::GoalTarget as MoveArmTarget;
+use peppygen::exposed_services::limb_motion::check_arm_move::CheckArmMoveTarget;
+use peppygen::exposed_services::workspace::check_positions::{
+    CheckPositionsPointsItem, RequestData as CheckPositionsRequest,
 };
 use peppygen::fixtures::exposed_actions::limb_motion::execute_joint_path;
 use peppygen::fixtures::exposed_actions::limb_motion::{move_arm_joints, move_gripper};
@@ -33,7 +39,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 mod helpers;
 use helpers::MODEL;
-use helpers::fixtures::{description, posture};
+use helpers::fixtures::{contract_pose, description, posture};
 use helpers::params::params;
 use robot_description::states;
 
@@ -43,6 +49,100 @@ const ARM_NAMES: [&str; 2] = ["left_arm", "right_arm"];
 
 /// The model of the v2 robot, whose design carries the cameras.
 const V2: &str = "openarm_v2";
+
+/// The robot frame of the tests' robots: the root link of each description,
+/// one name for v1 and v2.
+fn robot_frame() -> String {
+    description(MODEL).root_link().to_owned()
+}
+
+/// When a test's left arm follower measures its joints: a time of its own,
+/// apart from the node's clock, so a report that gives it gives the time of
+/// the measurement.
+fn left_arm_measured_at() -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+}
+
+/// A check_positions request of `positions` in `frame`, or in the robot frame
+/// for none, at `timestamp`, or at the latest time for none.
+fn points_in(
+    frame: Option<&str>,
+    timestamp: Option<SystemTime>,
+    positions: &[[f64; 3]],
+) -> CheckPositionsRequest {
+    CheckPositionsRequest {
+        frame: frame.map(str::to_owned),
+        timestamp,
+        points: positions
+            .iter()
+            .map(|&position| CheckPositionsPointsItem { position })
+            .collect(),
+    }
+}
+
+/// A check_positions request of `positions` in the robot frame at the latest
+/// time.
+fn robot_frame_points(positions: &[[f64; 3]]) -> CheckPositionsRequest {
+    points_in(Some(&robot_frame()), None, positions)
+}
+
+/// The grasp point of the arm at `index` of limb_state's arm order in
+/// `snapshot`: its position and its orientation.
+fn grasp_point_of(
+    snapshot: &peppygen::fixtures::emitted_topics::limb_state::limb_states::Message,
+    index: usize,
+) -> ([f64; 3], [f64; 4]) {
+    let point = &snapshot.grasp_points[index];
+    (point.position, point.orientation)
+}
+
+/// Every grasp point of `snapshot`, in limb_state's arm order.
+fn grasp_points_of(
+    snapshot: &peppygen::fixtures::emitted_topics::limb_state::limb_states::Message,
+) -> Vec<([f64; 3], [f64; 4])> {
+    (0..snapshot.grasp_points.len())
+        .map(|index| grasp_point_of(snapshot, index))
+        .collect()
+}
+
+/// A target of `$target` (move_arm's or check_arm_move's) in the robot frame
+/// at the latest time, at `$position` with `$orientation`, `None` for none.
+macro_rules! robot_frame_target {
+    ($target:path, $position:expr, $orientation:expr) => {{
+        $target {
+            frame: Some(robot_frame()),
+            timestamp: None,
+            position: $position,
+            orientation: $orientation,
+        }
+    }};
+}
+
+/// Assert that each grasp point of `got` stands within `tolerance` of its
+/// counterpart in `expected`, position and orientation.
+fn assert_grasp_points_close(
+    got: &[([f64; 3], [f64; 4])],
+    expected: &[([f64; 3], [f64; 4])],
+    tolerance: f64,
+) {
+    assert_eq!(got.len(), expected.len(), "{got:?}");
+    for (index, ((position, orientation), (want_position, want_orientation))) in
+        got.iter().zip(expected).enumerate()
+    {
+        assert_all_close(
+            &format!("grasp point {index} position"),
+            position,
+            want_position,
+            tolerance,
+        );
+        assert_all_close(
+            &format!("grasp point {index} orientation"),
+            orientation,
+            want_orientation,
+            tolerance,
+        );
+    }
+}
 
 /// The posture `state` of the arm `arm_name` of the model the tests launch.
 fn launched_posture(arm_name: &str, state: &str) -> [f64; 7] {
@@ -836,9 +936,10 @@ fn error_reply<T: std::fmt::Debug, F>(
 /// The result of a posture goal, as either postures action gives it.
 #[derive(Debug)]
 struct PostureResult {
+    frame: String,
+    timestamp: SystemTime,
     arm_names: Vec<String>,
-    positions: Vec<f64>,
-    orientations: Vec<f64>,
+    grasp_points: Vec<([f64; 3], [f64; 4])>,
 }
 
 /// Send one goal of `$action` (move_to_ready or move_to_home) with
@@ -892,9 +993,14 @@ macro_rules! complete_posture {
         );
         match goal.get_result(DEADLINE).await?.outcome {
             $action::ResultOutcome::Completed(data) => PostureResult {
+                frame: data.frame,
+                timestamp: data.timestamp,
                 arm_names: data.arm_names,
-                positions: data.positions,
-                orientations: data.orientations,
+                grasp_points: data
+                    .grasp_points
+                    .iter()
+                    .map(|point| (point.position, point.orientation))
+                    .collect(),
             },
             other => panic!("{} did not complete: {other:?}", stringify!($action)),
         }
@@ -1224,8 +1330,11 @@ async fn a_goal_on_an_arm_a_leader_streams_waits_for_the_stream_to_stop() -> pep
 
     let check = check_arm_move::RequestData {
         arm_name: "left_arm".to_string(),
-        position: [0.3, 0.2, 0.3],
-        orientation: Some([0.0, 0.0, 0.0, 1.0]),
+        target: robot_frame_target!(
+            CheckArmMoveTarget,
+            [0.3, 0.2, 0.3],
+            Some([0.0, 0.0, 0.0, 1.0])
+        ),
         duration_s: 0.0,
     };
     let reply = error_reply(
@@ -1423,7 +1532,8 @@ async fn a_joint_move_the_governor_holds_fails_its_settle_with_timeout() -> pepp
 ///   the 50 mm the grasp point still stands from the target, and gives no
 ///   result;
 /// - the same move, cancelled by its caller, ends cancelled for that reason
-///   with where the arm stands, as limb_state gives it, not the goal.
+///   with where the arm stands, as limb_state gives it, not the goal, at the
+///   time of the joints it comes from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_measured_grasp_point()
 -> peppygen::Result<()> {
@@ -1438,7 +1548,7 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
     let ready = launched_posture("left_arm", states::READY);
     pump_states!(mocks.pairings.left_arm.joint_states, || {
         peppygen::paired_topics::left_arm::joint_states::Message {
-            timestamp: SystemTime::now(),
+            timestamp: left_arm_measured_at(),
             positions: ready.to_vec(),
             velocities: vec![0.0; 7],
             efforts: Vec::new(),
@@ -1447,24 +1557,13 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
     pump_right_arm_and_grippers!(mocks);
 
     let snapshot = next_snapshot(&mut harness).await?;
-    let start = [
-        snapshot.positions[0],
-        snapshot.positions[1],
-        snapshot.positions[2],
-    ];
-    let orientation = [
-        snapshot.orientations[0],
-        snapshot.orientations[1],
-        snapshot.orientations[2],
-        snapshot.orientations[3],
-    ];
+    let (start, orientation) = grasp_point_of(&snapshot, 0);
     let raised = [start[0], start[1], start[2] + 0.05];
     let check = check_arm_move::poll(
         &harness,
         &check_arm_move::RequestData {
             arm_name: "left_arm".to_string(),
-            position: raised,
-            orientation: Some(orientation),
+            target: robot_frame_target!(CheckArmMoveTarget, raised, Some(orientation)),
             duration_s: 1.0,
         },
         DEADLINE,
@@ -1475,8 +1574,7 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
 
     let raise = |duration_s: f64| move_arm::GoalRequestData {
         arm_name: "left_arm".to_string(),
-        position: raised,
-        orientation: Some(orientation),
+        target: robot_frame_target!(MoveArmTarget, raised, Some(orientation)),
         duration_s,
         settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
         settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
@@ -1523,12 +1621,126 @@ async fn a_pose_move_that_cannot_settle_fails_and_a_cancelled_one_reports_the_me
         other => panic!("the cancelled move did not end cancelled: {other:?}"),
     };
     assert_eq!(reason, "cancelled by its caller");
-    assert_all_close("final_position", &data.final_position, &start, 1e-9);
+    assert_eq!(data.final_pose.frame, robot_frame());
+    assert_eq!(
+        data.final_pose.timestamp,
+        left_arm_measured_at(),
+        "the final pose holds at the time of the joints it comes from"
+    );
     assert_all_close(
-        "final_orientation",
-        &data.final_orientation,
+        "final_pose position",
+        &data.final_pose.position,
+        &start,
+        1e-9,
+    );
+    assert_all_close(
+        "final_pose orientation",
+        &data.final_pose.orientation,
         &orientation,
         1e-9,
+    );
+    harness.shutdown().await
+}
+
+/// In pose mode the backbone relays each arm's measured grasp point up its
+/// pose_link slot: each pose_states names the robot frame and the time of the
+/// joints it comes from, and stands where limb_states reports the grasp point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pose_states_name_the_robot_frame_and_the_time_of_the_measured_joints()
+-> peppygen::Result<()> {
+    let (mut harness, mocks) = start_ready_vacant(
+        peppygen::Parameters {
+            upstream_mode: "pose".to_string(),
+            ..params()
+        },
+        MODEL,
+    )
+    .await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let mut pose_states = mocks.pairings.leader_left_arm_pose.pose_states;
+    let ready = launched_posture("left_arm", states::READY);
+    pump_states!(mocks.pairings.left_arm.joint_states, || {
+        peppygen::paired_topics::left_arm::joint_states::Message {
+            timestamp: left_arm_measured_at(),
+            positions: ready.to_vec(),
+            velocities: vec![0.0; 7],
+            efforts: Vec::new(),
+        }
+    });
+    pump_right_arm_and_grippers!(mocks);
+
+    let snapshot = next_snapshot(&mut harness).await?;
+    let (position, orientation) = grasp_point_of(&snapshot, 0);
+    let state = tokio::time::timeout(DEADLINE, pose_states.next())
+        .await
+        .expect("no pose_states before the deadline")?
+        .expect("pose_states subscription open");
+    assert_eq!(
+        state.frame,
+        robot_frame(),
+        "pose_states names the robot frame"
+    );
+    assert_eq!(
+        state.timestamp,
+        left_arm_measured_at(),
+        "pose_states holds at the time of the joints it comes from"
+    );
+    assert_all_close("pose_states position", &state.position, &position, 1e-9);
+    assert_all_close(
+        "pose_states orientation",
+        &state.orientation,
+        &orientation,
+        1e-9,
+    );
+    harness.shutdown().await
+}
+
+/// A limb_states snapshot holds both arms under one timestamp: the newest of
+/// their joint-state times, as MoveIt's CurrentStateMonitor stamps the robot
+/// state with its latest joint update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_holds_at_the_newest_joint_state_time_of_its_arms() -> peppygen::Result<()> {
+    let left_at = left_arm_measured_at();
+    let right_at = left_at + Duration::from_secs(5);
+    let (mut harness, mocks) = start_ready_vacant(params(), MODEL).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let left_ready = launched_posture("left_arm", states::READY);
+    pump_states!(mocks.pairings.left_arm.joint_states, || {
+        peppygen::paired_topics::left_arm::joint_states::Message {
+            timestamp: left_at,
+            positions: left_ready.to_vec(),
+            velocities: vec![0.0; 7],
+            efforts: Vec::new(),
+        }
+    });
+    let right_rest = right_home();
+    pump_states!(mocks.pairings.right_arm.joint_states, || {
+        peppygen::paired_topics::right_arm::joint_states::Message {
+            timestamp: right_at,
+            positions: right_rest.to_vec(),
+            velocities: vec![0.0; 7],
+            efforts: Vec::new(),
+        }
+    });
+    pump_gripper_half_open!(
+        mocks.pairings.left_gripper.gripper_states,
+        peppygen::paired_topics::left_gripper::gripper_states
+    );
+    pump_gripper_half_open!(
+        mocks.pairings.right_gripper.gripper_states,
+        peppygen::paired_topics::right_gripper::gripper_states
+    );
+
+    let snapshot = next_snapshot(&mut harness).await?;
+    assert_eq!(
+        snapshot.timestamp, right_at,
+        "the snapshot holds at the right arm's joint time, the newer of the two"
     );
     harness.shutdown().await
 }
@@ -1811,9 +2023,9 @@ async fn limb_states_snapshots_carry_names_counts_and_measured_state() -> peppyg
             home_of(ARM_NAMES[i / 7])[i % 7]
         );
     }
-    assert_eq!(snapshot.positions.len(), 6, "3 per arm");
-    assert_eq!(snapshot.orientations.len(), 8, "4 per arm");
-    for (arm, quat) in snapshot.orientations.chunks(4).enumerate() {
+    assert_eq!(snapshot.frame, robot_frame());
+    assert_eq!(snapshot.grasp_points.len(), 2, "one per arm");
+    for (arm, (_, quat)) in grasp_points_of(&snapshot).iter().enumerate() {
         let norm = quat.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(
             (norm - 1.0).abs() < 1e-6,
@@ -2088,14 +2300,14 @@ async fn a_posture_result_reports_each_arms_measured_grasp_point() -> peppygen::
     let home = complete_posture!(harness, move_to_home, 0.0);
     let at_home = snapshot_with_both_arms_at(&mut harness, states::HOME).await?;
     for (result, snapshot) in [(ready, at_ready), (home, at_home)] {
-        assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
-        assert_all_close("positions", &result.positions, &snapshot.positions, 1e-9);
-        assert_all_close(
-            "orientations",
-            &result.orientations,
-            &snapshot.orientations,
-            1e-9,
+        assert_eq!(result.frame, robot_frame());
+        assert_ne!(
+            result.timestamp,
+            SystemTime::UNIX_EPOCH,
+            "a measured pose has a time"
         );
+        assert_eq!(result.arm_names, ["left_arm", "right_arm"]);
+        assert_grasp_points_close(&result.grasp_points, &grasp_points_of(&snapshot), 1e-9);
     }
     harness.shutdown().await
 }
@@ -2246,14 +2458,14 @@ async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<
         }
         other => panic!("the stopped posture did not end cancelled: {other:?}"),
     };
+    assert_eq!(data.frame, robot_frame());
     assert_eq!(data.arm_names, ["left_arm", "right_arm"]);
-    assert_all_close("positions", &data.positions, &snapshot.positions, 1e-9);
-    assert_all_close(
-        "orientations",
-        &data.orientations,
-        &snapshot.orientations,
-        1e-9,
-    );
+    let reported: Vec<_> = data
+        .grasp_points
+        .iter()
+        .map(|point| (point.position, point.orientation))
+        .collect();
+    assert_grasp_points_close(&reported, &grasp_points_of(&snapshot), 1e-9);
     harness.shutdown().await
 }
 
@@ -2372,7 +2584,15 @@ async fn home_closes_fully_open_grippers(model: &str) -> peppygen::Result<()> {
     let home = complete_posture!(harness, move_to_home, 0.0);
     let at_home = snapshot_with_both_arms_at(&mut harness, states::HOME).await?;
     assert_eq!(home.arm_names, ["left_arm", "right_arm"]);
-    assert_all_close("positions", &home.positions, &at_home.positions, 1e-9);
+    let positions = |points: &[([f64; 3], [f64; 4])]| -> Vec<f64> {
+        points.iter().flat_map(|(position, _)| *position).collect()
+    };
+    assert_all_close(
+        "positions",
+        &positions(&home.grasp_points),
+        &positions(&grasp_points_of(&at_home)),
+        1e-9,
+    );
     for (_, gripper) in followers.grippers() {
         gripper.jaws_at(0.0).await;
     }
@@ -2595,21 +2815,10 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
 
     // Where the left grasp point stands, from the robot's own snapshot.
     let snapshot = next_snapshot(&mut harness).await?;
-    let position = [
-        snapshot.positions[0],
-        snapshot.positions[1],
-        snapshot.positions[2],
-    ];
-    let orientation = [
-        snapshot.orientations[0],
-        snapshot.orientations[1],
-        snapshot.orientations[2],
-        snapshot.orientations[3],
-    ];
+    let (position, orientation) = grasp_point_of(&snapshot, 0);
     let check = |arm_name: &str, position: [f64; 3]| check_arm_move::RequestData {
         arm_name: arm_name.to_string(),
-        position,
-        orientation: Some(orientation),
+        target: robot_frame_target!(CheckArmMoveTarget, position, Some(orientation)),
         duration_s: 0.0,
     };
 
@@ -2634,8 +2843,7 @@ async fn a_plan_check_answers_without_moving_the_arm() -> peppygen::Result<()> {
         &harness,
         &move_arm::GoalRequestData {
             arm_name: "left_arm".to_string(),
-            position: far_position,
-            orientation: Some(orientation),
+            target: robot_frame_target!(MoveArmTarget, far_position, Some(orientation)),
             duration_s: 0.0,
             settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
             settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
@@ -2699,24 +2907,13 @@ async fn a_position_goal_completes_at_the_turn_the_hand_starts_with() -> peppyge
     pump_right_arm_and_grippers!(mocks);
 
     let snapshot = next_snapshot(&mut harness).await?;
-    let start = [
-        snapshot.positions[0],
-        snapshot.positions[1],
-        snapshot.positions[2],
-    ];
-    let orientation = [
-        snapshot.orientations[0],
-        snapshot.orientations[1],
-        snapshot.orientations[2],
-        snapshot.orientations[3],
-    ];
+    let (start, orientation) = grasp_point_of(&snapshot, 0);
     let lifted = [start[0], start[1], start[2] + 0.02];
     let goal = move_arm::send_goal(
         &harness,
         &move_arm::GoalRequestData {
             arm_name: "left_arm".to_string(),
-            position: lifted,
-            orientation: None,
+            target: robot_frame_target!(MoveArmTarget, lifted, None),
             duration_s: 0.0,
             settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
             settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
@@ -2733,14 +2930,14 @@ async fn a_position_goal_completes_at_the_turn_the_hand_starts_with() -> peppyge
         other => panic!("a position goal did not complete: {other:?}"),
     };
     assert_all_close(
-        "final_position",
-        &data.final_position,
+        "final_pose position",
+        &data.final_pose.position,
         &lifted,
         SETTLE_POSITION_TOLERANCE_M,
     );
     assert_all_close(
-        "final_orientation",
-        &data.final_orientation,
+        "final_pose orientation",
+        &data.final_pose.orientation,
         &orientation,
         SETTLE_ORIENTATION_TOLERANCE_RAD,
     );
@@ -2777,25 +2974,15 @@ fn place_in_the_robot_frame(
     transforms: &peppygen::fixtures::emitted_topics::transforms::transforms::Message,
     model: &str,
 ) -> srs_model::nalgebra::Isometry3<f64> {
-    use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
+    use srs_model::nalgebra::Isometry3;
 
-    let published = transforms
-        .child_frames
-        .iter()
-        .enumerate()
-        .map(|(index, child)| {
-            let [x, y, z] = std::array::from_fn(|axis| transforms.positions[3 * index + axis]);
-            let [i, j, k, w] =
-                std::array::from_fn(|axis| transforms.orientations[4 * index + axis]);
-            (
-                child.clone(),
-                transforms.parent_frames[index].clone(),
-                Isometry3::from_parts(
-                    Translation3::new(x, y, z),
-                    UnitQuaternion::from_quaternion(Quaternion::new(w, i, j, k)),
-                ),
-            )
-        });
+    let published = transforms.transforms.iter().map(|record| {
+        (
+            record.child_frame.clone(),
+            record.frame.clone(),
+            contract_pose(record.position, record.orientation),
+        )
+    });
     let fixed = description(model)
         .fixed_transforms()
         .into_iter()
@@ -2833,25 +3020,19 @@ async fn transforms_at_each_snapshot_place_the_grasp_points_it_reports() -> pepp
     let snapshot = next_snapshot(&mut harness).await?;
     let transforms = transforms_at(&mut harness, snapshot.timestamp).await?;
 
-    let count = transforms.child_frames.len();
-    assert_eq!(transforms.parent_frames.len(), count);
-    assert_eq!(transforms.positions.len(), 3 * count);
-    assert_eq!(transforms.orientations.len(), 4 * count);
+    let count = transforms.transforms.len();
     let arms = description(V2).arms();
     let fingers: usize = arms.iter().map(|arm| arm.gripper.fingers.len()).sum();
-    assert_eq!(count, 2 * 7 + fingers, "{:?}", transforms.child_frames);
+    assert_eq!(count, 2 * 7 + fingers, "{:?}", transforms.transforms);
     for (index, arm) in arms.iter().enumerate() {
         let place = place_in_the_robot_frame(&arm.grasp_link, &transforms, V2);
-        let reported_position = &snapshot.positions[3 * index..3 * index + 3];
-        let [x, y, z, w] = std::array::from_fn(|axis| snapshot.orientations[4 * index + axis]);
-        let reported_rotation = srs_model::nalgebra::UnitQuaternion::from_quaternion(
-            srs_model::nalgebra::Quaternion::new(w, x, y, z),
-        );
+        let (reported_position, reported_orientation) = grasp_point_of(&snapshot, index);
+        let reported_rotation = contract_pose(reported_position, reported_orientation).rotation;
         let at = place.translation.vector;
         assert_all_close(
             &format!("{} grasp position", arm.name),
             &[at.x, at.y, at.z],
-            reported_position,
+            &reported_position,
             1e-9,
         );
         let turn = place.rotation.angle_to(&reported_rotation);
@@ -3008,6 +3189,11 @@ async fn without_camera_geometry_the_workspace_is_described_without_a_view_check
     assert!(answer.workable && answer.area > 0.0, "{answer:?}");
     assert!(answer.rectangle.is_some() && answer.reach.is_some());
     assert_eq!(answer.view, None);
+    assert_eq!(
+        answer.frame,
+        robot_frame(),
+        "the bounds are in the robot frame"
+    );
 
     let not_a_number = describe_workspace::RequestData {
         surface_height: f64::NAN,
@@ -3029,8 +3215,8 @@ async fn without_camera_geometry_the_workspace_is_described_without_a_view_check
 /// With the chest camera's geometry linked, check_positions judges each
 /// point by reach and by what the camera sees through its own intrinsics: a
 /// point 0.30 m ahead at table height is workable, one a meter ahead is out
-/// of reach by how far the closest arm stops. A list that does not split
-/// into points gets an error reply with `rejected`.
+/// of reach by how far the closest arm stops. A request without a point gets
+/// an error reply with `rejected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_camera_sees()
 -> peppygen::Result<()> {
@@ -3043,9 +3229,7 @@ async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_came
         Ok::<_, get_depth_intrinsics::Failure>(chest_depth_intrinsics())
     );
 
-    let points = check_positions::RequestData {
-        positions: vec![0.30, 0.0, 0.45, 1.0, 0.0, 0.45],
-    };
+    let points = robot_frame_points(&[[0.30, 0.0, 0.45], [1.0, 0.0, 0.45]]);
     let answer = check_positions::poll(&harness, &points, DEADLINE).await?;
     assert!(
         v2_camera_names().contains(&answer.perception_camera),
@@ -3055,6 +3239,11 @@ async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_came
         panic!("one result per point: {:?}", answer.results);
     };
     assert_eq!(near.position, [0.30, 0.0, 0.45]);
+    assert_eq!(
+        (near.frame.as_str(), near.timestamp),
+        (robot_frame().as_str(), None),
+        "a robot-frame point at the latest time on a robot whose frame stands in itself"
+    );
     assert!(
         near.workable && near.reachable && near.in_view,
         "{}",
@@ -3077,18 +3266,16 @@ async fn with_camera_geometry_linked_check_positions_reports_what_the_chest_came
     );
     assert!(!answer.all_workable);
 
-    let ragged = check_positions::RequestData {
-        positions: vec![0.30, 0.0],
-    };
+    let none = robot_frame_points(&[]);
     let refused = error_reply(
-        check_positions::poll(&harness, &ragged, DEADLINE).await,
+        check_positions::poll(&harness, &none, DEADLINE).await,
         check_positions::Failure::of,
     );
     assert_eq!(
         refused,
         check_positions::Failure::new(
             check_positions::FailureKind::Rejected,
-            "positions must hold 3 values (x, y, z) per point"
+            "points must hold at least one point"
         )
     );
     harness.shutdown().await
@@ -3109,9 +3296,7 @@ async fn a_linked_camera_without_depth_is_refused_naming_the_chest_camera() -> p
         Err::<get_depth_intrinsics::ResponseData, _>(no_depth_intrinsics())
     );
 
-    let point = check_positions::RequestData {
-        positions: vec![0.30, 0.0, 0.45],
-    };
+    let point = robot_frame_points(&[[0.30, 0.0, 0.45]]);
     let refused = error_reply(
         check_positions::poll(&harness, &point, DEADLINE).await,
         check_positions::Failure::of,
@@ -3146,9 +3331,7 @@ async fn a_linked_camera_of_an_unknown_depth_model_is_refused_naming_the_model()
         })
     );
 
-    let point = check_positions::RequestData {
-        positions: vec![0.30, 0.0, 0.45],
-    };
+    let point = robot_frame_points(&[[0.30, 0.0, 0.45]]);
     let refused = error_reply(
         check_positions::poll(&harness, &point, DEADLINE).await,
         check_positions::Failure::of,
@@ -3183,9 +3366,7 @@ async fn a_linked_camera_of_an_unknown_colour_lens_is_refused_naming_the_lens()
         Ok::<_, get_depth_intrinsics::Failure>(chest_depth_intrinsics())
     );
 
-    let point = check_positions::RequestData {
-        positions: vec![0.30, 0.0, 0.45],
-    };
+    let point = robot_frame_points(&[[0.30, 0.0, 0.45]]);
     let refused = error_reply(
         check_positions::poll(&harness, &point, DEADLINE).await,
         check_positions::Failure::of,
@@ -3491,17 +3672,13 @@ async fn an_arm_move_ends_by_its_contact_gap_and_a_blocked_arm_holds_where_it_st
 
     let raise_by = async |harness: &mut Harness, from: [f64; 7], up_m: f64, contact_gap_m: f64| {
         let snapshot = snapshot_measuring(harness, &from).await?;
-        let mut position = [0.0; 3];
-        position.copy_from_slice(&snapshot.positions[..3]);
+        let (mut position, orientation) = grasp_point_of(&snapshot, 0);
         position[2] += up_m;
-        let mut orientation = [0.0; 4];
-        orientation.copy_from_slice(&snapshot.orientations[..4]);
         let goal = move_arm::send_goal(
             harness,
             &move_arm::GoalRequestData {
                 arm_name: "left_arm".to_string(),
-                position,
-                orientation: Some(orientation),
+                target: robot_frame_target!(MoveArmTarget, position, Some(orientation)),
                 duration_s: 1.0,
                 settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
                 settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
@@ -4739,6 +4916,419 @@ async fn a_backbone_whose_initializer_serves_another_description_ends() -> peppy
              backbone was built with {built}: build the backbone and the initializer from one \
              public-peppy-libs commit"
         )
+    );
+    harness.shutdown().await
+}
+
+// ---- Placement by the robot's tree --------------------------------------------
+
+/// The robot frame of the tests' base standing at `x, y` (m) on the floor of
+/// odom, turned by `yaw` (rad) about +z.
+fn base_in_odom(x: f64, y: f64, yaw: f64) -> srs_model::nalgebra::Isometry3<f64> {
+    srs_model::nalgebra::Isometry3::new(
+        srs_model::nalgebra::Vector3::new(x, y, 0.0),
+        srs_model::nalgebra::Vector3::new(0.0, 0.0, yaw),
+    )
+}
+
+/// Publishes on the other_transforms link, as a base's odometry does, the robot frame at
+/// `base` in odom, measured at `at`; every message of the tests' base starts
+/// at `started`.
+async fn publish_base(
+    other_transforms: &peppygen::mock::deps::other_transforms::Mock,
+    started: SystemTime,
+    at: SystemTime,
+    base: &srs_model::nalgebra::Isometry3<f64>,
+) -> peppygen::Result<()> {
+    use peppygen::consumed_topics::other_transforms::transforms;
+
+    let (position, orientation) = pose_arrays(base);
+    other_transforms
+        .transforms
+        .publish(&transforms::Message {
+            timestamp: at,
+            transforms: vec![transforms::MessageTransformsItem {
+                frame: "odom".to_string(),
+                child_frame: robot_frame(),
+                position,
+                orientation,
+            }],
+            start_timestamp: started,
+        })
+        .await
+}
+
+/// A move_arm target in `frame` at `timestamp`, or at the latest time for
+/// none, at `pose`.
+fn target_at(
+    frame: &str,
+    timestamp: Option<SystemTime>,
+    pose: &srs_model::nalgebra::Isometry3<f64>,
+) -> MoveArmTarget {
+    let (position, orientation) = pose_arrays(pose);
+    MoveArmTarget {
+        frame: Some(frame.to_string()),
+        timestamp,
+        position,
+        orientation: Some(orientation),
+    }
+}
+
+/// A move_arm goal of the left arm to `target`, at the tests' settle.
+fn left_arm_goal_to(
+    target: MoveArmTarget,
+) -> peppygen::fixtures::exposed_actions::limb_motion::move_arm::GoalRequestData {
+    peppygen::fixtures::exposed_actions::limb_motion::move_arm::GoalRequestData {
+        arm_name: "left_arm".to_string(),
+        target,
+        duration_s: 0.0,
+        settle_position_tolerance_m: SETTLE_POSITION_TOLERANCE_M,
+        settle_orientation_tolerance_rad: SETTLE_ORIENTATION_TOLERANCE_RAD,
+        settle_timeout_s: SETTLE_TIMEOUT_S,
+        contact_gap_m: NO_CONTACT_CHECK_M,
+    }
+}
+
+/// The node with the robot ready, the left arm a perfect follower, the right
+/// arm at home and both grippers half open, and its tree holding the tests'
+/// base at `base_then` at `then` and at `base_now` at `now`, both measured
+/// before the call: the node and the publisher of its tree, the left arm's
+/// follower, and the first snapshot of the node.
+async fn start_on_a_moving_base(
+    then: SystemTime,
+    base_then: &srs_model::nalgebra::Isometry3<f64>,
+    now: SystemTime,
+    base_now: &srs_model::nalgebra::Isometry3<f64>,
+) -> peppygen::Result<(
+    Harness,
+    peppygen::mock::deps::other_transforms::Mock,
+    watch::Receiver<[f64; 7]>,
+    peppygen::fixtures::emitted_topics::limb_state::limb_states::Message,
+)> {
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let (mut harness, mocks) = start_ready_vacant(params(), MODEL).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    let followed = spawn_left_arm_follower(
+        mocks.pairings.left_arm.joint_states,
+        mocks.pairings.left_arm.joint_setpoints,
+    )
+    .followed;
+    pump_right_arm_and_grippers!(mocks);
+    // A snapshot comes once the node runs for the robot's model, which it
+    // starts after it subscribed to its tree.
+    let snapshot = next_snapshot(&mut harness).await?;
+    let other_transforms = mocks
+        .deps
+        .other_transforms
+        .into_iter()
+        .next()
+        .expect("the other_transforms link binds one publisher");
+    publish_base(&other_transforms, then, then, base_then).await?;
+    publish_base(&other_transforms, then, now, base_now).await?;
+    // A point in the robot frame at `now` is placed once the tree holds the
+    // base at `now`, which arrives after the base at `then`.
+    let probe = points_in(Some(&robot_frame()), Some(now), &[[0.3, 0.0, 0.45]]);
+    check_positions::poll(&harness, &probe, DEADLINE).await?;
+    Ok((harness, other_transforms, followed, snapshot))
+}
+
+/// Against a tree whose odom to robot frame moves between a pose's time and
+/// its goal's acceptance, the backbone places a pose given in odom, and the
+/// same pose in the robot frame with the timestamp of that time, at one place
+/// in odom, and a robot-frame pose with no timestamp where the robot frame
+/// stands at acceptance: each goal ends with the grasp point at that place,
+/// as the result's final pose in the robot frame says. check_positions places
+/// the points of a request the same way, points with no frame as points in
+/// the robot frame, and a robot-frame point with no timestamp stays where the
+/// robot frame stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_goal_is_placed_where_its_frame_stood_at_its_time_as_the_base_moves()
+-> peppygen::Result<()> {
+    use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+    use srs_model::nalgebra::Isometry3;
+
+    let now = SystemTime::now() - Duration::from_secs(1);
+    let then = now - Duration::from_secs(2);
+    let base_then = base_in_odom(-0.05, 0.02, -0.1);
+    let base_now = base_in_odom(0.10, 0.05, 0.2);
+    let (harness, _other_transforms, _followed, snapshot) =
+        start_on_a_moving_base(then, &base_then, now, &base_now).await?;
+
+    // The place the goals name: 2 cm above the left grasp point, where the
+    // robot frame stands at acceptance; in odom, and in the robot frame as it
+    // stood at `then`.
+    let (start, orientation) = grasp_point_of(&snapshot, 0);
+    let in_robot = contract_pose([start[0], start[1], start[2] + 0.02], orientation);
+    let in_odom = base_now * in_robot;
+    let in_robot_then = base_then.inverse() * in_odom;
+    assert!(
+        (in_robot_then.translation.vector - in_robot.translation.vector).norm() > 0.05,
+        "the base moves far enough between the two times to tell the places apart"
+    );
+
+    let (place, place_orientation) = pose_arrays(&in_robot);
+    let check = async |frame: Option<&str>, timestamp, pose: &Isometry3<f64>| {
+        let request = points_in(frame, timestamp, &[pose_arrays(pose).0]);
+        let checked = check_positions::poll(&harness, &request, DEADLINE).await?;
+        let [result] = <[_; 1]>::try_from(checked.results).expect("one result for one point");
+        peppygen::Result::Ok(result)
+    };
+    let odom_latest = check(Some("odom"), None, &in_odom).await?;
+    let odom_then = check(Some("odom"), Some(then), &in_odom).await?;
+    let robot_then = check(Some(&robot_frame()), Some(then), &in_robot_then).await?;
+    let no_frame_then = check(None, Some(then), &in_robot_then).await?;
+    let robot_latest = check(Some(&robot_frame()), None, &in_robot_then).await?;
+    for (what, result) in [
+        ("odom at the latest time", &odom_latest),
+        ("odom at then", &odom_then),
+        ("robot frame at then", &robot_then),
+        ("no frame, the robot frame, at then", &no_frame_then),
+    ] {
+        assert_all_close(what, &result.position, &place, 1e-9);
+        assert_eq!(result.frame, robot_frame(), "{what}");
+        assert_eq!(
+            result.timestamp,
+            Some(now),
+            "{what}: the robot frame's place at the latest time"
+        );
+    }
+    assert_all_close(
+        "robot frame at the latest time",
+        &robot_latest.position,
+        &pose_arrays(&in_robot_then).0,
+        1e-9,
+    );
+
+    for (what, target) in [
+        (
+            "robot frame at then",
+            target_at(&robot_frame(), Some(then), &in_robot_then),
+        ),
+        ("odom at the latest time", target_at("odom", None, &in_odom)),
+        (
+            "robot frame at the latest time",
+            target_at(&robot_frame(), None, &in_robot),
+        ),
+    ] {
+        let goal = move_arm::send_goal(
+            &harness,
+            &left_arm_goal_to(target),
+            peppygen::DEFAULT_FEEDBACK_BOUND,
+            DEADLINE,
+        )
+        .await?;
+        assert!(goal.accepted, "{what}: goal refused: {:?}", goal.refusal);
+        let data = match goal.get_result(DEADLINE).await?.outcome {
+            move_arm::ResultOutcome::Completed(data) => data,
+            other => panic!("{what}: the goal did not complete: {other:?}"),
+        };
+        assert_eq!(data.final_pose.frame, robot_frame(), "{what}");
+        assert_all_close(
+            &format!("{what} final_pose position"),
+            &data.final_pose.position,
+            &place,
+            SETTLE_POSITION_TOLERANCE_M,
+        );
+        assert_all_close(
+            &format!("{what} final_pose orientation"),
+            &data.final_pose.orientation,
+            &place_orientation,
+            SETTLE_ORIENTATION_TOLERANCE_RAD,
+        );
+    }
+    harness.shutdown().await
+}
+
+/// A goal in a frame the backbone's tree does not hold is refused with
+/// unknown_frame, and one in the robot frame at a time older than the tree's
+/// window with extrapolation, each when the backbone decides on the goal,
+/// before the arm moves; a plan check and a check of points the tree cannot
+/// place get the same kind as an error reply, naming what they could not
+/// place. A target and points with no frame lie in the robot frame, so at a
+/// time older than the window they get extrapolation too. A check of an
+/// empty list of points gets `rejected` before its frame is placed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_goal_the_tree_cannot_place_is_refused_before_the_arm_moves() -> peppygen::Result<()> {
+    use helpers::params::CACHE_WINDOW_S;
+    use peppygen::fixtures::exposed_actions::limb_motion::move_arm;
+    use peppygen::fixtures::exposed_services::limb_motion::check_arm_move;
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let now = SystemTime::now() - Duration::from_secs(1);
+    let then = now - Duration::from_secs(2);
+    let base = base_in_odom(0.10, 0.05, 0.2);
+    let (mut harness, _other_transforms, followed, snapshot) =
+        start_on_a_moving_base(then, &base, now, &base).await?;
+    let held = *followed.borrow();
+    let (start, orientation) = grasp_point_of(&snapshot, 0);
+    let lifted = [start[0], start[1], start[2] + 0.02];
+    let before_the_window = now - Duration::from_secs_f64(CACHE_WINDOW_S + 5.0);
+    let lifted_in = |frame: Option<&str>, timestamp| MoveArmTarget {
+        frame: frame.map(str::to_owned),
+        timestamp,
+        position: lifted,
+        orientation: Some(orientation),
+    };
+
+    for (target, kind, cause) in [
+        (
+            lifted_in(Some("nowhere"), None),
+            move_arm::FailureKind::UnknownFrame,
+            "the target: no transform of the tree names the frame nowhere",
+        ),
+        (
+            lifted_in(Some(&robot_frame()), Some(before_the_window)),
+            move_arm::FailureKind::Extrapolation,
+            "the target: the transform ",
+        ),
+        (
+            lifted_in(None, Some(before_the_window)),
+            move_arm::FailureKind::Extrapolation,
+            "the target: the transform ",
+        ),
+    ] {
+        let goal = move_arm::send_goal(
+            &harness,
+            &left_arm_goal_to(target),
+            peppygen::DEFAULT_FEEDBACK_BOUND,
+            DEADLINE,
+        )
+        .await?;
+        let refusal = goal
+            .refusal
+            .expect("a goal the tree cannot place is refused");
+        assert_eq!(refusal.kind, kind, "{}", refusal.message);
+        assert!(refusal.message.starts_with(cause), "{}", refusal.message);
+    }
+
+    let check_in = |frame: Option<&str>, timestamp| check_arm_move::RequestData {
+        arm_name: "left_arm".to_string(),
+        target: CheckArmMoveTarget {
+            frame: frame.map(str::to_owned),
+            timestamp,
+            position: lifted,
+            orientation: Some(orientation),
+        },
+        duration_s: 0.0,
+    };
+    for (check, kind) in [
+        (
+            check_in(Some("nowhere"), None),
+            check_arm_move::FailureKind::UnknownFrame,
+        ),
+        (
+            check_in(None, Some(before_the_window)),
+            check_arm_move::FailureKind::Extrapolation,
+        ),
+    ] {
+        let reply = error_reply(
+            check_arm_move::poll(&harness, &check, DEADLINE).await,
+            check_arm_move::Failure::of,
+        );
+        assert_eq!(reply.kind, kind, "{}", reply.message);
+    }
+    let old_points = points_in(None, Some(before_the_window), &[[0.3, 0.0, 0.45]]);
+    let reply = error_reply(
+        check_positions::poll(&harness, &old_points, DEADLINE).await,
+        check_positions::Failure::of,
+    );
+    assert_eq!(
+        reply.kind,
+        check_positions::FailureKind::Extrapolation,
+        "{}",
+        reply.message
+    );
+    let points = points_in(Some("nowhere"), None, &[[0.3, 0.0, 0.45]]);
+    let reply = error_reply(
+        check_positions::poll(&harness, &points, DEADLINE).await,
+        check_positions::Failure::of,
+    );
+    assert_eq!(reply.kind, check_positions::FailureKind::UnknownFrame);
+    assert!(
+        reply
+            .message
+            .starts_with("the points: no transform of the tree names the frame nowhere"),
+        "{}",
+        reply.message
+    );
+    let no_points = points_in(Some("nowhere"), None, &[]);
+    let reply = error_reply(
+        check_positions::poll(&harness, &no_points, DEADLINE).await,
+        check_positions::Failure::of,
+    );
+    assert_eq!(
+        reply,
+        check_positions::Failure::new(
+            check_positions::FailureKind::Rejected,
+            "points must hold at least one point"
+        )
+    );
+
+    // The coordinator streams on: every setpoint since holds the arm where it
+    // stood.
+    next_snapshot(&mut harness).await?;
+    assert_eq!(*followed.borrow(), held, "the arm moved for a refused goal");
+    harness.shutdown().await
+}
+
+/// The backbone takes the transforms of the joints it measures into its own
+/// tree as it publishes them: with the robot's initializer's fixed joints on
+/// the other_transforms link, a point at the origin of an arm's grasp link at the
+/// latest time is placed where limb_states reports that arm's grasp point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_point_in_a_link_the_backbone_measures_is_placed_by_the_transforms_it_publishes()
+-> peppygen::Result<()> {
+    use peppygen::consumed_topics::other_transforms::static_transforms;
+    use peppygen::fixtures::exposed_services::workspace::check_positions;
+
+    let (mut harness, mocks) = start_ready_vacant(params(), MODEL).await?;
+    pump_is_ready(
+        mocks.deps.robot_init.is_ready,
+        Arc::new(AtomicBool::new(true)),
+    );
+    pump_arm_at_home!(
+        mocks.pairings.left_arm.joint_states,
+        peppygen::paired_topics::left_arm::joint_states,
+        left_home(),
+    );
+    pump_right_arm_and_grippers!(mocks);
+    let snapshot = next_snapshot(&mut harness).await?;
+    let fixed = description(MODEL)
+        .fixed_transforms()
+        .into_iter()
+        .map(|transform| {
+            let (position, orientation) = pose_arrays(&transform.pose);
+            static_transforms::MessageTransformsItem {
+                frame: transform.parent.to_owned(),
+                child_frame: transform.child.to_owned(),
+                position,
+                orientation,
+            }
+        })
+        .collect();
+    mocks.deps.other_transforms[0]
+        .static_transforms
+        .publish(&static_transforms::Message { transforms: fixed })
+        .await?;
+
+    let grasp_link = &description(MODEL).arms()[0].grasp_link;
+    let answer = check_positions::poll(
+        &harness,
+        &points_in(Some(grasp_link), None, &[[0.0; 3]]),
+        DEADLINE,
+    )
+    .await?;
+    let (reported, _orientation) = grasp_point_of(&snapshot, 0);
+    assert_all_close(
+        &format!("the origin of {grasp_link}"),
+        &answer.results[0].position,
+        &reported,
+        1e-9,
     );
     harness.shutdown().await
 }

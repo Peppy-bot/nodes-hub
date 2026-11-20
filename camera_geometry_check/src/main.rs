@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
-use camera_core::pose::Pose;
 use camera_geometry_check::{median_reading_m, pixel_at};
+use control_core::geometry::Pose;
 use peppygen::consumed_services::camera::{depth_stream_info, video_stream_info};
 use peppygen::consumed_services::geometry::{
     get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
@@ -190,10 +190,11 @@ async fn report(
     }
     match &extrinsics {
         Ok(extrinsics) => println!(
-            "get_depth_to_color_extrinsics {} | t {:?} q {:?}",
+            "get_depth_to_color_extrinsics {} | in {} t {:?} q {:?}",
             extrinsics.align_mode,
-            extrinsics.depth_to_color_position,
-            extrinsics.depth_to_color_orientation,
+            extrinsics.depth_to_color.frame,
+            extrinsics.depth_to_color.position,
+            extrinsics.depth_to_color.orientation,
         ),
         Err(reply) => println!("get_depth_to_color_extrinsics error reply: {reply}"),
     }
@@ -206,7 +207,7 @@ async fn report(
         depth_info.depth_unit,
     );
 
-    let frame = latest
+    let depth_frame = latest
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
@@ -214,34 +215,41 @@ async fn report(
     let answered_depth = depth.as_ref().ok();
     println!(
         "checks                        colour size = video_stream_info: {} | depth size = depth frame: {} | \
-         align_mode = frame header: {} | both depth answers name one mode: {}",
+         align_mode = frame header: {} | both depth answers name one mode: {} | \
+         extrinsics' frame = frame header: {}",
         verdict(
             color
                 .as_ref()
                 .ok()
                 .map(|color| (color.width, color.height) == (color_info.width, color_info.height))
         ),
-        verdict(
-            answered_depth.map(|depth| (depth.width, depth.height) == (frame.width, frame.height))
-        ),
-        verdict(answered_depth.map(|depth| depth.align_mode == frame.header.align_mode)),
+        verdict(answered_depth.map(|depth| {
+            (depth.width, depth.height) == (depth_frame.width, depth_frame.height)
+        })),
+        verdict(answered_depth.map(|depth| depth.align_mode == depth_frame.header.align_mode)),
         verdict(
             answered_depth
                 .zip(extrinsics.as_ref().ok())
                 .map(|(depth, extrinsics)| depth.align_mode == extrinsics.align_mode)
+        ),
+        verdict(
+            extrinsics
+                .as_ref()
+                .ok()
+                .map(|extrinsics| extrinsics.depth_to_color.frame == depth_frame.header.frame)
         ),
     );
     let depth =
         depth.map_err(|reply| format!("the camera refuses its depth intrinsics: {reply}"))?;
 
     let pixel = (
-        pixel_at(params.pixel_u_fraction, frame.width),
-        pixel_at(params.pixel_v_fraction, frame.height),
+        pixel_at(params.pixel_u_fraction, depth_frame.width),
+        pixel_at(params.pixel_v_fraction, depth_frame.height),
     );
     let (reading_m, readings) = median_reading_m(
-        &frame.frame,
-        frame.width,
-        frame.height,
+        &depth_frame.data,
+        depth_frame.width,
+        depth_frame.height,
         pixel,
         params.window,
         depth_info.depth_unit,
@@ -273,8 +281,13 @@ async fn report(
         depth_model,
     );
     println!(
-        "depth pixel ({}, {}) of frame {} reads {:.4} m (median of {} readings)",
-        pixel.0, pixel.1, frame.header.frame_id, reading_m, readings,
+        "depth pixel ({}, {}) of capture {} in {} reads {:.4} m (median of {} readings)",
+        pixel.0,
+        pixel.1,
+        depth_frame.header.capture_index,
+        depth_frame.header.frame,
+        reading_m,
+        readings,
     );
     println!(
         "  in the depth optical frame : X {:+.4} m (right)  Y {:+.4} m (down)  Z {:+.4} m (forward)",
@@ -293,11 +306,12 @@ async fn report(
             return Ok(());
         }
     };
-    let in_color_frame = Pose::new(
-        extrinsics.depth_to_color_position,
-        extrinsics.depth_to_color_orientation,
+    let in_color_frame = Pose::parse(
+        extrinsics.depth_to_color.position,
+        extrinsics.depth_to_color.orientation,
     )
     .map_err(|error| format!("the depth-to-colour extrinsics: {error}"))?
+    .transform()
     .apply(in_depth_frame);
     let color_camera = Pinhole::parse(&Intrinsics {
         width: color.width,

@@ -1,15 +1,15 @@
 import av
 from av.codec.context import ThreadType
 import asyncio
-import json
 import queue
 import threading
 import time
-from importlib.resources import files
 from pathlib import Path
 
 
-from peppygen import NodeBuilder, NodeRunner, StandaloneConfig, clock
+from camera_core_py.sensor_mounts import CAMERA, DESCRIBE_SENSORS_TIMEOUT_S, read_sensor
+from peppygen import NodeBuilder, NodeRunner, clock
+from peppygen.consumed_services.sensor_mounts import describe_sensors
 from peppygen.exposed_services.camera import (
     set_brightness,
     set_contrast,
@@ -101,6 +101,30 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     actual_fps = get_source_video_fps(video_path)
     print(f"[uvc_camera] Detected source video frame rate: {actual_fps} fps")
 
+    # The frame every picture names, read once before the first picture: with
+    # the sensor_mounts link bound, the one the robot's sensor_mounts gives the
+    # camera's name; with the link vacant, the camera's name. A node stopped
+    # before a bound sensor_mounts answers has nothing to stream.
+    mounts = describe_sensors.bound_producer(node_runner)
+
+    async def describe() -> describe_sensors.ResponseData:
+        answer = await describe_sensors.poll(
+            node_runner, mounts, DESCRIBE_SENSORS_TIMEOUT_S
+        )
+        return answer.data
+
+    camera = await read_sensor(
+        CAMERA,
+        node_runner.copy(),
+        node_runner.bound_instance_id(),
+        None if mounts is None else describe,
+        node_runner.cancellation_token(),
+    )
+    if camera is None:
+        return []
+    picture_frame = camera.frame
+    print(f"[uvc_camera] Each picture names frame {picture_frame}")
+
     width = video_params.resolution.width
     height = video_params.resolution.height
     av_format = ENCODING_TO_AV_FORMAT[encoding]
@@ -142,7 +166,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         # serialization off the loop's GIL time as well. Decoding is paced to
         # the target frame rate so the worker does not peg a CPU core decoding
         # far ahead of what the consumer emits (which would only get dropped).
-        frame_id = 0
+        capture_index = 0
         while not stop.is_set():
             print("[uvc_camera] Opening video file for playback...")
             with av.open(str(video_path)) as container:
@@ -176,12 +200,16 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                         # Sim mode before the first tick: skip, never mis-timestamp.
                         time.sleep(frame_duration)
                         continue
-                    header = MessageHeader(timestamp=timestamp, frame_id=frame_id)
+                    header = MessageHeader(
+                        frame=picture_frame,
+                        timestamp=timestamp,
+                        capture_index=capture_index,
+                    )
                     payload = video_stream.build_message(
                         header, encoding, width, height, bytes(rgb_frame.planes[0])
                     )
                     offer_latest_frame(frame_queue, payload)
-                    frame_id = (frame_id + 1) % (2**32)
+                    capture_index = (capture_index + 1) % (2**32)
                     time.sleep(frame_duration)
             print("[uvc_camera] Video ended, restarting from beginning...")
 
@@ -343,16 +371,7 @@ async def listen_for_video_stream_info_requests(
 
 
 def main():
-    # Fallback configuration for standalone execution (e.g., `uv run`).
-    # Ignored when the node is launched by the peppy daemon, which provides its own parameters.
-    standalone_config = StandaloneConfig()
-
-    mock_params_path = files("uvc_camera_python_mock") / "mock_parameters.json"
-    if mock_params_path.is_file():
-        mock_params = json.loads(mock_params_path.read_text())
-        standalone_config = standalone_config.with_parameters(mock_params)
-
-    NodeBuilder().standalone(standalone_config).run(setup)
+    NodeBuilder().run(setup)
 
 
 if __name__ == "__main__":

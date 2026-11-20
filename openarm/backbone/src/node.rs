@@ -12,8 +12,12 @@ use std::time::{Duration, SystemTime};
 
 use control_core::fault::Fault;
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
+use control_core::robot_tree::RobotTree;
 use control_core::serving;
-use control_core::time::{RateOutOfRange, period_from_hz};
+use control_core::time::{
+    DurationError, RateOutOfRange, duration_from_secs, period_from_hz, wait_from_secs,
+};
+use frame_tree::{FrameName, FrameNameError};
 use peppygen::consumed_topics::collision_ctrl::governor_control;
 use peppygen::exposed_services::limb_state::get_limb_names;
 use peppygen::{NodeRunner, Parameters, Result};
@@ -26,12 +30,15 @@ use tracing::{error, info};
 use workspace_core::surface_block::ArmBodies;
 
 use crate::actions;
+use crate::clock;
 use crate::coordinator::{self, ArmChannels};
+use crate::follow::follow_tree;
 use crate::governor;
 use crate::identity;
 use crate::liveness;
 use crate::move_slot::MoveSlot;
 use crate::path_checks::PathChecks;
+use crate::placement::Placer;
 use crate::planner::{PathGuard, PlanConfig, Planner};
 use crate::robot::{self, ARMS, LIMBS};
 use crate::startup;
@@ -70,6 +77,12 @@ pub enum NodeError {
     #[error("parameter start_tolerance_rad")]
     StartTolerance(#[source] NotPositiveFinite),
 
+    #[error("parameter cache_window_s")]
+    CacheWindow(#[source] DurationError),
+
+    #[error("parameter lookup_timeout_s")]
+    LookupTimeout(#[source] DurationError),
+
     #[error("parameter max_joint_velocity_rad_s_{joint}")]
     JointVelocityCap {
         joint: usize,
@@ -92,6 +105,9 @@ pub enum NodeError {
 
     #[error("the model the robot's initializer serves")]
     Model(#[source] robot::ModelError),
+
+    #[error("the root link of the robot's description, the robot frame")]
+    RobotFrame(#[source] FrameNameError),
 
     #[error(
         "the robot's initializer serves the description {served} of {model}, and this \
@@ -206,6 +222,8 @@ struct Launch {
     velocity_filter_cutoff_hz: f64,
     upstream_mode: UpstreamMode,
     governor: governor::Settings,
+    cache_window: Duration,
+    lookup_timeout: Duration,
 }
 
 impl Launch {
@@ -244,6 +262,10 @@ impl Launch {
             .map_err(NodeError::EeVelocity)?;
         let start_tolerance =
             PositiveFinite::parse(params.start_tolerance_rad).map_err(NodeError::StartTolerance)?;
+        let cache_window =
+            duration_from_secs(params.cache_window_s).map_err(NodeError::CacheWindow)?;
+        let lookup_timeout =
+            wait_from_secs(params.lookup_timeout_s).map_err(NodeError::LookupTimeout)?;
         // Enforce the documented contract: the cutoff must sit below the control loop's
         // Nyquist frequency, or the low-pass does not attenuate (and above it is
         // meaningless). A hard bound at Nyquist; the node default sits well under it.
@@ -280,20 +302,31 @@ impl Launch {
             velocity_filter_cutoff_hz: params.velocity_filter_cutoff_hz,
             upstream_mode: params.upstream_mode.parse::<UpstreamMode>()?,
             governor,
+            cache_window,
+            lookup_timeout,
         })
     }
 }
 
 /// The node's entry point, in the shape `NodeBuilder::run` (and the test harness) take
-/// once `fault` is bound: parse every parameter, serve the limb names, and, on a task
-/// of its own, ask the robot's initializer for the model and run the node for it. The
-/// initializer may start after this node, so `setup` returns without its answer, and a
-/// robot this node cannot run raises `fault`.
+/// once `fault` is bound: parse every parameter, serve the limb names, follow the
+/// robot's tree, and, on a task of its own, ask the robot's initializer for the model
+/// and run the node for it. The initializer may start after this node, so `setup`
+/// returns without its answer, and a robot this node cannot run raises `fault`, as
+/// does the end of a simulation clock's ticks.
 pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>, fault: Fault) -> Result<()> {
     let launch = Launch::parse(&params)?;
     // Pairing timestamps read this instance's bound clock, so setpoint
     // consumers age samples on one timeline.
     peppygen::clock::init(&node_runner).await?;
+    // The robot's tree, on the same clock, filled from the start, so a
+    // command's placement finds every transform published since.
+    let clock = clock::node_clock(&node_runner, fault.clone()).await?;
+    let tree = Arc::new(
+        RobotTree::new(launch.cache_window, clock)
+            .expect("duration_from_secs gives a window above 0"),
+    );
+    follow_tree(&node_runner, tree.clone()).await?;
     info!(
         "a follower silent for over {:?} is frozen (followers report at {} Hz, control loop {} Hz)",
         launch.stale_limit, launch.follower_state_rate_hz, params.control_rate_hz
@@ -308,7 +341,7 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>, fault: Faul
     }
     serve_limb_names(&node_runner);
     let token = node_runner.cancellation_token().clone();
-    let run = run_once_identified(node_runner, launch, fault.clone());
+    let run = run_once_identified(node_runner, launch, tree, fault.clone());
     tokio::spawn(
         fault.raise_on_panic("the start for the robot's model", run, move || {
             token.cancel()
@@ -341,12 +374,17 @@ fn serve_limb_names(node_runner: &Arc<NodeRunner>) {
 /// Asks the robot's initializer for the model until it answers, then runs the node for
 /// it. A model this node does not drive, or a description it cannot build from,
 /// raises `fault`.
-async fn run_once_identified(node_runner: Arc<NodeRunner>, launch: Launch, fault: Fault) {
+async fn run_once_identified(
+    node_runner: Arc<NodeRunner>,
+    launch: Launch,
+    tree: Arc<RobotTree>,
+    fault: Fault,
+) {
     let Some(identified) = identity::identify(&node_runner).await else {
         return;
     };
     let ran = match identified {
-        Ok(driven) => run(&node_runner, launch, driven),
+        Ok(driven) => run(&node_runner, launch, tree, driven),
         Err(refusal) => Err(refusal),
     };
     if let Err(refusal) = ran {
@@ -357,8 +395,14 @@ async fn run_once_identified(node_runner: Arc<NodeRunner>, launch: Launch, fault
 
 /// Builds the arm models and the governor from the description of `driven`, wires the
 /// channels, and spawns the services answered from bringup plus the readiness-gated
-/// coordination loop, every action handler and every stream listener.
-fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, ARMS>) -> NodeResult {
+/// coordination loop, every action handler and every stream listener. Every command is
+/// placed by `tree` in the robot frame, the root link of the description.
+fn run(
+    node_runner: &Arc<NodeRunner>,
+    launch: Launch,
+    tree: Arc<RobotTree>,
+    driven: Driven<ARM_DOF, ARMS>,
+) -> NodeResult {
     let Launch {
         cycle_period,
         stale_limit,
@@ -370,6 +414,8 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
         velocity_filter_cutoff_hz,
         upstream_mode,
         governor: governor_settings,
+        cache_window: _,
+        lookup_timeout,
     } = launch;
     // The robot's description, held to the arms this node drives, for the life of the
     // process: the arm models, the self-collision model, the workspace, the transforms
@@ -379,6 +425,12 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
     info!("driving {}", model.id());
     let ready = robot::postures_of(driven, states::READY).map_err(NodeError::Model)?;
     let home = robot::postures_of(driven, states::HOME).map_err(NodeError::Model)?;
+    let robot_frame = description.root_link();
+    let placer = Arc::new(Placer::new(
+        tree.clone(),
+        FrameName::parse(robot_frame).map_err(NodeError::RobotFrame)?,
+        lookup_timeout,
+    ));
 
     // The arm models (FK/IK/Jacobian/limits), each from its arm of the description:
     // its chain from its base link with the URDF's joint limits, for IK seeding,
@@ -461,6 +513,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
         stream_ee_velocity_m_s: max_stream_ee_velocity.get(),
         limits,
         start_tolerance_rad: start_tolerance.get(),
+        robot_frame,
     };
     let planners = models.map(|arm, model| Planner::new(arm, model, plan_cfg(limits[arm])));
 
@@ -521,6 +574,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
         node_runner.clone(),
         node_runner.cancellation_token().clone(),
         workspace,
+        placer.clone(),
     );
 
     // Gate exposing actions + streaming on the robot being ready, on a task of
@@ -543,6 +597,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
             PathChecks::new(path_checker),
             config_rx,
             joint_transforms,
+            tree,
             coordinator::RunConfig {
                 cycle_period,
                 stale_limit,
@@ -570,6 +625,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
         ));
         set.spawn(actions::arm::run_move_arm(
             runner.clone(),
+            placer.clone(),
             goal_txs.clone(),
             move_slots.clone(),
             fresh.clone(),
@@ -595,6 +651,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
             fresh.clone(),
             None,
             request_tx.clone(),
+            robot_frame,
         ));
         set.spawn(actions::postures::run_move_to_home(
             runner.clone(),
@@ -603,6 +660,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
             fresh.clone(),
             Some(posture_grippers),
             request_tx.clone(),
+            robot_frame,
         ));
         set.spawn(actions::gripper::run_move_gripper(
             runner.clone(),
@@ -620,6 +678,7 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
             actions::arm::run_check_arm_move(
                 runner.clone(),
                 token.clone(),
+                placer.clone(),
                 request_tx,
                 fresh.clone(),
                 arm_activity.clone(),
@@ -640,7 +699,12 @@ fn run(node_runner: &Arc<NodeRunner>, launch: Launch, driven: Driven<ARM_DOF, AR
             ),
             UpstreamMode::Pose => spawn_supervised(
                 &mut set,
-                streams::run_pose_command_listener(runner.clone(), command_txs, arm_activity),
+                streams::run_pose_command_listener(
+                    runner.clone(),
+                    placer,
+                    command_txs,
+                    arm_activity,
+                ),
             ),
         }
         spawn_supervised(

@@ -9,6 +9,7 @@ from control_core_py.params import require_positive, require_rate
 from so101.device import BUS_MAX_RATE_HZ
 
 from so101_backbone.model import ARM
+from so101_backbone.placement import MAX_LOOKUP_TIMEOUT_S
 
 
 class UpstreamMode(Enum):
@@ -33,6 +34,9 @@ class Config:
     # from where the arm holds once the path is planned, before the goal
     # fails.
     start_tolerance_rad: float
+    # How long (s) the placement of a command waits for the robot's tree,
+    # from 0 to MAX_LOOKUP_TIMEOUT_S.
+    lookup_timeout_s: float
 
 
 def parse(params) -> Config:
@@ -59,7 +63,21 @@ def parse(params) -> Config:
             "max_gripper_rate_frac_s", params.max_gripper_rate_frac_s
         ),
         start_tolerance_rad=require_positive("start_tolerance_rad", params.start_tolerance_rad),
+        lookup_timeout_s=_lookup_timeout(params.lookup_timeout_s),
     )
+
+
+def _lookup_timeout(value) -> float:
+    """The `lookup_timeout_s` parameter: from 0 to MAX_LOOKUP_TIMEOUT_S, the
+    wait transform_lookup's lookup_transform takes, or a ValueError naming
+    it, so the node stops at its start."""
+    timeout_s = float(value)
+    if not 0.0 <= timeout_s <= MAX_LOOKUP_TIMEOUT_S:
+        raise ValueError(
+            f"lookup_timeout_s is {value}: set it from 0 to {MAX_LOOKUP_TIMEOUT_S:g} s, "
+            "the wait transform_lookup's lookup_transform takes"
+        )
+    return timeout_s
 
 
 def _per_joint(params, prefix: str) -> tuple[float, ...]:

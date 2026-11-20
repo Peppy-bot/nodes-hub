@@ -21,16 +21,18 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
+from control_core_py.geometry import Pose
 from peppygen.exposed_actions.robots import attach
 from peppygen.exposed_services.robots import is_ready
 from robot_description_py import RobotDescription
 
 from sim_robot_core.models import hold_to_bundled
 from sim_robot_core.registry import Caller, Registry, Robot, StillJoining
+from sim_robot_core.world import attach_placement, failure_kind_of
 
 from edits import Edits
 from mujoco_models import MujocoModel, MujocoModels
-from world import SPOT_PITCH_M, Placement, World, name_in_the_scene, within_one_spot
+from world import SPOT_PITCH_M, World, name_in_the_scene, within_one_spot
 
 # How long a robot's stay waits between checks of its own pair grace time, as
 # a share of that time: a robot whose limbs are gone leaves within a quarter
@@ -57,7 +59,7 @@ class _Promise:
     """What an admitted robot that does not stand yet was promised: where it
     stands, and the model it stands as, as its description describes it."""
 
-    placement: Placement
+    placement: Pose
     known: MujocoModel
 
 
@@ -77,14 +79,6 @@ class Ending(enum.Enum):
     STOPPED = "stopped"
     #: Its holder could not be told it stands, so it is taken out.
     FAILED = "failed"
-
-
-def _asked_placement(asked) -> Optional[Placement]:
-    """The placement an attach goal names, or None when it leaves the spot
-    to the engine. Raises ValueError for a placement the scene cannot take."""
-    if asked is None:
-        return None
-    return Placement.of(asked.position, asked.yaw)
 
 
 class RobotsIO:
@@ -149,7 +143,7 @@ class RobotsIO:
         self._rebind = rebind
         self._unbind = unbind or (lambda: None)
 
-    def stand(self, name: str, known: MujocoModel, placement: Placement) -> None:
+    def stand(self, name: str, known: MujocoModel, placement: Pose) -> None:
         """Stands a robot of the model `known` and composes the scene around
         it, on the thread that steps the scene. A robot the scene cannot take
         (a model asking for other simulation settings, a camera whose body
@@ -281,10 +275,12 @@ class RobotsIO:
         robot. Admitting reserves the name, or hands this caller's standing
         robot over to the goal being admitted.
 
-        A request this engine never takes (a name it cannot stand a robot
-        under, a model it has no entry for, a description that does not read,
-        that the entry does not fit or that is not the one this simulation was
-        built with, a placement that is not finite) is refused with
+        A placement in a frame other than world is refused with
+        `unknown_frame`. A request this engine never takes (a name it cannot
+        stand a robot under, a model it has no entry for, a description that
+        does not read, that the entry does not fit or that is not the one this
+        simulation was built with, a placement that no contract takes or that
+        turns about an axis other than +z) is refused with
         `rejected`. The robot of the caller while it still joins is refused
         with `busy`: the same attach takes it over once it stands. A request the scene cannot take now (a name or a spot
         another robot holds, a second robot of the caller, another model for
@@ -299,9 +295,11 @@ class RobotsIO:
             description = RobotDescription.parse(request.data.urdf, request.data.srdf)
             known = self._models.of(request.data.model, description)
             hold_to_bundled(request.data.model, description)
-            asked = _asked_placement(request.data.placement)
+            asked = attach_placement(request.data.placement)
         except ValueError as error:
-            return attach.GoalDecision.refuse(attach.FailureKind.REJECTED, str(error))
+            return attach.GoalDecision.refuse(
+                attach.FailureKind(failure_kind_of(error)), str(error)
+            )
         try:
             adopted = self._robots.admit(robot_name, known.entry, caller)
         except StillJoining as error:
@@ -322,7 +320,7 @@ class RobotsIO:
         self._admitted = robot_name
         return attach.GoalDecision.accept()
 
-    def _placement(self, asked: Optional[Placement], name: str) -> Placement:
+    def _placement(self, asked: Optional[Pose], name: str) -> Pose:
         """Where the robot stands: what it asked for, or a spot of the
         engine's own. A spot another robot stands on is refused, because two
         robots in one place resolve their overlap by throwing each other.
@@ -334,13 +332,13 @@ class RobotsIO:
         holder = self._whoever_holds(asked, name)
         if holder is not None:
             raise ValueError(
-                f"{holder} within {SPOT_PITCH_M:g} m of {list(asked.position)}: stand "
+                f"{holder} within {SPOT_PITCH_M:g} m of {list(asked.position.position)}: stand "
                 "this robot further off, or turn its `placement.auto` on and take the spot "
                 "this scene gives it"
             )
         return asked
 
-    def _whoever_holds(self, placement: Placement, name: str) -> Optional[str]:
+    def _whoever_holds(self, placement: Pose, name: str) -> Optional[str]:
         """Who is in the way of a robot joining as `name`: the robot standing
         there, or the copy promised the spot while it waits to stand. None
         while the spot is free. A robot standing under `name` itself is the

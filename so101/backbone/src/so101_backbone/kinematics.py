@@ -32,10 +32,12 @@ from dataclasses import dataclass
 
 import numpy as np
 import placo
-from so101.transforms import (
-    matrix_from_pose,
-    pose_from_matrix,
-    relative_rotation_rad,
+from control_core_py.geometry import (
+    angle_shortest_path,
+    quaternion_of,
+    quaternion_of_yaw,
+    rotate,
+    rotation_of,
     slerp,
 )
 
@@ -185,6 +187,24 @@ def _bar(value: float) -> float:
     return value
 
 
+def _matrix_of(position, orientation) -> np.ndarray:
+    """The 4x4 transform placo takes for the pose at `position` turned by the
+    unit quaternion `orientation`, [x, y, z, w]: its rotation matrix as tf2's
+    setRotation builds it."""
+    matrix = np.eye(4)
+    matrix[:3, :3] = rotation_of(tuple(float(q) for q in orientation))
+    matrix[:3, 3] = position
+    return matrix
+
+
+def _pose_of(matrix: np.ndarray) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """The position and the quaternion [x, y, z, w] of a 4x4 transform of
+    placo, the quaternion as tf2's getRotation reads it."""
+    rows = tuple(tuple(float(v) for v in row) for row in matrix[:3, :3])
+    x, y, z = (float(v) for v in matrix[:3, 3])
+    return (x, y, z), quaternion_of(rows)
+
+
 def _arm_model(urdf_path: str):
     """The arm's placo model for the solvers, which move it by its kinematics
     alone: its collision meshes load with no self-collision pairs."""
@@ -245,7 +265,7 @@ class Kinematics:
     def forward_kinematics(self, positions_rad: tuple[float, ...]):
         """(position m, quaternion xyzw) of the end effector."""
         _set_joints(self._robot, positions_rad)
-        return pose_from_matrix(self._robot.get_T_world_frame(END_EFFECTOR_FRAME))
+        return _pose_of(self._robot.get_T_world_frame(END_EFFECTOR_FRAME))
 
     def inverse_kinematics(
         self,
@@ -264,7 +284,7 @@ class Kinematics:
         takes any orientation passes math.pi or more."""
         position_bar = _bar(position_tolerance_m)
         orientation_bar = _bar(orientation_tolerance_rad)
-        target_matrix = matrix_from_pose(position, orientation)
+        target_matrix = _matrix_of(position, orientation)
         target_position = tuple(position)
         target_orientation = tuple(orientation)
         solution_rad = tuple(seed_rad)
@@ -273,7 +293,7 @@ class Kinematics:
             reached, reached_orientation = self.forward_kinematics(solution_rad)
             if math.dist(reached, target_position) > position_bar:
                 continue
-            if relative_rotation_rad(reached_orientation, target_orientation) <= orientation_bar:
+            if angle_shortest_path(reached_orientation, target_orientation) <= orientation_bar:
                 return solution_rad
         return None
 
@@ -322,7 +342,7 @@ class Kinematics:
         few QP iterations, unverified, so an out-of-reach target tracks the
         workspace boundary instead of freezing the arm. None only for a
         solution the solver corrupted (non-finite)."""
-        target_matrix = matrix_from_pose(position, orientation)
+        target_matrix = _matrix_of(position, orientation)
         solution_rad = tuple(seed_rad)
         for _ in range(IK_STREAM_ITERATIONS):
             solution_rad = self._step(solution_rad, target_matrix)
@@ -904,11 +924,8 @@ class _PanAxis:
     def seen_at_pan_zero(self, vector: np.ndarray, pan: float) -> np.ndarray:
         """`vector`, a world vector, turned back about the axis by what `pan`
         turns the arm: where it lies for the arm at pan zero."""
-        angle = -self.turn * pan
-        cos, sin = math.cos(angle), math.sin(angle)
-        return np.array(
-            [cos * vector[0] - sin * vector[1], sin * vector[0] + cos * vector[1], vector[2]]
-        )
+        turned_back = quaternion_of_yaw(-self.turn * pan)
+        return np.array(rotate(turned_back, tuple(float(c) for c in vector)))
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ the wire. It serves the [Rerun](https://rerun.io) web viewer (Rerun 0.41.0) and 
 
 - the color image of one camera, and its depth image when `depth_image` is set;
 - the depth samples of that camera as points in the robot frame, where the robot's tree
-  of frames places the camera when the depth frame was taken;
+  of frames places the frame each depth frame names, at the time it was taken;
 - the motion planner's voxel map: the occupied cubes that its plans keep their clearance
   from, as the planner publishes them;
 - each arm's grasp point with its axes and a trail of its past positions;
@@ -73,8 +73,9 @@ uvx --from rerun-sdk==0.41.0 rerun recording.rrd
 
 The viewer lays the page out (a Rerun blueprint, kept by the data server for each page):
 
-- left, the 3D view `Robot`: the robot frame `world` with the links, the arms' grasp
-  points and trails, the camera's points, the planner's cubes and the planning scene;
+- left, the 3D view `Robot`: the robot frame, at the entity `world`, with the links,
+  the arms' grasp points and trails, the camera's points, the planner's cubes and the
+  planning scene;
 - right, from the top: the camera's image (and the depth image in a second tab with
   `depth_image`); the plots `Joints`, one line for each joint of each arm, and
   `Grippers`, one line for each gripper; and the texts `Scene changes`, `Planner map`,
@@ -118,9 +119,8 @@ their shells.
 | `cloud_stride` | 4 | the points come from every n-th pixel across and down |
 | `scene_poll_hz` | 2.0 | how many times a second it reads the planning scene |
 | `trail_length` | 100 | how many past grasp-point positions each trail holds |
-| `camera_name` | `chest` | the camera of `sensor_mounts` that the `camera` link is |
 | `cache_window_s` | none | how long each moving transform's past stamps are kept, counted back from its newest; finite and above 0 |
-| `lookup_timeout_s` | none | how long a depth frame waits for the tree to place the camera at its time; finite and 0 or above, 0 for no wait |
+| `lookup_timeout_s` | none | how long a depth frame waits for the tree to place the frame it names at its time; finite and 0 or above, 0 for no wait |
 
 The color images go to the page as JPEG. The rates bound the work of the node and the
 data on the link: a color frame of the simulated OpenArm chest camera is 1280x720 (2.8 MB
@@ -140,24 +140,36 @@ address on `web_port`.
 | `identity` | `robot_identity:v1` | zero_or_one | no robot links |
 | `camera` | `rgbd_camera:v1` | zero_or_one | no images, no points |
 | `geometry` | `camera_geometry:v1` | zero_or_one | no points |
-| `sensor_mounts` | `sensor_mounts:v1` | zero_or_one | no points |
+| `sensor_mounts` | `sensor_mounts:v1` | zero_or_one | no points; the arms, the scene and the voxel map are drawn in the frame each names |
 | `transforms` | `transforms:v1` | zero_or_more | no points |
 | `motion_planning` | `motion_planning:v1` | zero_or_one | no scene, no voxel map; each joint is named by its index |
 
-The viewer asks the camera's geometry and its frame on the robot when a depth frame first
-needs them, and asks again after a failed ask, so a camera that answers late is drawn once
-it answers. It asks the geometry again when the frames change their size or their
-alignment. It keeps the robot's tree from the transforms of every publisher of the
-`transforms` link, and places the camera's frame in the robot frame at the time each
-depth frame was taken, so the points of a camera on a moving arm stand where the arm held
-it. A depth frame waits up to `lookup_timeout_s` of the node's clock, the simulation's
-under `--clock simulation`, for the transforms of its time; a newer depth frame takes the
-place of one that waits, and one whose wait runs out draws no points, with the lookup's
-failure in the log. The moving transforms are dropped when the node's clock goes back. A
-simulation clock that closes ends the node with an error, for its restart policy to start
-it again. It reads the planning scene at
-`scene_poll_hz` and draws it at each read, at its time on the node's clock, and logs the
-changes from the read before.
+The viewer asks the camera's geometry when a depth frame first needs it, and again after a
+failed ask. It asks the robot frame, which `sensor_mounts`' `describe_sensors` names, in the
+background when a depth frame, a snapshot of the arms, a voxel map or a read of the
+planning scene first needs it, once for all of them, and again when one needs it after a
+failed ask. Until `sensor_mounts` answers, the viewer drops each of them, a depth frame
+drawing its image and no points, so a camera or a `sensor_mounts` that answers late is
+drawn from the next value after its answer. With the `sensor_mounts` link bound, a snapshot of
+`limb_states`, a map of `occupancy_map` or a read of `get_planning_scene` that names
+another frame than the robot frame is not drawn, with both frames in the log; without the
+link, the viewer draws each in the frame it names, which its contract gives as the robot
+frame. It asks the geometry
+again when the frames change their size, their alignment or the frame they name. A depth
+frame names the camera's frame in its header, and `get_depth_to_color_extrinsics` places
+the depth stream in that frame; a frame that names another draws no points, with both
+frames in the log. It keeps the robot's tree from the transforms of every publisher of the
+`transforms` link, and places the frame each depth frame names in the robot frame at the
+time the depth frame was taken, so the points of a camera on a moving arm stand where the
+arm held it. A depth frame waits up to `lookup_timeout_s` of the node's clock, the
+simulation's under `--clock simulation`, for the transforms of its time; a newer depth
+frame takes the place of one that waits, and one that the tree does not place draws no
+points, with the lookup's failure kind (`unknown_frame` for a frame no transform of the
+tree names, `no_chain`, `extrapolation` or `broken_tree`) and its cause in the log. The
+moving transforms are dropped when the node's clock goes back. A simulation clock that
+closes ends the node with an error, for its restart policy to start it again. It reads the
+planning scene at `scene_poll_hz` and draws it at each read, at its time on the node's
+clock, and logs the changes from the read before.
 
 The arms are drawn at most `arms_rate_hz` times a second: the grasp points, the links and
 the plots. Each snapshot still adds its point to the trails. With the `motion_planning`

@@ -5,9 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use camera_core::pose::{Pose, PoseError};
 use chain_kinematics::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use chain_kinematics::{Tree, TreeError};
+use frame_tree::{NotATransform, Transform};
 use robot_description::urdf_rs::{self, Geometry};
 use robot_description::{DescriptionError, FingerSpan, RobotDescription, mesh_name};
 
@@ -40,7 +40,7 @@ pub enum BodyError {
         value: f64,
     },
     #[error("link {link}: the origin of a collision shape: {reason}")]
-    Origin { link: String, reason: PoseError },
+    Origin { link: String, reason: NotATransform },
 }
 
 /// Why the links cannot be placed for a snapshot.
@@ -220,7 +220,7 @@ impl RobotBody {
     pub fn link_poses(
         &self,
         snapshot: &ArmsSnapshot,
-    ) -> Result<Vec<(&BodyLink, Pose)>, PlacingError> {
+    ) -> Result<Vec<(&BodyLink, Transform)>, PlacingError> {
         let mut positions = vec![0.0; self.tree.joints().len()];
         for arm in &self.arms {
             let state = snapshot
@@ -372,7 +372,7 @@ fn collision_shapes(
 
 /// A URDF `<origin>`: its `xyz`, turned by the roll, pitch and yaw of its `rpy` about the
 /// fixed x, y and z axes, as chain_kinematics reads a joint's origin.
-fn urdf_pose(origin: &urdf_rs::Pose) -> Result<Pose, PoseError> {
+fn urdf_pose(origin: &urdf_rs::Pose) -> Result<Transform, NotATransform> {
     let [x, y, z] = origin.xyz.0;
     let [roll, pitch, yaw] = origin.rpy.0;
     pose_of(&Isometry3::from_parts(
@@ -381,10 +381,10 @@ fn urdf_pose(origin: &urdf_rs::Pose) -> Result<Pose, PoseError> {
     ))
 }
 
-fn pose_of(isometry: &Isometry3<f64>) -> Result<Pose, PoseError> {
+fn pose_of(isometry: &Isometry3<f64>) -> Result<Transform, NotATransform> {
     let position = isometry.translation.vector;
     let turn = isometry.rotation.quaternion();
-    Pose::new(
+    Transform::new(
         [position.x, position.y, position.z],
         [turn.i, turn.j, turn.k, turn.w],
     )
@@ -419,7 +419,7 @@ mod tests {
         }
     }
 
-    fn pose_of_link<'a>(poses: &'a [(&BodyLink, Pose)], name: &str) -> &'a Pose {
+    fn pose_of_link<'a>(poses: &'a [(&BodyLink, Transform)], name: &str) -> &'a Transform {
         &poses
             .iter()
             .find(|(link, _)| link.name == name)
@@ -621,7 +621,7 @@ mod tests {
 
     /// True when `pose` and `expected` place the frame within `tolerance` (m), its origin
     /// and the tips of its unit axes.
-    fn same_pose(pose: &Pose, expected: &Isometry3<f64>, tolerance: f64) -> bool {
+    fn same_pose(pose: &Transform, expected: &Isometry3<f64>, tolerance: f64) -> bool {
         [[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
             .into_iter()
             .all(|point| {
@@ -687,7 +687,7 @@ mod tests {
                 assert!(
                     same_pose(
                         pose_of_link(&poses, link),
-                        &posed.link_pose_world(segment),
+                        &posed.link_pose_root(segment),
                         1e-9
                     ),
                     "{link}"

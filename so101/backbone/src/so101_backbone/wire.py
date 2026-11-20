@@ -1,24 +1,34 @@
 """Wire-input parsing beyond what the so101 library covers: the leader's pose
-stream and the follower's state streams. Parse, don't validate: a pose
-setpoint either becomes a typed target or a SetpointError naming the fault,
-and a state message becomes the value it measures or None."""
+stream and the follower's state streams, and how long the node waits for a
+service's answer. Parse, don't validate: a pose setpoint either becomes a pose
+in its frame at its time or a SetpointError naming the fault, and a state
+message becomes the value it measures or None."""
 
 from __future__ import annotations
 
 import math
 
+from control_core_py.geometry import GeometryError, Pose, Stamped
 from control_core_py.runtime import SetpointError
 from so101 import units
-from so101.transforms import PoseError, matrix_from_pose
+
+from so101_backbone.model import frame_of
+
+# How long the node waits for a service's answer on the wire, beyond the time
+# the provider holds the request: the answers of the robot's initializer carry
+# the collision meshes.
+ANSWER_WAIT_S = 10.0
 
 
-def parse_pose_setpoint(position, orientation):
-    """(position, orientation) validated as a rigid pose."""
+def parse_pose_setpoint(frame, timestamp, position, orientation) -> Stamped[Pose]:
+    """The setpoint as the geometry types hold it, in its frame or, with none,
+    in the robot frame, its orientation normalized, or a SetpointError saying
+    what to send: a value that is not finite, an orientation whose squared
+    norm lies 0.01 or more from 1, or an empty frame."""
     try:
-        matrix_from_pose(position, orientation)
-    except PoseError as e:
+        return Stamped.parse(frame_of(frame), timestamp, Pose.parse(position, orientation))
+    except GeometryError as e:
         raise SetpointError(str(e)) from e
-    return tuple(float(v) for v in position), tuple(float(v) for v in orientation)
 
 
 def parse_arm_states(m) -> tuple[float, ...] | None:

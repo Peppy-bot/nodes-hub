@@ -88,7 +88,7 @@ class Subscription:
 
 
 class FailureKind(str, enum.Enum):
-    """The failure kinds of attach: the kinds of peppy, then the kind of
+    """The failure kinds of attach: the kinds of peppy, then the kinds of
     simulation_robot that attach lists, as the generated module names them."""
 
     ATTEMPT_FAILED = "attempt_failed"
@@ -97,6 +97,7 @@ class FailureKind(str, enum.Enum):
     RESOURCE_UNAVAILABLE = "resource_unavailable"
     REJECTED = "rejected"
     BUSY = "busy"
+    UNKNOWN_FRAME = "unknown_frame"
 
 
 @dataclass(frozen=True)
@@ -180,9 +181,11 @@ def _topic_module(slot_module: types.ModuleType, slot: str, topic: str) -> types
     module.arrivals = []
     module.publisher = Publisher()
     module.peers = lambda _runner: list(slot_module.members)
-    # A payload is the fields it was built from, so a test reads them back.
-    module.build_message = lambda *fields: fields
+    # A payload is the fields it was built from, so a test reads them back:
+    # a tuple of the fields given in order, or a dict of those given by name.
+    module.build_message = lambda *fields, **named: named or fields
     module.MessageHeader = lambda **fields: types.SimpleNamespace(**fields)
+    module.MessageDepthToColor = lambda **fields: types.SimpleNamespace(**fields)
 
     async def subscribe(_runner) -> Subscription:
         return Subscription(module.arrivals)
@@ -200,7 +203,7 @@ def _object_states_module() -> types.ModuleType:
     module = types.ModuleType("peppygen.emitted_topics.objects.object_states")
     module.TOPIC_NAME = "object_states"
     module.publisher = Publisher()
-    module.build_message = lambda timestamp, objects: (timestamp, objects)
+    module.build_message = lambda frame, timestamp, objects: (frame, timestamp, objects)
     module.MessageObjectsItem = lambda **fields: fields
 
     async def declare_publisher(_runner) -> Publisher:

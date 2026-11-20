@@ -7,9 +7,24 @@
     services: [
       {
         name: "check_reach",
-        description: "Whether the arm reaches a position.",
-        request_message_format: { position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] } },
+        description: "Whether the arm reaches each point.",
+        request_message_format: {
+          points: {
+            $type: "array",
+            $items: { $type: "object", frame: { $type: "string", $optional: true }, timestamp: { $type: "time", $optional: true }, position: { $type: "array", $items: "f64", $length: 3 } },
+          },
+        },
         response_message_format: { reachable: { $type: "bool", $marks: ["checks_reach"] }, margin: "f64" },
+      },
+      {
+        name: "check_positions",
+        description: "Whether the arm works each point, the points in frame at timestamp, as check_positions of workspace takes them.",
+        request_message_format: {
+          frame: { $type: "string", $optional: true },
+          timestamp: { $type: "time", $optional: true },
+          points: { $type: "array", $items: { $type: "object", position: { $type: "array", $items: "f64", $length: 3 } } },
+        },
+        response_message_format: { all_workable: { $type: "bool", $marks: ["checks_reach"] } },
       },
       {
         name: "find",
@@ -18,25 +33,134 @@
         response_message_format: {
           found: "bool",
           item_id: { $type: "string", $marks: ["item_id"] },
-          position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] },
+          item_point: { $type: "object", frame: "string", timestamp: "time", position: { $type: "array", $items: "f64", $length: 3 } },
           kind: { $type: "string", $enum: ["block", "cup", "unknown"] },
           count: "u64",
           note: { $type: "string", $optional: true },
+        },
+      },
+      {
+        name: "get_planning_scene",
+        description: "The objects of the scene in frame at timestamp and each attached object in the frame of its link, each shape posed relative to its object and each vertex of a mesh to its shape.",
+        response_message_format: {
+          frame: "string",
+          timestamp: "time",
+          objects: {
+            $type: "array",
+            $items: {
+              $type: "object",
+              id: "string",
+              position: { $type: "array", $items: "f64", $length: 3 },
+              orientation: { $type: "array", $items: "f64", $length: 4 },
+              shapes: {
+                $type: "array",
+                $items: {
+                  $type: "object",
+                  kind: "string",
+                  mesh_vertices: { $type: "array", $items: { $type: "object", position: { $type: "array", $items: "f64", $length: 3 } } },
+                  position: { $type: "array", $items: "f64", $length: 3 },
+                  orientation: { $type: "array", $items: "f64", $length: 4 },
+                },
+              },
+            },
+          },
+          attached_objects: {
+            $type: "array",
+            $items: {
+              $type: "object",
+              id: "string",
+              frame: "string",
+              position: { $type: "array", $items: "f64", $length: 3 },
+              orientation: { $type: "array", $items: "f64", $length: 4 },
+              shapes: {
+                $type: "array",
+                $items: {
+                  $type: "object",
+                  kind: "string",
+                  position: { $type: "array", $items: "f64", $length: 3 },
+                  orientation: { $type: "array", $items: "f64", $length: 4 },
+                },
+              },
+            },
+          },
+        },
+      },
+      {
+        name: "plan_path",
+        description: "A path of the arm through waypoints, as plan_cartesian_path of motion_planning gives it: each waypoint's grasp-point pose in the result's frame, at every time.",
+        request_message_format: { arm_name: "string" },
+        response_message_format: {
+          frame: "string",
+          waypoints: {
+            $type: "array",
+            $items: {
+              $type: "object",
+              joint_positions: { $type: "array", $items: "f64" },
+              position: { $type: "array", $items: "f64", $length: 3 },
+              orientation: { $type: "array", $items: "f64", $length: 4 },
+            },
+          },
+        },
+      },
+      {
+        name: "odometry",
+        description: "The pose of the base in frame and its twist in child_frame.",
+        response_message_format: {
+          frame: "string",
+          child_frame: "string",
+          timestamp: "time",
+          pose: { $type: "object", position: { $type: "array", $items: "f64", $length: 3 }, orientation: { $type: "array", $items: "f64", $length: 4 } },
+          twist: { $type: "object", linear_velocity: { $type: "array", $items: "f64", $length: 3 }, angular_velocity: { $type: "array", $items: "f64", $length: 3 } },
+        },
+      },
+      {
+        name: "cloud",
+        description: "The points a sensor measured, in the frame of its header.",
+        response_message_format: {
+          header: { $type: "object", frame: "string", timestamp: "time", capture_index: "u32" },
+          points: { $type: "array", $items: { $type: "object", position: { $type: "array", $items: "f64", $length: 3 } } },
         },
       },
     ],
     actions: [
       {
         name: "grab",
-        description: "Grab an item, by its id or at a position.",
+        description: "Grab an item, by its id or at a target.",
         goal_service: { request_message_format: {
           item_id: { $type: "string", $marks: ["item_id"] },
-          position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] },
+          target: {
+            $type: "object",
+            frame: { $type: "string", $optional: true },
+            timestamp: { $type: "time", $optional: true },
+            position: { $type: "array", $items: "f64", $length: 3 },
+            orientation: { $type: "array", $items: "f64", $length: 4, $optional: true },
+          },
           speed: "u32",
         } },
         result_service: { response_message_format: { success: "bool", item_id: { $type: "string", $marks: ["item_id"] } } },
         failure_kinds: ["unreachable"],
         marks: ["moves_robot", "reaches_for_item"],
+      },
+      {
+        name: "move_arm",
+        description: "Move the grasp point of an arm to a target, with the goal of move_arm of limb_motion.",
+        goal_service: { request_message_format: {
+          arm_name: "string",
+          target: {
+            $type: "object",
+            frame: { $type: "string", $optional: true },
+            timestamp: { $type: "time", $optional: true },
+            position: { $type: "array", $items: "f64", $length: 3 },
+            orientation: { $type: "array", $items: "f64", $length: 4, $optional: true },
+          },
+          duration_s: "f64",
+          settle_position_tolerance_m: "f64",
+          settle_orientation_tolerance_rad: "f64",
+          settle_timeout_s: "f64",
+          contact_gap_m: "f64",
+        } },
+        result_service: { response_message_format: { ended_on_contact: "bool" } },
+        marks: ["moves_robot"],
       },
       {
         name: "home",
@@ -55,6 +179,20 @@
     ],
     topics: [
       { name: "state", description: "Whether the arm is busy and holds an item.", qos_profile: "standard", message_format: { busy: "bool", holding: "bool" } },
+      {
+        name: "limb_states",
+        description: "The grasp point of each arm in frame at timestamp.",
+        qos_profile: "sensor_data",
+        message_format: {
+          frame: "string",
+          timestamp: "time",
+          arm_names: { $type: "array", $items: "string" },
+          grasp_points: {
+            $type: "array",
+            $items: { $type: "object", position: { $type: "array", $items: "f64", $length: 3 }, orientation: { $type: "array", $items: "f64", $length: 4 } },
+          },
+        },
+      },
     ],
   },
 }

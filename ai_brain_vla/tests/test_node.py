@@ -11,8 +11,8 @@ from functools import partial
 from brain_core.perception import geometry
 from brain_core.ports import Box
 from conftest import (
-    PARAMS, ROBOT_FRAME, FakeDetector, FakeManipulator, answer_the_camera, colour_intrinsics, depth_frame, rgb_frame,
-    sensors_described,
+    PARAMS, PLACE_MEASURED_AT, ROBOT_FRAME, FakeDetector, FakeManipulator, answer_the_camera, colour_intrinsics, depth_frame,
+    rgb_frame, sensors_described,
 )
 from peppygen.consumed_actions.limb_motion import move_gripper
 from peppygen.exposed_actions.brain_model import switch_model as switch_action
@@ -35,6 +35,7 @@ from peppygen.fixtures.exposed_services.brain_model import list_models as list_m
 from peppygen.fixtures.exposed_services.item_manipulation import get_state as get_state_fx
 from peppygen.parameters import Parameters
 from wire import (
+    UNREAD_TARGET,
     WAIT,
     accepted_grip,
     grab_by_pose,
@@ -45,6 +46,7 @@ from wire import (
     refusal_of,
     result_of,
     stop_grip_at,
+    target,
 )
 
 from ai_brain_vla.__main__ import setup
@@ -80,16 +82,27 @@ def with_fake_detector(detector=None):
     return partial(setup, detectors={"sam3_siglip": lambda gallery: detector or FakeDetector()})
 
 
-async def publish_a_capture(h, frame_id: int = 1) -> None:
+async def publish_a_capture(h, capture_index: int = 1) -> None:
     camera = h.mocks.deps.camera
     assert await camera.video_stream.wait_for_subscriber(WAIT)
     assert await camera.depth_stream.wait_for_subscriber(WAIT)
-    await camera.video_stream.publish(rgb_frame(16, 12, frame_id=frame_id))
-    await camera.depth_stream.publish(depth_frame(1.0, 16, 12, frame_id=frame_id))
+    await camera.video_stream.publish(rgb_frame(16, 12, capture_index=capture_index))
+    await camera.depth_stream.publish(depth_frame(1.0, 16, 12, capture_index=capture_index))
 
 
 def grab_request(gripper_name: str, item_id: str = "", position=(0.5, 0.1, 0.7)):
-    return grab_action.GoalRequestData(gripper_name=gripper_name, item_id=item_id, position=list(position), orientation=QUAT, max_effort=0.0)
+    """A grab_item goal of `item_id`, or, with none, of the target at
+    `position` turned by QUAT in the robot frame at the latest time."""
+    goal_target = UNREAD_TARGET if item_id else target(position, QUAT)
+    return grab_action.GoalRequestData(gripper_name=gripper_name, item_id=item_id, target=goal_target, max_effort=0.0)
+
+
+def place_request(position, target_item_id=None):
+    """A place_item goal into `target_item_id`, or, with none, at the target
+    at `position` turned by QUAT in the robot frame at the latest time."""
+    record = place_action.GoalRequestDataTarget
+    goal_target = target([0.0, 0.0, 0.0], frame=None, record=record) if target_item_id else target(position, QUAT, record=record)
+    return place_action.GoalRequestData(gripper_name="", target=goal_target, target_item_id=target_item_id)
 
 
 async def first_accepted_scan(h):
@@ -138,10 +151,10 @@ async def test_the_node_answers_every_member_with_the_none_models():
         dropped = await result_of(drop_fx, h, drop_action.GoalRequestData(gripper_name="", target_item_id=None))
         assert dropped.success is False and dropped.message == "no gripper holds an item"
         placed = await result_of(
-            place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.5, 0.1, 0.7], orientation=QUAT, target_item_id=None)
+            place_fx, h, place_request([0.5, 0.1, 0.7])
         )
         assert placed.success is False and placed.message == "no gripper holds an item"
-        assert placed.final_position == [0.0, 0.0, 0.0]
+        assert placed.final_point is None
 
         # item_perception refuses a search of the model "none" with
         # precondition_failed, as brain_model says.
@@ -202,18 +215,21 @@ async def test_every_member_completes_over_the_wire_with_models():
         answer_the_camera(h)
         await publish_a_capture(h)
         scan = await scanned(h)
-        assert scan.labels == ["cup"] and scan.confidences == [0.9] and len(scan.positions) == 3
-        # The robot placed the camera at its origin looking along +Z: the
-        # box's centre, a metre deep, is a metre ahead.
-        assert [round(v, 6) for v in scan.positions] == [0.0, 0.0, 1.0]
+        assert scan.labels == ["cup"] and scan.confidences == [0.9] and len(scan.points) == 1
+        # The robot placed the frame the picture names at its origin, looking
+        # along +Z: the box's centre, a metre deep, is a metre ahead, in the
+        # robot frame at the capture time of the picture.
+        assert [round(v, 6) for v in scan.points[0].position] == [0.0, 0.0, 1.0]
+        assert (scan.frame, scan.timestamp) == (ROBOT_FRAME, 1.0)
         assert scan.regions == [7.0, 5.0, 9.0, 7.0]
         assert scan.camera == "chest" and (scan.image_width, scan.image_height) == (16, 12)
-        assert scan.frame_timestamp > 0.0
         [cup] = scan.item_ids
 
         found = await result_of(identify_fx, h, identify_action.GoalRequestData(description="the cup", timeout_s=0.0))
         assert (found.item_id, found.label, found.confidence) == (cup, "cup", 0.9)
-        assert found.position == scan.positions and found.orientation is None
+        point = found.item_point
+        assert (point.frame, point.timestamp, point.position) == (ROBOT_FRAME, 1.0, scan.points[0].position)
+        assert found.item_pose is None
         assert found.region == [7.0, 5.0, 9.0, 7.0] and found.camera == "chest"
         assert detector.phrases == [[], ["the cup"]]
 
@@ -234,15 +250,18 @@ async def test_every_member_completes_over_the_wire_with_models():
         assert state.holding == [True, False] and state.held_item_ids == [cup, ""]
 
         unknown = await result_of(
-            place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.0, 0.0, 0.0], orientation=None, target_item_id="bowl_9-zz")
+            place_fx, h, place_request([0.0, 0.0, 0.0], target_item_id="bowl_9-zz")
         )
         assert (unknown.success, unknown.message) == (False, "unknown item 'bowl_9-zz': scan or identify it again")
         placed = await result_of(
-            place_fx, h, place_action.GoalRequestData(gripper_name="", position=[0.6, 0.2, 0.75], orientation=QUAT, target_item_id=None)
+            place_fx, h, place_request([0.6, 0.2, 0.75])
         )
         assert placed.success is True, placed.message
         assert (placed.gripper_name, placed.item_id) == ("left_gripper", cup)
-        assert placed.final_position == [0.6, 0.2, 0.76]
+        # Where the backbone measured the grasp point when the jaws opened, in
+        # the robot frame at the time of that measurement.
+        final = placed.final_point
+        assert (final.frame, final.timestamp, final.position) == (ROBOT_FRAME, PLACE_MEASURED_AT, [0.6, 0.2, 0.76])
 
         by_pose = await result_of(grab_fx, h, grab_request("right_gripper", position=(0.5, -0.1, 0.7)))
         assert by_pose.success is True and by_pose.item_id.startswith("item_1-")
@@ -316,24 +335,25 @@ async def test_the_camera_is_asked_again_until_it_knows_its_geometry(monkeypatch
         assert h.mocks.deps.geometry.get_depth_intrinsics.captured_count() == 1
 
 
-async def test_the_robot_is_asked_again_until_it_names_the_camera(monkeypatch):
-    # The robot answers, but carries no camera by the name the brain looks
-    # through: the brain keeps asking, and the first scan after the answer
-    # that names it succeeds.
+async def test_the_robot_is_asked_again_until_it_names_its_robot_frame(monkeypatch):
+    # The robot answers, but names no robot frame: the brain keeps asking,
+    # and the first scan after the answer that names one succeeds, whatever
+    # cameras that answer names.
     monkeypatch.setattr(geometry, "RETRY_S", 0.0)
     detector = FakeDetector([Box("cup", 0.9, 7, 5, 9, 7)])
     async with harness.start(with_fakes(detector), parameters=faked()) as h:
-        wrists_only = sensors_described(names=("wrist_left", "wrist_right"))
-        answer_the_camera(h, sensors=(wrists_only, wrists_only, sensors_described()))
+        unnamed = sensors_described()
+        unnamed.robot_frame = ""
+        answer_the_camera(h, sensors=(unnamed, unnamed, sensors_described(names=("wrist_left",))))
         await publish_a_capture(h)
         scan = await scanned(h)
         assert scan.labels == ["cup"]
         assert h.mocks.deps.sensor_mounts.describe_sensors.captured_count() == 3
-        # The scan placed the camera where it stood when its capture was
-        # taken, waiting as long as the launcher set.
+        # The scan placed the frame its picture names where it stood when the
+        # picture was taken, waiting as long as the launcher set.
         [lookup] = h.mocks.deps.transform_lookup.lookup_transform.captured()
         assert (lookup.target_frame, lookup.source_frame) == (ROBOT_FRAME, "chest_color_optical_frame")
-        assert (lookup.time, lookup.timeout_s) == (1.0, PARAMS["lookup_timeout_s"])
+        assert (lookup.source_timestamp, lookup.target_timestamp, lookup.timeout_s) == (1.0, 1.0, PARAMS["lookup_timeout_s"])
 
 
 # The scripted grab over the wire: the real scripted manipulator, the
@@ -353,7 +373,7 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         await once_the_brain_has_limbs(h)
         plan(h, True, True, True)
         grab = await grab_fx.send_goal(
-            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, position=[0.0] * 3, orientation=None, max_effort=15.0),
+            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, target=UNREAD_TARGET, max_effort=15.0),
             5.0,
         )
         assert grab.accepted, grab.refusal

@@ -1,8 +1,9 @@
 """Wiring: parse parameters, check the description the robot's initializer
-serves, build the kinematics, limits, and coordinator, and run the control
-tick, the upstream consumers, the state relays, the readouts (limb_states and
-the joints' transforms), the limb name service, the stop and plan check
-services, one server per exposed action, and the workspace services."""
+serves, build the kinematics, limits, the placement of commands by the
+robot's tree and the coordinator, and run the control tick, the upstream
+consumers, the state relays, the readouts (limb_states and the joints'
+transforms), the limb name service, the stop and plan check services, one
+server per exposed action, and the workspace services."""
 
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import time
 
 import peppygen.clock
 from control_core_py import runtime
-from control_core_py.runtime import CancellationToken
+from control_core_py.runtime import CancellationToken, SetpointError
 from peppygen import NodeBuilder, NodeRunner
 from peppygen.emitted_topics.limb_state import limb_states
 from peppygen.emitted_topics.transforms import transforms
@@ -56,8 +57,9 @@ from so101_backbone.actions import (
 from so101_backbone.coordinator import Coordinator
 from so101_backbone.failures import Refusal
 from so101_backbone.kinematics import Kinematics
-from so101_backbone.model import ARM, DESCRIPTION, urdf_path
+from so101_backbone.model import ARM, DESCRIPTION, ROBOT_FRAME, urdf_path
 from so101_backbone.params import UpstreamMode
+from so101_backbone.placement import Placer
 from so101_backbone.reach import fit_reach_ball
 from so101_backbone.transforms import transforms_message
 from so101_backbone.wire import parse_arm_states, parse_gripper_states, parse_pose_setpoint
@@ -176,6 +178,36 @@ async def _consume(
     await runtime.consume_gated(subscription, token, label, _now_s, stale_timeout_s, handle)
 
 
+async def _consume_pose_setpoints(
+    node_runner: NodeRunner,
+    coordinator: Coordinator,
+    placer: Placer,
+    token: CancellationToken,
+):
+    """The leader's pose stream over the shared gated consume: each setpoint
+    parsed into a pose in its frame at its time, then placed in the robot
+    frame by the robot's tree, as pose_link places a setpoint. A setpoint
+    stamped at a time keeps its stamp downstream; one with no timestamp, at
+    the latest time, is stamped as it is taken. A setpoint the tree cannot
+    place is rejected, as one no contract takes is."""
+
+    async def handle(m) -> None:
+        setpoint = parse_pose_setpoint(m.frame, m.timestamp, m.position, m.orientation)
+        try:
+            pose = await placer.place_setpoint(setpoint)
+        except Refusal as e:
+            raise SetpointError(str(e)) from None
+        coordinator.leader_pose.set(
+            (pose.position.position, pose.orientation.quaternion),
+            wire_timestamp_s=_now_s() if m.timestamp is None else m.timestamp,
+        )
+
+    await _consume(
+        node_runner, leader_pose_setpoints, WIRE_AGE_LIMIT_S, token,
+        "leader pose_setpoints", handle,
+    )
+
+
 async def _relay_states(
     node_runner: NodeRunner,
     *,
@@ -250,8 +282,8 @@ async def _publish_readouts(
     pairing-free whole-robot readout; any stale limb skips the tick, a
     partial robot is not a snapshot), the transforms of the arm's and the
     gripper's joints of that snapshot, which started over at `started_s`,
-    and, in pose mode, the pose_states relay on the leader slot. Stamps are
-    the measurement's capture time."""
+    and, in pose mode, the pose_states relay on the leader slot. Every pose
+    is in the robot frame, and stamps are the measurement's capture time."""
     limb_publisher = await limb_states.declare_publisher(node_runner)
     transforms_publisher = await transforms.declare_publisher(node_runner)
     pose_publisher = await leader_pose_states.declare_publisher(node_runner) if pose_mode else None
@@ -268,18 +300,23 @@ async def _publish_readouts(
             position, orientation = kinematics.forward_kinematics(measured)
             if pose_publisher is not None:
                 await pose_publisher.publish(
-                    leader_pose_states.build_message(timestamp, list(position), list(orientation))
+                    leader_pose_states.build_message(
+                        ROBOT_FRAME, timestamp, list(position), list(orientation)
+                    )
                 )
             opening = coordinator.fresh_measured_gripper()
             if opening is not None:
+                grasp_point = limb_states.MessageGraspPointsItem(
+                    position=list(position), orientation=list(orientation)
+                )
                 await limb_publisher.publish(
                     limb_states.build_message(
+                        ROBOT_FRAME,
                         timestamp,
                         _ARM_NAMES,
                         _JOINTS_PER_ARM,
                         list(measured),
-                        list(position),
-                        list(orientation),
+                        [grasp_point],
                         _GRIPPER_NAMES,
                         [opening],
                     )
@@ -312,7 +349,8 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         f"{reach.center[2]:.3f}) radius={reach.radius:.3f}"
     )
     coordinator = Coordinator(config, kinematics, limits, reach)
-    layer = ActionLayer(coordinator, config, limits)
+    placer = Placer(node_runner, ROBOT_FRAME, config.lookup_timeout_s)
+    layer = ActionLayer(coordinator, config, limits, placer, _now_s)
     runtime.log(f"upstream_mode={config.upstream_mode.value}")
 
     token = node_runner.cancellation_token()
@@ -323,11 +361,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         coordinator.leader_joints.set(
             parse_joint_setpoints(m.positions, m.velocities, m.efforts),
             wire_timestamp_s=m.timestamp,
-        )
-
-    def on_pose_setpoints(m):
-        coordinator.leader_pose.set(
-            parse_pose_setpoint(m.position, m.orientation), wire_timestamp_s=m.timestamp
         )
 
     def on_gripper_setpoints(m):
@@ -390,12 +423,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         )
     else:
         tasks.append(
-            asyncio.create_task(
-                _consume(
-                    node_runner, leader_pose_setpoints, WIRE_AGE_LIMIT_S, token,
-                    "leader pose_setpoints", on_pose_setpoints,
-                )
-            )
+            asyncio.create_task(_consume_pose_setpoints(node_runner, coordinator, placer, token))
         )
 
     def server(module, make_decide, driver, label):
@@ -405,10 +433,12 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         return (module, make_decide(pending), drive_taking(pending, driver), pending, label)
 
     def drive_posture(ctx, plan):
-        return layer.drive_posture(ctx, plan, kinematics)
+        return layer.drive_posture(
+            ctx, plan, kinematics, move_to_ready.ResultGraspPointsItem
+        )
 
     def drive_home(ctx, move):
-        return layer.drive_home(ctx, move, kinematics)
+        return layer.drive_home(ctx, move, kinematics, move_to_home.ResultGraspPointsItem)
 
     action_servers = [
         server(move_arm_joints,
@@ -443,9 +473,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     async def on_check_arm_move(request) -> check_arm_move.Response:
         d = request.data
         try:
-            check = await layer.check_arm_move(
-                d.arm_name, tuple(d.position), d.orientation, d.duration_s, check_solver,
-            )
+            check = await layer.check_arm_move(d.arm_name, d.target, d.duration_s, check_solver)
         except Refusal as e:
             # The error reply of a check that move_arm would refuse, with
             # the kind of that refusal.
@@ -473,7 +501,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # keeps its rate while a surface is measured.
     tasks.append(
         asyncio.create_task(
-            workspace_service.serve(node_runner, ReachWorker(urdf_path()))
+            workspace_service.serve(node_runner, ReachWorker(urdf_path()), placer)
         )
     )
     return tasks

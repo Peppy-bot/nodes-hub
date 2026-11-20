@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 
 use control_core::chase::{chase_along, chase_step};
+use control_core::geometry::pose_arrays;
 use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
 use control_core::positive_finite::PositiveFinite;
 use control_core::time::{duration_from_secs, ticks_within};
@@ -38,14 +39,15 @@ use srs_model::{Arm, JointVec, Limit, plan_line};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::failure::{Failure, FailureKind};
+use crate::failure::{Failure, FailureKind, PathFailure};
 use crate::governor::{HandBasis, PathArms};
 use crate::move_slot::{ARM_BUSY, MoveSlot, SlotRelease};
+use crate::publish::clock_now;
 use crate::robot::LIMBS;
 use crate::settle::{
     ContactGap, PoseTolerance, Settle, Verdict, joint_shortfall, pose_shortfall, verdict,
 };
-use crate::types::world_pose_arrays;
+use crate::streams::ArmState;
 use crate::upstream::Upstream;
 
 mod path;
@@ -96,6 +98,9 @@ pub struct PlanConfig {
     /// goal and at its run start, and at its run start from where it stood
     /// when the goal was taken.
     pub start_tolerance_rad: f64,
+    /// The robot frame, the root link of the robot's URDF: the frame of every
+    /// pose the arm model gives, and of each Cartesian result.
+    pub robot_frame: &'static str,
 }
 
 /// Why an arm has no fresh measurement of its joints.
@@ -108,18 +113,20 @@ pub enum Unmeasured {
     Stale,
 }
 
-/// The joints an arm measured, or why it has no fresh measurement of them.
-pub type Measurement = Result<JointVec, Unmeasured>;
+/// The joint state an arm measured, or why it has no fresh measurement of it.
+pub type Measurement = Result<ArmState, Unmeasured>;
 
 /// The note a cancelled move_arm or move_arm_joints goal adds to its reason
 /// when its result reports the joints commanded last, because the arm has
 /// no fresh measurement.
 const COMMANDED_JOINTS_NOTE: &str = "the result comes from the joints commanded last";
 
-/// How a move ended. A posture share reports it to the posture action that
+/// How a move ended, its failure a [`Failure`] of the moves, or a
+/// [`PathFailure`] for a share of a joint path, which its judgment can fail
+/// with `unreachable`. A posture share reports it to the posture action that
 /// sent it, the failure labelled with the name of its arm.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Outcome {
+pub enum Outcome<F = Failure> {
     /// The move ran to its end, and an arm move with a settle settled.
     Complete,
     /// The move ended on contact before it settled, and its goal completes:
@@ -131,7 +138,7 @@ pub enum Outcome {
     /// stop service, whose reason names the stop.
     Cancelled(String),
     /// The move failed, and its goal gives no result.
-    Failed(Failure),
+    Failed(F),
 }
 
 /// What `check_arm_move` answers for an arm that can take the move.
@@ -352,7 +359,7 @@ impl Goal {
     pub async fn fail(self, failure: Failure, planner: &Planner) {
         match self {
             Goal::Joint { reply, .. } => reply.fail(planner.arm, failure).await,
-            Goal::Cartesian { ctx, .. } => planner.fail_cartesian(&ctx, failure).await,
+            Goal::Cartesian { ctx, .. } => planner.fail_cartesian(&ctx, failure.into()).await,
         }
     }
 
@@ -622,7 +629,7 @@ impl Planner {
         if gap == ContactGap::NONE {
             return false;
         }
-        let grasp_point = |q: &JointVec| self.world_ee_pose(q).translation.vector;
+        let grasp_point = |q: &JointVec| self.root_ee_pose(q).translation.vector;
         gap.is_exceeded_by((grasp_point(commanded) - grasp_point(measured)).norm())
     }
 
@@ -631,15 +638,15 @@ impl Planner {
     /// which is the joints commanded last ([`cancelled_reason`] says so).
     fn reported_joints(&self, measured: &Measurement) -> JointVec {
         match measured {
-            Ok(q) => *q,
+            Ok(state) => state.positions,
             Err(_) => self.setpoint,
         }
     }
 
-    /// The end effector's pose at `q` in the world frame, from the planner's
+    /// The end effector's pose at `q` in the robot frame, from the planner's
     /// arm model.
-    pub fn world_ee_pose(&self, q: &JointVec) -> Isometry3<f64> {
-        self.model.world_ee_pose(q)
+    pub fn root_ee_pose(&self, q: &JointVec) -> Isometry3<f64> {
+        self.model.root_ee_pose(q)
     }
 
     /// Retune the stream's end-effector speed cap at runtime (the commander's
@@ -656,7 +663,7 @@ impl Planner {
     /// active mode to a joint target, then chase it under the velocity limits.
     /// A pending goal that a stop came before, after its admission
     /// ([`MoveSlot::take_stop`]), does not start: it ends cancelled for the
-    /// stop's reason, reporting `measured_q`, and frees its move slot.
+    /// stop's reason, reporting `measured`, and frees its move slot.
     ///
     /// A streamed tick also carries the end-effector Jacobians of its step: the
     /// governor's EE-speed limiter caps a streamed hand, and this is the one place
@@ -664,7 +671,7 @@ impl Planner {
     /// carries `None`: it runs on the timing it was admitted with.
     pub async fn tick(
         &mut self,
-        measured_q: JointVec,
+        measured: ArmState,
         command: Option<Upstream>,
         goals: &mut mpsc::Receiver<Goal>,
         move_slot: &MoveSlot,
@@ -675,7 +682,7 @@ impl Planner {
         while let Ok(goal) = goals.try_recv() {
             if let Some(reason) = move_slot.take_stop() {
                 let _release = move_slot.release_on_drop();
-                goal.stop(&reason, Ok(measured_q), self).await;
+                goal.stop(&reason, Ok(measured), self).await;
             } else if matches!(mode, Mode::Follow) {
                 mode = self
                     .start_goal(goal, move_slot.release_on_drop(), now)
@@ -690,7 +697,7 @@ impl Planner {
             target,
             next_mode,
             origin,
-        } = self.advance(mode, measured_q, &command, now).await;
+        } = self.advance(mode, measured, &command, now).await;
         self.mode = next_mode;
 
         let dt = self.cfg.cycle_period.as_secs_f64();
@@ -701,7 +708,7 @@ impl Planner {
                     from: self.setpoint,
                     to: target,
                     at: now,
-                    measured: measured_q,
+                    measured,
                 });
                 chase_along(&self.setpoint, &target, vmax, dt)
             }
@@ -738,7 +745,7 @@ impl Planner {
         match std::mem::replace(&mut self.mode, Mode::Follow) {
             Mode::Follow => {}
             Mode::JointMove(JointMove { reply, .. }) => reply.fail(self.arm, failure).await,
-            Mode::CartesianMove(m) => self.fail_cartesian(&m.ctx, failure).await,
+            Mode::CartesianMove(m) => self.fail_cartesian(&m.ctx, failure.into()).await,
             Mode::PathShare(m) => m.fail(self, failure),
         }
     }
@@ -776,7 +783,7 @@ impl Planner {
             }
         };
         if let (true, Ok(stood)) = (played, measured) {
-            self.hold_where_it_stands(stood);
+            self.hold_where_it_stands(stood.positions);
         }
         true
     }
@@ -822,7 +829,7 @@ impl Planner {
             }
             Some(Upstream::Pose(pose)) => {
                 let q = self.setpoint;
-                let ee = self.world_ee_pose(&q);
+                let ee = self.root_ee_pose(&q);
                 let limits = StepLimits {
                     max_joint_velocity: self.cfg.max_joint_velocity_rad_s,
                     ee: self.stream_step_rates(),
@@ -843,7 +850,7 @@ impl Planner {
     async fn advance(
         &mut self,
         mode: Mode,
-        measured_q: JointVec,
+        measured: ArmState,
         command: &Option<Upstream>,
         now: Instant,
     ) -> Advance {
@@ -857,9 +864,9 @@ impl Planner {
         }
         match mode {
             Mode::Follow => self.advance_follow(command),
-            Mode::JointMove(m) => self.advance_joint(m, measured_q, now).await,
-            Mode::CartesianMove(m) => self.advance_cartesian(m, measured_q, now).await,
-            Mode::PathShare(m) => self.advance_path_share(m, measured_q, now),
+            Mode::JointMove(m) => self.advance_joint(m, measured, now).await,
+            Mode::CartesianMove(m) => self.advance_cartesian(m, measured, now).await,
+            Mode::PathShare(m) => self.advance_path_share(m, measured, now),
         }
     }
 
@@ -886,7 +893,8 @@ impl Planner {
     /// the trajectory's end from the planned end on, and against the goal's
     /// contact gap on every tick. Any terminal drops `m` (and with it the
     /// slot release), releasing the move slot.
-    async fn advance_joint(&mut self, m: JointMove, measured_q: JointVec, now: Instant) -> Advance {
+    async fn advance_joint(&mut self, m: JointMove, measured: ArmState, now: Instant) -> Advance {
+        let measured_q = measured.positions;
         let JointMove {
             traj,
             reply,
@@ -914,7 +922,7 @@ impl Planner {
         };
         let elapsed = traj.clock().elapsed_secs(now);
         let end = self.end_move(&outcome, q_des, Some(measured_q));
-        reply.finish(self, outcome, Ok(measured_q), elapsed).await;
+        reply.finish(self, outcome, Ok(measured), elapsed).await;
         end
     }
 
@@ -926,15 +934,16 @@ impl Planner {
     async fn advance_cartesian(
         &mut self,
         m: CartesianMove,
-        measured_q: JointVec,
+        measured: ArmState,
         now: Instant,
     ) -> Advance {
+        let measured_q = measured.positions;
         let q_des = m.traj.sample(now);
         let outcome = match m.ctx.cancel_cause() {
             Some(cause) => Some(Outcome::Cancelled(cause.reason().to_string())),
             None => {
                 let shortfall = || {
-                    let measured = self.model.world_ee_pose(&measured_q);
+                    let measured = self.model.root_ee_pose(&measured_q);
                     pose_shortfall(&measured, &m.target, &m.settle.tolerance)
                 };
                 verdict(
@@ -956,7 +965,7 @@ impl Planner {
         };
         let elapsed = m.traj.clock().elapsed_secs(now);
         let end = self.end_move(&outcome, q_des, Some(measured_q));
-        self.finish_cartesian(&m.ctx, outcome, Ok(measured_q), elapsed)
+        self.finish_cartesian(&m.ctx, outcome, Ok(measured), elapsed)
             .await;
         end
     }
@@ -978,7 +987,7 @@ impl Planner {
             request.position,
             request
                 .orientation
-                .unwrap_or_else(|| self.world_ee_pose(&self.setpoint).rotation),
+                .unwrap_or_else(|| self.root_ee_pose(&self.setpoint).rotation),
         )
     }
 
@@ -1057,7 +1066,7 @@ impl Planner {
         let planning = Instant::now();
         let target = self.line_goal(&request);
         let Some(walk) = plan_line(&self.model, &target, self.setpoint) else {
-            let failure = Failure::new(FailureKind::Unreachable, NOT_PLANNED);
+            let failure = PathFailure::Unreachable(NOT_PLANNED.to_string());
             self.fail_cartesian(&ctx, failure).await;
             // `move_slot` drops here: the slot is released even on this early
             // exit.
@@ -1067,7 +1076,7 @@ impl Planner {
         // of the motion.
         let traj = self.line_trajectory(&walk, request.duration, now + planning.elapsed());
         if let Err(failure) = path::check_move_time(&traj, "move", SPLIT_INTO_SHORTER_MOVES) {
-            self.fail_cartesian(&ctx, failure).await;
+            self.fail_cartesian(&ctx, failure.into()).await;
             return Mode::Follow;
         }
         info!(
@@ -1085,10 +1094,39 @@ impl Planner {
         })
     }
 
+    /// The result's final pose: the grasp point at the joints
+    /// [`Planner::reported_joints`] gives for `measured`, in the robot frame,
+    /// at the time of the measurement, as its follower stamped it. Without a
+    /// fresh measurement it is the grasp point of the joints commanded last,
+    /// at the time on the node's clock the backbone reports them; a node
+    /// clock that has not ticked then gives no time, and the goal fails with
+    /// `attempt_failed`.
+    fn final_pose(
+        &self,
+        measured: &Measurement,
+    ) -> std::result::Result<move_arm::MoveArmResultFinalPose, Failure> {
+        let (position, orientation) =
+            pose_arrays(&self.root_ee_pose(&self.reported_joints(measured)));
+        let timestamp = match measured {
+            Ok(state) => state.timestamp,
+            Err(_) => clock_now().map_err(|reason| {
+                Failure::new(
+                    FailureKind::AttemptFailed,
+                    format!("the grasp point of the joints commanded last has no time: {reason}"),
+                )
+            })?,
+        };
+        Ok(move_arm::MoveArmResultFinalPose {
+            frame: self.cfg.robot_frame.to_owned(),
+            timestamp,
+            position,
+            orientation,
+        })
+    }
+
     /// End a Cartesian goal on `outcome`: it completes, saying whether on
-    /// contact, or ends cancelled with the world pose of the joints
-    /// [`Planner::reported_joints`] gives for `measured`, and fails with no
-    /// result.
+    /// contact, or ends cancelled with the [`Planner::final_pose`] of
+    /// `measured`, and fails with no result.
     async fn finish_cartesian(
         &self,
         ctx: &move_arm::GoalContext,
@@ -1096,21 +1134,18 @@ impl Planner {
         measured: Measurement,
         elapsed: f64,
     ) {
-        let reported_pose =
-            || world_pose_arrays(&self.world_ee_pose(&self.reported_joints(&measured)));
-        let ended = match outcome {
-            Outcome::Complete | Outcome::Contact { .. } => {
-                let (pos, quat) = reported_pose();
-                ctx.complete(pos, quat, outcome.ended_on_contact(), elapsed)
-                    .await
+        let ended = match (outcome, self.final_pose(&measured)) {
+            (Outcome::Failed(failure), _) | (_, Err(failure)) => {
+                return self.fail_cartesian(ctx, failure.into()).await;
             }
-            Outcome::Cancelled(reason) => {
-                let (pos, quat) = reported_pose();
+            (Outcome::Cancelled(reason), Ok(pose)) => {
                 let reason = cancelled_reason(reason, &measured);
-                ctx.complete_cancelled(reason, pos, quat, false, elapsed)
+                ctx.complete_cancelled(reason, pose, false, elapsed).await
+            }
+            (outcome @ (Outcome::Complete | Outcome::Contact { .. }), Ok(pose)) => {
+                ctx.complete(pose, outcome.ended_on_contact(), elapsed)
                     .await
             }
-            Outcome::Failed(failure) => return self.fail_cartesian(ctx, failure).await,
         };
         if let Err(e) = ended {
             error!("{}: move_arm end: {e}", LIMBS.arm_name(self.arm));
@@ -1118,8 +1153,9 @@ impl Planner {
     }
 
     /// Fail a Cartesian goal with `failure`, with no result.
-    async fn fail_cartesian(&self, ctx: &move_arm::GoalContext, failure: Failure) {
-        if let Err(e) = ctx.fail(failure.kind.into(), failure.message).await {
+    async fn fail_cartesian(&self, ctx: &move_arm::GoalContext, failure: PathFailure) {
+        let (kind, message) = failure.for_member();
+        if let Err(e) = ctx.fail(kind, message).await {
             error!("{}: move_arm end: {e}", LIMBS.arm_name(self.arm));
         }
     }
@@ -1141,7 +1177,7 @@ fn step_onto(from: &JointVec, onto: &JointVec, max_velocity: &JointVec, dt: f64)
     })
 }
 
-impl Outcome {
+impl<F> Outcome<F> {
     /// What the result of an arm move says of `ended_on_contact`: true for
     /// the arm whose own contact ended the move.
     pub fn ended_on_contact(&self) -> bool {
@@ -1153,6 +1189,16 @@ impl Outcome {
     /// ([`Planner::hold_where_it_stands`]).
     fn ended_short(&self) -> bool {
         !matches!(self, Self::Complete)
+    }
+
+    /// The same outcome, its failure as `of` gives it.
+    pub fn map_failure<G>(self, of: impl FnOnce(F) -> G) -> Outcome<G> {
+        match self {
+            Self::Complete => Outcome::Complete,
+            Self::Contact { this_arm } => Outcome::Contact { this_arm },
+            Self::Cancelled(reason) => Outcome::Cancelled(reason),
+            Self::Failed(failure) => Outcome::Failed(of(failure)),
+        }
     }
 }
 
@@ -1180,6 +1226,7 @@ pub(crate) fn cancelled_reason(reason: String, measured: &Measurement) -> String
 mod tests {
     use super::*;
 
+    use control_core::geometry::Pose;
     use robot_description::{PerArm, states};
     use srs_model::ELBOW;
     use srs_model::chain_kinematics::{PRECISION_M, PRECISION_RAD, pose_miss};
@@ -1188,7 +1235,7 @@ mod tests {
     use crate::robot::ARMS;
     use crate::test_support::{
         LEFT, POSE_TEST_Q, RIGHT, V1, V2, bundled_arm, claimed_move_slot, plan_config,
-        planner_holding, postures,
+        planner_holding, postures, standing_at,
     };
 
     /// The slack the stream test reads its arrival against.
@@ -1241,7 +1288,13 @@ mod tests {
             .expect("queue the goal");
         let now = Instant::now();
         planner
-            .tick([0.0; ARM_DOF], None, &mut goals, &move_slot, now)
+            .tick(
+                standing_at([0.0; ARM_DOF]),
+                None,
+                &mut goals,
+                &move_slot,
+                now,
+            )
             .await;
         assert!(move_slot.is_claimed(), "move in flight holds the slot");
 
@@ -1276,7 +1329,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        let tick = planner.tick(held, None, &mut goals, &move_slot, now).await;
+        let tick = planner
+            .tick(standing_at(held), None, &mut goals, &move_slot, now)
+            .await;
         let outcome = done_rx.recv().await.expect("the stopped goal reports");
         assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
         assert_eq!(tick.candidate, held, "no move starts");
@@ -1298,14 +1353,14 @@ mod tests {
             .expect("queue the goal");
         let start = Instant::now();
         planner
-            .tick(held, None, &mut goals, &move_slot, start)
+            .tick(standing_at(held), None, &mut goals, &move_slot, start)
             .await;
         assert!(move_slot.is_claimed(), "move in flight holds the slot");
 
         let measured_at_stop = [0.1; ARM_DOF];
         let now = start + Duration::from_millis(300);
         let stopped = planner
-            .stop_active("stopped: operator", Ok(measured_at_stop), now)
+            .stop_active("stopped: operator", Ok(standing_at(measured_at_stop)), now)
             .await;
         assert!(stopped, "a move was in flight");
         let outcome = done_rx.recv().await.expect("the stopped move reports");
@@ -1315,7 +1370,7 @@ mod tests {
         // With nothing active a stop ends nothing and moves no command.
         assert!(
             !planner
-                .stop_active("stopped: again", Ok([0.3; ARM_DOF]), now)
+                .stop_active("stopped: again", Ok(standing_at([0.3; ARM_DOF])), now)
                 .await
         );
         let later = now + Duration::from_secs(1);
@@ -1332,7 +1387,9 @@ mod tests {
             .send(Goal::posture_share([0.2; ARM_DOF], done_tx))
             .await
             .expect("queue the goal");
-        planner.tick(held, None, &mut goals, &move_slot, now).await;
+        planner
+            .tick(standing_at(held), None, &mut goals, &move_slot, now)
+            .await;
         assert!(move_slot.is_claimed(), "the later goal runs");
         assert!(
             done_rx.try_recv().is_err(),
@@ -1365,7 +1422,13 @@ mod tests {
             .await
             .expect("queue the goal");
         planner
-            .tick(held, None, &mut goals, &move_slot, Instant::now())
+            .tick(
+                standing_at(held),
+                None,
+                &mut goals,
+                &move_slot,
+                Instant::now(),
+            )
             .await;
         let Outcome::Failed(failure) = done_rx.try_recv().expect("the move ends at once") else {
             panic!("the move fails");
@@ -1401,7 +1464,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        planner.tick(held, None, &mut goals, &move_slot, now).await;
+        planner
+            .tick(standing_at(held), None, &mut goals, &move_slot, now)
+            .await;
         assert!(move_slot.is_claimed(), "the move is in flight");
         let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
             panic!("the goal starts a joint move");
@@ -1409,7 +1474,7 @@ mod tests {
         let planned_end = planned_end(traj.clock());
         let settling = planned_end + POSTURE_SETTLE.timeout / 2;
         planner
-            .tick(held, None, &mut goals, &move_slot, settling)
+            .tick(standing_at(held), None, &mut goals, &move_slot, settling)
             .await;
         assert!(
             done_rx.try_recv().is_err(),
@@ -1417,7 +1482,7 @@ mod tests {
         );
         planner
             .tick(
-                held,
+                standing_at(held),
                 None,
                 &mut goals,
                 &move_slot,
@@ -1447,7 +1512,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let now = Instant::now();
-        let tick = planner.tick(held, None, &mut goals, &move_slot, now).await;
+        let tick = planner
+            .tick(standing_at(held), None, &mut goals, &move_slot, now)
+            .await;
         planner.commit(tick.candidate);
         let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
             panic!("the goal starts a joint move");
@@ -1457,7 +1524,7 @@ mod tests {
         for step in 1..=5 {
             let tick = planner
                 .tick(
-                    held,
+                    standing_at(held),
                     None,
                     &mut goals,
                     &move_slot,
@@ -1470,7 +1537,7 @@ mod tests {
         assert_ne!(planner.setpoint(), held, "the commanded arm moves");
         planner
             .tick(
-                held,
+                standing_at(held),
                 None,
                 &mut goals,
                 &move_slot,
@@ -1510,7 +1577,9 @@ mod tests {
             .await
             .expect("queue the goal");
         let held = planner.setpoint();
-        let tick = planner.tick(held, None, &mut goals, move_slot, now).await;
+        let tick = planner
+            .tick(standing_at(held), None, &mut goals, move_slot, now)
+            .await;
         planner.commit(tick.candidate);
         let Mode::JointMove(JointMove { traj, .. }) = &planner.mode else {
             panic!("the goal starts a joint move");
@@ -1545,7 +1614,9 @@ mod tests {
         move_slot: &MoveSlot,
         now: Instant,
     ) -> JointVec {
-        let tick = planner.tick(measured, None, goals, move_slot, now).await;
+        let tick = planner
+            .tick(standing_at(measured), None, goals, move_slot, now)
+            .await;
         planner.commit(tick.candidate);
         tick.candidate
     }
@@ -1672,7 +1743,13 @@ mod tests {
         let mut proposals = 0;
         for k in 1..=50 {
             let tick = planner
-                .tick(stood, None, &mut goals, &move_slot, at + cycle * k)
+                .tick(
+                    standing_at(stood),
+                    None,
+                    &mut goals,
+                    &move_slot,
+                    at + cycle * k,
+                )
                 .await;
             planner.commit(held_at);
             if tick.candidate == held_at {
@@ -1752,7 +1829,7 @@ mod tests {
         let (_goal_tx, mut goals) = mpsc::channel(1);
         let streamed = planner
             .tick(
-                stood,
+                standing_at(stood),
                 Some(joint_cmd(on_the_way)),
                 &mut goals,
                 &move_slot,
@@ -1915,8 +1992,8 @@ mod tests {
         let commanded = POSE_TEST_Q;
         let mut measured = commanded;
         measured[ELBOW] -= 0.05;
-        let apart = (planner.world_ee_pose(&commanded).translation.vector
-            - planner.world_ee_pose(&measured).translation.vector)
+        let apart = (planner.root_ee_pose(&commanded).translation.vector
+            - planner.root_ee_pose(&measured).translation.vector)
             .norm();
         assert!(apart > 1e-3, "the elbow moves the grasp point: {apart} m");
         let gap = |m: f64| ContactGap::of(PositiveFinite::parse(m).expect("a positive gap"));
@@ -1942,8 +2019,8 @@ mod tests {
             for arm in PerArm::<(), ARMS>::ids() {
                 let model = bundled_arm(model_id, arm);
                 let planner = Planner::new(arm, model, plan_config());
-                let r = planner.world_ee_pose(&ready[arm]);
-                let h = planner.world_ee_pose(&home[arm]);
+                let r = planner.root_ee_pose(&ready[arm]);
+                let h = planner.root_ee_pose(&home[arm]);
                 let label = format!("{model_id} {}", LIMBS.arm_name(arm));
                 assert!(
                     h.translation.z < r.translation.z,
@@ -1975,11 +2052,11 @@ mod tests {
         let mirror =
             |([x, y, z], [qx, qy, qz, qw]): ([f64; 3], [f64; 4])| ([x, -y, z], [-qx, qy, -qz, qw]);
         let at = |pose: &Isometry3<f64>, (position, orientation): ([f64; 3], [f64; 4])| {
-            let [x, y, z, w] = orientation;
-            let expected =
-                UnitQuaternion::from_quaternion(srs_model::nalgebra::Quaternion::new(w, x, y, z));
-            let off_m = (pose.translation.vector - Vector3::from(position)).norm();
-            let off_rad = pose.rotation.angle_to(&expected);
+            let expected = Isometry3::from(
+                Pose::parse(position, orientation).expect("a grasp point the contracts take"),
+            );
+            let off_m = (pose.translation.vector - expected.translation.vector).norm();
+            let off_rad = pose.rotation.angle_to(&expected.rotation);
             off_m < 1e-3 && off_rad < 5e-3
         };
         let (ready, home) = (postures(V2, states::READY), postures(V2, states::HOME));
@@ -1991,19 +2068,19 @@ mod tests {
             };
             let model = bundled_arm(V2, arm);
             let planner = Planner::new(arm, model, plan_config());
-            let r = planner.world_ee_pose(&ready[arm]);
-            let h = planner.world_ee_pose(&home[arm]);
+            let r = planner.root_ee_pose(&ready[arm]);
+            let h = planner.root_ee_pose(&home[arm]);
             assert!(
                 at(&r, ready_grasp),
                 "v2 {} ready grasp point at {:?}",
                 LIMBS.arm_name(arm),
-                world_pose_arrays(&r)
+                pose_arrays(&r)
             );
             assert!(
                 at(&h, home_grasp),
                 "v2 {} home grasp point at {:?}",
                 LIMBS.arm_name(arm),
-                world_pose_arrays(&h)
+                pose_arrays(&h)
             );
         }
     }
@@ -2013,7 +2090,11 @@ mod tests {
         let planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         Goal::posture_share([0.5; ARM_DOF], done_tx)
-            .stop("stopped: operator", Ok([0.1; ARM_DOF]), &planner)
+            .stop(
+                "stopped: operator",
+                Ok(standing_at([0.1; ARM_DOF])),
+                &planner,
+            )
             .await;
         let outcome = done_rx.recv().await.expect("the stopped goal reports");
         assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
@@ -2035,7 +2116,13 @@ mod tests {
                 .expect("queue the goal");
         }
         planner
-            .tick([0.0; ARM_DOF], None, &mut goals, &move_slot, Instant::now())
+            .tick(
+                standing_at([0.0; ARM_DOF]),
+                None,
+                &mut goals,
+                &move_slot,
+                Instant::now(),
+            )
             .await;
         let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
         assert_eq!(
@@ -2072,9 +2159,12 @@ mod tests {
         let held = [0.2; ARM_DOF];
         let planner = test_planner(held);
         let measured = [0.1; ARM_DOF];
-        assert_eq!(planner.reported_joints(&Ok(measured)), measured);
         assert_eq!(
-            cancelled_reason("stopped: operator".to_string(), &Ok(measured)),
+            planner.reported_joints(&Ok(standing_at(measured))),
+            measured
+        );
+        assert_eq!(
+            cancelled_reason("stopped: operator".to_string(), &Ok(standing_at(measured))),
             "stopped: operator"
         );
         for unmeasured in [Unmeasured::Stale, Unmeasured::NotYet] {
@@ -2089,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn a_plan_check_answers_the_duration_and_moves_nothing() {
         let mut planner = pose_planner();
-        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let start = planner.root_ee_pose(&POSE_TEST_Q);
         let near = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             start.rotation,
@@ -2124,7 +2214,13 @@ mod tests {
             .await
             .expect("queue the goal");
         planner
-            .tick(POSE_TEST_Q, None, &mut goals, &move_slot, Instant::now())
+            .tick(
+                standing_at(POSE_TEST_Q),
+                None,
+                &mut goals,
+                &move_slot,
+                Instant::now(),
+            )
             .await;
         assert_eq!(
             planner.check_cartesian(&request_to(near)),
@@ -2174,14 +2270,14 @@ mod tests {
         // the only thing that knows the chain. One tick must close some of the
         // gap without leaping to it.
         let mut planner = pose_planner();
-        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let start = planner.root_ee_pose(&POSE_TEST_Q);
         let goal = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             start.rotation,
         );
 
         let stepped = planner.follow_target(&Some(Upstream::Pose(goal)));
-        let moved = planner.world_ee_pose(&stepped);
+        let moved = planner.root_ee_pose(&stepped);
         let before = (goal.translation.vector - start.translation.vector).norm();
         let after = (goal.translation.vector - moved.translation.vector).norm();
         assert!(
@@ -2202,14 +2298,14 @@ mod tests {
         // long way off must produce the same bounded step as a near one, so an
         // operator's flick cannot become a lunge.
         let mut planner = pose_planner();
-        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let start = planner.root_ee_pose(&POSE_TEST_Q);
         let far = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(5.0, 0.0, 0.0)).into(),
             start.rotation,
         );
 
         let stepped = planner.follow_target(&Some(Upstream::Pose(far)));
-        let moved = planner.world_ee_pose(&stepped);
+        let moved = planner.root_ee_pose(&stepped);
         let travelled = (moved.translation.vector - start.translation.vector).norm();
         let cfg = plan_config();
         let budget = cfg.stream_ee_velocity_m_s * cfg.cycle_period.as_secs_f64();
@@ -2222,14 +2318,14 @@ mod tests {
     #[test]
     fn a_pose_step_respects_the_angular_speed_cap() {
         let mut planner = pose_planner();
-        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let start = planner.root_ee_pose(&POSE_TEST_Q);
         let twisted = Isometry3::from_parts(
             start.translation,
             UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 1.0) * start.rotation,
         );
 
         let stepped = planner.follow_target(&Some(Upstream::Pose(twisted)));
-        let moved = planner.world_ee_pose(&stepped);
+        let moved = planner.root_ee_pose(&stepped);
         let cfg = plan_config();
         let budget = planner.stream_step_rates().angular_rad_s * cfg.cycle_period.as_secs_f64();
         let turned = moved.rotation.angle_to(&start.rotation);
@@ -2245,7 +2341,7 @@ mod tests {
         // Step toward a pose off the held one and commit the governed result,
         // as the coordinator does, so the hold is asserted mid-motion.
         let mut planner = pose_planner();
-        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let start = planner.root_ee_pose(&POSE_TEST_Q);
         let goal = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             start.rotation,
@@ -2303,7 +2399,7 @@ mod tests {
     #[test]
     fn a_line_the_limits_cannot_run_within_the_longest_move_has_no_plan() {
         let mut planner = pose_planner();
-        let start = planner.world_ee_pose(&POSE_TEST_Q);
+        let start = planner.root_ee_pose(&POSE_TEST_Q);
         let target = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             start.rotation,
@@ -2322,7 +2418,7 @@ mod tests {
     fn a_position_alone_keeps_the_turn_the_hand_starts_with() {
         let held = postures(V2, states::READY)[RIGHT];
         let mut planner = launcher_planner(RIGHT, held);
-        let start = planner.world_ee_pose(&held);
+        let start = planner.root_ee_pose(&held);
         let target = Isometry3::from_parts(
             (start.translation.vector + Vector3::new(0.05, 0.0, 0.0)).into(),
             UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 3.0) * start.rotation,
@@ -2346,7 +2442,7 @@ mod tests {
     fn a_one_centimeter_line_takes_under_a_second() {
         let held = postures(V2, states::READY)[RIGHT];
         let mut planner = launcher_planner(RIGHT, held);
-        let mut lift = planner.world_ee_pose(&held);
+        let mut lift = planner.root_ee_pose(&held);
         lift.translation.vector.z += 0.01;
         let checked = planner.check_cartesian(&request_to(lift));
         let Ok(PlanCheck::Reachable(duration)) = checked else {
@@ -2389,7 +2485,7 @@ mod tests {
         let lagging = POSE_TEST_Q.map(|q| q + 0.3);
         let tick = planner
             .tick(
-                lagging,
+                standing_at(lagging),
                 None,
                 &mut goals,
                 &claimed_move_slot(),
@@ -2410,7 +2506,7 @@ mod tests {
         let start_q: JointVec = [1.139, 1.678, 0.169, 1.339, 0.789, 0.142, 0.120];
         let goal_q: JointVec = [0.827, 1.185, -0.038, 0.856, 1.044, -0.204, 0.530];
         let mut planner = launcher_planner(RIGHT, start_q);
-        let target = planner.world_ee_pose(&goal_q);
+        let target = planner.root_ee_pose(&goal_q);
         let walk = plan_line(&planner.model, &target, start_q).expect("the line tracks");
         assert!(walk[0][WRIST_BEND] * walk[walk.len() - 1][WRIST_BEND] < 0.0);
         let checked = planner.check_cartesian(&request_to(target));
@@ -2444,7 +2540,7 @@ mod tests {
         let goal_q: JointVec = [-0.541, 1.614, 0.364, 0.160, 1.046, -0.227, -0.532];
         let mut planner = Planner::new(arm, model, cfg);
         planner.commit(start_q);
-        let target = planner.world_ee_pose(&goal_q);
+        let target = planner.root_ee_pose(&goal_q);
         let checked = planner.check_cartesian(&request_to(target));
         assert!(
             matches!(checked, Ok(PlanCheck::Unreachable(_))),
@@ -2467,7 +2563,7 @@ mod tests {
             q = next;
         }
         assert_eq!(
-            pose_shortfall(&planner.world_ee_pose(&q), &target, &ARRIVED),
+            pose_shortfall(&planner.root_ee_pose(&q), &target, &ARRIVED),
             None,
             "the stream ends at {q:?}"
         );
@@ -2496,7 +2592,7 @@ mod tests {
         let start_q = postures(V2, states::READY)[arm];
         let mut planner = Planner::new(arm, model, cfg);
         planner.commit(start_q);
-        let start = planner.world_ee_pose(&start_q);
+        let start = planner.root_ee_pose(&start_q);
         let dt = planner.cfg.cycle_period.as_secs_f64();
         let mut target = start;
         let mut qs = vec![start_q];
@@ -2604,7 +2700,7 @@ mod tests {
         let mut planner = launcher_planner(arm, ready);
         let mut straight = ready;
         straight[ELBOW] = planner.cfg.limits[ELBOW].lo;
-        let out_to = planner.world_ee_pose(&straight);
+        let out_to = planner.root_ee_pose(&straight);
         let checked = planner.check_cartesian(&request_to(out_to));
         assert!(
             matches!(checked, Ok(PlanCheck::Reachable(_))),
@@ -2613,12 +2709,12 @@ mod tests {
         let out =
             plan_line(&planner.model, &out_to, ready).expect("a line out to the straight arm");
         let reached = *out.last().expect("a walk holds its seed");
-        let landed = pose_miss(&planner.world_ee_pose(&reached), &out_to);
+        let landed = pose_miss(&planner.root_ee_pose(&reached), &out_to);
         assert!(
             landed.position_m <= PRECISION_M && landed.orientation_rad <= PRECISION_RAD,
             "the line lands {landed:?} from the straight arm's pose"
         );
-        let back = plan_line(&planner.model, &planner.world_ee_pose(&ready), reached)
+        let back = plan_line(&planner.model, &planner.root_ee_pose(&ready), reached)
             .expect("a line back in to Ready");
         let walk: Vec<JointVec> = out.iter().chain(&back[1..]).copied().collect();
         let ticks = line_ticks(&planner, &walk, Instant::now());
@@ -2688,7 +2784,13 @@ mod tests {
                 for k in 0..6000u32 {
                     let measured = planner.setpoint();
                     let tick = planner
-                        .tick(measured, None, &mut goals, &move_slot, t0 + period * k)
+                        .tick(
+                            standing_at(measured),
+                            None,
+                            &mut goals,
+                            &move_slot,
+                            t0 + period * k,
+                        )
                         .await;
                     planner.commit(tick.candidate);
                     ticks.push(tick.candidate);
@@ -2727,7 +2829,7 @@ mod tests {
         // A pose move to where a nearby posture puts the grasp point.
         let planner = launcher_planner(arm, start);
         let nearby: JointVec = std::array::from_fn(|i| start[i] + 0.1 * (target[i] - start[i]));
-        let goal = planner.world_ee_pose(&nearby);
+        let goal = planner.root_ee_pose(&nearby);
         let Some(walk) = plan_line(&planner.model, &goal, start) else {
             tc.event("no line");
             return;

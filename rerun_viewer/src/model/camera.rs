@@ -5,8 +5,8 @@ use std::num::NonZeroU32;
 
 use camera_core::encoding::{ColorEncoding, DEPTH_ENCODING, DepthFrame};
 use camera_core::pinhole::{DepthModel, Pinhole};
-use camera_core::pose::Pose;
 use control_core::positive_finite::PositiveFinite;
+use frame_tree::{FrameName, Transform};
 
 /// A color image as the viewer draws it: raw RGB pixels, or a JPEG as it came.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,13 +38,14 @@ pub enum ColorImageError {
 }
 
 impl ColorImage {
-    /// The image of a frame of `width` by `height` pixels in the encoding `encoding`
-    /// names. A bgr8 or yuyv frame becomes RGB; an mjpeg frame stays a JPEG.
+    /// The image of a frame of `width` by `height` pixels whose bytes `data` holds in the
+    /// encoding `encoding` names. A bgr8 or yuyv frame becomes RGB; an mjpeg frame stays a
+    /// JPEG.
     pub fn parse(
         encoding: &str,
         width: u32,
         height: u32,
-        frame: Vec<u8>,
+        data: Vec<u8>,
     ) -> Result<Self, ColorImageError> {
         let encoding = ColorEncoding::from_name(encoding)
             .ok_or_else(|| ColorImageError::Encoding(encoding.to_string()))?;
@@ -54,22 +55,22 @@ impl ColorImage {
             pixels,
         };
         match encoding {
-            ColorEncoding::Mjpeg => Ok(Self::Jpeg(frame)),
+            ColorEncoding::Mjpeg => Ok(Self::Jpeg(data)),
             ColorEncoding::Rgb8 => {
-                check_size(encoding, width, height, 3, frame.len())?;
-                Ok(rgb(frame))
+                check_size(encoding, width, height, 3, data.len())?;
+                Ok(rgb(data))
             }
             ColorEncoding::Bgr8 => {
-                check_size(encoding, width, height, 3, frame.len())?;
-                Ok(rgb(bgr_to_rgb(&frame)))
+                check_size(encoding, width, height, 3, data.len())?;
+                Ok(rgb(bgr_to_rgb(&data)))
             }
             ColorEncoding::Yuyv => {
                 // A yuyv pair of pixels shares its chroma.
                 if !width.is_multiple_of(2) {
                     return Err(ColorImageError::OddWidth(width));
                 }
-                check_size(encoding, width, height, 2, frame.len())?;
-                Ok(rgb(yuyv_to_rgb(&frame)))
+                check_size(encoding, width, height, 2, data.len())?;
+                Ok(rgb(yuyv_to_rgb(&data)))
             }
         }
     }
@@ -140,14 +141,14 @@ fn check_size(
     Ok(())
 }
 
-fn bgr_to_rgb(frame: &[u8]) -> Vec<u8> {
-    let (pixels, _) = frame.as_chunks::<3>();
+fn bgr_to_rgb(data: &[u8]) -> Vec<u8> {
+    let (pixels, _) = data.as_chunks::<3>();
     pixels.iter().flat_map(|&[b, g, r]| [r, g, b]).collect()
 }
 
 /// RGB from YCbCr 4:2:2 (Y0, U, Y1, V for each pair of pixels), by the BT.601
 /// full-range equations.
-fn yuyv_to_rgb(frame: &[u8]) -> Vec<u8> {
+fn yuyv_to_rgb(data: &[u8]) -> Vec<u8> {
     let rgb = |y: u8, u: u8, v: u8| {
         let (y, u, v) = (f32::from(y), f32::from(u) - 128.0, f32::from(v) - 128.0);
         let byte = |value: f32| value.round().clamp(0.0, 255.0) as u8;
@@ -157,7 +158,7 @@ fn yuyv_to_rgb(frame: &[u8]) -> Vec<u8> {
             byte(y + 1.772 * u),
         ]
     };
-    let (pairs, _) = frame.as_chunks::<4>();
+    let (pairs, _) = data.as_chunks::<4>();
     pairs
         .iter()
         .flat_map(|&[y0, u, y1, v]| {
@@ -238,7 +239,7 @@ impl DepthImage {
         self.depth_unit
     }
 
-    fn frame(&self) -> DepthFrame<'_> {
+    fn depth_frame(&self) -> DepthFrame<'_> {
         DepthFrame::parse(&self.samples, self.width, self.height)
             .expect("parse checked the length against the size")
     }
@@ -250,7 +251,9 @@ impl DepthImage {
 pub struct DepthCamera {
     pub lens: Pinhole,
     pub depth_model: DepthModel,
-    pub depth_in_color: Pose,
+    /// The camera's frame, the color optical frame, which the frames must name.
+    pub frame: FrameName,
+    pub depth_in_color: Transform,
     /// The alignment the geometry describes, which the frames must carry.
     pub align_mode: String,
 }
@@ -258,7 +261,7 @@ pub struct DepthCamera {
 impl DepthCamera {
     /// Where the depth optical frame stands in the robot frame, the color optical frame
     /// standing at `color_in_robot`: a point goes through the depth-to-color pose first.
-    pub fn depth_in_robot(&self, color_in_robot: &Pose) -> Pose {
+    pub fn depth_in_robot(&self, color_in_robot: &Transform) -> Transform {
         color_in_robot.compose(&self.depth_in_color)
     }
 
@@ -284,7 +287,7 @@ pub struct LensSizeError {
 pub fn strided_points(
     image: &DepthImage,
     camera: &DepthCamera,
-    depth_in_robot: &Pose,
+    depth_in_robot: &Transform,
     stride: NonZeroU32,
 ) -> Result<Vec<[f32; 3]>, LensSizeError> {
     if !camera.fits(image) {
@@ -295,12 +298,12 @@ pub fn strided_points(
             lens_height: camera.lens.height(),
         });
     }
-    let frame = image.frame();
+    let depth = image.depth_frame();
     let step = stride.get() as usize;
     let mut points = Vec::new();
     for v in (0..image.height).step_by(step) {
         for u in (0..image.width).step_by(step) {
-            let sample = frame.sample(u, v).expect("u and v lie inside the frame");
+            let sample = depth.sample(u, v).expect("u and v lie inside the frame");
             if sample == 0 {
                 continue;
             }
@@ -338,6 +341,7 @@ mod tests {
             })
             .unwrap(),
             depth_model: DepthModel::Z,
+            frame: FrameName::parse("chest_color_optical_frame").unwrap(),
             depth_in_color: translation([0.0; 3]),
             align_mode: "depth_to_color".to_string(),
         }
@@ -401,7 +405,7 @@ mod tests {
     fn the_points_go_through_the_pose_of_the_depth_frame() {
         // A quarter turn about z takes (x, y, z) to (-y, x, z), then the origin adds.
         let samples = [2_u16; 12];
-        let depth_in_robot = Pose::new([1.0, 2.0, 3.0], quarter_turn_about_z()).unwrap();
+        let depth_in_robot = Transform::new([1.0, 2.0, 3.0], quarter_turn_about_z()).unwrap();
         let points = strided_points(
             &image(samples),
             &camera(),
@@ -459,7 +463,7 @@ mod tests {
         // robot's y. The other order would put the depth frame at (1.1, 0, 0).
         let mut camera = camera();
         camera.depth_in_color = translation([0.1, 0.0, 0.0]);
-        let color_in_robot = Pose::new([1.0, 0.0, 0.0], quarter_turn_about_z()).unwrap();
+        let color_in_robot = Transform::new([1.0, 0.0, 0.0], quarter_turn_about_z()).unwrap();
         let depth_in_robot = camera.depth_in_robot(&color_in_robot);
         assert!(close(depth_in_robot.origin(), [1.0, 0.1, 0.0], 1e-12));
     }

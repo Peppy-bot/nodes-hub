@@ -1,10 +1,13 @@
 """The object reader: which engine source each spawned object reads from, the
-x, y, z, w orientation PhysX hands over, velocities moved from the centre of
-mass to the object's origin, and when the rigid-body view is created again.
-The engine calls are faked; everything under test is pure python."""
+x, y, z, w orientation PhysX hands over and the one read off the USD stage,
+velocities moved from the centre of mass to the object's origin, and when the
+rigid-body view is created again. The engine calls are faked, apart from the
+USD stage the authored pose is read off."""
 
 import importlib
+import sys
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -162,3 +165,26 @@ def test_a_dynamic_object_physx_does_not_simulate_fails_the_read_and_drops_the_v
 def test_nothing_spawned_reads_nothing(engine):
     assert engine.reader.read([]) == []
     assert engine.trace == []
+
+
+def test_an_authored_pose_is_read_off_the_stage_in_x_y_z_w_with_its_scale_taken_out(monkeypatch):
+    pytest.importorskip("pxr", reason="USD Python wheels are unavailable on this platform")
+    from pxr import Gf, Usd, UsdGeom
+
+    stage = Usd.Stage.CreateInMemory()
+    xform = UsdGeom.Xformable(UsdGeom.Xform.Define(stage, "/World/RuntimeObjects/obj_table"))
+    xform.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 0.4))
+    xform.AddOrientOp().Set(Gf.Quatf(_HALF_TURN, Gf.Vec3f(0.0, 0.0, _HALF_TURN)))
+    xform.AddScaleOp().Set(Gf.Vec3f(2.0, 2.0, 2.0))
+    omni = ModuleType("omni")
+    omni.usd = ModuleType("omni.usd")
+    omni.usd.get_context = lambda: SimpleNamespace(get_stage=lambda: stage)
+    monkeypatch.setitem(sys.modules, "omni", omni)
+    monkeypatch.setitem(sys.modules, "omni.usd", omni.usd)
+    monkeypatch.syspath_prepend(str(_ENGINE_DIR))
+    module = importlib.import_module("object_state")
+
+    position, orientation = module._authored_world_pose("/World/RuntimeObjects/obj_table")
+
+    assert position == pytest.approx((1.0, 2.0, 0.4))
+    assert orientation == pytest.approx((0.0, 0.0, _HALF_TURN, _HALF_TURN))

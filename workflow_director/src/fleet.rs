@@ -1,9 +1,10 @@
 //! The fleet as the director knows it: the fleet listing, with the pinned
-//! document of each contract of each robot and the model of each robot,
-//! kept current by a `fleet.changes` goal. The services of the director read
-//! the latest snapshot; a run reads a fresh listing when it arrives.
+//! document of each contract of each robot and the model and the links of
+//! each robot, kept current by a `fleet.changes` goal. The services of the
+//! director read the latest snapshot; a run reads a fresh listing when it
+//! arrives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use workflow_documents::KnownLocation;
 
 use crate::contract::ContractShape;
 
-/// The contract that gives the model of a robot.
+/// The contract that gives the model of a robot and its description.
 pub const ROBOT_IDENTITY: (&str, &str) = ("robot_identity", "v1");
 /// The contract of the locations a skill knows, which the director lists
 /// before a run and teaches through `locations`.
@@ -29,6 +30,10 @@ const SKILL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a robot has to give its model.
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a robot has to give its description, which carries its
+/// collision meshes.
+const DESCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a call of the daemon may take.
 pub const DAEMON_TIMEOUT: Duration = Duration::from_secs(10);
@@ -331,6 +336,12 @@ pub struct Snapshot {
     pub unreadable: BTreeMap<String, String>,
     /// The model of each robot that gave it, by robot name.
     pub models: BTreeMap<String, String>,
+    /// The links of each robot whose description gave them, as its URDF
+    /// names them, by robot name.
+    pub links: BTreeMap<String, RobotLinks>,
+    /// The robots whose description gave no links, by name: the director
+    /// asks such a robot again when the listing gives its entry otherwise.
+    pub unread_links: BTreeSet<String>,
     /// Whether the director has read the listing yet.
     pub ready: bool,
 }
@@ -344,7 +355,7 @@ pub async fn read_fleet(runner: &NodeRunner) -> peppygen::Result<Fleet> {
 
 /// The snapshot of `fleet`, each pin of which `known` lacks fetched with
 /// `fleet.contract` (or taken from the documents of the listing) and parsed.
-pub async fn snapshot_of(
+async fn snapshot_of(
     runner: &NodeRunner,
     fleet: Fleet,
     known: &BTreeMap<String, Arc<ContractShape>>,
@@ -377,13 +388,61 @@ pub async fn snapshot_of(
         contracts,
         unreadable,
         models: BTreeMap::new(),
+        links: BTreeMap::new(),
+        unread_links: BTreeSet::new(),
         ready: true,
     }
 }
 
+/// The links of a robot as its URDF names them: its root link, the robot
+/// frame, and the others.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RobotLinks {
+    pub root: String,
+    pub others: BTreeSet<String>,
+}
+
+impl RobotLinks {
+    /// The links that `urdf` names, its root link the one link that no joint
+    /// names as its child.
+    fn of_urdf(urdf: &str) -> Result<RobotLinks, String> {
+        let robot = urdf_rs::read_from_string(urdf)
+            .map_err(|error| format!("its URDF does not read: {error}"))?;
+        let children: BTreeSet<&str> = robot
+            .joints
+            .iter()
+            .map(|joint| joint.child.link.as_str())
+            .collect();
+        let (roots, others): (Vec<String>, Vec<String>) = robot
+            .links
+            .into_iter()
+            .map(|link| link.name)
+            .partition(|name| !children.contains(name.as_str()));
+        let [root] = <[String; 1]>::try_from(roots).map_err(|roots| {
+            format!(
+                "its URDF has {} root links, where a robot has one",
+                roots.len()
+            )
+        })?;
+        Ok(RobotLinks {
+            root,
+            others: others.into_iter().collect(),
+        })
+    }
+}
+
+/// The snapshot of `fleet` with the documents, the models and the links of
+/// its robots, each taken from `latest` when it holds it.
+pub async fn snapshot_described(runner: &NodeRunner, fleet: Fleet, latest: &Snapshot) -> Snapshot {
+    let mut snapshot = snapshot_of(runner, fleet, &latest.contracts).await;
+    snapshot.models = models_of(runner, &snapshot, &latest.models).await;
+    (snapshot.links, snapshot.unread_links) = links_of(runner, &snapshot, latest).await;
+    snapshot
+}
+
 /// The model of each robot of `snapshot`: from `known` for a robot of the
 /// same name, else from `robot_identity.get_identity` of the robot.
-pub async fn models_of(
+async fn models_of(
     runner: &NodeRunner,
     snapshot: &Snapshot,
     known: &BTreeMap<String, String>,
@@ -409,27 +468,116 @@ async fn model_of(
     snapshot: &Snapshot,
     robot: &Robot,
 ) -> Result<String, String> {
+    let response =
+        identity_answer(runner, snapshot, robot, "get_identity", IDENTITY_TIMEOUT).await?;
+    response["model"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or("get_identity gave no model".to_owned())
+}
+
+/// The links of each robot of `snapshot`, and the robots whose description
+/// gave none: as `latest` knows them where [`known_links`] says, else from
+/// the URDF that `robot_identity.get_description` of the robot gives.
+async fn links_of(
+    runner: &NodeRunner,
+    snapshot: &Snapshot,
+    latest: &Snapshot,
+) -> (BTreeMap<String, RobotLinks>, BTreeSet<String>) {
+    let mut links = BTreeMap::new();
+    let mut unread = BTreeSet::new();
+    for robot in snapshot.fleet.robots.values() {
+        match known_links(latest, robot) {
+            KnownLinks::Read(known) => {
+                links.insert(robot.name.clone(), known.clone());
+            }
+            KnownLinks::Unread => {
+                unread.insert(robot.name.clone());
+            }
+            KnownLinks::Unasked => match links_of_robot(runner, snapshot, robot).await {
+                Ok(of_robot) => {
+                    links.insert(robot.name.clone(), of_robot);
+                }
+                Err(reason) => {
+                    tracing::info!("the links of {}: {reason}", robot.name);
+                    unread.insert(robot.name.clone());
+                }
+            },
+        }
+    }
+    (links, unread)
+}
+
+/// What a snapshot knows of the links of a robot.
+#[derive(Debug, PartialEq)]
+enum KnownLinks<'s> {
+    /// The links its description gave.
+    Read(&'s RobotLinks),
+    /// Its description gave none.
+    Unread,
+    /// The director asks the robot.
+    Unasked,
+}
+
+/// What `latest` knows of the links of `robot`, as the listing gives it
+/// now: for a robot whose entry is unchanged, the links its description gave
+/// or that it gave none; for a new robot, or one whose entry changed, as at a
+/// repin or a new model, nothing.
+fn known_links<'s>(latest: &'s Snapshot, robot: &Robot) -> KnownLinks<'s> {
+    if latest.fleet.robots.get(&robot.name) != Some(robot) {
+        return KnownLinks::Unasked;
+    }
+    match latest.links.get(&robot.name) {
+        Some(links) => KnownLinks::Read(links),
+        None if latest.unread_links.contains(&robot.name) => KnownLinks::Unread,
+        None => KnownLinks::Unasked,
+    }
+}
+
+async fn links_of_robot(
+    runner: &NodeRunner,
+    snapshot: &Snapshot,
+    robot: &Robot,
+) -> Result<RobotLinks, String> {
+    let response = identity_answer(
+        runner,
+        snapshot,
+        robot,
+        "get_description",
+        DESCRIPTION_TIMEOUT,
+    )
+    .await?;
+    let urdf = response["urdf"]
+        .as_str()
+        .ok_or("get_description gave no URDF")?;
+    RobotLinks::of_urdf(urdf)
+}
+
+/// The answer of `member` of the one robot_identity:v1 instance of `robot`,
+/// within `bound`.
+async fn identity_answer(
+    runner: &NodeRunner,
+    snapshot: &Snapshot,
+    robot: &Robot,
+    member: &str,
+    bound: Duration,
+) -> Result<serde_json::Value, String> {
     let (name, tag) = ROBOT_IDENTITY;
     let [instance] = robot.instances_of(name, tag)[..] else {
         return Err("it has no single instance of robot_identity:v1".to_owned());
     };
-    let request = serde_json::json!({});
-    let response = call_skill(
+    call_skill(
         runner,
         snapshot,
         robot,
         ROBOT_IDENTITY,
         instance,
-        "get_identity",
-        &request,
-        IDENTITY_TIMEOUT,
+        member,
+        &serde_json::json!({}),
+        bound,
     )
     .await
-    .map_err(|error| error.message)?;
-    response["model"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or("get_identity gave no model".to_owned())
+    .map_err(|error| error.message)
 }
 
 /// The answer of `teach` and of `list` of locations:v1.
@@ -595,12 +743,8 @@ pub async fn follow(runner: Arc<NodeRunner>, snapshots: watch::Sender<Arc<Snapsh
                     break;
                 }
             };
-            let (known, known_models) = {
-                let latest = snapshots.borrow();
-                (latest.contracts.clone(), latest.models.clone())
-            };
-            let mut snapshot = snapshot_of(&runner, fleet_of!(&feedback.listing), &known).await;
-            snapshot.models = models_of(&runner, &snapshot, &known_models).await;
+            let latest = Arc::clone(&snapshots.borrow());
+            let snapshot = snapshot_described(&runner, fleet_of!(&feedback.listing), &latest).await;
             snapshots.send_replace(Arc::new(snapshot));
         }
     }
@@ -610,6 +754,77 @@ pub async fn follow(runner: Arc<NodeRunner>, snapshots: watch::Sender<Arc<Snapsh
 mod tests {
     use super::*;
     use crate::testing::{LOCATIONS_PIN, robot};
+
+    /// The links of a robot are the links its URDF names: its root link, the
+    /// one no joint names as its child, and the others. A URDF with two
+    /// roots, or one that does not read, gives none.
+    #[test]
+    fn the_links_of_a_robot_are_the_root_and_the_other_links_of_its_urdf() {
+        let urdf = r#"<robot name="arm">
+            <link name="grasp_link"/>
+            <link name="base_link"/>
+            <link name="arm_link"/>
+            <joint name="shoulder" type="fixed">
+              <parent link="base_link"/>
+              <child link="arm_link"/>
+            </joint>
+            <joint name="wrist" type="fixed">
+              <parent link="arm_link"/>
+              <child link="grasp_link"/>
+            </joint>
+          </robot>"#;
+        assert_eq!(
+            RobotLinks::of_urdf(urdf),
+            Ok(RobotLinks {
+                root: "base_link".to_owned(),
+                others: ["arm_link", "grasp_link"].map(str::to_owned).into(),
+            })
+        );
+        let two_roots = urdf.replace(
+            r#"<joint name="wrist" type="fixed">
+              <parent link="arm_link"/>
+              <child link="grasp_link"/>
+            </joint>"#,
+            "",
+        );
+        assert_eq!(
+            RobotLinks::of_urdf(&two_roots),
+            Err("its URDF has 2 root links, where a robot has one".to_owned())
+        );
+        assert!(
+            RobotLinks::of_urdf("<robot")
+                .unwrap_err()
+                .starts_with("its URDF does not read")
+        );
+    }
+
+    /// A robot is not asked for its links again while the listing gives its
+    /// entry as it did: one whose links were read keeps them, and one whose
+    /// description gave none stays without. A robot whose entry changes, as at
+    /// a stop or a repin, or a new one, is asked.
+    #[test]
+    fn a_robot_is_asked_for_its_links_again_when_its_entry_changes() {
+        let mut latest = crate::testing::snapshot(vec![robot("arm"), robot("eyes")]);
+        latest.links.remove("arm");
+        latest.unread_links.insert("arm".to_owned());
+        assert_eq!(known_links(&latest, &robot("arm")), KnownLinks::Unread);
+        let stopped = Robot {
+            software: "stopped".to_owned(),
+            ..robot("arm")
+        };
+        assert_eq!(known_links(&latest, &stopped), KnownLinks::Unasked);
+        let mut repinned = robot("arm");
+        repinned.contracts[0].sha256 = "b".repeat(64);
+        assert_eq!(known_links(&latest, &repinned), KnownLinks::Unasked);
+        assert_eq!(known_links(&latest, &robot("hand")), KnownLinks::Unasked);
+        assert_eq!(
+            known_links(&latest, &robot("eyes")),
+            KnownLinks::Read(&latest.links["eyes"])
+        );
+        let mut repinned_eyes = robot("eyes");
+        repinned_eyes.contracts[0].sha256 = "b".repeat(64);
+        assert_eq!(known_links(&latest, &repinned_eyes), KnownLinks::Unasked);
+    }
 
     /// Each instance of a contract that a robot lists at two pins serves the
     /// pin of its own entry, and an instance that serves none has none.

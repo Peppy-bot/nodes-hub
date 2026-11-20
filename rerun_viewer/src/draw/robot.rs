@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use camera_core::pose::Pose;
+use frame_tree::Transform;
 
 use crate::canvas::{Canvas, Look, Rgba};
 use crate::draw::part_path;
@@ -58,7 +58,7 @@ pub fn draw_body(canvas: &dyn Canvas, body: &RobotBody) {
 }
 
 /// Places each link of `poses` at its pose, at `at`.
-pub fn draw_link_poses(canvas: &dyn Canvas, at: SystemTime, poses: &[(&BodyLink, Pose)]) {
+pub fn draw_link_poses(canvas: &dyn Canvas, at: SystemTime, poses: &[(&BodyLink, Transform)]) {
     canvas.set_time(at);
     for (link, pose) in poses {
         canvas.place(&link_path(&link.name), pose);

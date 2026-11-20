@@ -16,9 +16,11 @@ from unittest.mock import Mock
 
 import pytest
 import robot_description_py
-from entries import staged_release
+from control_core_py.geometry import GeometryError, quaternion_of_yaw
+from entries import placement_at, staged_release
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
+from sim_robot_core.world import UnknownFrame, attach_placement
 
 import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
@@ -29,7 +31,7 @@ import mujoco_models  # noqa: E402  pylint: disable=C0413
 from mujoco_models import MujocoModels  # noqa: E402  pylint: disable=C0413
 from robots_io import Ending, RobotsIO, _Promise  # noqa: E402  pylint: disable=C0413
 from edits import Edits  # noqa: E402  pylint: disable=C0413
-from world import Placement, World  # noqa: E402  pylint: disable=C0413
+from world import World  # noqa: E402  pylint: disable=C0413
 
 # The shipped models, from the pinned release of Waldo's catalogue.
 MODELS = MujocoModels.read(assets_dir=staged_release(mujoco_models.ASSETS_DIR))
@@ -41,10 +43,32 @@ def _known(model: str):
     return MODELS.of(model, robot_description_py.model(model).description())
 
 
+def _asks_for(
+    position=(0.0, 0.0, 0.0),
+    orientation=(0.0, 0.0, 0.0, 1.0),
+    frame: str = "world",
+    timestamp: float | None = None,
+):
+    """The placement a request carries, as the contract hands it over: a
+    pose in `frame` at `timestamp`, the latest time for None, facing as
+    authored unless `orientation` says otherwise."""
+    return SimpleNamespace(
+        frame=frame, timestamp=timestamp, position=list(position), orientation=list(orientation)
+    )
+
+
+def _refusal_of(placement, refusal=GeometryError) -> str:
+    """The message the shared placement of a robot's base refuses
+    `placement` with: a GeometryError, or `refusal`."""
+    with pytest.raises(refusal) as refused:
+        attach_placement(placement)
+    return str(refused.value)
+
+
 def _promised(model: str = "openarm_v2", placement=None) -> _Promise:
     """What the admission of a robot of `model` promises it: `placement`,
     the origin when None, and its model."""
-    return _Promise(placement=placement or Placement.of((0.0, 0.0, 0.0), 0.0), known=_known(model))
+    return _Promise(placement=placement or placement_at(0.0), known=_known(model))
 CALLER = Caller(core_node="sim16", instance_id="alpha_init_inst")
 
 # What a robot holds once every limb of its model is paired.
@@ -174,23 +198,23 @@ def test_a_robot_that_asks_for_no_spot_is_promised_one_of_the_engines_own():
 
     assert _accepted(io._admit(_request()))
 
-    assert io._promises["alpha"].placement == Placement.of((0.0, 0.0, 0.0), 0.0)
+    assert io._promises["alpha"].placement == placement_at(0.0)
 
 
-def test_a_robot_stands_on_the_spot_it_asked_for():
+def test_a_robot_stands_on_the_spot_it_asked_for_turned_about_z_at_any_timestamp():
     io = _robots_io()
-    asked = SimpleNamespace(position=[1.0, -2.0, 0.0], yaw=0.5)
+    asked = _asks_for((1.0, -2.0, 0.0), quaternion_of_yaw(0.5), timestamp=12.5)
 
     assert _accepted(io._admit(_request(placement=asked)))
 
-    assert io._promises["alpha"].placement == Placement.of((1.0, -2.0, 0.0), 0.5)
+    assert io._promises["alpha"].placement == placement_at(1.0, -2.0, yaw=0.5)
 
 
 def test_a_spot_another_robot_was_promised_is_refused_with_what_to_ask_instead():
     io = _robots_io()
     assert _accepted(io._admit(_request()))
 
-    taken = SimpleNamespace(position=[0.0, 0.0, 0.0], yaw=0.0)
+    taken = _asks_for()
     decision = io._admit(_request(robot="charlo", instance="charlo_init_inst", placement=taken))
 
     refusal = _refused(decision, FailureKind.PRECONDITION_FAILED)
@@ -200,14 +224,47 @@ def test_a_spot_another_robot_was_promised_is_refused_with_what_to_ask_instead()
     assert io._robots.of_name("charlo") is None
 
 
-def test_a_placement_that_is_not_finite_is_rejected():
+@pytest.mark.parametrize(
+    "placement",
+    [
+        _asks_for((float("nan"), 0.0, 0.0)),
+        _asks_for(orientation=(2**-0.5, 0.0, 0.0, 2**-0.5)),
+        _asks_for(orientation=(0.0, 0.0, 0.0, 1.0051)),
+        _asks_for(timestamp=-1.0),
+    ],
+    ids=["not_finite", "turned_about_x", "no_unit_quaternion", "before_the_epoch"],
+)
+def test_a_placement_no_contract_takes_is_rejected_before_anything_is_reserved(placement):
+    """A robot attached at NaN compiles and simulates nothing, and a base
+    faces a turn about +z alone, so such a placement is rejected as the robot
+    is admitted, with the shared parse's message, before its name is
+    reserved."""
     io = _robots_io()
-    nowhere = SimpleNamespace(position=[float("nan"), 0.0, 0.0], yaw=0.0)
 
-    decision = io._admit(_request(placement=nowhere))
+    decision = io._admit(_request(placement=placement))
 
-    assert "finite in every coordinate" in _refused(decision, FailureKind.REJECTED)
+    assert _refused(decision, FailureKind.REJECTED) == _refusal_of(placement)
     assert io._robots.robots() == []
+    assert io._promises == {}
+
+
+@pytest.mark.parametrize("frame", ["base_footprint", "odom"])
+def test_a_placement_in_a_frame_other_than_world_is_refused_with_unknown_frame_before_anything_changes(
+    frame,
+):
+    """world is the one frame of the simulation: an attach whose placement
+    names another frame is refused with `unknown_frame`, naming the frame and
+    saying to send world, and no name is reserved and no spot promised."""
+    io = _robots_io()
+    placement = _asks_for((3.0, 0.0, 0.0), frame=frame)
+
+    decision = io._admit(_request(placement=placement))
+
+    message = _refused(decision, FailureKind.UNKNOWN_FRAME)
+    assert message == _refusal_of(placement, UnknownFrame)
+    assert frame in message and "world" in message
+    assert io._robots.robots() == []
+    assert io._promises == {}
 
 
 def test_a_second_robot_joins_beside_the_first_on_a_spot_of_its_own():
@@ -459,7 +516,7 @@ def test_standing_a_robot_composes_the_scene_around_it_and_takes_it_back_out_on_
     io.binds_with(lambda: composed.append("rebind"), lambda: composed.append("unbind"))
     known = _known("openarm_v2")
 
-    io.stand("alpha", known, Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", known, placement_at(0.0))
 
     assert composed == ["unbind", "rebind"]
     assert [robot.instance for robot in io._world.robots()] == ["alpha"]
@@ -469,7 +526,7 @@ def test_standing_a_robot_composes_the_scene_around_it_and_takes_it_back_out_on_
 
     io.binds_with(refuse, lambda: composed.append("unbind"))
     with pytest.raises(RuntimeError, match="this scene compiles nothing"):
-        io.stand("charlo", known, Placement.of((3.0, 0.0, 0.0), 0.0))
+        io.stand("charlo", known, placement_at(3.0))
 
     assert [robot.instance for robot in io._world.robots()] == ["alpha"], "the fleet is unchanged"
 
@@ -480,7 +537,7 @@ def test_taking_a_robot_out_composes_the_scene_around_the_ones_that_remain():
     io._robots = Mock(spec=["renew", "release", "stand"])
     composed = []
     io.binds_with(lambda: composed.append("rebind"), lambda: composed.append("unbind"))
-    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), placement_at(0.0))
     composed.clear()
 
     io.unstand("alpha")
@@ -848,7 +905,7 @@ def test_a_robot_the_scene_refused_gives_back_its_name_and_its_spot():
     what the admission held goes back with the answer."""
     io = _standing_io()
     io.binds_with(lambda: None, lambda: None)
-    io._world.add("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io._world.add("alpha", _known("openarm_v2"), placement_at(0.0))
     goal = _Goal(_request())
 
     async def stand_and_drain():
@@ -1146,13 +1203,13 @@ def test_a_scene_that_will_not_let_go_is_taken_up_again(change):
         raise RuntimeError("this scene will not let go")
 
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), placement_at(0.0))
     composed.clear()
     io.binds_with(lambda: composed.append("rebind"), refuse_to_let_go)
 
     with pytest.raises(RuntimeError, match="this scene will not let go"):
         if change == "stand":
-            io.stand("bravo", _known("openarm_v2"), Placement.of((3.0, 0.0, 0.0), 0.0))
+            io.stand("bravo", _known("openarm_v2"), placement_at(3.0))
         else:
             io.unstand("alpha")
 
@@ -1175,12 +1232,12 @@ def test_a_stand_that_cannot_compose_the_scene_puts_the_previous_one_back():
             raise refusal
 
     io.binds_with(lambda: None, lambda: composed.append("unbind"))
-    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), placement_at(0.0))
     composed.clear()
     io.binds_with(rebind, lambda: composed.append("unbind"))
 
     with pytest.raises(RuntimeError, match="this scene compiles nothing"):
-        io.stand("charlo", _known("openarm_v2"), Placement.of((3.0, 0.0, 0.0), 0.0))
+        io.stand("charlo", _known("openarm_v2"), placement_at(3.0))
 
     # The scene was composed again without the robot that could not join.
     assert composed == ["unbind", "refused", "rebind"]
@@ -1193,7 +1250,7 @@ def test_a_copy_that_comes_straight_back_keeps_the_spot_it_was_promised():
     promised must survive the goal that is leaving."""
     io = _ending_io()
     goal = _Answers()
-    promised = _promised(placement=Placement.of((1.5, 0.0, 0.0), 0.0))
+    promised = _promised(placement=placement_at(1.5))
 
     def admit_the_copy_again(_change):
         # The copy is admitted while the take-out waits for the thread that
@@ -1251,13 +1308,13 @@ def test_a_spot_a_robot_stands_on_is_refused_naming_that_robot():
     promised it is named as about to."""
     io = _robots_io()
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), placement_at(0.0))
 
     decision = io._admit(
         _request(
             robot="charlo",
             instance="charlo_init_inst",
-            placement=SimpleNamespace(position=[0.1, 0.0, 0.0], yaw=0.0),
+            placement=_asks_for((0.1, 0.0, 0.0)),
         )
     )
 
@@ -1270,7 +1327,7 @@ def test_a_copy_that_comes_straight_back_takes_the_spot_it_had():
     copy is coming back to, and nothing else may be told to move for it."""
     io = _robots_io()
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), placement_at(0.0))
 
     # The take-out gave the name back; the robot has yet to leave the scene.
     asked_again = io._admit(_request(instance="alpha_init_2"))
@@ -1279,13 +1336,13 @@ def test_a_copy_that_comes_straight_back_takes_the_spot_it_had():
     where_it_stands = io._admit(
         _request(
             instance="alpha_init_3",
-            placement=SimpleNamespace(position=[0.0, 0.0, 0.0], yaw=0.0),
+            placement=_asks_for(),
         )
     )
 
     assert _accepted(asked_again)
     assert _accepted(where_it_stands)
-    assert io._promises["alpha"].placement == Placement.of((0.0, 0.0, 0.0), 0.0)
+    assert io._promises["alpha"].placement == placement_at(0.0)
 
 
 def test_a_goal_that_never_reached_its_stay_gives_back_what_it_reserved():
@@ -1404,12 +1461,12 @@ def test_a_spot_the_robot_coming_back_stands_on_is_its_own():
     it go, so the lattice offers it the spot it is standing on."""
     io = _robots_io()
     io.binds_with(lambda: None, lambda: None)
-    io.stand("alpha", _known("openarm_v2"), Placement.of((0.0, 0.0, 0.0), 0.0))
+    io.stand("alpha", _known("openarm_v2"), placement_at(0.0))
     world = io._world
 
-    assert world.occupied(Placement.of((0.0, 0.0, 0.0), 0.0))
-    assert not world.occupied(Placement.of((0.0, 0.0, 0.0), 0.0), leaving="alpha")
-    assert world.free_spot((), "alpha").position == (0.0, 0.0, 0.0)
+    assert world.occupied(placement_at(0.0))
+    assert not world.occupied(placement_at(0.0), leaving="alpha")
+    assert world.free_spot((), "alpha") == placement_at(0.0)
 
 
 def test_a_goal_whose_spot_was_taken_back_gives_its_name_back():

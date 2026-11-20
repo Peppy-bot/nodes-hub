@@ -6,7 +6,8 @@
 //! in the fleet listing. With roles, each role reads the pins of its robot,
 //! each call and observation resolves to the instance that serves it, and
 //! the item ids that a workflow passes are proven to come from the instance
-//! that takes them.
+//! that takes them. Each point, pose and twist that a workflow passes names
+//! its frame and its time as [`crate::frames`] says.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use serde_json::Value as Json;
 use workflow_documents::expression::{
     Expr, Expression, FieldType, PathStep, RefPath, Type, TypeScope,
 };
-use workflow_documents::marks::{CHECKS_REACH, ITEM_ID, LOCATION, REACHES_FOR_ITEM, ROBOT_FRAME};
+use workflow_documents::marks::{CHECKS_REACH, ITEM_ID, LOCATION, REACHES_FOR_ITEM};
 use workflow_documents::run::{Attendance, Incidents};
 use workflow_documents::workflow::{Arg, Call, ObservationSource, Step, StepKind};
 use workflow_documents::{Located, Name, NameTag, RobotName, StepId, Workflow, robots_named_twice};
@@ -28,6 +29,7 @@ use crate::engine::plan::{
     ObservationRead, Plan, Producer, SkillLocations, Target, Watch,
 };
 use crate::fleet::{LOCATIONS, Robot, Snapshot};
+use crate::frames::{self, Crossing, FrameOfValues, Holder, Holding, Placed};
 
 /// The run-wide choices that a plan carries beside its workflow.
 pub struct RunChoices<'a> {
@@ -42,14 +44,30 @@ pub struct RunChoices<'a> {
 
 /// Where each name of a role comes from: the role whose call or
 /// observation gives it, the producer of the result or the observation, the
-/// format of its value, and its source: the name of the result or the
-/// observation, which a loop element takes from the list of its loop.
+/// format of its value, its source: the name of the result or the
+/// observation, which a loop element takes from the list of its loop, and
+/// what holds the value.
 #[derive(Clone, Debug)]
 struct Origin {
     role: Name,
     producer: Option<Producer>,
     field: Field,
     source: Name,
+    holding: Holding,
+}
+
+/// What a refusal of a literal record says to write.
+const PASS_FROM_A_REPORT: &str = "pass the record from a report of a skill of the robot by `$ref`, which brings its frame and its timestamp";
+
+/// The frames that a literal record takes, as its refusal names them.
+const LITERAL_FRAMES: &str = "a literal names the robot frame, by its name or by leaving `frame` out, or a frame that the robot's tree holds above its robot frame, odom, map, or world where a node publishes it, and no node publishes one into a robot's tree";
+
+/// The call that an argument goes to: its role, the alias of its contract,
+/// and the producer that serves it once the role is bound.
+struct Callee<'c> {
+    role: &'c Name,
+    alias: &'c Name,
+    producer: Option<&'c Producer>,
 }
 
 struct Checker<'a> {
@@ -65,8 +83,15 @@ struct Checker<'a> {
     /// Where each observation comes from, which every role reads.
     observation_origins: BTreeMap<Name, Origin>,
     tables: BTreeMap<Name, (Json, Type)>,
+    /// The tables whose every row is a `{ $location }`, with the location of
+    /// each row by its key, which a field with the mark location takes and
+    /// no expression reads.
+    location_tables: BTreeMap<Name, BTreeMap<String, Name>>,
     /// The locations each skill instance is given, by role.
     locations: Vec<SkillLocations>,
+    /// The roles whose literal records were held against the links of their
+    /// robots.
+    reads_links: BTreeSet<Name>,
 }
 
 impl<'a> Checker<'a> {
@@ -303,7 +328,13 @@ impl<'a> Checker<'a> {
                             );
                             continue;
                         }
-                        let bound = self.args(&at, role, args, &found.input, None);
+                        let callee = Callee {
+                            role,
+                            alias: &member.alias,
+                            producer: None,
+                        };
+                        let owner = format!("`{member}`");
+                        let bound = self.args(&at, &callee, &owner, args, &found.input);
                         let Some(producer) =
                             self.producer(&at, role, &member.alias, observation.instance.as_ref())
                         else {
@@ -385,6 +416,7 @@ impl<'a> Checker<'a> {
                     marks: BTreeSet::new(),
                 },
                 source: name.clone(),
+                holding: Holding::Root,
             },
         );
     }
@@ -397,16 +429,25 @@ impl<'a> Checker<'a> {
     }
 
     /// The types and the values of the tables: each row a literal, all rows
-    /// of one type.
+    /// of one type; or, for a table whose every row is a `{ $location }`,
+    /// the location of each row, which no expression reads.
     fn check_tables(&mut self) {
         for (name, rows) in &self.workflow.tables {
+            let locations: Option<BTreeMap<String, Name>> = rows
+                .iter()
+                .map(|(key, row)| Some((key.clone(), location_of_row(row)?)))
+                .collect();
+            if let Some(locations) = locations.filter(|locations| !locations.is_empty()) {
+                self.location_tables.insert(name.clone(), locations);
+                continue;
+            }
             let mut row_type = None;
             for (key, row) in rows {
                 let ty = literal_type(row);
                 match (&row_type, ty) {
                     (_, None) => self.error(
                         format!("tables.{name}.{key}"),
-                        "a row is a bool, a number, a string or a list of them",
+                        "a row is a bool, a number, a string or a list of them, or `{ $location: \"<name>\" }` in a table whose every row is one",
                     ),
                     (None, Some(ty)) => row_type = Some(ty),
                     (Some(first), Some(ty))
@@ -531,6 +572,7 @@ impl<'a> Checker<'a> {
                                 marks: BTreeSet::new(),
                             },
                             source: result.clone(),
+                            holding: Holding::Root,
                         },
                     );
                 }
@@ -605,16 +647,28 @@ impl<'a> Checker<'a> {
     }
 
     /// The origin of each element of the list a `for_each` walks: the item of
-    /// the list field at that path.
+    /// the list field at that path, held by the record that holds the list
+    /// when that record is of a result. A loop reads the list of an
+    /// observation from one message, which a call of its body does not read
+    /// again, so its elements are held by no record a call reads.
     fn element_origin(&self, role: &Name, list: &Expression) -> Option<Origin> {
         let path = RefPath::parse(list.source()).ok()?;
         let origin = self.origin_of(role, &path)?;
+        let of_a_result = self
+            .origins
+            .get(role)
+            .is_some_and(|origins| origins.contains_key(&path.root));
         match origin.field.kind {
             FieldKind::List(item) => {
                 let mut item = *item;
                 item.marks.extend(origin.field.marks.iter().cloned());
+                let holding = match of_a_result {
+                    true => origin.holding,
+                    false => Holding::ObservationElement { list: path },
+                };
                 Some(Origin {
                     field: item,
+                    holding,
                     ..origin
                 })
             }
@@ -622,7 +676,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The field that `path` reads, with the producer of its root.
+    /// The field that `path` reads, with the producer of its root and the
+    /// record that holds it.
     fn origin_of(&self, role: &Name, path: &RefPath) -> Option<Origin> {
         let root = self
             .origins
@@ -631,9 +686,21 @@ impl<'a> Checker<'a> {
             .or_else(|| self.observation_origins.get(&path.root))?
             .clone();
         let mut field = root.field;
+        let mut holding = root.holding;
+        let mut at = RefPath {
+            root: path.root.clone(),
+            steps: Vec::new(),
+        };
         for step in &path.steps {
             field = match (step, field.kind) {
-                (PathStep::Field(name), FieldKind::Object(format)) => format.0.get(name)?.clone(),
+                (PathStep::Field(name), FieldKind::Object(format)) => {
+                    let next = format.0.get(name)?.clone();
+                    holding = Holding::Record(Holder {
+                        path: at.clone(),
+                        record: format,
+                    });
+                    next
+                }
                 (PathStep::Index(_), FieldKind::List(item)) => {
                     let mut item = *item;
                     item.marks.extend(field.marks.iter().cloned());
@@ -641,46 +708,378 @@ impl<'a> Checker<'a> {
                 }
                 _ => return None,
             };
+            at.steps.push(step.clone());
         }
-        Some(Origin { field, ..root })
+        Some(Origin {
+            field,
+            holding,
+            ..root
+        })
     }
 
-    /// A row of a table that goes to a field with the mark location: a
-    /// `{ $location }` of a declared location, which the skill takes by its
-    /// name.
-    #[allow(clippy::too_many_arguments)]
-    fn location_row(
-        &mut self,
-        at: &str,
-        role: &Name,
-        name: &str,
-        field: &Field,
-        table: &Name,
-        row_key: &str,
-        row: &Json,
-        producer: Option<&Producer>,
-    ) -> Option<Json> {
-        let Some(location) = location_of_row(row) else {
+    /// The robots that a call of `callee` may reach: the robot of its role,
+    /// or before a binding each robot of the listing that implements the
+    /// contract of its alias.
+    fn robots_of(&self, callee: &Callee) -> Vec<&'a Robot> {
+        if self.binding.is_some() {
+            return self.robot_of(callee.role).into_iter().collect();
+        }
+        let Some(contract) = self.contract_ref(callee.alias) else {
+            return Vec::new();
+        };
+        self.snapshot
+            .fleet
+            .robots
+            .values()
+            .filter(|robot| {
+                robot
+                    .contract(contract.name.as_str(), contract.tag())
+                    .is_some()
+            })
+            .collect()
+    }
+
+    /// Whether a literal record of a call of `callee` takes `frame`, the
+    /// frame it names: the robot frame of each robot the call may reach, its
+    /// root link, or a frame that is no link of it, as the URDF of its
+    /// robot_identity:v1 names its links. An empty frame names no frame. For
+    /// a robot whose links the director does not know, a named frame is
+    /// refused, as the director cannot tell its robot frame from its other
+    /// links; a literal with no frame names the robot frame without a name and
+    /// comes here not at all.
+    fn takes_literal_frame(&mut self, at: &str, callee: &Callee, frame: &str) -> bool {
+        if frame.is_empty() {
             self.error(
                 at,
-                format!("the row `{row_key}` of `{table}` for `{name}`: a location takes `{{ $location }}` rows"),
+                format!(
+                    "a literal in an empty frame, which names no frame: {LITERAL_FRAMES}: {PASS_FROM_A_REPORT}"
+                ),
+            );
+            return false;
+        }
+        self.reads_links.insert(callee.role.clone());
+        for robot in self.robots_of(callee) {
+            match self.snapshot.links.get(&robot.name) {
+                None => {
+                    self.error(at, format!(
+                        "`{}` gives no URDF through robot_identity:v1, so the director cannot tell whether `{frame}` is its robot frame, another link of it or a frame its tree holds above its robot frame: leave `frame` out for the robot frame, or {PASS_FROM_A_REPORT}",
+                        robot.name
+                    ));
+                    return false;
+                }
+                Some(links) if links.others.contains(frame) => {
+                    self.error(at, format!(
+                        "a literal in `{frame}`, a link of `{}` other than its robot frame `{}`: {LITERAL_FRAMES}: {PASS_FROM_A_REPORT}",
+                        robot.name, links.root
+                    ));
+                    return false;
+                }
+                Some(_) => {}
+            }
+        }
+        true
+    }
+
+    /// A record that names its frame, given field by field: its frame, its
+    /// timestamp and its values in that frame are literals, and the record
+    /// takes the frame it names as `takes_literal_frame` says.
+    fn record_in_parts(
+        &mut self,
+        at: &str,
+        callee: &Callee,
+        args: &BTreeMap<String, Arg>,
+        format: &Format,
+    ) -> bool {
+        let mut fine = true;
+        for (name, arg) in args {
+            let Some(field) = format.0.get(name) else {
+                continue;
+            };
+            let part = name == frames::FRAME
+                || name == frames::TIMESTAMP
+                || frames::in_the_records_frame(name, field);
+            if part && !is_literal(arg) {
+                self.error(at, format!(
+                    "`{name}` is a part of a record that names its frame: give the frame, the timestamp and the values of the record as literals, the record whole by one `$ref` to a point, a pose or a twist, or its records of values by `$ref` to one record that names one `frame`, which brings them"
+                ));
+                fine = false;
+            }
+        }
+        if let Some(Arg::Literal(Json::String(frame))) = args.get(frames::FRAME) {
+            fine &= self.takes_literal_frame(at, callee, frame);
+        }
+        fine
+    }
+
+    /// A record that names its frame at the level of `format`, whose values
+    /// in that frame a call of `callee` gives by `$ref` (`values_by_ref`):
+    /// each value of one record that gives one frame and one timestamp, or
+    /// one value that names its own, whose frame and timestamp the record
+    /// takes with them, each value with the fields its field takes, and no
+    /// timestamp where their record leaves it out. The values of another
+    /// role go to the call in world alone, which the run checks. A literal
+    /// value beside them, values of two records, a list of values that each
+    /// name their own, and a frame or a timestamp given beside them that is
+    /// not the `$ref` of theirs are refused.
+    fn record_by_refs(
+        &mut self,
+        at: &str,
+        callee: &Callee,
+        args: &BTreeMap<String, Arg>,
+        format: &Format,
+    ) -> Option<BTreeMap<String, BoundArg>> {
+        let mut bound = BTreeMap::new();
+        let mut stamps: Vec<(&RefPath, frames::Stamp, Option<Crossing>)> = Vec::new();
+        for (name, arg) in args {
+            let Some(field) = format.0.get(name) else {
+                continue;
+            };
+            if name == frames::FRAME
+                || name == frames::TIMESTAMP
+                || !frames::in_the_records_frame(name, field)
+            {
+                continue;
+            }
+            let literal_beside = || {
+                format!(
+                    "`{name}` is a literal beside values given by `$ref`: give every value of a record that names its frame by `$ref` to one record that names one `frame`, or the frame, the timestamp and every value as literals"
+                )
+            };
+            let value = match (arg, &field.kind) {
+                (Arg::Ref(path), _) => {
+                    let (placed, stamp, crossing) =
+                        self.value_by_ref(at, callee, name, path, field)?;
+                    stamps.push((path, stamp, crossing));
+                    BoundArg::Placed(placed)
+                }
+                (Arg::List(items), FieldKind::List(item)) => {
+                    let Some(paths) = items.iter().map(ref_path).collect::<Option<Vec<_>>>() else {
+                        self.error(at, literal_beside());
+                        return None;
+                    };
+                    let mut placed_items = Vec::new();
+                    for path in paths {
+                        let (placed, stamp, crossing) =
+                            self.value_by_ref(at, callee, name, path, item)?;
+                        stamps.push((path, stamp, crossing));
+                        placed_items.push(BoundArg::Placed(placed));
+                    }
+                    BoundArg::List(placed_items)
+                }
+                _ => {
+                    self.error(at, literal_beside());
+                    return None;
+                }
+            };
+            bound.insert(name.clone(), value);
+        }
+        let Some((first_path, stamp, crossing)) = stamps.first().cloned() else {
+            return Some(bound);
+        };
+        if let Some((other, _, _)) = stamps.iter().find(|(_, other, _)| *other != stamp) {
+            self.error(at, format!(
+                "`{first_path}` and `{other}` come from two records: give values of one record that names one `frame`, or one value that names its frame"
+            ));
+            return None;
+        }
+        for (name, given) in [
+            (frames::FRAME, Some(&stamp.frame)),
+            (frames::TIMESTAMP, stamp.timestamp.as_ref()),
+        ] {
+            match (args.get(name), given) {
+                (None, _) => {}
+                (Some(Arg::Ref(path)), Some(given)) if path == given => {}
+                (Some(_), Some(given)) => {
+                    self.error(at, format!(
+                        "remove `{name}`: the values of the record come by `$ref` from a record that gives `{given}`, which the record takes with them"
+                    ));
+                    return None;
+                }
+                (Some(_), None) => {
+                    self.error(at, format!(
+                        "remove `{name}`: the values of the record come by `$ref` from a record whose values hold at every time, which gives none"
+                    ));
+                    return None;
+                }
+            }
+        }
+        bound.insert(
+            frames::FRAME.to_owned(),
+            BoundArg::Frame(FrameOfValues {
+                frame: stamp.frame,
+                values: first_path.clone(),
+                crossing,
+            }),
+        );
+        if let Some(timestamp) = stamp.timestamp {
+            bound.insert(frames::TIMESTAMP.to_owned(), BoundArg::Timestamp(timestamp));
+        }
+        Some(bound)
+    }
+
+    /// The value at `path` that the field `name` of a record that names its
+    /// frame at its level takes, which `field` gives the format of: the
+    /// record or the list of records at `path`, each with the fields that
+    /// the field takes, and where its frame and its timestamp are read: in
+    /// the record that holds it, or in the record itself when it names its
+    /// own; and the roles the value passes between when the role that gives
+    /// it is not the role of the call.
+    fn value_by_ref(
+        &mut self,
+        at: &str,
+        callee: &Callee,
+        name: &str,
+        path: &RefPath,
+        field: &Field,
+    ) -> Option<(Placed, frames::Stamp, Option<Crossing>)> {
+        let role = callee.role;
+        let Some(origin) = self.origin_of(role, path) else {
+            self.error(
+                at,
+                format!("`$ref: {path}` reads no field of a result or an observation"),
             );
             return None;
         };
-        self.location_value(at, role, name, field, &location, producer)
+        let (Some((target, each)), Some((record, listed))) =
+            (frames::records_of(field), frames::records_of(&origin.field))
+        else {
+            self.error(at, format!(
+                "`$ref: {path}` is {}, and `{name}` takes {}: give a record or a list of records of a point, a pose or a twist",
+                origin.field.ty(),
+                field.ty()
+            ));
+            return None;
+        };
+        if !compatible(&origin.field.kind, &field.kind) {
+            self.error(
+                at,
+                format!(
+                    "`$ref: {path}` is {}, and `{name}` takes {}: give `{name}` a `$ref` to {}",
+                    origin.field.ty(),
+                    field.ty(),
+                    named_records(target, each)
+                ),
+            );
+            return None;
+        }
+        let stamp = match frames::stamp_of(path, record, &origin.holding) {
+            Ok(Some(stamp)) => stamp,
+            Ok(None) if !listed => frames::Stamp::of_record(path, record),
+            Ok(None) => {
+                self.error(at, format!(
+                    "`{path}` holds values that each name a frame of their own, and `{name}` takes values in the one frame of the request: give values of one record that names one `frame`, or one value that names its frame"
+                ));
+                return None;
+            }
+            Err(reason) => {
+                self.error(at, reason);
+                return None;
+            }
+        };
+        let placed = Placed {
+            value: path.clone(),
+            each,
+            stamp: None,
+            fields: target.0.keys().cloned().collect(),
+            crossing: None,
+        };
+        Some((placed, stamp, Crossing::between(&origin.role, role)))
     }
 
-    /// The value of the field `name` with the mark location that a call of
-    /// `role` on `producer` gives `location`: the name of the location, in
-    /// the canonical form of the field, which the skill knows.
-    fn location_value(
+    /// The records that name their frame which a `$ref` to `path` gives the
+    /// field `name`, which takes `target` records, or a list of them
+    /// (`each`). A record that names its frame goes as it is,
+    /// and a plain value with the frame and the timestamp of the record that
+    /// holds it; each gives the fields of the target, and a field that the
+    /// target may leave out, as the orientation of a target that takes one
+    /// from a point, goes absent where the value gives none.
+    fn placed_ref(
         &mut self,
         at: &str,
         role: &Name,
         name: &str,
+        path: &RefPath,
+        origin: &Origin,
+        field: &Field,
+    ) -> Option<BoundArg> {
+        let (target, each) = frames::framed_records(field)?;
+        let record = frames::records_of(&origin.field)
+            .filter(|(_, listed)| *listed == each)
+            .map(|(record, _)| record);
+        let Some(record) = record else {
+            self.error(
+                at,
+                format!(
+                    "`$ref: {path}` is {}, and `{name}` takes {}: give `{name}` a `$ref` to {}",
+                    origin.field.ty(),
+                    field.ty(),
+                    named_records(target, each)
+                ),
+            );
+            return None;
+        };
+        let stamp = match frames::stamp_of(path, record, &origin.holding) {
+            Ok(stamp) => stamp,
+            Err(reason) => {
+                self.error(at, reason);
+                return None;
+            }
+        };
+        let values: Vec<&String> = target
+            .0
+            .keys()
+            .filter(|field| *field != frames::FRAME && *field != frames::TIMESTAMP)
+            .collect();
+        if !values.iter().any(|field| record.0.contains_key(*field)) {
+            self.error(
+                at,
+                format!(
+                    "`{path}` gives none of the values that `{name}` takes: give `{name}` a `$ref` to {}",
+                    named_records(target, each)
+                ),
+            );
+            return None;
+        }
+        for field in values {
+            let wanted = &target.0[field];
+            match record.0.get(field) {
+                Some(have) if compatible(&have.kind, &wanted.kind) => {}
+                None if wanted.optional => {}
+                _ => {
+                    let giving = match each {
+                        false => "that gives",
+                        true => "that each give",
+                    };
+                    self.error(
+                        at,
+                        format!(
+                            "`{path}` gives no `{field}` of the kind `{name}` takes: give `{name}` a `$ref` to {} {giving} `{field}`",
+                            named_records(target, each)
+                        ),
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(BoundArg::Placed(Placed {
+            value: path.clone(),
+            each,
+            stamp,
+            fields: target.0.keys().cloned().collect(),
+            crossing: Crossing::between(&origin.role, role),
+        }))
+    }
+
+    /// The value of the field `name` with the mark location that a call of
+    /// `callee` gives `location`: the name of the location, in the canonical
+    /// form of the field, which the skill knows.
+    fn location_value(
+        &mut self,
+        at: &str,
+        callee: &Callee,
+        name: &str,
         field: &Field,
         location: &Name,
-        producer: Option<&Producer>,
     ) -> Option<Json> {
         let value = match field.canonical(&Json::String(location.to_string())) {
             Ok(value) => value,
@@ -692,7 +1091,7 @@ impl<'a> Checker<'a> {
                 return None;
             }
         };
-        self.uses_location(role, location, producer);
+        self.uses_location(callee.role, location, callee.producer);
         Some(value)
     }
 
@@ -736,7 +1135,13 @@ impl<'a> Checker<'a> {
         let mut result = None;
         for (shape, found_member) in found {
             let producer = self.producer(at, role, &member.alias, instance);
-            let bound = self.args(at, role, args, &found_member.input, producer.as_ref());
+            let callee = Callee {
+                role,
+                alias: &member.alias,
+                producer: producer.as_ref(),
+            };
+            let owner = format!("`{member}`");
+            let bound = self.args(at, &callee, &owner, args, &found_member.input);
             if let (Some(producer), Some(args)) = (&producer, bound) {
                 self.calls.insert(
                     CallSite {
@@ -763,32 +1168,55 @@ impl<'a> Checker<'a> {
         result
     }
 
-    /// The arguments bound against `format`: each field of the format, the
-    /// required ones present, each literal in its canonical form, each field
-    /// with a mark fed only as its mark says.
+    /// The arguments bound against `format`, the request of `owner` or the
+    /// record of one of its fields: each field of the format, the required
+    /// ones present, each literal in its canonical form, each field with a
+    /// mark fed only as its mark says, and a record that names its frame
+    /// given in parts as `record_in_parts` says.
     fn args(
         &mut self,
         at: &str,
-        role: &Name,
+        callee: &Callee,
+        owner: &str,
         args: &BTreeMap<String, Arg>,
         format: &Format,
-        producer: Option<&Producer>,
     ) -> Option<BTreeMap<String, BoundArg>> {
         let mut bound = BTreeMap::new();
         let mut fine = true;
+        if frames::names_its_frame(format) {
+            if values_by_ref(args, format) {
+                bound = self.record_by_refs(at, callee, args, format)?;
+            } else if !self.record_in_parts(at, callee, args, format) {
+                return None;
+            }
+        }
         for (name, field) in &format.0 {
-            if !field.optional && !args.contains_key(name) {
+            if !field.optional && !args.contains_key(name) && !bound.contains_key(name) {
                 self.error(at, format!("`{name}` is a required argument"));
                 fine = false;
             }
         }
         for (name, arg) in args {
+            if bound.contains_key(name) {
+                continue;
+            }
             let Some(field) = format.0.get(name) else {
-                self.error(at, format!("the member takes no argument `{name}`"));
+                let arguments: Vec<String> = format
+                    .0
+                    .iter()
+                    .map(|(name, field)| argument_as_listed(name, field))
+                    .collect();
+                self.error(
+                    at,
+                    format!(
+                        "{owner} has no argument `{name}`: its arguments are {}",
+                        arguments.join(", ")
+                    ),
+                );
                 fine = false;
                 continue;
             };
-            match self.arg(at, role, name, arg, field, producer) {
+            match self.arg(at, callee, name, arg, field) {
                 Some(arg) => {
                     bound.insert(name.clone(), arg);
                 }
@@ -801,13 +1229,13 @@ impl<'a> Checker<'a> {
     fn arg(
         &mut self,
         at: &str,
-        role: &Name,
+        callee: &Callee,
         name: &str,
         arg: &Arg,
         field: &Field,
-        producer: Option<&Producer>,
     ) -> Option<BoundArg> {
-        let marked = field.marks.contains(ROBOT_FRAME) || field.marks.contains(ITEM_ID);
+        let role = callee.role;
+        let marked = field.marks.contains(ITEM_ID);
         match arg {
             Arg::Literal(_) | Arg::Object(_) | Arg::List(_) | Arg::Ref(_)
                 if field.marks.contains(LOCATION) =>
@@ -819,7 +1247,7 @@ impl<'a> Checker<'a> {
                 None
             }
             Arg::Location(location) if field.marks.contains(LOCATION) => self
-                .location_value(at, role, name, field, location, producer)
+                .location_value(at, callee, name, field, location)
                 .map(BoundArg::Literal),
             Arg::Location(_) => {
                 self.error(
@@ -829,20 +1257,34 @@ impl<'a> Checker<'a> {
                 None
             }
             Arg::Literal(_) | Arg::Object(_) | Arg::List(_) if marked => {
-                self.error(at, format!("`{name}` holds a position, a pose or an item id; give it a `$ref` to a result or an observation"));
+                self.error(
+                    at,
+                    format!(
+                        "`{name}` holds an item id; give it a `$ref` to a result or an observation"
+                    ),
+                );
                 None
             }
-            Arg::Literal(literal) => match field.canonical(literal) {
-                Ok(value) => Some(BoundArg::Literal(value)),
-                Err(reason) => {
-                    self.error(at, format!("`{name}`: {reason}"));
-                    None
-                }
-            },
+            Arg::Literal(literal) => {
+                let value = match field.canonical(literal) {
+                    Ok(value) => value,
+                    Err(reason) => {
+                        self.error(at, format!("`{name}`: {reason}"));
+                        return None;
+                    }
+                };
+                let named = frames::literal_frames(field, &value);
+                let taken = named
+                    .into_iter()
+                    .all(|frame| self.takes_literal_frame(at, callee, frame));
+                taken.then_some(BoundArg::Literal(value))
+            }
             Arg::Object(fields) => match &field.kind {
-                FieldKind::Object(format) => self
-                    .args(at, role, fields, format, producer)
-                    .map(BoundArg::Object),
+                FieldKind::Object(format) => {
+                    let owner = format!("`{name}`");
+                    self.args(at, callee, &owner, fields, format)
+                        .map(BoundArg::Object)
+                }
                 _ => {
                     self.error(at, format!("`{name}` is no object"));
                     None
@@ -851,7 +1293,7 @@ impl<'a> Checker<'a> {
             Arg::List(items) => match &field.kind {
                 FieldKind::List(item) => items
                     .iter()
-                    .map(|a| self.arg(at, role, name, a, item, producer))
+                    .map(|a| self.arg(at, callee, name, a, item))
                     .collect::<Option<Vec<_>>>()
                     .map(BoundArg::List),
                 _ => {
@@ -867,6 +1309,17 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 };
+                if frames::framed_records(field).is_some() {
+                    return self.placed_ref(at, role, name, path, &origin, field);
+                }
+                if origin.role != *role && frames::holds_framed_records(field) {
+                    self.error(at, format!(
+                        "`{name}` holds points, poses or twists, and `{path}` comes from the role `{}`: {}; give `{name}` field by field, with a `$ref` of its own to each point, pose or twist, which the run sends in world alone",
+                        origin.role,
+                        frames::BETWEEN_ROBOTS_IN_WORLD
+                    ));
+                    return None;
+                }
                 if !compatible(&origin.field.kind, &field.kind) {
                     self.error(
                         at,
@@ -878,20 +1331,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                if field.marks.contains(ROBOT_FRAME) {
-                    if !origin.field.marks.contains(ROBOT_FRAME) {
-                        self.error(
-                            at,
-                            format!("`{name}` takes a position or a pose in the frame of the robot, and `{path}` holds none"),
-                        );
-                        return None;
-                    }
-                    if origin.role != *role {
-                        self.error(at, format!("`{path}` is in the frame of the robot of `{}`, and `{name}` goes to the robot of `{role}`: a position is valid only for the robot whose frame it is in", origin.role));
-                        return None;
-                    }
-                }
-                if field.marks.contains(ITEM_ID) {
+                if marked {
                     if !origin.field.marks.contains(ITEM_ID) {
                         self.error(
                             at,
@@ -899,7 +1339,7 @@ impl<'a> Checker<'a> {
                         );
                         return None;
                     }
-                    if let (Some(from), Some(to)) = (&origin.producer, producer)
+                    if let (Some(from), Some(to)) = (&origin.producer, callee.producer)
                         && from != to
                     {
                         self.error(at, format!("the item id of `{path}` comes from `{}`, and `{name}` goes to `{}`: an item id is valid only on the instance that gives it", from.instance, to.instance));
@@ -910,46 +1350,59 @@ impl<'a> Checker<'a> {
             }
             Arg::Table { table, key } => {
                 if marked {
-                    self.error(
-                        at,
-                        format!(
-                            "`{name}` holds a position, a pose or an item id; give it a `$ref`"
-                        ),
-                    );
+                    self.error(at, format!("`{name}` holds an item id; give it a `$ref`"));
                     return None;
                 }
-                let Some((value, Type::Table { keys, .. })) = self.tables.get(table).cloned()
-                else {
-                    self.error(
-                        at,
-                        format!("`$table` names `{table}`, which has no rows of one type"),
-                    );
-                    return None;
+                let canonical = match (
+                    field.marks.contains(LOCATION),
+                    self.location_tables.get(table).cloned(),
+                ) {
+                    (true, Some(locations)) => {
+                        let mut canonical = BTreeMap::new();
+                        for (row_key, location) in locations {
+                            let value = self.location_value(at, callee, name, field, &location)?;
+                            canonical.insert(row_key, value);
+                        }
+                        canonical
+                    }
+                    (true, None) => {
+                        self.error(at, format!("`{name}` takes a location, and `$table` names `{table}`, whose rows are not `{{ $location }}`s: give it a table whose every row is `{{ $location: \"<name>\" }}`"));
+                        return None;
+                    }
+                    (false, Some(_)) => {
+                        self.error(at, format!("`$table` names `{table}`, a table of locations, and `{name}` takes no location: a `$location` goes only to a field with the mark location"));
+                        return None;
+                    }
+                    (false, None) => {
+                        let Some((Json::Object(rows), Type::Table { .. })) =
+                            self.tables.get(table).cloned()
+                        else {
+                            self.error(
+                                at,
+                                format!("`$table` names `{table}`, which has no rows of one type"),
+                            );
+                            return None;
+                        };
+                        let mut canonical = BTreeMap::new();
+                        for (row_key, row) in rows {
+                            let value = match field.canonical(&row) {
+                                Ok(value) => value,
+                                Err(reason) => {
+                                    self.error(
+                                        at,
+                                        format!(
+                                            "the row `{row_key}` of `{table}` for `{name}`: {reason}"
+                                        ),
+                                    );
+                                    return None;
+                                }
+                            };
+                            canonical.insert(row_key, value);
+                        }
+                        canonical
+                    }
                 };
-                let rows: BTreeMap<String, Json> = value
-                    .as_object()
-                    .map(|rows| rows.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
-                let mut canonical = BTreeMap::new();
-                for (row_key, row) in rows {
-                    let value = match field.marks.contains(LOCATION) {
-                        true => self
-                            .location_row(at, role, name, field, table, &row_key, &row, producer)?,
-                        false => match field.canonical(&row) {
-                            Ok(value) => value,
-                            Err(reason) => {
-                                self.error(
-                                    at,
-                                    format!(
-                                        "the row `{row_key}` of `{table}` for `{name}`: {reason}"
-                                    ),
-                                );
-                                return None;
-                            }
-                        },
-                    };
-                    canonical.insert(row_key, value);
-                }
+                let keys: BTreeSet<String> = canonical.keys().cloned().collect();
                 let key = match key.as_ref() {
                     Arg::Ref(path) => {
                         let enum_values =
@@ -1204,19 +1657,20 @@ impl<'a> Checker<'a> {
         members.filter(|members| !members.is_empty())
     }
 
-    /// The sources of the positions that `call` of `role` checks: of each
-    /// `$ref` of an argument that the request of `members`, the member of
-    /// the call on each pin, marks `robot_frame` on every pin.
+    /// The sources of the points that `call` of `role` checks: of each
+    /// `$ref` of an argument that takes records that name their frame, or
+    /// values in the frame of a request that names its frame at its level,
+    /// in the request of `members`, the member of the call on each pin.
     fn checked_sources(&self, role: &Name, call: &Call, members: &[Member]) -> BTreeSet<Name> {
         call.args
             .iter()
             .filter(|(name, _)| {
                 members.iter().all(|member| {
-                    member
-                        .input
-                        .0
-                        .get(name.as_str())
-                        .is_some_and(|field| field.marks.contains(ROBOT_FRAME))
+                    member.input.0.get(name.as_str()).is_some_and(|field| {
+                        frames::framed_records(field).is_some()
+                            || (frames::names_its_frame(&member.input)
+                                && frames::in_the_records_frame(name, field))
+                    })
                 })
             })
             .flat_map(|(_, arg)| refs_of(arg))
@@ -1226,14 +1680,14 @@ impl<'a> Checker<'a> {
     }
 
     /// The sources of the items that `call` of `role` reaches: of each
-    /// `$ref` of its arguments that reads an item id or a position.
+    /// `$ref` of its arguments that reads an item id, a point or a pose.
     fn reached_sources(&self, role: &Name, call: &Call) -> BTreeSet<Name> {
         call.args
             .values()
             .flat_map(refs_of)
             .filter_map(|path| self.origin_of(role, path))
             .filter(|origin| {
-                origin.field.marks.contains(ITEM_ID) || origin.field.marks.contains(ROBOT_FRAME)
+                origin.field.marks.contains(ITEM_ID) || frames::is_geometry(&origin.field)
             })
             .map(|origin| origin.source)
             .collect()
@@ -1264,6 +1718,69 @@ fn calls_of<'w>(trees: impl Iterator<Item = &'w Step>) -> Vec<(&'w Step, &'w Cal
         });
     }
     calls
+}
+
+/// What a field that takes `target` records, or a list of them (`each`),
+/// takes, as a refusal names it: "a pose", "a list of points".
+fn named_records(target: &Format, each: bool) -> String {
+    let (one, many) = frames::kind_of(target);
+    match each {
+        false => one.to_owned(),
+        true => format!("a list of {many}"),
+    }
+}
+
+/// The argument `name` of `field` as the refusal of an unknown argument
+/// lists it: with what it takes when it takes records that name their frame.
+fn argument_as_listed(name: &str, field: &Field) -> String {
+    let Some((record, each)) = frames::framed_records(field) else {
+        return format!("`{name}`");
+    };
+    let with = match each {
+        false => "with",
+        true => "each with",
+    };
+    format!(
+        "`{name}` ({} {with} frame and timestamp)",
+        named_records(record, each)
+    )
+}
+
+/// Whether `arg` holds literals alone.
+fn is_literal(arg: &Arg) -> bool {
+    match arg {
+        Arg::Literal(_) => true,
+        Arg::List(items) => items.iter().all(is_literal),
+        Arg::Object(fields) => fields.values().all(is_literal),
+        Arg::Ref(_) | Arg::Table { .. } | Arg::Location(_) => false,
+    }
+}
+
+/// Whether `args` give a value of the record of `format`, which names its
+/// frame at its level, by `$ref`: a record of values in that frame, or a
+/// list of them, that is a `$ref` or a list of `$ref`s.
+fn values_by_ref(args: &BTreeMap<String, Arg>, format: &Format) -> bool {
+    args.iter().any(|(name, arg)| {
+        let in_frame = name != frames::FRAME
+            && name != frames::TIMESTAMP
+            && format.0.get(name).is_some_and(|field| {
+                frames::in_the_records_frame(name, field) && frames::records_of(field).is_some()
+            });
+        let by_ref = match arg {
+            Arg::Ref(_) => true,
+            Arg::List(items) => items.iter().any(|item| ref_path(item).is_some()),
+            _ => false,
+        };
+        in_frame && by_ref
+    })
+}
+
+/// The path of `arg` when it is a `$ref`.
+fn ref_path(arg: &Arg) -> Option<&RefPath> {
+    match arg {
+        Arg::Ref(path) => Some(path),
+        _ => None,
+    }
 }
 
 /// Each `$ref` that `arg` holds, in an object, a list or the key of a table.
@@ -1392,7 +1909,9 @@ fn run_checker<'a>(
         origins: BTreeMap::new(),
         observation_origins: BTreeMap::new(),
         tables: BTreeMap::new(),
+        location_tables: BTreeMap::new(),
         locations: Vec::new(),
+        reads_links: BTreeSet::new(),
     };
     checker.check_contracts();
     checker.check_binding(confirmed);
@@ -1487,6 +2006,7 @@ pub fn plan(
         cancel_timeout: choices.cancel_timeout,
         watch: choices.watch,
         of_a_trial: choices.of_a_trial,
+        reads_links: checker.reads_links,
         workflow,
     })
 }
@@ -1524,12 +2044,12 @@ fn monitor_target(
     let request_fits = member.kind == MemberKind::Service
         && member.input.0.keys().collect::<BTreeSet<_>>()
             == BTreeSet::from([&"robot".to_owned(), &"step".to_owned()]);
-    let response_fits = ["anomaly", "kind", "severity", "description", "frame"]
+    let response_fits = ["anomaly", "kind", "severity", "description", "data"]
         .iter()
         .all(|field| member.output.0.contains_key(*field));
     if !request_fits || !response_fits {
         return Err(format!(
-            "`{contract}.{}` is no anomaly monitor: a service of {{ robot, step }} that answers {{ anomaly, kind, severity, description, frame }}",
+            "`{contract}.{}` is no anomaly monitor: a service of {{ robot, step }} that answers {{ anomaly, kind, severity, description, data }}",
             monitor.member
         ));
     }
@@ -1627,8 +2147,10 @@ fn location_calls_of_role<'w>(
     calls
 }
 
-/// The location that a row of a table names: `{ $location: <name> }`.
+/// The location that a row of a table names: `{ $location: <name> }`, an
+/// object that holds `$location` alone.
 fn location_of_row(row: &Json) -> Option<Name> {
+    let row = row.as_object().filter(|row| row.len() == 1)?;
     row.get("$location")
         .and_then(Json::as_str)
         .and_then(|location| Name::parse(location).ok())

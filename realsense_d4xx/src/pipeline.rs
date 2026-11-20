@@ -67,8 +67,8 @@ const ALIGN_QUEUE_DEPTH: i32 = 1;
 /// effectively broken and we drop the frame.
 const ALIGN_WAIT: Duration = Duration::from_millis(200);
 
-/// Heartbeat interval. At each tick, log either the latest captured frame
-/// id (healthy) or a "no frame" warning (`Pipeline::wait` timing out is
+/// Heartbeat interval. At each tick, log either the latest capture index
+/// (healthy) or a "no frame" warning (`Pipeline::wait` timing out is
 /// otherwise silent, so a wedged camera looks identical to a healthy one
 /// from the outside).
 const STATUS_LOG_INTERVAL: Duration = Duration::from_secs(10);
@@ -156,9 +156,9 @@ impl Capture {
         } = self;
         let mut align_to_color: Option<Align> = None;
         let mut align_to_depth: Option<Align> = None;
-        let mut frame_id: u32 = 0;
+        let mut capture_index: u32 = 0;
         let mut last_status = Instant::now();
-        let mut latest_id_this_interval: Option<u32> = None;
+        let mut latest_index_this_interval: Option<u32> = None;
 
         info!("capture loop started");
         loop {
@@ -170,15 +170,15 @@ impl Capture {
             // warn that the pipeline is silent (otherwise indistinguishable
             // from a healthy idle stream).
             if last_status.elapsed() >= STATUS_LOG_INTERVAL {
-                match latest_id_this_interval {
-                    Some(id) => info!("captured frame {id}"),
+                match latest_index_this_interval {
+                    Some(index) => info!("captured frame {index}"),
                     None => warn!(
                         "no frame in last {}s; capture appears stalled",
                         last_status.elapsed().as_secs(),
                     ),
                 }
                 last_status = Instant::now();
-                latest_id_this_interval = None;
+                latest_index_this_interval = None;
             }
 
             let frames = match pipeline.wait(Some(WAIT_TIMEOUT)) {
@@ -225,22 +225,22 @@ impl Capture {
             let Ok(timestamp) = clock_now() else {
                 continue; // clock not ready yet: skip rather than mis-stamp
             };
-            let id = frame_id;
-            frame_id = frame_id.wrapping_add(1);
-            latest_id_this_interval = Some(id);
+            let index = capture_index;
+            capture_index = capture_index.wrapping_add(1);
+            latest_index_this_interval = Some(index);
 
             let frameset = FrameSet {
-                frame_id: id,
+                capture_index: index,
                 timestamp,
                 align_mode: mode,
                 images: StreamPair {
                     color: Image {
-                        bytes: frame_bytes(&color),
+                        data: frame_bytes(&color),
                         width: color.width() as u32,
                         height: color.height() as u32,
                     },
                     depth: Image {
-                        bytes: frame_bytes(&depth),
+                        data: frame_bytes(&depth),
                         width: depth.width() as u32,
                         height: depth.height() as u32,
                     },
@@ -250,7 +250,7 @@ impl Capture {
             match tx.try_send(frameset) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!("emit backlog full, dropping frame {id}");
+                    warn!("emit backlog full, dropping frame {index}");
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     error!("emit task closed; stopping capture loop");

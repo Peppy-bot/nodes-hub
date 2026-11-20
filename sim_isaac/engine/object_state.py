@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from control_core_py.geometry import rotate, xyzw_of_wxyz
+
 # The stage root of runtime objects. The launcher spawns, moves and removes
 # each scene_manipulation object at object_prim_path(object_id), the path the
 # reader reads it from.
@@ -27,9 +29,10 @@ _AT_REST = (0.0, 0.0, 0.0)
 
 @dataclass(frozen=True)
 class ObjectRecord:
-    """One spawned object in a snapshot: its world pose (orientation a unit
-    quaternion x, y, z, w), its world-axis velocities at its origin, and the
-    name, asset, physics, mass and scale it was spawned with."""
+    """One spawned object in a snapshot: its pose in world (orientation a
+    unit quaternion x, y, z, w), its velocities along world's axes at its
+    origin, and the name, asset, physics, mass and scale it was spawned
+    with."""
 
     object_id: str
     name: str
@@ -59,7 +62,8 @@ class ObjectRecord:
 
 @dataclass(frozen=True)
 class ObjectStateSnapshot:
-    """Every spawned object at one capture, and the instant of that capture."""
+    """Every spawned object at one capture, in world, and the simulated
+    instant of that capture."""
 
     timestamp_s: float
     objects: tuple[ObjectRecord, ...]
@@ -180,7 +184,7 @@ def origin_velocity(
     its centre of mass: v_origin = v_com - w x (R * com_offset), where
     com_offset is the centre of mass in the body frame and R the body's
     orientation."""
-    offset = _rotate(orientation, com_offset)
+    offset = rotate(orientation, com_offset)
     wx, wy, wz = angular
     cross = (
         wy * offset[2] - wz * offset[1],
@@ -188,22 +192,6 @@ def origin_velocity(
         wx * offset[1] - wy * offset[0],
     )
     return tuple(float(v - c) for v, c in zip(com_linear, cross))
-
-
-def _rotate(
-    orientation: tuple[float, float, float, float], vector: list[float]
-) -> tuple[float, float, float]:
-    """Rotate vector by the unit quaternion (x, y, z, w)."""
-    x, y, z, w = orientation
-    vx, vy, vz = vector
-    tx = 2.0 * (y * vz - z * vy)
-    ty = 2.0 * (z * vx - x * vz)
-    tz = 2.0 * (x * vy - y * vx)
-    return (
-        vx + w * tx + (y * tz - z * ty),
-        vy + w * ty + (z * tx - x * tz),
-        vz + w * tz + (x * ty - y * tx),
-    )
 
 
 # --- engine reads, Isaac's main thread only ---
@@ -240,13 +228,8 @@ def _authored_world_pose(
     )
     translation = matrix.ExtractTranslation()
     rotation = matrix.RemoveScaleShear().ExtractRotationQuat()
-    imaginary = rotation.GetImaginary()
+    wxyz = (rotation.GetReal(), *rotation.GetImaginary())
     return (
         (float(translation[0]), float(translation[1]), float(translation[2])),
-        (
-            float(imaginary[0]),
-            float(imaginary[1]),
-            float(imaginary[2]),
-            float(rotation.GetReal()),
-        ),
+        tuple(float(value) for value in xyzw_of_wxyz(wxyz)),
     )

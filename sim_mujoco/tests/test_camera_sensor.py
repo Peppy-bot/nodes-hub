@@ -14,9 +14,10 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import pytest
+from control_core_py.geometry import normalized
 
 from entries import known
-from sim_robot_core.cameras import CameraConfig, DepthSpec
+from sim_robot_core.cameras import DEPTH_TO_COLOR, CameraConfig, DepthSpec, pinhole
 from sim_robot_core.models import ModelEntry
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
@@ -24,7 +25,6 @@ sys.path.insert(0, str(_ENGINE_DIR))
 sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 
 import camera_sensor
-from camera_geometry import pinhole
 from camera_sensor import (
     _HEARTBEAT_TIMEOUT_S,
     _LATE_REPORT_PERIOD_S,
@@ -68,6 +68,7 @@ def scene_fixture(tmp_path):
 def color_camera(name="wrist", parent="link_a", fps=_FPS):
     return CameraConfig(
         name=name,
+        frame=f"{name}_optical_frame",
         parent_link=parent,
         pos=(0.0, 0.0, 0.1),
         quat_wxyz=(1.0, 0.0, 0.0, 0.0),
@@ -82,6 +83,7 @@ def color_camera(name="wrist", parent="link_a", fps=_FPS):
 def rgbd_camera(name="chest", parent=_WELDED_LINK, fps=_FPS):
     return CameraConfig(
         name=name,
+        frame=f"{name}_optical_frame",
         parent_link=parent,
         pos=(0.0, 0.0, 0.2),
         quat_wxyz=(1.0, 0.0, 0.0, 0.0),
@@ -171,15 +173,17 @@ class FakeIO:
         return self.now_s
 
     def publish_color_frame(
-        self, robot, name, timestamp_s, frame_id, encoding, width, height, frame
+        self, robot, name, timestamp_s, frame, capture_index, encoding, width, height, data
     ):
         assert robot == ROBOT
-        self.frames.append((name, frame_id, encoding, width, height, frame, timestamp_s))
+        self.frames.append((name, frame, capture_index, encoding, width, height, data, timestamp_s))
         return self.delivers
 
-    def publish_rgbd_frames(self, robot, name, timestamp_s, frame_id, align_mode, color, depth):
+    def publish_rgbd_frames(
+        self, robot, name, timestamp_s, frame, capture_index, align_mode, color, depth
+    ):
         assert robot == ROBOT
-        self.rgbd.append((name, frame_id, align_mode, color, depth, timestamp_s))
+        self.rgbd.append((name, frame, capture_index, align_mode, color, depth, timestamp_s))
         return self.delivers
 
     def publish_color_stream_info(self, robot, name, width, height, fps, encoding):
@@ -200,11 +204,11 @@ class FakeIO:
 
     def publish_rgbd_geometry(
         self, robot, name, color, depth, depth_model, min_depth_m, max_depth_m,
-        align_mode, depth_to_color_position, depth_to_color_orientation,
+        align_mode, frame, depth_to_color,
     ):
         assert robot == ROBOT
         self.geometries.append((name, color, depth, depth_model, min_depth_m, max_depth_m,
-                                align_mode, depth_to_color_position, depth_to_color_orientation))
+                                align_mode, frame, depth_to_color))
 
 
 @pytest.fixture(name="clock")
@@ -366,14 +370,14 @@ def test_color_capture_publishes_a_full_rgb8_frame(scene, clock):
 
     render_due(sensor, model, color, depth, pose=np.zeros(model.nq))
 
-    name, frame_id, encoding, width, height, frame, _ = io.frames[0]
-    assert (name, frame_id, encoding) == ("wrist", 0, "rgb8")
+    name, frame, capture_index, encoding, width, height, data, _ = io.frames[0]
+    assert (name, frame, capture_index, encoding) == ("wrist", "wrist_optical_frame", 0, "rgb8")
     assert (width, height) == _COLOR
-    assert len(frame) == _COLOR[0] * _COLOR[1] * 3
-    assert set(frame) == {7}
+    assert len(data) == _COLOR[0] * _COLOR[1] * 3
+    assert set(data) == {7}
 
 
-def test_rgbd_capture_pairs_color_and_depth_under_one_frame_id(scene, clock):
+def test_rgbd_capture_pairs_color_and_depth_under_one_capture_index(scene, clock):
     camera = rgbd_camera()
     model = compile_model_with_cameras(scene, [camera])
     io = FakeIO()
@@ -381,8 +385,13 @@ def test_rgbd_capture_pairs_color_and_depth_under_one_frame_id(scene, clock):
 
     render_due(sensor, model, color, depth, pose=np.zeros(model.nq))
 
-    name, frame_id, align_mode, color_frame, depth_frame, _ = io.rgbd[0]
-    assert (name, frame_id, align_mode) == ("chest", 0, "depth_to_color")
+    name, frame, capture_index, align_mode, color_frame, depth_frame, _ = io.rgbd[0]
+    assert (name, frame, capture_index, align_mode) == (
+        "chest",
+        "chest_optical_frame",
+        0,
+        "depth_to_color",
+    )
     assert color_frame[:3] == ("rgb8", _COLOR[0], _COLOR[1])
     assert depth_frame[:3] == ("z16", _DEPTH[0], _DEPTH[1])
     # Depth renders at the depth stream's own size, so no resampling happens.
@@ -393,7 +402,7 @@ def test_rgbd_capture_pairs_color_and_depth_under_one_frame_id(scene, clock):
     assert depth[(camera.depth.height, camera.depth.width)].rendered == ["chest"]
 
 
-def test_frame_ids_count_captures_per_camera(scene, clock):
+def test_capture_indices_count_captures_per_camera(scene, clock):
     cameras = [color_camera(name="fast", fps=20), color_camera(name="slow", fps=5)]
     model = compile_model_with_cameras(scene, cameras)
     io = FakeIO()
@@ -405,8 +414,8 @@ def test_frame_ids_count_captures_per_camera(scene, clock):
         render_due(sensor, model, color, depth, pose=pose)
 
     per_camera = {}
-    for name, frame_id, *_ in io.frames:
-        per_camera.setdefault(name, []).append(frame_id)
+    for name, _, capture_index, *_ in io.frames:
+        per_camera.setdefault(name, []).append(capture_index)
     assert per_camera["fast"] == [0, 1, 2]
     assert per_camera["slow"] == [0]
 
@@ -535,9 +544,9 @@ def test_camera_placement_reaches_the_compiled_model(scene):
 
     # MuJoCo normalizes what it is given, which reorders nothing: a wxyz read
     # as xyzw still fails here.
-    expected = np.array(camera.quat_wxyz) / np.linalg.norm(camera.quat_wxyz)
+    expected = normalized(camera.quat_wxyz)
     assert model.cam_pos[index].tolist() == pytest.approx(list(camera.pos))
-    assert model.cam_quat[index].tolist() == pytest.approx(expected.tolist())
+    assert model.cam_quat[index].tolist() == pytest.approx(list(expected))
     assert model.cam_fovy[index] == pytest.approx(camera.fovy_deg)
 
 
@@ -634,7 +643,7 @@ def test_background_depth_publishes_as_invalid(scene, clock):
 
     render_due(sensor, model, color, depth, pose=np.zeros(model.nq))
 
-    payload = io.rgbd[0][4][3]
+    payload = io.rgbd[0][5][3]
     assert set(struct.unpack(f"<{_DEPTH[0] * _DEPTH[1]}H", payload)) == {0}
 
 
@@ -784,7 +793,7 @@ def test_an_rgbd_camera_says_how_its_depth_sits_against_its_colour(scene, clock)
 
     # Depth has a renderer of its own at the depth stream's size, so its grid
     # is a centred pinhole of the same field of view, seen from the colour
-    # camera's own frame.
+    # camera's own frame: the identity in the camera's frame.
     assert io.geometries == [
         (
             "chest",
@@ -794,8 +803,8 @@ def test_an_rgbd_camera_says_how_its_depth_sits_against_its_colour(scene, clock)
             0.1,
             10.0,
             "depth_to_color",
-            (0.0, 0.0, 0.0),
-            (0.0, 0.0, 0.0, 1.0),
+            "chest_optical_frame",
+            DEPTH_TO_COLOR,
         )
     ]
     depth_model = io.geometries[0][2]
@@ -813,7 +822,7 @@ def test_each_robots_cameras_render_under_its_own_prefix_and_publish_for_it(scen
             self.published = []
 
         def publish_color_frame(
-            self, robot, name, timestamp_s, frame_id, encoding, width, height, frame
+            self, robot, name, timestamp_s, frame, capture_index, encoding, width, height, data
         ):
             self.published.append((robot, name))
             return True

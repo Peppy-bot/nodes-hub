@@ -97,8 +97,9 @@ impl<const N: usize, const K: usize> SelfModel<N> for HeldOtherArms<N, K> {
 }
 
 /// The self model of a plan of every arm of a robot of `K` arms, a state of `D` joints
-/// holding each arm's in turn: every checked pair, or those a turn of one arm judges, the
-/// last arm's with every other arm and, of two arms, the first's without the second.
+/// holding each arm's in the model's order: every checked pair, or those a turn of one arm
+/// judges, of an arm sampled after every other arm its pairs with them all, and of an arm
+/// sampled first its pairs without the others.
 pub struct EveryArm<const N: usize, const K: usize, const D: usize> {
     copies: Copies<N, K>,
 }
@@ -110,7 +111,8 @@ impl<const N: usize, const K: usize, const D: usize> EveryArm<N, K, D> {
             assert!(D == N * K, "a state holds the joints of every arm");
             assert!(
                 K <= 2,
-                "a turn of one arm reads the last arm's pairs, and the first's of two"
+                "a turn of one arm reads its pairs with every other arm or with none, which \
+                 covers each turn of two arms"
             );
         };
         Self {
@@ -120,15 +122,7 @@ impl<const N: usize, const K: usize, const D: usize> EveryArm<N, K, D> {
 
     /// Each arm's joints of the state `q`.
     fn at(q: &[f64; D]) -> Joints<N, K> {
-        std::array::from_fn(|k| Arms::<N, D>::slice(q, k))
-    }
-
-    /// Refuses a turn of an arm whose pairs the self model reads for no turn.
-    fn no_turn_of(k: usize) -> ! {
-        panic!(
-            "a turn of arm {k} of a plan of {K} arms: the self model reads the last arm's, \
-             and the first's of two"
-        )
+        std::array::from_fn(|arm| Arms::<N, D>::slice(q, arm))
     }
 }
 
@@ -138,9 +132,10 @@ impl<const N: usize, const K: usize, const D: usize> SelfModel<D> for EveryArm<N
         let mut model = self.copies.free_copy();
         clearance_of(match moving {
             Moving::All => model.min_distance_within(&at, within),
-            Moving::Arm(k) if k + 1 == K => model.min_distance_of_chain_within(k, &at, within),
-            Moving::Arm(0) if K == 2 => model.min_distance_of_chain_alone_within(0, &at, within),
-            Moving::Arm(k) => Self::no_turn_of(k),
+            Moving::Arm { arm, before } if before.len() + 1 == K => {
+                model.min_distance_of_chain_within(arm, &at, within)
+            }
+            Moving::Arm { arm, .. } => model.min_distance_of_chain_alone_within(arm, &at, within),
         })
     }
 
@@ -149,9 +144,10 @@ impl<const N: usize, const K: usize, const D: usize> SelfModel<D> for EveryArm<N
         let mut model = self.copies.free_copy();
         pair_of(match moving {
             Moving::All => model.min_distance(&at),
-            Moving::Arm(k) if k + 1 == K => model.min_distance_of_chain(k, &at),
-            Moving::Arm(0) if K == 2 => model.min_distance_of_chain_alone(0, &at),
-            Moving::Arm(k) => Self::no_turn_of(k),
+            Moving::Arm { arm, before } if before.len() + 1 == K => {
+                model.min_distance_of_chain(arm, &at)
+            }
+            Moving::Arm { arm, .. } => model.min_distance_of_chain_alone(arm, &at),
         })
     }
 }
@@ -161,6 +157,7 @@ mod tests {
     use crate::robot::tests::{ARM_DOF, ARMS, DUAL_DOF, LEFT, RIGHT, bundled, home, ready};
 
     use super::*;
+    use motion_planning_core::ArmSet;
     use robot_description::PerArm;
 
     /// A bound under the distance of every pair of the robots at the postures of the tests.
@@ -178,9 +175,17 @@ mod tests {
         );
     }
 
-    // A turn of the left arm, first in the state, reads its pairs without the right arm,
-    // and a turn of the right arm its pairs with the left: the left arm at Ready and the
-    // right at its home posture, where those stand nearest at different distances.
+    /// The turn of the arm at place `arm` after the turns of the arms at `before`.
+    fn turn(arm: usize, before: &[usize]) -> Moving {
+        Moving::Arm {
+            arm,
+            before: ArmSet::of(before.iter().copied()),
+        }
+    }
+
+    // A turn of an arm sampled first reads its pairs without the other arm, and a turn of an
+    // arm sampled after it its pairs with it, in either order of the two: the left arm at Ready
+    // and the right at its home posture, where those stand nearest at different distances.
     #[test]
     fn a_turn_of_one_arm_of_both_reads_its_pairs_with_the_arms_before_it() {
         let robot = bundled::<ARM_DOF, DUAL_DOF, ARMS>("openarm_v2");
@@ -192,11 +197,16 @@ mod tests {
             nearest.expect("a measured state").distance
         };
         let left_alone = distance(model.min_distance_of_chain_alone(0, &at));
+        let right_alone = distance(model.min_distance_of_chain_alone(1, &at));
+        let of_left = distance(model.min_distance_of_chain(0, &at));
         let of_right = distance(model.min_distance_of_chain(1, &at));
         let of_all = distance(model.min_distance(&at));
         assert_ne!(left_alone, of_right);
-        reads(&both, &q, Moving::Arm(0), left_alone);
-        reads(&both, &q, Moving::Arm(1), of_right);
+        assert_ne!(right_alone, of_left);
+        reads(&both, &q, turn(0, &[]), left_alone);
+        reads(&both, &q, turn(1, &[0]), of_right);
+        reads(&both, &q, turn(1, &[]), right_alone);
+        reads(&both, &q, turn(0, &[1]), of_left);
         reads(&both, &q, Moving::All, of_all);
     }
 
@@ -229,7 +239,7 @@ mod tests {
             .of_one_arm(NonZeroUsize::MIN, ArmId::new(0), &PerArm::new([q]));
         let every = robot.own.of_every_arm::<5>(NonZeroUsize::MIN);
         reads(&alone, &q, Moving::All, of_all);
-        reads(&every, &q, Moving::Arm(0), of_all);
+        reads(&every, &q, turn(0, &[]), of_all);
         reads(&every, &q, Moving::All, of_all);
     }
 }

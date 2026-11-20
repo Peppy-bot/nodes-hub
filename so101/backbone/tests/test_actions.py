@@ -23,10 +23,11 @@ from conftest import (
     make_layer,
     path_result_joints,
 )
+from control_core_py.geometry import angle_shortest_path
 from path_timing_py import JOINT_PATH_CORNER_DEVIATION, MIN_JOINT_CHANGE_RAD, JointTrajectory
 from peppygen.exposed_actions.limb_motion import execute_joint_path
+from peppygen.exposed_actions.postures import move_to_ready
 from so101.staleness import COMMAND_SILENCE_LIMIT_S
-from so101.transforms import relative_rotation_rad
 
 from so101_backbone import actions
 from so101_backbone import limits as limits_mod
@@ -49,7 +50,7 @@ from so101_backbone.coordinator import (
 )
 from so101_backbone.failures import FailureKind, Refusal
 from so101_backbone.kinematics import Kinematics
-from so101_backbone.model import DESCRIPTION, urdf_path
+from so101_backbone.model import DESCRIPTION, ROBOT_FRAME, urdf_path
 from so101_backbone.postures import HOME_POSITIONS_RAD, READY_POSITIONS_RAD
 
 # The reason the generated goal context gives for each cause of a cancel
@@ -90,8 +91,58 @@ def admit_path(layer, *waypoints, **fields):
     )
 
 
+def pose_goal_data(position, orientation, duration_s=0.0, settle=SETTLE, contact_gap_m=0.0):
+    """The data of a move_arm goal of these fields, its target in the robot
+    frame at the latest time; an orientation of None is none."""
+    position_tolerance_m, orientation_tolerance_rad, settle_timeout_s = settle
+    return SimpleNamespace(
+        arm_name="arm",
+        target=SimpleNamespace(
+            frame=ROBOT_FRAME,
+            timestamp=None,
+            position=position,
+            orientation=orientation,
+        ),
+        duration_s=duration_s,
+        settle_position_tolerance_m=position_tolerance_m,
+        settle_orientation_tolerance_rad=orientation_tolerance_rad,
+        settle_timeout_s=settle_timeout_s,
+        contact_gap_m=contact_gap_m,
+    )
+
+
 def admit_pose(layer, position, orientation, duration_s=0.0, settle=SETTLE, contact_gap_m=0.0):
-    return layer._admit_pose_move(position, orientation, duration_s, *settle, contact_gap_m)
+    """Admit the move_arm goal of these fields, its target in the robot frame,
+    where the robot-frame placer of the tests leaves it."""
+    fields = actions._pose_fields(
+        pose_goal_data(position, orientation, duration_s, settle, contact_gap_m)
+    )
+    return layer._admit_pose_move(fields, actions._goal_of(fields.target.value, fields.duration_s))
+
+
+# The item of a posture result's grasp points the drives of the tests build.
+GRASP_POINT = move_to_ready.ResultGraspPointsItem
+
+# The capture time of a measurement a test stamps.
+MEASURED_AT_S = 1_700_000_123.25
+
+# The time on the node's clock of a check a test makes.
+CHECKED_AT_S = 1_700_000_456.5
+
+
+def measured_grasp_result(kinematics, coordinator, joints):
+    """The pose fields a posture result gives for the measured `joints`: the
+    robot frame, the capture time of the measurement, the arm and its grasp
+    point."""
+    position, orientation = kinematics.forward_kinematics(joints)
+    point = GRASP_POINT(position=list(position), orientation=list(orientation))
+    return (ROBOT_FRAME, coordinator.measured_joints.wire_timestamp_s, ["arm"], [point])
+
+
+def check_target(position, orientation):
+    """The target of a check_arm_move request at these fields, in the robot
+    frame at the latest time."""
+    return pose_goal_data(position, orientation).target
 
 
 # The gripper moves below wait up to 2 s past the planned end of their travel
@@ -600,13 +651,14 @@ async def test_a_posture_result_reports_the_grasp_point_of_the_measured_joints(
     # The plan ends with the follower 0.05 rad off the posture in every
     # joint, inside the posture's settle: the result gives where it stands.
     near_ready = tuple(p + 0.05 for p in READY_POSITIONS_RAD)
-    coordinator.measured_joints.set(near_ready)
+    coordinator.measured_joints.set(near_ready, wire_timestamp_s=MEASURED_AT_S)
     run_arm_plan_to_its_end(coordinator, plan)
     ctx = FakeGoalContext()
-    await layer.drive_posture(ctx, plan, kinematics)
-    position, orientation = kinematics.forward_kinematics(near_ready)
+    await layer.drive_posture(ctx, plan, kinematics, GRASP_POINT)
+    position, _ = kinematics.forward_kinematics(near_ready)
     assert position != kinematics.forward_kinematics(READY_POSITIONS_RAD)[0]
-    assert ctx.completed == (["arm"], list(position), list(orientation))
+    assert ctx.completed == measured_grasp_result(kinematics, coordinator, near_ready)
+    assert ctx.completed[:2] == (ROBOT_FRAME, MEASURED_AT_S)
     assert coordinator.try_claim_arm()
 
 
@@ -626,20 +678,21 @@ def test_a_posture_the_arm_stops_short_of_fails_with_timeout(follower_never_stal
     assert plan.failed.message.endswith(" rad from the target at joint 5, 2.0 s after the planned end")
 
 
-async def test_a_posture_with_stale_follower_state_reports_empty_arrays(follower_never_stale):
+async def test_a_posture_with_stale_follower_state_reports_no_pose(follower_never_stale):
     kinematics = FakeKinematics()
-    coordinator, layer = make_layer(kinematics)
+    coordinator, layer = make_layer(kinematics, now_s=lambda: CHECKED_AT_S)
     coordinator.measured_joints.set(MEASURED)
     plan = layer._admit_posture(READY_POSITIONS_RAD, 0.0)
     # The follower stands at the posture by its planned end.
     coordinator.measured_joints.set(READY_POSITIONS_RAD)
     run_arm_plan_to_its_end(coordinator, plan)
     # The follower sends no more state after it receives the last sample.
-    # No measurement is fresh, thus the result gives no pose.
+    # No measurement is fresh, thus the result gives no pose, at the time of
+    # the check that found none.
     coordinator.measured_joints.clear()
     ctx = FakeGoalContext()
-    await layer.drive_posture(ctx, plan, kinematics)
-    assert ctx.completed == ([], [], [])
+    await layer.drive_posture(ctx, plan, kinematics, GRASP_POINT)
+    assert ctx.completed == (ROBOT_FRAME, CHECKED_AT_S, [], [])
 
 
 def stop_every_move(layer, _ctx):
@@ -669,10 +722,9 @@ async def test_a_stopped_posture_reports_the_measured_grasp_point(
     coordinator.measured_joints.set(stopped_at)
     ctx = FakeGoalContext()
     cut_the_move(layer, ctx)
-    await layer.drive_posture(ctx, plan, kinematics)
-    position, orientation = kinematics.forward_kinematics(stopped_at)
+    await layer.drive_posture(ctx, plan, kinematics, GRASP_POINT)
     assert ctx.completed is None
-    assert ctx.cancelled == (reason, ["arm"], list(position), list(orientation))
+    assert ctx.cancelled == (reason, *measured_grasp_result(kinematics, coordinator, stopped_at))
     assert plan.aborted
     assert coordinator.try_claim_arm()
 
@@ -724,7 +776,7 @@ async def test_move_to_home_closes_the_gripper_then_moves_the_arm_home(
     # duration_s is the time of the arm move alone.
     move = admit_home(layer, duration_s=5.0)
     ctx = FakeGoalContext()
-    drive = asyncio.create_task(layer.drive_home(ctx, move, kinematics))
+    drive = asyncio.create_task(layer.drive_home(ctx, move, kinematics, GRASP_POINT))
 
     # The close runs from fully open until the jaws stand still, closed or
     # on an item. The arm gets no setpoint before that.
@@ -741,8 +793,7 @@ async def test_move_to_home_closes_the_gripper_then_moves_the_arm_home(
     run_arm_plan_to_its_end(coordinator, plan)
     await drive
 
-    position, orientation = kinematics.forward_kinematics(HOME_POSITIONS_RAD)
-    assert ctx.completed == (["arm"], list(position), list(orientation))
+    assert ctx.completed == measured_grasp_result(kinematics, coordinator, HOME_POSITIONS_RAD)
     assert coordinator.try_claim_arm()
 
 
@@ -765,10 +816,9 @@ async def test_a_close_that_is_cut_ends_move_to_home_before_the_arm_moves(
     gripper_step(coordinator, 1.0, 0.0)
     ctx = FakeGoalContext()
     cut_the_close(layer, ctx)
-    await layer.drive_home(ctx, move, kinematics)
+    await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
-    position, orientation = kinematics.forward_kinematics(MEASURED)
-    assert ctx.cancelled == (reason, ["arm"], list(position), list(orientation))
+    assert ctx.cancelled == (reason, *measured_grasp_result(kinematics, coordinator, MEASURED))
     assert move.close.aborted
     assert coordinator._arm.plan is None and coordinator.commanded_arm is None
     assert both_limbs_free(coordinator)
@@ -782,7 +832,7 @@ async def test_a_close_that_fails_fails_move_to_home_and_the_arm_does_not_move(
     move = admit_home(layer)
     coordinator._fail_gripper_plan(move.close, FOLLOWER_SILENT)
     ctx = FakeGoalContext()
-    await layer.drive_home(ctx, move, kinematics)
+    await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
     assert ctx.failed == (FailureKind.RESOURCE_UNAVAILABLE, "the follower stopped reporting")
     assert ctx.completed is None and ctx.cancelled is None
@@ -800,14 +850,11 @@ async def test_a_stop_between_the_close_and_the_arm_move_ends_move_to_home_cance
     # The close ended and no plan is installed: the stop names no limb.
     assert layer.stop_moves("the operator asked") == []
     ctx = FakeGoalContext()
-    await layer.drive_home(ctx, move, kinematics)
+    await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
-    position, orientation = kinematics.forward_kinematics(MEASURED)
     assert ctx.cancelled == (
         "stopped: the operator asked",
-        ["arm"],
-        list(position),
-        list(orientation),
+        *measured_grasp_result(kinematics, coordinator, MEASURED),
     )
     assert coordinator._arm.plan is None
     assert both_limbs_free(coordinator)
@@ -820,7 +867,7 @@ async def test_an_arm_with_stale_state_after_the_close_fails_move_to_home(follow
     run_gripper_plan_to_its_end(coordinator, move.close, 0.0)
     coordinator.measured_joints.clear()
     ctx = FakeGoalContext()
-    await layer.drive_home(ctx, move, kinematics)
+    await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
     assert ctx.failed == (FailureKind.RESOURCE_UNAVAILABLE, "the follower stopped reporting")
     assert coordinator._arm.plan is None
@@ -884,7 +931,7 @@ async def test_move_to_home_gives_a_gripper_with_no_fresh_state_no_close(followe
     assert not coordinator.try_claim_arm()
 
     ctx = FakeGoalContext()
-    drive = asyncio.create_task(layer.drive_home(ctx, move, kinematics))
+    drive = asyncio.create_task(layer.drive_home(ctx, move, kinematics, GRASP_POINT))
     plan = await installed_plan(coordinator)
     assert plan.profile.end == HOME_POSITIONS_RAD
     assert coordinator.gripper_tick(0.0) is None
@@ -892,8 +939,7 @@ async def test_move_to_home_gives_a_gripper_with_no_fresh_state_no_close(followe
     run_arm_plan_to_its_end(coordinator, plan)
     await drive
 
-    position, orientation = kinematics.forward_kinematics(HOME_POSITIONS_RAD)
-    assert ctx.completed == (["arm"], list(position), list(orientation))
+    assert ctx.completed == measured_grasp_result(kinematics, coordinator, HOME_POSITIONS_RAD)
     assert both_limbs_free(coordinator)
 
 
@@ -927,7 +973,7 @@ async def test_a_surprise_in_the_arm_move_of_move_to_home_fails_the_goal(
     owner = layer if broken == "_move_within_ceiling" else coordinator
     monkeypatch.setattr(owner, broken, raising(ValueError("no trajectory")))
     ctx = FakeGoalContext()
-    await layer.drive_home(ctx, move, kinematics)
+    await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
     assert ctx.failed == (FailureKind.ATTEMPT_FAILED, message)
     assert ctx.completed is None and ctx.cancelled is None
@@ -946,7 +992,7 @@ async def test_a_wait_that_ends_with_no_cancel_fails_move_to_home_before_the_arm
     gripper_step(coordinator, 1.0, 0.0)
     ctx = FakeGoalContext()
     ctx.request_cancel(cause="a cause with no reason")
-    await layer.drive_home(ctx, move, kinematics)
+    await layer.drive_home(ctx, move, kinematics, GRASP_POINT)
 
     assert ctx.failed == (
         FailureKind.ATTEMPT_FAILED,
@@ -1644,7 +1690,7 @@ def test_decide_refuses_any_admission_surprise_without_holding_the_slot():
     assert coordinator.try_claim_arm(), "no surprise may leave the slot held"
 
 
-def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
+async def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
     from peppygen.exposed_actions.limb_motion import move_arm, move_gripper
     from peppygen.exposed_actions.postures import move_to_home, move_to_ready
 
@@ -1653,18 +1699,7 @@ def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
     coordinator.measured_gripper.set(0.5)
     coordinator.leader_joints.set((0.0,) * 5)
     coordinator.leader_gripper.set(0.5)
-    pose = SimpleNamespace(
-        data=SimpleNamespace(
-            arm_name="arm",
-            position=[0.1, 0.0, 0.2],
-            orientation=[0.0, 0.0, 0.0, 1.0],
-            duration_s=0.0,
-            settle_position_tolerance_m=0.01,
-            settle_orientation_tolerance_rad=0.2,
-            settle_timeout_s=2.0,
-            contact_gap_m=0.0,
-        )
-    )
+    pose = SimpleNamespace(data=pose_goal_data([0.1, 0.0, 0.2], [0.0, 0.0, 0.0, 1.0]))
     gripper = SimpleNamespace(
         data=SimpleNamespace(
             gripper_name="gripper", opening=0.2, max_effort=0.0, settle_timeout_s=2.0
@@ -1673,7 +1708,11 @@ def test_a_goal_on_a_limb_a_leader_streams_is_refused_with_leader_streaming():
     posture = SimpleNamespace(data=SimpleNamespace(duration_s=0.0))
 
     for decision, module, reason in (
-        (layer.decide_pose(move_arm, PendingSlot())(pose), move_arm, ARM_WORDS.leader_streaming),
+        (
+            await layer.decide_pose(move_arm, PendingSlot())(pose),
+            move_arm,
+            ARM_WORDS.leader_streaming,
+        ),
         (
             layer.decide_gripper(move_gripper, PendingSlot())(gripper),
             move_gripper,
@@ -1748,7 +1787,7 @@ async def pose_move_at_the_end_of_its_plan(coordinator, layer, kinematics, measu
     plan = await installed_plan(coordinator)
     assert plan.profile.end == kinematics.solution
     coordinator.arm_published(True, coordinator.arm_tick(0.0))
-    coordinator.measured_joints.set(measured_at_end)
+    coordinator.measured_joints.set(measured_at_end, wire_timestamp_s=MEASURED_AT_S)
     coordinator.arm_published(True, coordinator.arm_tick(plan.profile.duration_s))
     return ctx, task, plan
 
@@ -1763,8 +1802,9 @@ async def test_a_pose_move_completes_once_the_measured_grasp_point_is_within_tol
     )
     assert plan.done.is_set()
     await task
-    position, _orientation, _ended_on_contact, _t = ctx.completed
-    assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
+    final_pose, _ended_on_contact, _t = ctx.completed
+    assert (final_pose.frame, final_pose.timestamp) == (ROBOT_FRAME, MEASURED_AT_S)
+    assert final_pose.position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
 async def test_a_pose_move_outside_its_tolerance_at_the_timeout_fails_with_timeout(
@@ -1800,8 +1840,9 @@ async def test_a_stale_follower_reports_the_commanded_pose(follower_never_stale)
     # The last command of a finished plan is its end sample.
     coordinator.measured_joints.clear()
     await task
-    position, _orientation, _ended_on_contact, _t = ctx.completed
-    assert position == list(kinematics.forward_kinematics(kinematics.solution)[0])
+    final_pose, _ended_on_contact, _t = ctx.completed
+    assert final_pose.frame == ROBOT_FRAME
+    assert final_pose.position == list(kinematics.forward_kinematics(kinematics.solution)[0])
 
 
 async def test_a_pose_move_is_timed_by_the_joint_limits_and_no_end_effector_cap():
@@ -2033,9 +2074,9 @@ async def test_a_pose_move_an_object_blocks_completes_on_contact_where_the_arm_s
     plan = await installed_plan(coordinator)
     run_blocked_arm_plan_to_its_contact(coordinator, plan, stood)
     await task
-    position, _orientation, ended_on_contact, _t = ctx.completed
+    final_pose, ended_on_contact, _t = ctx.completed
     assert ended_on_contact
-    assert position == list(kinematics.forward_kinematics(stood)[0])
+    assert final_pose.position == list(kinematics.forward_kinematics(stood)[0])
     assert coordinator.try_claim_arm()
 
 
@@ -2311,7 +2352,7 @@ async def test_a_stop_during_the_pose_solve_ends_the_goal_without_a_plan():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
-    reason, _position, _orientation, _ended_on_contact, _t = ctx.cancelled
+    reason, _final_pose, _ended_on_contact, _t = ctx.cancelled
     assert reason == "stopped: the operator asked"
     assert coordinator._arm.plan is None, "nothing was installed after the stop"
     assert coordinator.try_claim_arm()
@@ -2329,9 +2370,9 @@ async def test_a_stop_before_the_pose_drive_runs_ends_the_goal_as_stopped():
     await layer.drive_pose(ctx, goal, kinematics, kinematics)
 
     assert ctx.completed is None
-    reason, position, _orientation, _ended_on_contact, _t = ctx.cancelled
+    reason, final_pose, _ended_on_contact, _t = ctx.cancelled
     assert reason == "stopped: the operator asked"
-    assert position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
+    assert final_pose.position == list(kinematics.forward_kinematics((0.0,) * 5)[0])
     assert kinematics.solve_calls == []
     assert coordinator._arm.plan is None
     assert coordinator.try_claim_arm()
@@ -2393,7 +2434,7 @@ async def test_the_plan_check_answers_the_duration_the_joint_caps_floor():
     coordinator, layer = make_layer(kinematics, max_joint_velocity_rad_s=(2.0,) * 5)
     coordinator.measured_joints.set((0.0,) * 5)
     check = await layer.check_arm_move(
-        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+        "arm", check_target((0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
     )
     floored = JointTrajectory.through(
         ((0.0,) * 5, kinematics.solution), (2.0,) * 5, (MAX_JOINT_ACCELERATION_RAD_S2,) * 5, 0.0
@@ -2430,7 +2471,7 @@ async def test_the_plan_check_answers_the_duration_and_installs_nothing():
     coordinator.measured_joints.set((0.0,) * 5)
 
     check = await layer.check_arm_move(
-        "arm", (0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+        "arm", check_target((0.2, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
     )
 
     assert (check.reachable, check.reason) == (True, "")
@@ -2447,7 +2488,7 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
 
     kinematics.corrupted = True
     check = await layer.check_arm_move(
-        "arm", (5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+        "arm", check_target((5.0, 5.0, 5.0), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
     )
     assert (check.reachable, check.duration_s) == (False, 0.0)
     assert check.reason.startswith("goal pose not planned")
@@ -2455,22 +2496,22 @@ async def test_the_plan_check_answers_unreachable_and_refuses_as_the_move_would(
     kinematics.corrupted = False
     with pytest.raises(Refusal, match="unknown arm_name") as raised:
         await layer.check_arm_move(
-            "wing", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+            "wing", check_target((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
         )
     assert raised.value.kind is FailureKind.REJECTED
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0), 0.0, kinematics
+            "arm", check_target((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 0.0)), 0.0, kinematics
         )
-    assert refusal_of(raised) == (
-        FailureKind.REJECTED, "goal pose has an unnormalizable orientation"
-    )
+    kind, message = refusal_of(raised)
+    assert kind is FailureKind.REJECTED
+    assert message.startswith("the target: the orientation [0, 0, 0, 0] has a squared norm of 0,"), message
 
     # While an arm goal is in flight, the check is refused as a second goal is.
     admit_joints(layer, (0.5,) * 5, 1.0)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+            "arm", check_target((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
         )
     assert refusal_of(raised) == (FailureKind.PRECONDITION_FAILED, ARM_WORDS.busy)
     assert len(kinematics.solve_calls) == 1, "a refused check pays no solve"
@@ -2481,7 +2522,7 @@ async def test_the_plan_check_needs_fresh_follower_state():
     _coordinator, layer = make_layer(kinematics)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+            "arm", check_target((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
         )
     assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
 
@@ -2496,7 +2537,7 @@ async def test_a_solve_that_raises_fails_the_plan_check_with_attempt_failed():
     coordinator.measured_joints.set((0.0,) * 5)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, kinematics
+            "arm", check_target((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, kinematics
         )
     assert refusal_of(raised) == (
         FailureKind.ATTEMPT_FAILED, "pose solve failed: RuntimeError('solver surprise')"
@@ -2547,7 +2588,7 @@ async def test_the_move_check_refuses_in_the_goals_order():
     coordinator.leader_joints.set((0.0,) * 5)
     pose = ((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0))
     with pytest.raises(Refusal) as raised:
-        await layer.check_arm_move("arm", *pose, 0.0, None)
+        await layer.check_arm_move("arm", check_target(*pose), 0.0, None)
     assert refusal_of(raised) == (FailureKind.RESOURCE_UNAVAILABLE, ARM_WORDS.no_fresh_state)
     with pytest.raises(Refusal) as raised:
         admit_pose(layer, *pose)
@@ -2560,7 +2601,7 @@ async def test_the_move_check_gives_the_streaming_refusal_without_claiming():
     coordinator.leader_joints.set((0.0,) * 5)
     with pytest.raises(Refusal) as raised:
         await layer.check_arm_move(
-            "arm", (0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0), 0.0, None
+            "arm", check_target((0.1, 0.0, 0.2), (0.0, 0.0, 0.0, 1.0)), 0.0, None
         )
     assert refusal_of(raised) == (FailureKind.LEADER_STREAMING, ARM_WORDS.leader_streaming)
     assert coordinator.try_claim_arm()
@@ -2584,7 +2625,7 @@ async def test_a_walked_line_of_the_real_arm_stays_within_the_joint_limits(seed)
     near = tuple(q + rng.uniform(-0.3, 0.3) for q in start)
     position, orientation = kinematics.forward_kinematics(limits.clamp(near))
     coordinator.measured_joints.set(start)
-    goal = actions._pose_goal(position, orientation, 0.0)
+    goal = actions.PoseGoal(position, orientation, 0.0)
     try:
         profile = await layer._plan_pose(kinematics, start, goal)
     except actions._PlanRefused as refused:
@@ -2594,7 +2635,7 @@ async def test_a_walked_line_of_the_real_arm_stays_within_the_joint_limits(seed)
     assert profile.end == pytest.approx(profile.sample(profile.duration_s))
     landed, turned = kinematics.forward_kinematics(profile.end)
     assert math.dist(landed, position) <= 0.02
-    assert relative_rotation_rad(turned, orientation) <= 0.15
+    assert angle_shortest_path(turned, orientation) <= 0.15
 
 
 async def test_a_short_walked_line_rests_at_none_of_its_samples():
@@ -2610,7 +2651,7 @@ async def test_a_short_walked_line_rests_at_none_of_its_samples():
     )
     start = limits.clamp(READY_POSITIONS_RAD)
     (x, y, z), orientation = kinematics.forward_kinematics(start)
-    goal = actions._pose_goal((x, y, z + 0.01), None, 0.0)
+    goal = actions.PoseGoal((x, y, z + 0.01), None, 0.0)
     profile = await layer._plan_pose(kinematics, start, goal)
     assert profile.duration_s < 1.0
 
@@ -2620,7 +2661,7 @@ async def test_a_position_alone_with_no_plan_is_not_told_to_leave_orientation_ou
     kinematics.corrupted = True
     _, layer = make_layer(kinematics)
     with pytest.raises(actions._PlanRefused) as refused:
-        await layer._plan_pose(kinematics, (0.0,) * 5, actions._pose_goal((5.0, 5.0, 5.0), None, 0.0))
+        await layer._plan_pose(kinematics, (0.0,) * 5, actions.PoseGoal((5.0, 5.0, 5.0), None, 0.0))
     assert str(refused.value) == NOT_PLANNED
     assert "leave orientation out" in NOT_PLANNED_NAMING_ORIENTATION
     assert "leave orientation out" not in NOT_PLANNED

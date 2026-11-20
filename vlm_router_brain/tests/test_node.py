@@ -27,7 +27,10 @@ from peppygen.fixtures.exposed_services.brain_model import get_model as get_mode
 from peppygen.fixtures.exposed_services.brain_model import list_models as list_models_fx
 from peppygen.fixtures.exposed_services.item_manipulation import get_state as get_state_fx
 from wire import (
+    ATTEMPTS,
     CAMERAS,
+    ROBOT_FRAME,
+    UNREAD_TARGET,
     WAIT,
     accepted_grip,
     answer_the_camera,
@@ -85,7 +88,11 @@ async def test_identify_then_scan_succeed_and_the_start_made_no_call():
         assert result.status == identify_fx.ResultStatus.COMPLETED, result.failure
         found = result.data
         assert (found.label, found.confidence, found.camera) == ("the cup", 0.0, "chest")
-        assert [round(v, 6) for v in found.position] == [0.0, 0.0, 1.0]
+        # The point the chest camera saw, in the robot frame at the capture
+        # time of its picture; no pose: the model resolves no turn.
+        point = found.item_point
+        assert (point.frame, point.timestamp, [round(v, 6) for v in point.position]) == (ROBOT_FRAME, 1.0, [0.0, 0.0, 1.0])
+        assert found.item_pose is None
         assert found.region == [4.0, 3.0, 12.0, 9.0] and (found.image_width, found.image_height) == (16, 12)
         scanned = await result_of(scan_fx, h, scan())
         assert scanned.labels == ["cup"] and scanned.confidences == [0.0]
@@ -235,7 +242,7 @@ async def test_manipulation_switches_to_none_which_refuses_every_grab_to_a_catal
         # item_manipulation reports in its result.
         grabbed = await result_of(
             grab_fx, h,
-            grab_action.GoalRequestData(gripper_name="left_gripper", item_id="", position=[0.5, 0.1, 0.7], orientation=[0.0, 0.0, 0.0, 1.0], max_effort=0.0),
+            grab_by_pose([0.5, 0.1, 0.7], [0.0, 0.0, 0.0, 1.0]),
         )
         assert (grabbed.success, grabbed.message) == (False, "no manipulation model: manipulation_model is 'none'")
         back = await result_of(switch_fx, h, switch("manipulation", "scripted"))
@@ -302,7 +309,7 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         await once_the_brain_has_limbs(h)
         plan(h, True, True, True)
         grab = await grab_fx.send_goal(
-            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, position=[0.0] * 3, orientation=None, max_effort=15.0),
+            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, target=UNREAD_TARGET, max_effort=15.0),
             5.0,
         )
         assert grab.accepted, grab.refusal
@@ -328,6 +335,57 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         assert (state.holding, state.held_item_ids) == ([True, False], [found.item_id, ""])
         # The last snapshot the backbone published: the left jaws on the cup.
         assert state.gripper_openings == [0.3, 1.0]
+
+
+async def test_a_grab_target_is_placed_through_transform_lookup_and_one_the_tree_does_not_hold_is_refused_with_unknown_frame():
+    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params(), motion_planning_vacant=True) as h:
+        answer_the_camera(h)
+        # The brain places a target once it knows the robot frame, which
+        # describe_sensors names after its goal loops are up; a goal before
+        # that is accepted, and its result says why it was not placed.
+        for _ in range(ATTEMPTS):
+            goal = await grab_fx.send_goal(h, grab_by_pose([0.5, 0.1, 0.75], frame="odom", timestamp=2.5), 5.0)
+            if not goal.accepted:
+                break
+            early = (await goal.get_result(WAIT)).data
+            assert (early.success, early.message) == (False, "the robot's sensors have not been described yet")
+        assert goal.refusal == grab_fx.Failure("unknown_frame", "the target: no transform names odom")
+        # Where odom stood at the target's time, in the robot frame at the
+        # latest time.
+        request = h.mocks.deps.transform_lookup.lookup_transform.captured()[-1]
+        assert (request.target_frame, request.source_frame, request.source_timestamp, request.target_timestamp) == (
+            ROBOT_FRAME, "odom", 2.5, None,
+        )
+
+
+async def test_a_grab_target_with_no_frame_is_placed_from_the_robot_frame_through_transform_lookup():
+    async with harness.start(partial(setup, provider=FakeProvider()), parameters=params(), motion_planning_vacant=True) as h:
+        answer_the_camera(h)
+        await once_the_brain_has_limbs(h)
+        lookups = h.mocks.deps.transform_lookup.lookup_transform
+        # The brain places a target once it knows the robot frame; a goal
+        # before that is accepted, and its result says why it was not placed.
+        for _ in range(ATTEMPTS):
+            grab = await grab_fx.send_goal(h, grab_by_pose([0.5, 0.1, 0.75], frame=None, timestamp=2.5), 5.0)
+            assert grab.accepted, grab.refusal
+            placed = [request for request in lookups.captured() if request.source_timestamp == 2.5]
+            if placed:
+                break
+            early = (await grab.get_result(WAIT)).data
+            assert (early.success, early.message) == (False, "the robot's sensors have not been described yet")
+        # Where the robot frame stood at the target's time, in the robot
+        # frame at the latest time.
+        [request] = placed
+        assert (request.target_frame, request.source_frame, request.target_timestamp) == (ROBOT_FRAME, ROBOT_FRAME, None)
+        _, opening = await accepted_grip(h)
+        stop = await abort_fx.send_goal(h, abort_action.GoalRequestData(reason="operator"), 5.0)
+        assert stop.accepted, stop.refusal
+        await asyncio.wait_for(opening.cancel_signal(), WAIT)
+        await opening.complete_cancelled(
+            "cancelled by its caller", move_gripper.ResultResponseData(settled=False, final_opening=0.6, action_time=0.2)
+        )
+        result = (await grab.get_result(WAIT)).data
+        assert (result.success, result.message) == (False, "aborted: operator")
 
 
 async def test_a_gripper_that_closes_on_nothing_retreats_fails_the_grab_and_holds_nothing():
@@ -404,7 +462,7 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
         plan(h, True, True, True)
         with records_of(caplog, "brain_core.manipulators.scripted.manipulator") as log:
             grab = await grab_fx.send_goal(
-                h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, position=[0.0] * 3, orientation=None, max_effort=15.0),
+                h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, target=UNREAD_TARGET, max_effort=15.0),
                 5.0,
             )
             assert grab.accepted, grab.reason
@@ -432,7 +490,11 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
             limbs_done.set()
             done.set()
             await asyncio.gather(stream, wrist)
-        lookups = [(request.source_frame, request.time) for request in h.mocks.deps.transform_lookup.lookup_transform.captured()]
+        captured = h.mocks.deps.transform_lookup.lookup_transform.captured()
+        # Each picture's frame is placed in the robot frame at the picture's
+        # time, both times the same.
+        assert all(request.source_timestamp == request.target_timestamp for request in captured)
+        lookups = [(request.source_frame, request.source_timestamp) for request in captured]
         assert (result.success, result.gripper_name, result.item_id) == (True, "left_gripper", found.item_id), result.message
         line = next(record.getMessage() for record in log.records if "grab of item" in record.getMessage())
         assert "aligned in 2 steps: the grasp point moved 2.2 cm, the jaws close along 135 degrees" in line
@@ -441,9 +503,10 @@ async def test_identify_then_an_aligned_grab_moves_turns_and_holds_the_item(capl
         step = provider.calls[2]
         assert "Now: step 1 of 5." in step.prompt and "+x points toward 6 o'clock and +y toward 3 o'clock" in step.prompt
         assert step.schema["json_schema"]["strict"] is False
-        # The identify placed the chest camera at its capture's time; each
-        # step placed the wrist camera at its new picture's time, then the
-        # chest camera at its capture's time again.
+        # The identify placed the frame of the chest picture at its capture's
+        # time; each step placed the frame of the wrist's new picture at its
+        # time, then the frame of the chest picture at its capture's time
+        # again.
         chest, wrist_left = (CAMERAS[name][0] for name in ("chest", "wrist_left"))
         assert [frame for frame, _ in lookups] == [chest, wrist_left, chest, wrist_left, chest]
         assert [time for frame, time in lookups if frame == chest] == [1.0, 1.0, 1.0]
@@ -466,7 +529,9 @@ def described_left_arm():
 
 
 def a_scene(*objects):
-    return get_planning_scene.ResponseData(objects=list(objects), attached_objects=[], allowed_pairs=[], clearance_m=0.04, voxel_size_m=0.02)
+    return get_planning_scene.ResponseData(
+        frame=ROBOT_FRAME, timestamp=1.0, objects=list(objects), attached_objects=[], allowed_pairs=[], clearance_m=0.04, voxel_size_m=0.02,
+    )
 
 
 LEFT_GRIPPER_LINKS = ["openarm_left_ee_base_link", "openarm_left_ee_link1", "openarm_left_ee_link2"]
@@ -494,14 +559,14 @@ async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_
             planner.describe_arms.enqueue_response(described_left_arm())
         planner.get_planning_scene.enqueue_response(a_scene())
         planner.get_planning_scene.enqueue_response(a_scene(get_planning_scene.ResponseDataObjectsItem(
-            id=object_id, position=list(found.position), orientation=[0.0, 0.0, 0.0, 1.0], shapes=[],
+            id=object_id, position=list(found.item_point.position), orientation=[0.0, 0.0, 0.0, 1.0], shapes=[],
         )))
         for _ in range(2):
             planner.apply_collision_objects.enqueue_response()
         planner.set_allowed_collision.enqueue_response()
         planner.apply_attached_collision_object.enqueue_response()
         grab = await grab_fx.send_goal(
-            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, position=[0.0] * 3, orientation=None, max_effort=15.0),
+            h, grab_action.GoalRequestData(gripper_name="", item_id=found.item_id, target=UNREAD_TARGET, max_effort=15.0),
             5.0,
         )
         assert grab.accepted, grab.refusal
@@ -509,10 +574,15 @@ async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_
         down = [0.0, 1.0, 0.0, 0.0]
         pending = await planner.plan_joint_path.next_goal(WAIT)
         planned = pending.request
-        assert [round(v, 6) for v in planned.goal_position_constraints[0].position] == [0.0, 0.0, 1.05]
-        assert planned.goal_position_constraints[0].link_name == "openarm_left_tcp" and planned.goal_orientation_constraints[0].orientation == down
+        [position], [turn] = planned.goal_position_constraints, planned.goal_orientation_constraints
+        assert [round(v, 6) for v in position.position] == [0.0, 0.0, 1.05]
+        assert position.link_name == "openarm_left_tcp" and turn.orientation == down
+        # Each constraint leaves its frame out, for the robot frame, and its
+        # timestamp, for the latest time.
+        assert {(c.frame, c.timestamp) for c in (position, turn)} == {(None, None)}
         assert (planned.planner, planned.refiner, planned.allowed_planning_time_s) == ("rrt_connect", "none", 0.5)
         await (await pending.accept()).complete(plan_joint_path.ResultResponseData(
+            frame=ROBOT_FRAME,
             arms=[plan_joint_path.ResultResponseDataArmsItem(
                 arm_name="left_arm", start_joint_positions=START,
                 waypoints=[plan_joint_path.ResultResponseDataArmsItemWaypointsItem(joint_positions=AT_PRE, position=[0.0, 0.0, 1.05], orientation=down)],
@@ -521,9 +591,11 @@ async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_
         ))
         pending = await planner.plan_cartesian_path.next_goal(WAIT)
         reach = pending.request
-        assert (reach.avoid_collisions, reach.start_joint_positions) == (False, AT_PRE)
+        assert (reach.avoid_collisions, reach.start_joint_positions, reach.frame, reach.timestamp) == (False, AT_PRE, None, None)
         assert [[round(v, 6) for v in w.position] for w in reach.waypoints] == [[0.0, 0.0, 0.975], [0.0, 0.0, 1.05]]
-        await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(start_joint_positions=AT_PRE, waypoints=[], fraction=1.0, map_stamp=None))
+        await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(
+            frame=ROBOT_FRAME, start_joint_positions=AT_PRE, waypoints=[], fraction=1.0, map_stamp=None,
+        ))
         pending = await h.mocks.deps.limb_motion.execute_joint_path.next_goal(WAIT)
         [run] = pending.request.arms
         assert pending.request.contact_gap_m == 0.0
@@ -539,7 +611,9 @@ async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_
         pending = await planner.plan_cartesian_path.next_goal(WAIT)
         checked = pending.request
         assert (checked.avoid_collisions, checked.start_joint_positions) == (True, [])
-        await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(start_joint_positions=AT_PRE, waypoints=[], fraction=0.38, map_stamp=None))
+        await (await pending.accept()).complete(plan_cartesian_path.ResultResponseData(
+            frame=ROBOT_FRAME, start_joint_positions=AT_PRE, waypoints=[], fraction=0.38, map_stamp=None,
+        ))
         assert [round(v, 6) for v in (await land_move(h)).position] == [0.0, 0.0, 0.975]
         await stop_grip_at(h, 0.3)
         done = asyncio.Event()
@@ -551,12 +625,14 @@ async def test_with_the_planner_bound_a_scripted_grab_plans_its_transit_and_the_
         assert (result.success, result.item_id) == (True, found.item_id), result.message
         [added, moved] = [request.objects[0] for request in planner.apply_collision_objects.captured()]
         assert (added.id, added.operation, added.shapes[0].kind, added.shapes[0].dimensions) == (object_id, "add", "sphere", [0.05])
-        assert [round(v, 6) for v in added.position] == [round(v, 6) for v in found.position]
+        seen = found.item_point.position
+        assert (added.frame, added.timestamp) == (None, None)
+        assert [round(v, 6) for v in added.position] == [round(v, 6) for v in seen]
         [allowed] = planner.set_allowed_collision.captured()
         assert (allowed.name, allowed.other_names, allowed.allowed) == (object_id, LEFT_GRIPPER_LINKS, True)
         # The object moved by what the grasp point moved since the close.
         assert (moved.id, moved.operation) == (object_id, "move")
-        assert [round(v, 6) for v in moved.position] == [round(found.position[0], 6), round(found.position[1], 6), round(found.position[2] + 0.075, 6)]
+        assert [round(v, 6) for v in moved.position] == [round(seen[0], 6), round(seen[1], 6), round(seen[2] + 0.075, 6)]
         [attached] = planner.apply_attached_collision_object.captured()
         assert (attached.object_id, attached.link_name, attached.touch_links, attached.operation) == (object_id, "openarm_left_tcp", LEFT_GRIPPER_LINKS, "attach")
         state = await get_state_fx.poll(h, 5.0)

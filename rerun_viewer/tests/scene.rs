@@ -3,7 +3,10 @@
 
 mod common;
 
-use common::{TIMEOUT, bound, drew_at, free_lime, held_lime, right_arm, scene, start};
+use common::{
+    ODOM_FRAME, ROBOT_FRAME, TIMEOUT, bound, drew_at, free_lime, held_lime, hold_the_robot_frame,
+    logged, right_arm, scene, start,
+};
 use rerun_viewer::config::default_parameters;
 use rerun_viewer::draw::scene::CHANGES_PATH;
 use rerun_viewer::drawn::Drawn;
@@ -137,5 +140,61 @@ async fn an_unchanged_scene_is_drawn_again_and_logs_nothing() -> Result<(), Stri
             .len(),
         3
     );
+    harness.shutdown().await.map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scene_in_another_frame_than_the_robot_frame_is_dropped_and_logged() -> Result<(), String>
+{
+    let (harness, mocks, canvas) = start(bound(
+        &["motion_planning", "sensor_mounts"],
+        default_parameters(),
+    ))
+    .await?;
+    hold_the_robot_frame(&mocks, &canvas).await?;
+    let planner = mocks
+        .deps
+        .motion_planning
+        .as_ref()
+        .expect("the planner is linked");
+    planner
+        .describe_arms
+        .next_request(TIMEOUT)
+        .await
+        .map_err(|e| e.to_string())?
+        .respond(right_arm())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut elsewhere = scene(vec![free_lime([9.0, 9.0, 9.0])], vec![]);
+    elsewhere.frame = ODOM_FRAME.to_string();
+    let reads = [elsewhere, scene(vec![free_lime([0.4, -0.2, 0.1])], vec![])];
+    for read in reads {
+        planner
+            .get_planning_scene
+            .next_request(TIMEOUT)
+            .await
+            .map_err(|e| e.to_string())?
+            .respond(read)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    canvas
+        .wait_until(TIMEOUT, "the free lime", |drawn| {
+            drew_at(drawn, "world/scene/shells/brain/lime_1/shell_0_sphere")
+        })
+        .await?;
+    logged(&[
+        "get_planning_scene names the frame",
+        ODOM_FRAME,
+        ROBOT_FRAME,
+    ])
+    .await?;
+    let Drawn::Shape { shape, .. } =
+        &canvas.at("world/scene/shells/brain/lime_1/shell_0_sphere")[0]
+    else {
+        panic!("the shell is a shape")
+    };
+    assert_eq!(shape.pose.origin(), [0.4, -0.2, 0.1]);
+    assert_eq!(canvas.log_lines(CHANGES_PATH), ["added brain/lime_1"]);
     harness.shutdown().await.map_err(|e| e.to_string())
 }

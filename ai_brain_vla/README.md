@@ -40,6 +40,19 @@ the fingers or the held item meet something on the way down, the backbone ends
 the move on contact and the arm holds where it stands. Every other move names
 no contact check and runs as fast as the joint limits allow.
 
+A `grab_item` that names no item and a `place_item` that names no target item
+take the goal's `target`, which names its frame, or none for the robot frame,
+and its timestamp: the brain places it in the robot frame by the robot's tree
+through `transform_lookup` when it accepts the goal, and refuses the goal with
+the lookup's failure kind (`unknown_frame`, `no_chain`, `extrapolation`,
+`broken_tree`) for a target the tree cannot place, and with `rejected` for one
+no contract takes. A goal that comes before the robot names its robot frame,
+or whose lookup gets no answer, is accepted with its target unplaced, and its
+result fails naming why, such as "the robot's sensors have not been described
+yet". Each move it sends leaves its frame out, for the robot frame, and its
+timestamp, for the latest time, and a `place_item` reports where the jaws
+opened in the robot frame at the time the backbone measured it.
+
 Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
 item is down; `get_state`'s gripper opening shows the open jaws.
@@ -204,11 +217,11 @@ sequenceDiagram
 - `manipulation_model`: `scripted` or `none`, above; `scripted` by default.
 - `perception_gallery`: the shipped enrolment of `sam3_siglip`, above: empty
   is none, `waldo_catalogue` the one the node ships.
-- `camera_name`: the camera the brain looks through, by the name the robot's
-  `sensor_mounts` lists it under; the camera model, below. Required; the
-  OpenArm launchers set `chest`.
-- `lookup_timeout_s`: how long a lookup of the camera's place waits for the
-  robot's transforms of a picture's time (s), from 0 to 1, the longest wait
+- `camera_name`: the name the camera the brain looks through runs under,
+  which each search's result names. Required; the OpenArm launchers set
+  `chest`.
+- `lookup_timeout_s`: how long a lookup in the robot's tree waits for the
+  robot's transforms of its time (s), from 0 to 1, the longest wait
   `transform_lookup` takes; the camera model, below. Required: the launcher
   sets it for the robot.
 
@@ -219,11 +232,12 @@ frame, the frame the robot contracts define (fixed to the robot's base, +X
 the way the robot faces, +Y to its left, +Z up), it needs the depth under the
 box, which the depth stream gives, and a camera model: the intrinsics that
 turn a pixel into a ray, and the camera's pose in the robot frame that turns
-the ray into a point. Every position the brain reports is in that frame, and
-every result also says where each item is in the picture it looked at: the
-box in the pixels of the colour frame of the camera `camera_name` names, x to
-the right and y down, with the frame's size and capture time, so a caller can
-read a region against the same frame.
+the ray into a point. Every point and pose the brain reports names that frame
+and the capture time of the picture it comes from, and every result also says
+where each item is in the picture it looked at: the box in the pixels of the
+colour picture of the camera `camera_name` names, x to the right and y down,
+with the picture's size, so a caller can read a region against the same
+picture.
 
 - **Intrinsics come from the camera.** The `geometry` slot consumes
   `camera_geometry:v1`, served by the sim relays and by `zed_camera` and
@@ -239,27 +253,29 @@ read a region against the same frame.
   its simulation has spoken and a camera without a calibration gives for
   good, a depth model the brain does not read).
 - **Colour and depth are paired by capture.** The two streams share
-  `frame_id`, the capture-pair counter of `rgbd_camera:v1`; the brain keeps
-  the last eight frames of each and reads the depth of the same capture as
-  the picture. The depth is read at the colour pixels, so the streams have to
-  be aligned, as the relays and the ZED publish them and as `realsense_d4xx`
-  does under `depth_to_color`: a pair whose frames say `align_mode` "none",
-  or two different alignments, is refused with the reason.
-- **The pose comes from the robot's tree of frames.** The `sensor_mounts`
-  slot consumes `sensor_mounts:v1`, served by the robot's initializer:
-  `describe_sensors` names the robot frame and the frame of each camera the
-  robot's design carries, its optical frame (+X to the right of the image, +Y
-  down it, +Z along the view). The brain asks every 2 s until the robot gives
-  its response and names the camera `camera_name` names (the OpenArm
-  launchers name `chest`, the v2 head camera); until then both searches are
-  refused with `resource_unavailable`, naming the reason (slot vacant, not
-  answered yet, the robot's error reply, a robot that carries no camera by
-  that name). The `transform_lookup` slot consumes `transform_lookup:v1`:
-  each search asks `lookup_transform` where the camera's frame stood in the
-  robot frame when the picture it reads was taken, waiting up to
-  `lookup_timeout_s` for the transforms of that time, and a lookup that
-  fails refuses the search with `resource_unavailable` and the lookup's
-  words. A camera an arm carries is placed where the arm held it. The
+  `capture_index`, the capture-pair counter of `rgbd_camera:v1`; the brain
+  keeps the last eight frames of each and reads the depth of the same capture
+  as the picture. The depth is read at the colour pixels, so the streams have
+  to be aligned and name one frame, as the relays and the ZED publish them
+  and as `realsense_d4xx` does under `depth_to_color`: a pair whose frames
+  say `align_mode` "none", two different alignments or two different frames,
+  is refused with the reason.
+- **The pose comes from the robot's tree of frames.** Each picture names its
+  camera's frame in its header, its optical frame (+X to the right of the
+  image, +Y down it, +Z along the view). The `sensor_mounts` slot consumes
+  `sensor_mounts:v1`, served by the robot's initializer: `describe_sensors`
+  names the robot frame. The brain asks every 2 s until the robot gives its
+  response and names a robot frame; until then both searches are refused
+  with `resource_unavailable`, naming the reason (slot vacant, not answered
+  yet, the robot's error reply, a response that names no robot frame). The
+  `transform_lookup` slot consumes `transform_lookup:v1`: each search asks
+  `lookup_transform` where the frame its picture names stood in the robot
+  frame when the picture was taken, waiting up to `lookup_timeout_s` for the
+  transforms of that time. A picture whose frame the tree cannot place is
+  dropped, the log names the lookup's failure kind (`unknown_frame` for a
+  frame no transform names), and the search is refused with
+  `resource_unavailable` and the lookup's words. A camera an arm carries is
+  placed where the arm held it. The
   transforms of the robot's fixed joints are the design's, exact in a
   simulation and nominal on hardware.
 

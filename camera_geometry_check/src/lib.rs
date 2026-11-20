@@ -15,18 +15,18 @@ pub fn pixel_at(fraction: f64, size: u32) -> u32 {
 }
 
 /// The median reading, in meters, of the square window around pixel (u, v)
-/// of a z16 frame, and how many readings it is the median of. 0 is the
+/// of a z16 frame's `data`, and how many readings it is the median of. 0 is the
 /// stream's no-reading value and is left out; a window with no reading at all
 /// has no median.
 pub fn median_reading_m(
-    frame: &[u8],
+    data: &[u8],
     width: u32,
     height: u32,
     (u, v): (u32, u32),
     window: u32,
     depth_unit: f32,
 ) -> Result<Option<(f64, usize)>, DepthFrameSizeError> {
-    let frame = DepthFrame::parse(frame, width, height)?;
+    let frame = DepthFrame::parse(data, width, height)?;
     let rows = v.saturating_sub(window)..=v.saturating_add(window).min(height.saturating_sub(1));
     let columns = u.saturating_sub(window)..=u.saturating_add(window).min(width.saturating_sub(1));
     let mut readings: Vec<u16> = rows
@@ -66,14 +66,14 @@ mod tests {
         samples[6] = 0;
         samples[7] = 0;
         samples[12] = 9000;
-        let frame: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let (reading, count) = median_reading_m(&frame, 5, 5, (2, 2), 1, 0.001)
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let (reading, count) = median_reading_m(&data, 5, 5, (2, 2), 1, 0.001)
             .unwrap()
             .unwrap();
         assert_eq!(count, 7);
         assert!((reading - 1.5).abs() < 1e-6);
         // At the image's edge the window is what fits.
-        let (_, count) = median_reading_m(&frame, 5, 5, (0, 0), 1, 0.001)
+        let (_, count) = median_reading_m(&data, 5, 5, (0, 0), 1, 0.001)
             .unwrap()
             .unwrap();
         assert_eq!(count, 3);

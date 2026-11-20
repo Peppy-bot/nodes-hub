@@ -25,7 +25,7 @@ import robot_description_py
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
-from _world import known
+from _world import known, placement_at
 import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
 
@@ -784,7 +784,7 @@ class _Spots:
     """The stage's spots, every one of them free."""
 
     def free_spot(self, promised=(), leaving=None):
-        return SimpleNamespace(position=(1.5 * len(promised), 0.0, 0.0), yaw=0.0)
+        return placement_at(1.5 * len(promised))
 
 
 def _admitting() -> RobotsIO:

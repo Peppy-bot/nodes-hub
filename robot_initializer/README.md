@@ -24,8 +24,10 @@ When the process of the node dies without shutting down, the engine keeps the
 robot for its pair grace time, which is the sender grace of the attach goal,
 and then takes the robot out. A node of the same copy that comes back within
 that time attaches the robot that still stands, and the goal of the node that
-died ends cancelled. A `placement` names where the robot's base stands; the
-default lets the engine choose a free spot on the lattice it parks robots on.
+died ends cancelled. A `placement` names where the robot's base stands, at x,
+y, z turned yaw about the vertical, which the node sends as a pose in the
+simulation's `world` with no timestamp; the default lets the engine choose a free
+spot on the lattice it parks robots on.
 
 The node starts only once the robot stands. Its setup waits for the engine to
 accept the robot and then to say that the robot stands, so `peppy stack join`
@@ -131,9 +133,10 @@ is ready.
 
 The node implements `transforms` for the fixed joints of the robot's model:
 once it holds the model, before it joins a scene, it publishes one
-`static_transforms` message with the transform of every fixed joint of the
-URDF, each from the joint's parent link to its child link at the joint's
-origin, in the URDF's order of joints. The topic retains the message, so a
+`static_transforms` message with the transform record of every fixed joint
+of the URDF, each from the joint's parent link (`frame`) to its child link
+(`child_frame`) at the joint's origin, in the URDF's order of joints, with no
+timestamp since each holds at every time. The topic retains the message, so a
 node that subscribes later receives it too, for as long as this node runs.
 These transforms are the robot's design: exact in a simulation and nominal on
 hardware. A fixed joint whose transform the contract does not take, such as
@@ -142,8 +145,8 @@ node publishes nothing on `transforms`: the robot's backbone publishes the
 joints it measures there.
 
 The node exposes `describe_sensors` of the `sensor_mounts` contract, from the
-model alone. It answers the robot frame, the root link of the URDF (`world`
-on an OpenArm, `base_link` on an SO-101), and each camera of the model in the
+model alone. It answers the robot frame, the root link of the URDF
+(`base_link` on an OpenArm and on an SO-101), and each camera of the model in the
 URDF's order: its name, `rgbd_camera` for a camera the URDF gives a depth
 sensor and `rgb_camera` for one that gives color alone, its frame, the link
 `<camera>_optical_frame`, and the arm that carries it: the arm one of whose

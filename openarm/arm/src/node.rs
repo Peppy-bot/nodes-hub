@@ -434,17 +434,17 @@ async fn bring_up(
     })?;
     info!("model loaded ({model_id} {}, base '{base_link}')", arm.name);
 
-    // Gravity acts along world -Z, so it is only correct if the URDF carries the
+    // Gravity acts along the root's -Z, so it is only correct if the URDF carries the
     // mount tree above base_link to orient that frame. We do not force one (a
     // base-rooted URDF legitimately evaluates gravity in the base frame), so log
     // which frame is in play: identity mount means base_link is the URDF root.
-    if model.base_from_world() == Isometry3::identity() {
+    if model.base_from_root() == Isometry3::identity() {
         warn!(
-            "no world->base mount tree above '{base_link}': gravity/Coriolis evaluated in \
+            "no root->base mount tree above '{base_link}': gravity/Coriolis evaluated in \
              the base frame (correct only if base_link's frame is gravity-aligned)"
         );
     } else {
-        info!("mount tree resolved: gravity/Coriolis evaluated in the world frame");
+        info!("mount tree resolved: gravity/Coriolis evaluated in the root frame");
     }
 
     let kp = [

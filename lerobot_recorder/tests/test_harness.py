@@ -32,7 +32,7 @@ FPS = 10
 # The geometry the sink integration suite proves out: smaller frames stall
 # lerobot's SVT-AV1 encode (it pads toward 64x64 and hangs on 8x6 input).
 W, H = 32, 16
-FRAME = bytes([64, 96, 128]) * (W * H)  # bgr8: raw on the wire, no encoder needed
+PICTURE = bytes([64, 96, 128]) * (W * H)  # bgr8: raw on the wire, no encoder needed
 # The one limb the harness binds, under the mock identities the generated
 # harness seeds (instance ids are suffixed per instance, link is the mock's
 # source link).
@@ -75,7 +75,7 @@ async def stream(h, stop: asyncio.Event) -> None:
     joints = h.mocks.observed.observed_joints[0].joint_states
     setpoints = h.mocks.observed.commanded_joints[0].joint_setpoints
     camera = h.mocks.deps.color_cameras[0].video_stream
-    frame_id = 0
+    capture_index = 0
     while not stop.is_set():
         now = time.time()
         await joints.publish(
@@ -90,14 +90,18 @@ async def stream(h, stop: asyncio.Event) -> None:
         )
         await camera.publish(
             video_stream.Message(
-                header=video_stream.MessageHeader(timestamp=now, frame_id=frame_id),
+                header=video_stream.MessageHeader(
+                    frame="wrist_color_optical_frame",
+                    timestamp=now,
+                    capture_index=capture_index,
+                ),
                 encoding="bgr8",
                 width=W,
                 height=H,
-                frame=FRAME,
+                data=PICTURE,
             )
         )
-        frame_id += 1
+        capture_index += 1
         try:
             await asyncio.wait_for(stop.wait(), timeout=0.05)
         except TimeoutError:

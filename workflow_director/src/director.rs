@@ -793,16 +793,11 @@ impl Director {
         }
     }
 
-    /// The snapshot of the fresh fleet listing `fleet`, with the documents
-    /// and the models that the director knows already.
+    /// The snapshot of the fresh fleet listing `fleet`, with the documents,
+    /// the models and the links that the director knows already.
     pub async fn snapshot_of_listing(&self, fleet: Fleet) -> Snapshot {
-        let (known, known_models) = {
-            let latest = self.snapshots.borrow();
-            (latest.contracts.clone(), latest.models.clone())
-        };
-        let mut snapshot = fleet::snapshot_of(&self.runner, fleet, &known).await;
-        snapshot.models = fleet::models_of(&self.runner, &snapshot, &known_models).await;
-        snapshot
+        let latest = Arc::clone(&self.snapshots.borrow());
+        fleet::snapshot_described(&self.runner, fleet, &latest).await
     }
 
     /// The workflow, the bundle and the run document of `request`, and
@@ -1073,6 +1068,7 @@ impl Director {
                 .map(|(sha256, shape)| (sha256.clone(), shape.document.clone()))
                 .collect(),
             models: snapshot.models.clone(),
+            links: snapshot.links.clone(),
             allowed: self.config.allowed.to_string(),
             binding,
             run_document,
@@ -1135,7 +1131,7 @@ impl TeachHint<'_> {
             }
         }
         let entry = format!(
-            "{{ name: \"{missing}\", kind: \"<pose, landmark, surface or region>\", position: [<x>, <y>, <z>], orientation: [<x>, <y>, <z>, <w>], size: [<x>, <y>, <z>] }}"
+            "{{ name: \"{missing}\", kind: \"<pose, landmark, surface or region>\", frame: \"<world, or a frame of the robot's tree such as map; left out, the robot frame>\", position: [<x>, <y>, <z>], orientation: [<x>, <y>, <z>, <w>], size: [<x>, <y>, <z>] }}"
         );
         let entries: Vec<String> = kept
             .iter()
@@ -1634,11 +1630,12 @@ pub fn run_nodes(snapshot: &Snapshot, plan: &Plan, me: &Caller) -> Vec<RunNode> 
 /// observations and its monitor, at the pin of the instance each targets;
 /// locations:v1 of each robot whose skill it gives a location; alert:v1 of
 /// each physical robot it binds; and robot_identity:v1 of each robot whose
-/// role names a model. The lock holds one pin per contract, so a robot that
-/// lists one of these last three at two pins refuses the run, naming the
-/// robot; so does a contract that the run reads at two shas, naming the
-/// robot when both reads are of one robot, else the robots of the run; and
-/// a pin of the listing that does not read.
+/// role names a model or gives a literal record that names its frame, which
+/// the checker holds against the links of the robot. The lock holds one pin
+/// per contract, so a robot that lists one of these last three at two pins
+/// refuses the run, naming the robot; so does a contract that the run reads
+/// at two shas, naming the robot when both reads are of one robot, else the
+/// robots of the run; and a pin of the listing that does not read.
 pub fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<Lock, String> {
     let targets = plan
         .calls
@@ -1658,15 +1655,16 @@ pub fn versions(snapshot: &Snapshot, plan: &Plan, nodes: &[RunNode]) -> Result<L
             continue;
         };
         let gives_locations = plan.locations.iter().any(|skill| skill.role == *role);
-        let names_a_model = plan
-            .workflow
-            .roles
-            .get(role)
-            .is_some_and(|role| role.model.is_some());
+        let reads_identity = plan.reads_links.contains(role)
+            || plan
+                .workflow
+                .roles
+                .get(role)
+                .is_some_and(|role| role.model.is_some());
         let read = [
             (fleet::LOCATIONS, gives_locations),
             (alerts::ALERT, bound.physical),
-            (fleet::ROBOT_IDENTITY, names_a_model),
+            (fleet::ROBOT_IDENTITY, reads_identity),
         ];
         for ((name, tag), _) in read.into_iter().filter(|(_, read)| *read) {
             let pins: BTreeSet<&str> = robot
@@ -2637,6 +2635,39 @@ mod tests {
         assert!(pins.contains_key("test_arm:v1"), "{pins:?}");
     }
 
+    /// The lock of a run whose role gives a literal record that names its frame names robot_identity:v1 of its
+    /// robot, whose URDF gives the links the checker held the frame against; a run that gives none names it not.
+    #[test]
+    fn the_lock_names_robot_identity_of_a_robot_whose_links_the_run_read() {
+        let mut arm = robot("arm");
+        arm.contracts.push(crate::fleet::RobotContract {
+            name: "robot_identity".to_owned(),
+            tag: "v1".to_owned(),
+            sha256: SHA_B.to_owned(),
+            instances: vec!["brain".to_owned()],
+        });
+        let fleet = snapshot(vec![arm]);
+        let reaching = |points: Json| {
+            one_arm(
+                "arm",
+                json!({ "id": "reach", "timeout_s": 5, "call": { "member": "arm.check_reach", "args": { "points": points } } }),
+                json!([]),
+            )
+        };
+        let identity_pin = |value: &Json| {
+            let plan = plan_on(value, Attendance::Attended, &fleet);
+            versions(&fleet, &plan, &[])
+                .unwrap()
+                .contracts
+                .iter()
+                .find(|(contract, _)| contract.to_string() == "robot_identity:v1")
+                .map(|(_, pin)| pin.to_string())
+        };
+        let literal = json!([{ "frame": "map", "position": [1.0, 0.0, 0.0] }]);
+        assert_eq!(identity_pin(&reaching(literal)), Some(SHA_B.to_owned()));
+        assert_eq!(identity_pin(&reaching(json!([]))), None);
+    }
+
     /// A contract that the robots of a run pin at two shas refuses the run, naming the contract and both pins.
     #[test]
     fn a_contract_pinned_at_two_shas_refuses_the_run_naming_both() {
@@ -2788,17 +2819,20 @@ mod tests {
 
     /// The location `name` of a skill.
     fn location(name: &str) -> KnownLocation {
-        KnownLocation {
-            name: Name::parse(name).unwrap(),
-            kind: workflow_documents::LocationKind::Surface,
-            position: [0.0; 3],
-            orientation: [0.0, 0.0, 0.0, 1.0],
-            size: [0.5, 0.5, 0.0],
-        }
+        serde_json::from_value(json!({
+            "name": name,
+            "kind": "surface",
+            "frame": "map",
+            "position": [0.0, 0.0, 0.0],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+            "size": [0.5, 0.5, 0.0],
+        }))
+        .unwrap()
     }
 
-    /// The hint of a refusal teaches the locations of every skill of the robot, each once, and the missing one; a
-    /// skill whose locations are unknown gives no command and is named.
+    /// The hint of a refusal teaches the locations of every skill of the robot, each once, and the missing one, each
+    /// with no timestamp, since a location holds at every time; a skill whose locations are unknown gives no command
+    /// and is named.
     #[test]
     fn the_teach_hint_keeps_the_locations_of_every_skill() {
         let hint = TeachHint {
@@ -2825,6 +2859,7 @@ mod tests {
         for kept in [r#""name":"shelf""#, r#""name":"bin""#, r#"name: "crate""#] {
             assert_eq!(teach.matches(kept).count(), 1, "{kept} in {teach}");
         }
+        assert!(!teach.contains("timestamp"), "{teach}");
         let unknown = hint.refusal(
             &[
                 ("arm_brain".to_owned(), Some(vec![location("shelf")])),

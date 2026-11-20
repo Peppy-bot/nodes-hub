@@ -65,7 +65,14 @@
         // depth intrinsics the depths it measures. Optional: a vacant slot
         // leaves the workspace answers without a view check, and they say
         // so.
-        { name: "camera_geometry", tag: "v1", link_id: "perception_geometry", cardinality: "zero_or_one" }
+        { name: "camera_geometry", tag: "v1", link_id: "perception_geometry", cardinality: "zero_or_one" },
+        // The robot's tree of frames, bound to the other publishers of the
+        // tree: the robot's initializer (the fixed joints) and the base,
+        // where the robot has one. The backbone takes the transforms of the
+        // joints it measures into the tree as it publishes them. Each
+        // move_arm goal, check_arm_move request, check_positions point and
+        // pose setpoint is placed by it into the robot frame.
+        { name: "transforms", tag: "v1", link_id: "other_transforms", cardinality: "one_or_more" }
       ],
       pairings: [
         // The exclusive command loop with the one leading node (panel or
@@ -76,8 +83,9 @@
         // Subscribed only under `upstream_mode: "joints"`.
         { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_left_arm", cardinality: "zero_or_one" },
         { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_right_arm", cardinality: "zero_or_one" },
-        // The Cartesian alternative, one slot per arm: a world-frame
-        // end-effector pose streams in and the measured pose relays back.
+        // The Cartesian alternative, one slot per arm: an end-effector pose
+        // in a frame of the robot's tree streams in, placed into the robot
+        // frame, and the measured pose relays back in the robot frame.
         // Subscribed only under `upstream_mode: "pose"`.
         { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_left_arm_pose", cardinality: "zero_or_one" },
         { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_right_arm_pose", cardinality: "zero_or_one" },
@@ -184,8 +192,8 @@
         { link_id: "leader_left_gripper", name: "gripper_states" },
         { link_id: "leader_right_gripper", name: "gripper_states" },
         // The Cartesian state back-channel on each pose_link slot: the
-        // measured end-effector pose, world frame. Published only under
-        // upstream_mode "pose".
+        // measured end-effector pose, in the robot frame. Published only
+        // under upstream_mode "pose".
         { link_id: "leader_left_arm_pose", name: "pose_states" },
         { link_id: "leader_right_arm_pose", name: "pose_states" },
         // The contract-backed readouts; formats come from the contracts.
@@ -211,7 +219,11 @@
         { link_id: "leader_right_arm_pose", name: "pose_setpoints" },
         { link_id: "leader_left_gripper", name: "gripper_setpoints" },
         { link_id: "leader_right_gripper", name: "gripper_setpoints" },
-        { link_id: "collision_ctrl", name: "governor_control" }
+        { link_id: "collision_ctrl", name: "governor_control" },
+        // Every message of the other publishers of the robot's tree, taken
+        // into the tree the commands are placed by.
+        { link_id: "other_transforms", name: "transforms" },
+        { link_id: "other_transforms", name: "static_transforms" }
       ]
     },
     services: {
@@ -330,6 +342,19 @@
       // one-pole differentiator, 90 rad/s or about 14.3 Hz. A universal control constant
       // (same across generations and sim/real), so it keeps a node default.
       velocity_filter_cutoff_hz: { $type: "f64", $default: 15.0 },
+      // How long (s) the backbone keeps each moving transform of the robot's
+      // tree, counted back from the newest stamp of its child frame: finite
+      // and above 0. A command stamped before that is refused with
+      // extrapolation. The default is tf2's default cache time
+      // (BUFFER_CORE_DEFAULT_CACHE_TIME), which MoveIt's planning scene
+      // monitor keeps.
+      cache_window_s: { $type: "f64", $default: 10.0 },
+      // How long (s) the placement of a command waits, on the backbone's
+      // clock, for the robot's tree to place it at its timestamp: finite and
+      // 0 or above, 0 for no wait. A goal or a request whose wait runs out is
+      // refused with the failure of the lookup, and a pose setpoint is
+      // dropped.
+      lookup_timeout_s: "f64",
     }
   }
 }

@@ -8,7 +8,9 @@
 //! configuration as the arm joints (a gripper cannot open its
 //! fingers into the other arm), and the governed opening streams to each
 //! gripper over its gripper_link pairing slot. The governor is URDF-based, so
-//! it runs identically for the sim and the real arms.
+//! it runs identically for the sim and the real arms. Every pose a command
+//! names, in a frame at a time, is placed in the robot frame by the robot's
+//! tree, which the backbone follows on its other_transforms link.
 //!
 //! The library crate exists so the harness-driven integration tests can boot
 //! the node in-process: [`setup`] is the node's whole entry point, and
@@ -19,8 +21,10 @@
 
 mod actions;
 mod arm_order;
+mod clock;
 mod coordinator;
 mod failure;
+mod follow;
 mod governor;
 mod gripper_move;
 mod identity;
@@ -28,6 +32,7 @@ mod liveness;
 mod move_slot;
 mod node;
 mod path_checks;
+mod placement;
 mod planner;
 mod publish;
 mod robot;

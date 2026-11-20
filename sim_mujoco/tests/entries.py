@@ -1,13 +1,15 @@
 """The entries of the robots these suites stand: what a description gives a
 robot (its arms, its grippers with where each finger closes and opens, its
 cameras and its start posture), and what the release of Waldo's catalogue
-gives its MuJoCo model, written out for a fake robot of a test."""
+gives its MuJoCo model, written out for a fake robot of a test; and where a
+test stands a robot."""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
+from control_core_py.geometry import Pose, quaternion_of_yaw
 from robot_description_py import FingerSpan
 from sim_robot_core.cameras import CameraConfig
 from sim_robot_core.models import Arm, Gripper, ModelEntry
@@ -79,9 +81,15 @@ def entry(
     )
 
 
+def placement_at(x: float, y: float = 0.0, z: float = 0.0, yaw: float = 0.0) -> Pose:
+    """A robot's placement at (x, y, z) in world, turned `yaw` about +z."""
+    return Pose.parse((x, y, z), quaternion_of_yaw(yaw))
+
+
 def camera(name: str, parent_link: str, pos, quat_wxyz, fovy_deg: float, width: int, height: int, fps: int, depth=None) -> CameraConfig:
     return CameraConfig(
         name=name,
+        frame=f"{name}_optical_frame",
         parent_link=parent_link,
         pos=tuple(pos),
         quat_wxyz=tuple(quat_wxyz),

@@ -90,10 +90,12 @@ def answer_the_camera(h) -> None:
 
 
 async def _answer_lookups(service) -> None:
-    """Answers each lookup of a camera's frame in the robot frame with its
-    place of CAMERAS, and any other with the failure `unknown_frame`, until
-    the harness stops its mocks."""
+    """Answers each lookup in the robot frame of a camera's frame with its
+    place of CAMERAS, and of the robot frame with its origin, a transform
+    record stamped with the request's target time, and any other with the
+    failure `unknown_frame`, until the harness stops its mocks."""
     places = {frame: (position, orientation) for frame, position, orientation in CAMERAS.values()}
+    places[ROBOT_FRAME] = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
     while True:
         try:
             request, responder = await service.next_request(LOOKUP_WAIT_S)
@@ -106,23 +108,28 @@ async def _answer_lookups(service) -> None:
             )
             continue
         position, orientation = places[request.source_frame]
-        await responder.respond(lookup_transform.ResponseData(position=position, orientation=orientation, timestamp=request.time))
+        await responder.respond(
+            lookup_transform.ResponseData(
+                frame=request.target_frame, child_frame=request.source_frame, timestamp=request.target_timestamp,
+                position=position, orientation=orientation,
+            )
+        )
 
 
-async def publish_a_capture(h, frame_id: int = 1) -> None:
+async def publish_a_capture(h, capture_index: int = 1, frame: str = CAMERAS["chest"][0]) -> None:
     """One grey 16 x 12 colour frame and the depth frame of its capture, one
-    metre everywhere."""
+    metre everywhere, each naming `frame`, the chest camera's by default."""
     camera = h.mocks.deps.camera
     assert await camera.video_stream.wait_for_subscriber(WAIT)
     assert await camera.depth_stream.wait_for_subscriber(WAIT)
-    header = dict(timestamp=1.0, frame_id=frame_id, align_mode="depth_to_color")
+    header = dict(timestamp=1.0, frame=frame, capture_index=capture_index, align_mode="depth_to_color")
     await camera.video_stream.publish(
-        video_stream.Message(header=video_stream.MessageHeader(**header), encoding="rgb8", width=16, height=12, frame=bytes([128]) * (16 * 12 * 3))
+        video_stream.Message(header=video_stream.MessageHeader(**header), encoding="rgb8", width=16, height=12, data=bytes([128]) * (16 * 12 * 3))
     )
     await camera.depth_stream.publish(
         depth_stream.Message(
             header=depth_stream.MessageHeader(**header), encoding="z16", width=16, height=12,
-            frame=np.full((12, 16), 1000, dtype="<u2").tobytes(),
+            data=np.full((12, 16), 1000, dtype="<u2").tobytes(),
         )
     )
 
@@ -197,8 +204,11 @@ def limbs_at(limbs: FakeLimbs) -> limb_states.Message:
     """A limb_states snapshot of the OpenArm, two arms of seven joints, as
     `limbs` stand."""
     return limb_states.Message(
-        timestamp=limbs.stamp, arm_names=["left_arm", "right_arm"], joints_per_arm=[7, 7], joint_positions=[0.0] * 14,
-        positions=[*limbs.left_position, 0.4, -0.2, 0.9], orientations=[*limbs.left_orientation, 0.0, 1.0, 0.0, 0.0],
+        timestamp=limbs.stamp, frame=ROBOT_FRAME, arm_names=["left_arm", "right_arm"], joints_per_arm=[7, 7], joint_positions=[0.0] * 14,
+        grasp_points=[
+            limb_states.MessageGraspPointsItem(position=limbs.left_position, orientation=limbs.left_orientation),
+            limb_states.MessageGraspPointsItem(position=[0.4, -0.2, 0.9], orientation=[0.0, 1.0, 0.0, 0.0]),
+        ],
         gripper_names=["left_gripper", "right_gripper"], gripper_openings=[limbs.left_opening, 1.0],
     )
 
@@ -210,8 +220,23 @@ async def publish_limbs(h) -> None:
     await topic.publish(limbs_at(limbs_of(h)))
 
 
-def grab_by_pose(position, orientation=None) -> grab_action.GoalRequestData:
-    return grab_action.GoalRequestData(gripper_name="left_gripper", item_id="", position=list(position), orientation=orientation, max_effort=0.0)
+def target(position, orientation=None, frame=ROBOT_FRAME, timestamp=None) -> grab_action.GoalRequestDataTarget:
+    """A goal's target: `position` in `frame`, the robot frame when none, at
+    `timestamp`, the latest time when none, with `orientation`, or none."""
+    return grab_action.GoalRequestDataTarget(
+        frame=frame, timestamp=timestamp, position=list(position), orientation=None if orientation is None else list(orientation)
+    )
+
+
+# The target a goal that names its item by id sends, which is not read: a
+# zero position with no frame, no timestamp and no orientation.
+UNREAD_TARGET = target([0.0, 0.0, 0.0], frame=None)
+
+
+def grab_by_pose(position, orientation=None, frame=ROBOT_FRAME, timestamp=None) -> grab_action.GoalRequestData:
+    return grab_action.GoalRequestData(
+        gripper_name="left_gripper", item_id="", target=target(position, orientation, frame, timestamp), max_effort=0.0
+    )
 
 
 def plan(h, *answers: bool) -> None:
@@ -240,21 +265,23 @@ async def accepted_move(h):
     return pending.request, await pending.accept()
 
 
-async def land_move(h) -> move_arm.GoalRequest:
-    """The next move_arm goal, landed on its target: limb_states shows the
-    left grasp point there before the goal completes."""
+async def land_move(h) -> move_arm.GoalRequestTarget:
+    """The target of the next move_arm goal, which leaves its frame out,
+    for the robot frame, and its timestamp, for the latest time, landed on:
+    limb_states shows the left grasp point there before the goal completes."""
     request, active = await accepted_move(h)
     assert request.arm_name == "left_arm", request.arm_name
+    goal = request.target
+    assert (goal.frame, goal.timestamp) == (None, None), (goal.frame, goal.timestamp)
     limbs = limbs_of(h)
-    limbs.left_position, limbs.left_orientation = list(request.position), list(request.orientation)
+    limbs.left_position, limbs.left_orientation = list(goal.position), list(goal.orientation)
     limbs.stamp += 1.0
     await publish_limbs(h)
-    await active.complete(
-        move_arm.ResultResponseData(
-            final_position=request.position, final_orientation=request.orientation, ended_on_contact=False, action_time=1.0
-        )
+    final_pose = move_arm.ResultResponseDataFinalPose(
+        frame=ROBOT_FRAME, timestamp=limbs.stamp, position=goal.position, orientation=goal.orientation
     )
-    return request
+    await active.complete(move_arm.ResultResponseData(final_pose=final_pose, ended_on_contact=False, action_time=1.0))
+    return goal
 
 
 async def accepted_grip(h):
@@ -299,8 +326,8 @@ async def publish_wrist_until(h, done: asyncio.Event) -> None:
         stamp += 1
         await camera.video_stream.publish(
             wrist_video_stream.Message(
-                header=wrist_video_stream.MessageHeader(timestamp=float(stamp), frame_id=stamp), encoding="rgb8", width=16, height=12,
-                frame=bytes([128]) * (16 * 12 * 3),
+                header=wrist_video_stream.MessageHeader(timestamp=float(stamp), frame=CAMERAS["wrist_left"][0], capture_index=stamp),
+                encoding="rgb8", width=16, height=12, data=bytes([128]) * (16 * 12 * 3),
             )
         )
         await asyncio.sleep(0.01)

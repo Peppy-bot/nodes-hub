@@ -4,6 +4,8 @@ import math
 
 import pytest
 
+from control_core_py.geometry import product
+
 from vlm_router_brain.manipulators.vlm.directions import axes_in_picture, clock_hour, picture_direction
 
 
@@ -13,17 +15,6 @@ def quaternion(axis, degrees):
     s = math.sin(half)
     norm = math.sqrt(sum(a * a for a in axis))
     return (axis[0] / norm * s, axis[1] / norm * s, axis[2] / norm * s, math.cos(half))
-
-
-def multiply(a, b):
-    ax, ay, az, aw = a
-    bx, by, bz, bw = b
-    return (
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    )
 
 
 # A camera looking straight down (optical z along the robot's -z) with the
@@ -52,7 +43,7 @@ def test_looking_down_with_the_right_along_y_reads_x_at_6_and_y_at_3():
 def test_turning_that_camera_90_degrees_about_the_vertical_turns_the_hours_by_three():
     # The camera rolled a quarter turn about the robot's +z, counter-clockwise
     # seen from above: what was at 6 moves to 9, what was at 3 to 6.
-    turned = multiply(quaternion((0.0, 0.0, 1.0), 90.0), LOOKING_DOWN)
+    turned = product(quaternion((0.0, 0.0, 1.0), 90.0), LOOKING_DOWN)
     assert axes_in_picture(turned) == (9, 6)
 
 

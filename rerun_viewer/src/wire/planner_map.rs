@@ -13,10 +13,15 @@ use tracing::error;
 use crate::canvas::Canvas;
 use crate::draw::planner_map::draw_planner_map;
 use crate::model::planner_map::PlannerMap;
-use crate::wire::{sendable, stopped};
+use crate::wire::{Shared, sendable, stopped};
 
-/// Draws each message of occupancy_map as it comes, until the node stops.
-pub async fn follow_planner_map(runner: Arc<NodeRunner>, canvas: Arc<dyn Canvas>) {
+/// Draws each message of occupancy_map in the robot frame as it comes, until the node
+/// stops; a message in another frame is dropped, the first of a run logged.
+pub async fn follow_planner_map(
+    runner: Arc<NodeRunner>,
+    canvas: Arc<dyn Canvas>,
+    shared: Arc<Shared>,
+) {
     let cancelled = stopped(&runner);
     let mut subscription = match sendable(occupancy_map::subscribe(&runner)).await {
         Ok(subscription) => subscription,
@@ -29,12 +34,20 @@ pub async fn follow_planner_map(runner: Arc<NodeRunner>, canvas: Arc<dyn Canvas>
         canvas,
         unreadable: LatchedLog::warn("reading occupancy_map"),
     };
+    let other_frames = LatchedLog::warn("drawing occupancy_map");
     receiving::receive(
         "occupancy_map",
         cancelled,
         async move || subscription.next().await,
         async move |(_producer, message)| {
-            follower.on_message(&message);
+            let held = shared.hold_to_robot_frame(&runner, "occupancy_map", &message.frame);
+            match held {
+                Ok(()) => {
+                    other_frames.success();
+                    follower.on_message(&message);
+                }
+                Err(reason) => other_frames.failure(reason),
+            }
             ControlFlow::Continue(())
         },
     )
@@ -52,7 +65,11 @@ impl MapFollower {
         match PlannerMap::parse(
             message.timestamp,
             message.voxel_size_m,
-            &message.centers,
+            &message
+                .centers
+                .iter()
+                .map(|center| center.position)
+                .collect::<Vec<_>>(),
             &message.waiting,
         ) {
             Ok(map) => {

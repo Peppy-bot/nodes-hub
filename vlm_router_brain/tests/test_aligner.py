@@ -17,9 +17,9 @@ from test_loop import FakeStepModel
 from brain_core.limb_state import NO_SNAPSHOT, LimbStateStore
 from brain_core.manipulators.scripted.aligning import Aligned, AlignmentFailed, AlignRequest, GaveUp, OutOfSteps, Stopped
 from brain_core.manipulators.scripted.grasp import GraspDirection, approach, jaw_line_deg, lifted, orientation
-from brain_core.perception.camera import CameraPose
 from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal, TargetItem
 from brain_core.robot import MoveEnd, MoveResult
+from control_core_py.geometry import Placement
 
 from vlm_router_brain.manipulators.vlm.aligner import MIN_FRAME_WAIT_S, NOT_STARTED, ModelAligner
 
@@ -32,7 +32,10 @@ DOWN_0 = orientation(GraspDirection.DOWN, 0.0)
 # A wrist camera looking straight down, its picture's right along the
 # robot's +y: a half turn about (1, 1, 0).
 LOOKING_DOWN = (math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0)
-CHEST_POSE = CameraPose((0.08, 0.03, 0.79), (0.0, 0.0, 0.0, 1.0))
+# The frames the pictures name, and where the robot's tree places each.
+WRIST_FRAME = "wrist_left_color_optical_frame"
+CHEST_FRAME = "chest_color_optical_frame"
+POSES = {WRIST_FRAME: Placement((0.2, 0.2, 0.5), LOOKING_DOWN), CHEST_FRAME: Placement((0.08, 0.03, 0.79), (0.0, 0.0, 0.0, 1.0))}
 
 
 def cube(position=SEEN) -> Item:
@@ -55,7 +58,7 @@ class FakeWrists:
 
     def __init__(self, camera: Optional[str] = "wrist_left", frames: int = 10, period_s: Optional[float] = None) -> None:
         self.camera = camera
-        self.frames: deque = deque(_taken_at(rgb_frame(frame_id=i), WRIST_TAKEN_S + i) for i in range(1, frames + 1))
+        self.frames: deque = deque(_taken_at(rgb_frame(capture_index=i, frame=WRIST_FRAME), WRIST_TAKEN_S + i) for i in range(1, frames + 1))
         self.period = period_s
         self.waited: list[float] = []
 
@@ -77,25 +80,15 @@ class FakeWrists:
 
 
 class FakeChest:
-    """The chest perceiver: its latest frame, taken at CHEST_TAKEN_S, and its
-    camera at `pose` at every time, or not placed when `pose` is none; each
-    time it is asked to place the camera at is kept."""
+    """The chest perceiver: its latest frame, taken at CHEST_TAKEN_S."""
 
-    def __init__(self, *, frame=True, pose: Optional[CameraPose] = CHEST_POSE, unavailable: str = "") -> None:
+    def __init__(self, *, frame=True, unavailable: str = "") -> None:
         self.frames = SimpleNamespace(latest=self._latest)
-        self.pose = pose
-        self.placed_at: list[float] = []
         self._frame = frame
         self.unavailable = unavailable
 
     def why_unavailable(self):
         return self.unavailable
-
-    async def pose_at(self, timestamp: float) -> CameraPose:
-        self.placed_at.append(timestamp)
-        if self.pose is None:
-            raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, "the robot's sensors have not been described yet")
-        return self.pose
 
     def _latest(self):
         if not self._frame:
@@ -134,14 +127,19 @@ def _which(point) -> str:
     return "lift"
 
 
-# Each (camera, time) the fake robot was asked to place a camera at.
+# Each (frame, time) of a picture the fake robot was asked to place.
 PLACED: list[tuple[str, float]] = []
 
 
-async def camera_pose(name, timestamp):
-    assert name == "wrist_left"
-    PLACED.append((name, timestamp))
-    return CameraPose((0.2, 0.2, 0.5), LOOKING_DOWN)
+async def camera_pose(header):
+    """Where the frame `header` names stands, as POSES gives it, at every
+    time."""
+    PLACED.append((header.frame, header.timestamp))
+    return POSES[header.frame]
+
+
+async def undescribed(header):
+    raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, "the robot's sensors have not been described yet")
 
 
 def senses(*, wrists=None, chest=None, store=None, pose=camera_pose):
@@ -289,20 +287,18 @@ async def test_a_step_with_no_wrist_frame_after_the_move_fails_the_alignment():
         await a.align(request(), FakeMoves(), CancelToken())
 
 
-async def test_each_camera_is_placed_where_it_stood_when_its_picture_was_taken():
+async def test_each_camera_is_placed_where_the_frame_its_picture_names_stood_when_the_picture_was_taken():
     PLACED.clear()
-    chest = FakeChest()
-    a, _ = aligner('{"action": "ready"}', the_senses=senses(chest=chest))
+    a, _ = aligner('{"action": "ready"}', the_senses=senses())
     await a.align(request(), FakeMoves(), CancelToken())
-    assert PLACED == [("wrist_left", WRIST_TAKEN_S + 1)]
-    assert chest.placed_at == [CHEST_TAKEN_S]
+    assert PLACED == [(WRIST_FRAME, WRIST_TAKEN_S + 1), (CHEST_FRAME, CHEST_TAKEN_S)]
 
 
 async def test_a_step_with_no_chest_frame_no_chest_pose_or_no_limbs_fails_the_alignment():
     a, _ = aligner('{"action": "ready"}', the_senses=senses(chest=FakeChest(frame=False)))
     with pytest.raises(AlignmentFailed, match="no camera frame received"):
         await a.align(request(), FakeMoves(), CancelToken())
-    a, _ = aligner('{"action": "ready"}', the_senses=senses(chest=FakeChest(pose=None)))
+    a, _ = aligner('{"action": "ready"}', the_senses=senses(pose=undescribed))
     with pytest.raises(AlignmentFailed, match="the robot's sensors have not been described yet"):
         await a.align(request(), FakeMoves(), CancelToken())
     a, _ = aligner('{"action": "ready"}', the_senses=senses(store=LimbStateStore()))
@@ -310,12 +306,15 @@ async def test_a_step_with_no_chest_frame_no_chest_pose_or_no_limbs_fails_the_al
         await a.align(request(), FakeMoves(), CancelToken())
 
 
-async def test_a_camera_the_robot_cannot_place_fails_the_alignment_with_its_words():
-    async def no_pose(name, timestamp):
-        raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, "the robot carries no camera named 'wrist_left'")
+async def test_a_picture_whose_frame_the_robot_cannot_place_fails_the_alignment_with_its_words():
+    async def no_pose(header):
+        raise Refusal(
+            FailureKind.RESOURCE_UNAVAILABLE,
+            f"picture {header.capture_index} dropped: unknown_frame: the frame '{header.frame}' at 21.000 s: no transform names it",
+        )
 
     a, _ = aligner('{"action": "ready"}', the_senses=senses(pose=no_pose))
-    with pytest.raises(AlignmentFailed, match="carries no camera named 'wrist_left'"):
+    with pytest.raises(AlignmentFailed, match=f"^picture 1 dropped: unknown_frame: the frame '{WRIST_FRAME}'"):
         await a.align(request(), FakeMoves(), CancelToken())
 
 

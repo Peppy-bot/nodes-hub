@@ -5,7 +5,7 @@ fires to the outcome it reads."""
 import asyncio
 
 from brain_core.robot import GripResult, MoveCheck, MoveEnd, MoveResult, Robot
-from conftest import PARAMS, answer_the_camera
+from conftest import PARAMS, ROBOT_FRAME, answer_the_camera
 from peppygen.consumed_actions.limb_motion import move_arm, move_gripper
 from peppygen.consumed_services.limb_motion import check_arm_move
 from peppygen.fixtures import harness
@@ -53,10 +53,15 @@ async def in_flight(robot: Robot) -> None:
         await asyncio.sleep(0)
 
 
+# The time of the measurement of each move's final pose.
+MEASURED_AT = 3.5
+
+
 def arm_result() -> move_arm.ResultResponseData:
-    return move_arm.ResultResponseData(
-        final_position=[0.51, 0.1, 0.69], final_orientation=[0.0, 0.0, 0.0, 1.0], ended_on_contact=False, action_time=0.4
+    final_pose = move_arm.ResultResponseDataFinalPose(
+        frame=ROBOT_FRAME, timestamp=MEASURED_AT, position=[0.51, 0.1, 0.69], orientation=[0.0, 0.0, 0.0, 1.0]
     )
+    return move_arm.ResultResponseData(final_pose=final_pose, ended_on_contact=False, action_time=0.4)
 
 
 async def test_a_completed_move_returns_where_the_limb_stands():
@@ -65,10 +70,16 @@ async def test_a_completed_move_returns_where_the_limb_stands():
         move = asyncio.create_task(robot.move_arm("left_arm", POSITION, ORIENTATION, duration_s=1.5, **BARS))
         pending = await h.mocks.deps.limb_motion.move_arm.next_goal(WAIT)
         assert pending.request.arm_name == "left_arm"
-        assert pending.request.position == [0.5, 0.1, 0.7] and pending.request.duration_s == 1.5
+        # The target leaves its frame out, for the robot frame, and its
+        # timestamp, for the latest time.
+        target = pending.request.target
+        assert (target.frame, target.timestamp, target.position) == (None, None, [0.5, 0.1, 0.7])
+        assert pending.request.duration_s == 1.5
         active = await pending.accept()
         await active.complete(arm_result())
-        assert await asyncio.wait_for(move, WAIT) == MoveResult(MoveEnd.COMPLETED, "", "", (0.51, 0.1, 0.69), (0.0, 0.0, 0.0, 1.0))
+        assert await asyncio.wait_for(move, WAIT) == MoveResult(
+            MoveEnd.COMPLETED, "", "", (0.51, 0.1, 0.69), (0.0, 0.0, 0.0, 1.0), MEASURED_AT
+        )
 
         grip = asyncio.create_task(robot.set_gripper("left_gripper", 0.2, max_effort=5.0, settle_timeout_s=2.0))
         pending = await h.mocks.deps.limb_motion.move_gripper.next_goal(WAIT)
@@ -153,5 +164,5 @@ async def test_a_check_asks_the_backbone_and_reads_its_plan_or_its_reason():
         assert await robot.check_arm_move("left_arm", POSITION, ORIENTATION, **PLAN) == MoveCheck(True, "", 1.25)
         assert await robot.check_arm_move("left_arm", POSITION, ORIENTATION, **PLAN) == MoveCheck(False, "goal pose not planned", 0.0)
         [first, second] = service.captured()
-        assert (first.arm_name, first.position, first.orientation) == ("left_arm", [0.5, 0.1, 0.7], [0.0, 0.0, 0.0, 1.0])
+        assert (first.arm_name, first.target.position, first.target.orientation) == ("left_arm", [0.5, 0.1, 0.7], [0.0, 0.0, 0.0, 1.0])
         assert robot.moves_in_flight == 0

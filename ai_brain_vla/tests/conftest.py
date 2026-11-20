@@ -107,6 +107,10 @@ class FakeDetector:
         return Coverage(every_label=True)
 
 
+# When the fake manipulator's backbone measured the grasp point of a place.
+PLACE_MEASURED_AT = 2.5
+
+
 class FakeManipulator:
     """Succeeds at once unless told to wait for a stop. `begun` resolves when
     a sequence has reached it."""
@@ -137,7 +141,7 @@ class FakeManipulator:
         if self.wait_for_stop:
             await cancel.wait()
             cancel.check()
-        return Outcome(True, "", final_position)
+        return Outcome(True, "", final_position, PLACE_MEASURED_AT if final_position is not None else 0.0)
 
     async def grab(self, item: Item, gripper: Gripper, max_effort: float, cancel: CancelToken) -> Outcome:
         self.calls.append(("grab", item.item_id, gripper.name, max_effort))
@@ -149,7 +153,8 @@ class FakeManipulator:
 
     async def place(self, gripper: Gripper, to: Union[Pose, TargetItem], cancel: CancelToken) -> Outcome:
         """A place at a pose reports the jaws opened 1 cm above it; a place
-        into a target item, 1 cm above the item's top at its centre."""
+        into a target item, 1 cm above the item's top at its centre; each
+        measured at PLACE_MEASURED_AT."""
         if isinstance(to, TargetItem):
             self.calls.append(("place", gripper.name, to.item_id))
             return await self._run(cancel, final_position=(to.centre[0], to.centre[1], to.top_z + 0.01))
@@ -201,12 +206,14 @@ def sensors_described(names=tuple(CAMERAS)):
 
 
 async def _answer_lookups(service) -> None:
-    """Answers each lookup of a camera's frame in the robot frame with its
-    place of CAMERAS, and any other with the failure `unknown_frame`, until
-    the harness stops its mocks."""
+    """Answers each lookup in the robot frame of a camera's frame with its
+    place of CAMERAS, and of the robot frame with its origin, a transform
+    record stamped with the request's target time, and any other with the
+    failure `unknown_frame`, until the harness stops its mocks."""
     from peppygen.consumed_services.transform_lookup import lookup_transform
 
     places = {frame: (position, orientation) for frame, position, orientation in CAMERAS.values()}
+    places[ROBOT_FRAME] = ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
     while True:
         try:
             request, responder = await service.next_request(LOOKUP_WAIT_S)
@@ -219,7 +226,12 @@ async def _answer_lookups(service) -> None:
             )
             continue
         position, orientation = places[request.source_frame]
-        await responder.respond(lookup_transform.ResponseData(position=position, orientation=orientation, timestamp=request.time))
+        await responder.respond(
+            lookup_transform.ResponseData(
+                frame=request.target_frame, child_frame=request.source_frame, timestamp=request.target_timestamp,
+                position=position, orientation=orientation,
+            )
+        )
 
 
 def colour_intrinsics():
@@ -231,28 +243,35 @@ def colour_intrinsics():
     )
 
 
-def rgb_frame(width: int = 16, height: int = 12, *, frame_id: int = 1, align_mode: str = "depth_to_color"):
-    """A colour message of the given size, plain grey."""
+def rgb_frame(
+    width: int = 16, height: int = 12, *, capture_index: int = 1, align_mode: str = "depth_to_color", frame: str = CAMERAS["chest"][0]
+):
+    """A colour message of the given size, plain grey, that names `frame`,
+    the chest camera's by default."""
     from peppygen.consumed_topics.camera import video_stream
 
     return video_stream.Message(
-        header=video_stream.MessageHeader(timestamp=1.0, frame_id=frame_id, align_mode=align_mode),
+        header=video_stream.MessageHeader(timestamp=1.0, frame=frame, capture_index=capture_index, align_mode=align_mode),
         encoding="rgb8",
         width=width,
         height=height,
-        frame=bytes([128]) * (width * height * 3),
+        data=bytes([128]) * (width * height * 3),
     )
 
 
-def depth_frame(depth_m: float, width: int = 16, height: int = 12, unit: float = 0.001, *, frame_id: int = 1, align_mode: str = "depth_to_color"):
-    """A z16 depth message of the given size, `depth_m` everywhere."""
+def depth_frame(
+    depth_m: float, width: int = 16, height: int = 12, unit: float = 0.001, *, capture_index: int = 1,
+    align_mode: str = "depth_to_color", frame: str = CAMERAS["chest"][0],
+):
+    """A z16 depth message of the given size, `depth_m` everywhere, that
+    names `frame`, the chest camera's by default."""
     from peppygen.consumed_topics.camera import depth_stream
 
     value = int(round(depth_m / unit))
     return depth_stream.Message(
-        header=depth_stream.MessageHeader(timestamp=1.0, frame_id=frame_id, align_mode=align_mode),
+        header=depth_stream.MessageHeader(timestamp=1.0, frame=frame, capture_index=capture_index, align_mode=align_mode),
         encoding="z16",
         width=width,
         height=height,
-        frame=np.full((height, width), value, dtype="<u2").tobytes(),
+        data=np.full((height, width), value, dtype="<u2").tobytes(),
     )

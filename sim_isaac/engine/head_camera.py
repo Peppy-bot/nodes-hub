@@ -29,6 +29,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -40,6 +41,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import numpy as np
+from control_core_py.geometry import angle_shortest_path, xyzw_of_wxyz
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +294,6 @@ def check_chest_camera(rig: dict, entry) -> None:
         raise RuntimeError(f"the {entry.model} description has no {CHEST_CAMERA!r} camera")
     left = rig["cameras"]["left"]
     position = np.array(left["position_m"], dtype=np.float64)
-    quat = np.array(left["quat_wxyz"], dtype=np.float64)
     if chest.parent_link != PEDESTAL_LINK:
         raise RuntimeError(
             f"the chest camera mounts on {chest.parent_link!r}, the head camera on {PEDESTAL_LINK!r}"
@@ -302,13 +303,14 @@ def check_chest_camera(rig: dict, entry) -> None:
             f"the chest camera at {chest.pos} is not at the pack's left lens front"
             f" {tuple(position.round(6))}"
         )
-    alignment = abs(float(quat @ np.array(chest.quat_wxyz))) / (
-        np.linalg.norm(quat) * np.linalg.norm(chest.quat_wxyz)
+    # The cosine of half the turn from the left eye to the chest camera.
+    alignment = math.cos(
+        angle_shortest_path(xyzw_of_wxyz(left["quat_wxyz"]), xyzw_of_wxyz(chest.quat_wxyz)) / 2.0
     )
     if 1.0 - alignment > ORIENTATION_TOLERANCE:
         raise RuntimeError(
             f"the chest camera orientation {chest.quat_wxyz} is not the pack's left eye's"
-            f" {tuple(quat)}"
+            f" {tuple(left['quat_wxyz'])}"
         )
 
 

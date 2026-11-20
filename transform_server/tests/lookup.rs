@@ -1,6 +1,7 @@
 //! transform_lookup's lookup_transform over the wire, from a tree whose publishers are the
 //! robot's initializer, which sends the fixed transform of the camera on the arm, and the
-//! backbone, which sends the measured transform of the arm in the base link.
+//! backbone, which sends the measured transform of the arm in the base link, and of the
+//! base link in odom where a test moves the base.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,8 +28,30 @@ const BACKBONE: &str = "backbone";
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
+const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
+
 fn at(seconds: f64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs_f64(seconds)
+}
+
+/// The fixed record of `child` placed in `frame` at `position`, unturned.
+fn fixed(frame: &str, child: &str, position: [f64; 3]) -> static_transforms::MessageTransformsItem {
+    static_transforms::MessageTransformsItem {
+        frame: frame.into(),
+        child_frame: child.into(),
+        position,
+        orientation: IDENTITY,
+    }
+}
+
+/// The moving record of `child` placed in `frame` at `position`, unturned.
+fn moving(frame: &str, child: &str, position: [f64; 3]) -> transforms::MessageTransformsItem {
+    transforms::MessageTransformsItem {
+        frame: frame.into(),
+        child_frame: child.into(),
+        position,
+        orientation: IDENTITY,
+    }
 }
 
 /// The node on the harness's simulation clock, which reads 0 until a test ticks it.
@@ -57,10 +80,7 @@ async fn started() -> peppygen::Result<(Harness, Mocks)> {
 /// The camera fixed 1 m above the arm link, as the initializer sends it.
 fn camera_on_the_arm() -> static_transforms::Message {
     static_transforms::Message {
-        child_frames: vec!["camera".into()],
-        parent_frames: vec!["arm".into()],
-        positions: vec![0.0, 0.0, 1.0],
-        orientations: vec![0.0, 0.0, 0.0, 1.0],
+        transforms: vec![fixed("arm", "camera", [0.0, 0.0, 1.0])],
     }
 }
 
@@ -68,19 +88,19 @@ fn camera_on_the_arm() -> static_transforms::Message {
 fn arm_at(seconds: f64, x: f64) -> transforms::Message {
     transforms::Message {
         timestamp: at(seconds),
-        child_frames: vec!["arm".into()],
-        parent_frames: vec!["base_link".into()],
-        positions: vec![x, 0.0, 0.0],
-        orientations: vec![0.0, 0.0, 0.0, 1.0],
+        transforms: vec![moving("base_link", "arm", [x, 0.0, 0.0])],
         start_timestamp: at(1.0),
     }
 }
 
+/// The lookup of `source` in `target`, both at `time`, or at the latest time for none.
 fn request(target: &str, source: &str, time: Option<f64>, timeout_s: f64) -> RequestData {
+    let timestamp = time.map(at);
     RequestData {
         target_frame: target.into(),
         source_frame: source.into(),
-        time: time.map(at),
+        source_timestamp: timestamp,
+        target_timestamp: timestamp,
         timeout_s,
     }
 }
@@ -123,6 +143,10 @@ async fn a_lookup_at_a_time_interpolates_and_one_at_the_latest_time_answers_its_
         .expect("a lookup between two stamps");
     assert_eq!(between.position, [1.5, 0.0, 1.0]);
     assert_eq!(between.orientation, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        (between.frame.as_str(), between.child_frame.as_str()),
+        ("base_link", "camera")
+    );
     assert_eq!(between.timestamp, Some(at(20.5)));
 
     let latest = lookup(&harness, &request("base_link", "camera", None, 0.0))
@@ -155,10 +179,10 @@ async fn each_failure_of_a_lookup_gives_its_kind_and_names_its_cause() -> peppyg
     initializer
         .static_transforms
         .publish(&static_transforms::Message {
-            child_frames: vec!["camera".into(), "head".into()],
-            parent_frames: vec!["arm".into(), "torso".into()],
-            positions: vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-            orientations: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            transforms: vec![
+                fixed("arm", "camera", [0.0, 0.0, 1.0]),
+                fixed("torso", "head", [0.0; 3]),
+            ],
         })
         .await?;
     lookup(&harness, &request("torso", "head", None, LONGEST_WAIT_S))
@@ -232,10 +256,10 @@ async fn a_transform_from_two_publishers_breaks_the_tree_and_names_both() -> pep
     initializer
         .transforms
         .publish(&transforms::Message {
-            child_frames: vec!["arm".into(), "marker".into()],
-            parent_frames: vec!["base_link".into(), "arm".into()],
-            positions: vec![2.0, 0.0, 0.0, 0.0, 0.0, 0.5],
-            orientations: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            transforms: vec![
+                moving("base_link", "arm", [2.0, 0.0, 0.0]),
+                moving("arm", "marker", [0.0, 0.0, 0.5]),
+            ],
             ..arm_at(21.0, 2.0)
         })
         .await?;
@@ -281,6 +305,59 @@ async fn a_lookup_sent_with_the_message_that_lets_it_succeed_answers_it() -> pep
     );
     published?;
     assert_eq!(answer.map(|answer| answer.position), Ok([2.0, 0.0, 1.0]));
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_at_one_time_is_placed_through_its_root_in_a_frame_at_another()
+-> peppygen::Result<()> {
+    let (harness, mocks) = started().await?;
+    let [_, backbone] = &mocks.deps.transforms[..] else {
+        panic!("the harness binds two publishers");
+    };
+    // The base stands 1 m along odom's x at 20 s and 3 m along it at 21 s.
+    let base_at = |seconds, x| transforms::Message {
+        transforms: vec![moving("odom", "base_footprint", [x, 0.0, 0.0])],
+        ..arm_at(seconds, 0.0)
+    };
+    backbone.transforms.publish(&base_at(20.0, 1.0)).await?;
+    backbone.transforms.publish(&base_at(21.0, 3.0)).await?;
+    lookup(
+        &harness,
+        &request("odom", "base_footprint", Some(21.0), LONGEST_WAIT_S),
+    )
+    .await
+    .expect("the tree holds the base at 21 s");
+
+    // Where the base stood at 20 s, in the base's frame as it stands at the latest time:
+    // 2 m behind it, through odom, the root of the base's chain.
+    let stood = lookup(
+        &harness,
+        &RequestData {
+            source_timestamp: Some(at(20.0)),
+            ..request("base_footprint", "base_footprint", None, 0.0)
+        },
+    )
+    .await
+    .expect("a lookup through the root of the source's chain");
+    assert_eq!(stood.position, [-2.0, 0.0, 0.0]);
+    assert_eq!(stood.orientation, IDENTITY);
+    assert_eq!(
+        stood.timestamp,
+        Some(at(21.0)),
+        "the time of the target frame's place, the latest"
+    );
+
+    // At equal times the answer is the plain lookup at that time.
+    let same = lookup(
+        &harness,
+        &request("base_footprint", "base_footprint", Some(20.0), 0.0),
+    )
+    .await
+    .expect("a frame in itself");
+    assert_eq!(same.position, [0.0; 3]);
+    assert_eq!(same.timestamp, Some(at(20.0)));
 
     harness.shutdown().await
 }

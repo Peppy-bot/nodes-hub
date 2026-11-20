@@ -8,7 +8,7 @@ peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 robot_description = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "robot_description" }
 srs_model = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "srs_model" }
-control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core", features = ["nalgebra"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

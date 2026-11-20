@@ -15,6 +15,8 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
+from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, wxyz_of_xyzw
+
 import head_camera
 from isaac_models import IsaacModel
 
@@ -73,44 +75,6 @@ MIMIC_JOINT = "physxMimicJoint"
 # gravity's reach.
 PHYSX_RIGID_BODY_API = "PhysxRigidBodyAPI"
 DISABLE_GRAVITY = "physxRigidBody:disableGravity"
-
-
-@dataclass(frozen=True)
-class Placement:
-    """Where a robot's base stands: a world-frame position in metres and a
-    rotation about +z in radians."""
-
-    position: tuple[float, float, float]
-    yaw: float
-
-    @staticmethod
-    def of(position, yaw: float) -> "Placement":
-        """The placement a caller asked for, refusing anything the stage
-        cannot take: a prim placed at NaN reports no error and simulates
-        nothing."""
-        values = tuple(float(value) for value in position)
-        if len(values) != 3:
-            raise ValueError(f"a placement is 3 coordinates, got {len(values)}")
-        for value in (*values, float(yaw)):
-            if not math.isfinite(value):
-                raise ValueError("a placement is finite in every coordinate")
-        return Placement(position=values, yaw=float(yaw))
-
-    def degrees(self) -> float:
-        """The rotation as USD writes it, in degrees about +z."""
-        return math.degrees(self.yaw)
-
-    def orientation(self) -> tuple[float, float, float, float]:
-        """The rotation as a unit quaternion (x, y, z, w)."""
-        return yaw_orientation(self.yaw)
-
-
-def yaw_orientation(yaw: float) -> tuple[float, float, float, float]:
-    """The turn of `yaw` radians about +z as a unit quaternion (x, y, z, w):
-    the one rule every heading becomes an orientation by, a robot's and a
-    spawned object's alike."""
-    half = yaw / 2.0
-    return (0.0, 0.0, math.sin(half), math.cos(half))
 
 
 def _joints_named(root, names: set[str]) -> dict:
@@ -181,22 +145,23 @@ def name_in_the_stage(instance: str) -> str:
     return instance
 
 
-def within_one_spot(one: Placement, other: Placement) -> bool:
+def within_one_spot(one: Pose, other: Pose) -> bool:
     """Whether two placements are too close for a robot to stand on both. It
     is the distance between them that counts: two robots closer together than
     the lattice leaves them resolve their overlap by throwing each other,
     wherever the lattice's own lines happen to fall."""
-    return math.dist(one.position, other.position) < SPOT_PITCH_M
+    return math.dist(one.position.position, other.position.position) < SPOT_PITCH_M
 
 
 @dataclass(frozen=True)
 class Robot:
     """One robot in the stage: the name it stands under, the model it is,
-    and where."""
+    and where: the pose of its base in world, whose orientation turns about
+    +z alone."""
 
     instance: str
     known: IsaacModel
-    placement: Placement
+    placement: Pose
 
     @property
     def model(self) -> str:
@@ -234,8 +199,8 @@ class World:
             return list(self._robots.values())
 
     def free_spot(
-        self, promised: "tuple[Placement, ...]" = (), leaving: Optional[str] = None
-    ) -> Placement:
+        self, promised: "tuple[Pose, ...]" = (), leaving: Optional[str] = None
+    ) -> Pose:
         """A spot no robot stands on and none has been promised, walked out
         from the origin on a square lattice, so a fleet fills the floor. A
         robot admitted a moment ago has a spot and does not stand on it yet,
@@ -250,7 +215,9 @@ class World:
             # Along the axes before the diagonals, so a small fleet stands in
             # a cross around the origin.
             for row, column in sorted(square, key=lambda spot: (abs(spot[0]) + abs(spot[1]), spot)):
-                spot = Placement.of((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0), 0.0)
+                spot = Pose(
+                    Point((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)), UnitQuaternion(IDENTITY)
+                )
                 if not self.occupied(spot, promised, leaving):
                     return spot
         raise ValueError(
@@ -259,7 +226,7 @@ class World:
         )
 
     def standing_within(
-        self, placement: Placement, leaving: Optional[str] = None
+        self, placement: Pose, leaving: Optional[str] = None
     ) -> Optional[Robot]:
         """The robot standing within a spot of this placement, if one does.
         The robot named by `leaving` is on its way out, so the spot it stands
@@ -275,8 +242,8 @@ class World:
 
     def occupied(
         self,
-        placement: Placement,
-        promised: "tuple[Placement, ...]" = (),
+        placement: Pose,
+        promised: "tuple[Pose, ...]" = (),
         leaving: Optional[str] = None,
     ) -> bool:
         """Whether a robot stands within a spot of this placement, or has
@@ -325,7 +292,7 @@ class World:
         ).Set(CPU_BROADPHASE)
         return scene
 
-    def add(self, instance: str, known: IsaacModel, placement: Placement) -> Robot:
+    def add(self, instance: str, known: IsaacModel, placement: Pose) -> Robot:
         """Stands a robot of the model `known` in the stage. Admission has
         already found the caller a name and a spot, so this raises on
         either."""
@@ -351,21 +318,24 @@ class World:
             "robot '%s' (%s) joins at %s",
             instance,
             known.model,
-            list(placement.position),
+            list(placement.position.position),
         )
         return robot
 
-    def move(self, name: str, position, yaw: float) -> Robot:
-        """Puts a robot somewhere else in the stage, turned `yaw` radians
-        about +z. The record moves with the prim, so what the scene reports
-        and where the next robot is given room both follow it."""
+    def move(self, name: str, target: PoseTarget) -> Robot:
+        """Puts a robot somewhere else in the stage: its base at the
+        target's position, turned to the target's orientation, a turn about
+        +z, or keeping the heading it has when the target gives none. The
+        record moves with the prim, so what the scene reports and where the
+        next robot is given room both follow it."""
         robot = next((one for one in self.robots() if one.instance == name), None)
         if robot is None:
             raise KeyError(f"no robot stands as {name!r} in this stage")
+        heading = robot.placement.orientation if target.orientation is None else target.orientation
         moved = Robot(
             instance=robot.instance,
             known=robot.known,
-            placement=Placement.of(position, yaw),
+            placement=Pose(target.position, heading),
         )
 
         import omni.usd  # pylint: disable=C0415
@@ -375,15 +345,15 @@ class World:
             raise RuntimeError(
                 f"the prim {moved.prim()} of robot {name!r} does not exist"
             )
-        World.place(prim, moved.placement.position, moved.placement.orientation())
+        World.place(prim, moved.placement.position.position, moved.placement.orientation.quaternion)
 
         with self._lock:
             self._robots[moved.instance] = moved
         logger.info(
-            "robot '%s' moves to %s at a yaw of %s rad",
+            "robot '%s' moves to %s turned to %s",
             name,
-            list(moved.placement.position),
-            moved.placement.yaw,
+            list(moved.placement.position.position),
+            list(moved.placement.orientation.quaternion),
         )
         return moved
 
@@ -422,7 +392,7 @@ class World:
         prim = stage.DefinePrim(robot.prim(), "Xform")
         prim.GetReferences().AddReference(str(known.stage_path()))
 
-        World.place(prim, robot.placement.position, robot.placement.orientation())
+        World.place(prim, robot.placement.position.position, robot.placement.orientation.quaternion)
         World._hold_to_description(prim, known)
         World._start_in_posture(prim, known)
         World._couple_followers(prim, known)
@@ -616,7 +586,7 @@ class World:
 
         orient = ops.get(UsdGeom.XformOp.TypeOrient)
         if orientation is not None:
-            x, y, z, w = (float(value) for value in orientation)
+            w, x, y, z = (float(value) for value in wxyz_of_xyzw(orientation))
             orient = orient or xform.AddOrientOp()
             # USD refuses a quaternion of the wrong width outright, and a
             # referenced model brings whichever its author chose.

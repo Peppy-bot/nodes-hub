@@ -15,11 +15,13 @@
 //! all is a bringup fault and takes the node down.
 
 use std::future::Future;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use control_core::geometry::pose_arrays;
+use control_core::robot_tree::RobotTree;
 use control_core::throttle::Throttle;
-use frame_tree::MovingMessage;
+use frame_tree::{MovingMessage, Publisher as TreePublisher};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
@@ -37,11 +39,12 @@ use tracing::{error, warn};
 use crate::robot::ARMS;
 use crate::streams::{GripperState, THROTTLED_WARN_PERIOD};
 use crate::transforms::JointTransforms;
-use crate::types::{arm_pose_arrays, limb_names, world_pose_arrays};
+use crate::types::limb_names;
 
 /// Now on this instance's bound clock: the timeline its messages are
-/// stamped and aged on. Errors until the clock delivers its first tick.
-fn clock_now() -> Result<SystemTime, String> {
+/// stamped and aged on, and the time of each measurement a report gives.
+/// Errors until the clock delivers its first tick.
+pub(crate) fn clock_now() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
     Ok(UNIX_EPOCH + Duration::from_nanos(ns))
 }
@@ -57,45 +60,41 @@ type OpeningBuild = fn(SystemTime, f64, f64) -> peppygen::Result<Payload>;
 /// follower's effort ceiling.
 type ApertureBuild = fn(SystemTime, f64, f64, f64) -> peppygen::Result<Payload>;
 
-/// A world-frame end-effector pose: position and scalar-last quaternion.
-type PoseBuild = fn(SystemTime, [f64; 3], [f64; 4]) -> peppygen::Result<Payload>;
+/// An end-effector pose in a frame: position and scalar-last quaternion.
+type PoseBuild = fn(String, SystemTime, [f64; 3], [f64; 4]) -> peppygen::Result<Payload>;
 
 /// The governor proximity readout: nearest-pair distance and links, plus the
 /// disposition of the commanded motion.
 type StatusBuild = fn(SystemTime, f64, String, String, bool, bool) -> peppygen::Result<Payload>;
 
-/// The whole-robot state snapshot: the name tables and the per-limb arrays,
-/// flattened per the limb_state contract's slicing rule.
+/// The whole-robot state snapshot: its frame, the name tables, the joint
+/// vectors flattened per the limb_state contract's slicing rule, each arm's
+/// grasp point and each gripper's opening.
 type LimbStateBuild = fn(
+    String,
     SystemTime,
     Vec<String>,
     Vec<u32>,
     Vec<f64>,
-    Vec<f64>,
-    Vec<f64>,
+    Vec<limb_states::MessageGraspPointsItem>,
     Vec<String>,
     Vec<f64>,
 ) -> peppygen::Result<Payload>;
 
-/// The transforms of one measurement: each child frame, its parent frame, the
-/// child's position and orientation in the parent, index-aligned, and when
-/// they all started.
-type TransformsBuild = fn(
-    SystemTime,
-    Vec<String>,
-    Vec<String>,
-    Vec<f64>,
-    Vec<f64>,
-    SystemTime,
-) -> peppygen::Result<Payload>;
+/// The transforms of one measurement, each a record of a child frame placed
+/// in its parent frame, and when they all started.
+type TransformsBuild =
+    fn(SystemTime, Vec<transforms::MessageTransformsItem>, SystemTime) -> peppygen::Result<Payload>;
 
 /// One whole-robot state snapshot, gathered by the coordinator at the readout
 /// cadence: every limb's measured joints, grasp-point pose, and gripper
-/// opening, in place order like every [`PerArm`].
+/// opening, in place order like every [`PerArm`], and the time it holds at,
+/// the newest of the arms' joint-state times.
 pub struct LimbStateSnapshot {
     pub joints: PerArm<JointVec, ARMS>,
     pub poses: PerArm<Isometry3<f64>, ARMS>,
     pub openings: PerArm<f64, ARMS>,
+    pub measured_at: SystemTime,
 }
 
 /// One outbound slot: its declared publisher, that slot's generated
@@ -157,12 +156,15 @@ impl Publisher<OpeningBuild> {
 }
 
 impl Publisher<PoseBuild> {
-    /// Publish one arm's measured end-effector pose, world frame. What lets a
-    /// Cartesian leader hold no kinematics of its own.
-    pub async fn send(&self, pose: &Isometry3<f64>) {
-        let (position, orientation) = world_pose_arrays(pose);
-        self.emit(|timestamp| (self.build)(timestamp, position, orientation))
-            .await;
+    /// Publish one arm's measured end-effector pose in `frame`, the robot
+    /// frame, at `measured_at`, the time of the joints it comes from. What
+    /// lets a Cartesian leader hold no kinematics of its own.
+    pub async fn send(&self, frame: &str, measured_at: SystemTime, pose: &Isometry3<f64>) {
+        let (position, orientation) = pose_arrays(pose);
+        self.emit_at(measured_at, |timestamp| {
+            (self.build)(frame.to_owned(), timestamp, position, orientation)
+        })
+        .await;
     }
 }
 
@@ -199,20 +201,30 @@ impl Publisher<StatusBuild> {
 }
 
 impl Publisher<LimbStateBuild> {
-    /// Publish one whole-robot snapshot, flattened per the contract's slicing
-    /// rule: joint vectors concatenated in arm order, poses at fixed 3- and
-    /// 4-strides, the name tables labelling every index.
-    pub async fn send(&self, s: &LimbStateSnapshot) -> Option<SystemTime> {
-        let (positions, orientations) = arm_pose_arrays(&s.poses);
+    /// Publish one whole-robot snapshot in `frame`, the robot frame, at the
+    /// time it holds at: joint vectors concatenated in arm order, one grasp
+    /// point per arm, the name tables labelling every index.
+    pub async fn send(&self, frame: &str, s: &LimbStateSnapshot) -> Option<SystemTime> {
+        let grasp_points = s
+            .poses
+            .iter()
+            .map(|pose| {
+                let (position, orientation) = pose_arrays(pose);
+                limb_states::MessageGraspPointsItem {
+                    position,
+                    orientation,
+                }
+            })
+            .collect();
         let names = limb_names();
-        self.emit(move |timestamp| {
+        self.emit_at(s.measured_at, move |timestamp| {
             (self.build)(
+                frame.to_owned(),
                 timestamp,
                 names.arm_names,
                 names.joints_per_arm,
                 s.joints.into_array().concat(),
-                positions,
-                orientations,
+                grasp_points,
                 names.gripper_names,
                 s.openings.into_array().to_vec(),
             )
@@ -225,15 +237,18 @@ impl Publisher<TransformsBuild> {
     /// Publish `message`, the transforms of one measurement, under its
     /// timestamp.
     pub async fn send(&self, message: MovingMessage) {
+        let records = message
+            .transforms
+            .into_iter()
+            .map(|t| transforms::MessageTransformsItem {
+                frame: t.frame,
+                child_frame: t.child_frame,
+                position: t.position,
+                orientation: t.orientation,
+            })
+            .collect();
         self.emit_at(message.timestamp, |timestamp| {
-            (self.build)(
-                timestamp,
-                message.child_frames,
-                message.parent_frames,
-                message.positions,
-                message.orientations,
-                message.start_timestamp,
-            )
+            (self.build)(timestamp, records, message.start_timestamp)
         })
         .await;
     }
@@ -309,15 +324,31 @@ pub struct Publishers {
     transforms: Publisher<TransformsBuild>,
     /// What the transforms of a snapshot are worked out from.
     joint_transforms: JointTransforms,
+    /// The robot's tree, which takes each message of the transforms of a
+    /// snapshot as it is published, under `measured_by`.
+    tree: Arc<RobotTree>,
+    /// This backbone as a publisher of the robot's tree: its core node and
+    /// its instance id.
+    measured_by: TreePublisher,
+    /// The robot frame, which every measured pose this node publishes is in.
+    robot_frame: String,
 }
 
 impl Publishers {
     pub async fn declare(
         runner: &NodeRunner,
         joint_transforms: JointTransforms,
+        tree: Arc<RobotTree>,
     ) -> peppygen::Result<Self> {
+        let processor = runner.processor();
         Ok(Self {
+            robot_frame: joint_transforms.robot_frame().to_owned(),
             joint_transforms,
+            tree,
+            measured_by: TreePublisher {
+                core_node: processor.bound_core_node().to_owned(),
+                instance_id: processor.bound_instance_id().to_owned(),
+            },
             arm_setpoints: PerArm::new([
                 Publisher::declare(
                     "left_arm joint_setpoints".to_owned(),
@@ -424,21 +455,36 @@ impl Publishers {
             .await;
     }
 
+    /// The robot frame, which every measured pose this node publishes is in.
+    pub fn robot_frame(&self) -> &str {
+        &self.robot_frame
+    }
+
     /// Publish one whole-robot state snapshot, then the transforms of the
-    /// joints it measures under the same timestamp.
+    /// joints it measures under the same timestamp, which the robot's tree
+    /// takes as they are published, so a command in a link the backbone
+    /// measures is placed by them.
     pub async fn send_limb_states(&self, snapshot: &LimbStateSnapshot) {
-        let Some(timestamp) = self.limb_states.send(snapshot).await else {
+        let Some(timestamp) = self.limb_states.send(&self.robot_frame, snapshot).await else {
             return;
         };
-        match self
-            .joint_transforms
-            .message_at(timestamp, &snapshot.joints, &snapshot.openings)
-        {
-            Ok(message) => self.transforms.send(message).await,
-            Err(e) => self
-                .transforms
-                .log_throttled(|| error!("transforms build: {e}")),
+        let message =
+            match self
+                .joint_transforms
+                .message_at(timestamp, &snapshot.joints, &snapshot.openings)
+            {
+                Ok(message) => message,
+                Err(e) => {
+                    return self
+                        .transforms
+                        .log_throttled(|| error!("transforms build: {e}"));
+                }
+            };
+        if let Err(e) = self.tree.take_moving(&self.measured_by, &message) {
+            self.transforms
+                .log_throttled(|| error!("the robot's tree refused the transforms: {e}"));
         }
+        self.transforms.send(message).await;
     }
 }
 

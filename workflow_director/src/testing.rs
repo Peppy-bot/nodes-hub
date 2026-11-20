@@ -2,7 +2,7 @@
 //! that implement synthetic contracts, the plan of a workflow on it, and a
 //! host whose calls a test scripts, on a paused clock.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,11 +20,13 @@ use crate::contract::tests::TEST_ARM;
 use crate::engine::failure::Failure;
 use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
 use crate::engine::plan::{Plan, Target};
-use crate::fleet::{Fleet, Instance, Robot, RobotContract, Snapshot};
+use crate::fleet::{Fleet, Instance, Robot, RobotContract, RobotLinks, Snapshot};
 
 /// A perception contract for the tests: a scan that gives item ids and
-/// their positions, 3 entries each, and a locate that gives the position of
-/// one.
+/// their points, in one frame at one time, a locate that gives the point of
+/// one, a lookup that gives a pose with no timestamp where it holds at every
+/// time, as lookup_transform does, an aim at a pose whose orientation it
+/// needs, and a follow whose request holds the point of a find in a record.
 const TEST_PERCEPTION: &str = r#"
 {
   peppy_schema: "contract/v1",
@@ -37,14 +39,64 @@ const TEST_PERCEPTION: &str = r#"
         request_message_format: { description: "string" },
         response_message_format: {
           item_ids: { $type: "array", $items: { $type: "string", $marks: ["item_id"] } },
-          positions: { $type: "array", $items: "f64", $marks: ["robot_frame"], $optional: true },
+          frame: "string",
+          timestamp: "time",
+          points: { $type: "array", $items: { $type: "object", position: { $type: "array", $items: "f64", $length: 3 } } },
+        },
+      },
+      {
+        name: "locate_all",
+        description: "The position of each item that a description names, each with its frame and its time.",
+        request_message_format: { description: "string" },
+        response_message_format: {
+          item_points: { $type: "array", $items: { $type: "object", frame: "string", timestamp: "time", position: { $type: "array", $items: "f64", $length: 3 } } },
         },
       },
       {
         name: "locate",
         description: "The position of one item.",
         request_message_format: { item_id: { $type: "string", $marks: ["item_id"] } },
-        response_message_format: { found: "bool", position: { $type: "array", $items: "f64", $length: 3, $marks: ["robot_frame"] } },
+        response_message_format: {
+          found: "bool",
+          item_point: { $type: "object", frame: "string", timestamp: "time", position: { $type: "array", $items: "f64", $length: 3 } },
+        },
+      },
+      {
+        name: "lookup",
+        description: "Where a frame stands, with no timestamp where it holds at every time.",
+        request_message_format: { source_frame: "string" },
+        response_message_format: {
+          frame: "string",
+          child_frame: "string",
+          timestamp: { $type: "time", $optional: true },
+          position: { $type: "array", $items: "f64", $length: 3 },
+          orientation: { $type: "array", $items: "f64", $length: 4 },
+        },
+      },
+      {
+        name: "aim",
+        description: "Look along a pose, whose orientation the aim needs.",
+        request_message_format: {
+          target: {
+            $type: "object",
+            frame: { $type: "string", $optional: true },
+            timestamp: { $type: "time", $optional: true },
+            position: { $type: "array", $items: "f64", $length: 3 },
+            orientation: { $type: "array", $items: "f64", $length: 4 },
+          },
+        },
+        response_message_format: { aimed: "bool" },
+      },
+      {
+        name: "follow",
+        description: "Follow the item that a find found, at the point it gives.",
+        request_message_format: {
+          found: {
+            $type: "object",
+            item_point: { $type: "object", frame: { $type: "string", $optional: true }, timestamp: { $type: "time", $optional: true }, position: { $type: "array", $items: "f64", $length: 3 } },
+          },
+        },
+        response_message_format: { following: "bool" },
       },
     ],
   },
@@ -57,6 +109,19 @@ const PERCEPTION_PIN: &str = "22222222222222222222222222222222222222222222222222
 const TEST_LOCATIONS: &str = include_str!("../tests/fixtures/locations.json5");
 pub const LOCATIONS_PIN: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 const CORE: &str = "core";
+/// The links of each robot of the tests, as its URDF names them: its robot
+/// frame first.
+pub const LINKS: [&str; 3] = ["base_link", "arm_link", "grasp_link"];
+
+/// The links of each robot of the tests: [`LINKS`], its root link first.
+pub fn robot_links() -> RobotLinks {
+    RobotLinks {
+        root: LINKS[0].to_owned(),
+        others: LINKS[1..].iter().map(|link| (*link).to_owned()).collect(),
+    }
+}
+/// The time at which `find` measured the block, on the clock of transforms.
+pub const FOUND_AT: &str = "2026-11-18T12:00:00.250000000Z";
 
 pub fn name(text: &str) -> Name {
     Name::parse(text).unwrap()
@@ -115,6 +180,10 @@ pub fn snapshot(robots: Vec<Robot>) -> Snapshot {
         )
     })
     .collect();
+    let links = robots
+        .iter()
+        .map(|robot| (robot.name.clone(), robot_links()))
+        .collect();
     let fleet = Fleet {
         version: "0.0.0-test".to_owned(),
         core_node: CORE.to_owned(),
@@ -129,6 +198,8 @@ pub fn snapshot(robots: Vec<Robot>) -> Snapshot {
         contracts,
         unreadable: BTreeMap::new(),
         models: BTreeMap::new(),
+        links,
+        unread_links: BTreeSet::new(),
         ready: true,
     }
 }
@@ -567,7 +638,14 @@ impl Host for ScriptedHost {
     }
 }
 
-/// The answer of `find` for a block in reach.
+/// The answer of `find` for a block in reach, in the robot frame at
+/// [`FOUND_AT`].
 pub fn found() -> Json {
-    json!({ "found": true, "item_id": "b1", "position": [0.3, 0.0, 0.1], "kind": "block", "count": "1" })
+    json!({
+        "found": true,
+        "item_id": "b1",
+        "item_point": { "frame": LINKS[0], "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] },
+        "kind": "block",
+        "count": "1",
+    })
 }

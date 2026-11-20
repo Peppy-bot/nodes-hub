@@ -370,7 +370,7 @@ async fn a_robot_refused_with_busy_attaches_again_and_stands() -> peppygen::Resu
         .placement
         .clone()
         .expect("the robot names its spot again");
-    assert_eq!((spot.position, spot.yaw), ([1.0, -2.0, 0.0], 0.5));
+    common::assert_stands_at(&spot, [1.0, -2.0, 0.0], 0.5);
     let stay = again.accept().await?;
     stay.publish_feedback(&attach::FeedbackMessage { standing: true })
         .await?;
@@ -660,7 +660,7 @@ async fn a_robot_stands_where_it_is_told() -> peppygen::Result<()> {
         .placement
         .clone()
         .expect("this robot named its spot");
-    assert_eq!((spot.position, spot.yaw), ([1.0, -2.0, 0.0], 0.5));
+    common::assert_stands_at(&spot, [1.0, -2.0, 0.0], 0.5);
     goal.refuse(
         attach::FailureKind::Rejected,
         "that is enough of this robot",

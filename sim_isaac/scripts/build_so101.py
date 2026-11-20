@@ -22,8 +22,8 @@ rigid with. Where upstream and the description differ the description wins:
 each joint's limits are the URDF's, and the tool frame is the URDF's fixed
 joint that places the grasp link of the SRDF's arm, `gripper_frame_link`.
 
-CPU only: it needs the `mujoco`, `usd-core`, `numpy` and
-`robot_description_py` packages, no Isaac Sim.
+CPU only: it needs the `mujoco`, `usd-core`, `numpy`, `robot_description_py`
+and `control_core_py` packages, no Isaac Sim.
 
     python3 build_so101.py --release <staged release> --output <directory> \\
         [--archive <bundle.tar.gz>]
@@ -58,6 +58,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import robot_description_py
+from control_core_py.geometry import wxyz_of_xyzw
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, Vt
 
 # The SO-101 of the release, whose model directory the builder reads.
@@ -85,27 +86,24 @@ ARTICULATION_VELOCITY_ITERATIONS = 1
 
 @dataclass(frozen=True)
 class UrdfJoint:
-    """A joint of the URDF: the link it hangs from, the link it places, and
-    where it places it in the parent's frame."""
+    """A joint of the URDF: the link it hangs from and the link it places."""
 
     parent_link: str
     child_link: str
-    xyz: tuple[float, float, float]
-    rpy: tuple[float, float, float]
 
 
 @dataclass(frozen=True)
 class Description:
     """What the builder takes of the SO-101's description: the digest of its
     model, the limits of each joint its arm and its gripper move, every joint
-    of the URDF by name, the URDF's root link, and the tool frame, the fixed
-    joint that places the arm's grasp link."""
+    of the URDF by name, the URDF's root link, and the tool frame: where the
+    fixed joint that places the arm's grasp link stands it in its parent."""
 
     digest: str
     limits: dict[str, robot_description_py.JointLimits]
     joints: dict[str, UrdfJoint]
     root_link: str
-    tool: UrdfJoint
+    tool: robot_description_py.LinkTransform
 
 
 def sha256(data: bytes) -> str:
@@ -113,19 +111,16 @@ def sha256(data: bytes) -> str:
 
 
 def _urdf_joint(joint: ET.Element) -> UrdfJoint:
-    origin = joint.find("origin")
     return UrdfJoint(
         parent_link=joint.find("parent").get("link"),
         child_link=joint.find("child").get("link"),
-        xyz=tuple(float(v) for v in origin.get("xyz").split()),
-        rpy=tuple(float(v) for v in origin.get("rpy").split()),
     )
 
 
 def read_description() -> Description:
     """The SO-101's description as robot_description_py bundles it. The
-    bindings give the arm, its gripper and the joint limits; ElementTree
-    reads what they do not: each joint's parent, child and origin."""
+    bindings give the arm, its gripper, the joint limits and the tool frame;
+    ElementTree reads what they do not: each joint's parent and child."""
     model = robot_description_py.model(ROBOT_ID)
     described = model.description()
     (arm,) = described.arms
@@ -137,7 +132,7 @@ def read_description() -> Description:
     (root_link,) = {joint.parent_link for joint in joints.values()} - {
         joint.child_link for joint in joints.values()
     }
-    (tool,) = [joint for joint in joints.values() if joint.child_link == arm.grasp_link]
+    (tool,) = [fixed for fixed in described.fixed_transforms() if fixed.child == arm.grasp_link]
     return Description(
         digest=model.digest,
         limits={joint: described.joint_limits(joint) for joint in moved},
@@ -157,13 +152,6 @@ def links_of_bodies(model: mujoco.MjModel, description: Description) -> dict[str
         body = model.body(int(model.jnt_bodyid[joint_id])).name
         links[body] = description.joints[model.joint(joint_id).name].child_link
     return links
-
-
-def quat_from_rpy(rpy: tuple[float, float, float]) -> np.ndarray:
-    """URDF fixed-axis roll, pitch, yaw as a wxyz quaternion."""
-    quat = np.zeros(4)
-    mujoco.mju_euler2Quat(quat, np.array(rpy, dtype=np.float64), "XYZ")
-    return quat
 
 
 def compile_model(model_dir: Path, fuse: bool) -> mujoco.MjModel:
@@ -354,9 +342,9 @@ def define_root_joint(stage, root_link: str) -> None:
     ).Set(ARTICULATION_VELOCITY_ITERATIONS)
 
 
-def define_tool_frame(stage, tool: UrdfJoint) -> None:
-    prim = UsdGeom.Xform.Define(stage, f"{ROBOT_PATH}/{tool.parent_link}/{tool.child_link}")
-    set_pose(prim.GetPrim(), tool.xyz, quat_from_rpy(tool.rpy))
+def define_tool_frame(stage, tool: robot_description_py.LinkTransform) -> None:
+    prim = UsdGeom.Xform.Define(stage, f"{ROBOT_PATH}/{tool.parent}/{tool.child}")
+    set_pose(prim.GetPrim(), tool.position, wxyz_of_xyzw(tool.orientation))
 
 
 def build_stage(model_dir: Path, description: Description, output: Path) -> Path:

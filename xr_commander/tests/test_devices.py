@@ -1,7 +1,6 @@
 import math
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 from tests.helpers import ScriptedHeadset, squeezing_hand
@@ -67,7 +66,7 @@ def test_both_controllers_are_parsed_and_the_head_is_ignored():
     assert hands["left"].squeezing is True
     assert hands["left"].trigger == pytest.approx(0.25)
     assert hands["right"].squeezing is False
-    assert np.allclose(hands["right"].pose.position, [0.0, 2.0, 0.0])
+    assert hands["right"].pose.position.position == (0.0, 2.0, 0.0)
 
 
 def test_a_device_missing_its_grip_pose_or_gamepad_is_simply_untracked():
@@ -84,9 +83,19 @@ def test_a_gamepad_without_a_squeeze_button_is_untracked():
     assert parse_hands([short]) == {}
 
 
-def test_an_unusable_pose_drops_that_hand_rather_than_the_frame():
+@pytest.mark.parametrize(
+    "part, value",
+    [
+        ("orientation", {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0}),
+        # A squared norm 0.01 or more from 1.
+        ("orientation", {"x": 0.0, "y": 0.0, "z": 0.0, "w": 2.0}),
+        ("orientation", {"x": math.inf, "y": 0.0, "z": 0.0, "w": 1.0}),
+        ("position", {"x": 0.0, "y": math.nan, "z": 0.0}),
+    ],
+)
+def test_an_unusable_pose_drops_that_hand_rather_than_the_frame(part, value):
     broken = controller("left")
-    broken["gripPose"]["orientation"] = {"x": 0.0, "y": 0.0, "z": 0.0, "w": 0.0}
+    broken["gripPose"][part] = value
     good = controller("right")
     hands = parse_hands([broken, good])
     assert set(hands) == {"right"}

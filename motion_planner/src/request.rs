@@ -1,22 +1,31 @@
 //! The requests of plan_joint_path, plan_cartesian_path and check_joint_path, parsed
 //! against the robot's arms: the arms, where each one's path starts, and each arm's goal,
-//! its poses or its waypoints, in the terms of motion_planning_core. A request that does
-//! not parse is refused with `rejected`, and the message says what to send instead.
+//! its poses or its waypoints, in the terms of motion_planning_core. Each record of a
+//! request names its frame, the robot frame when it names none, and its timestamp: a
+//! constraint in a link of an arm the plan moves, or in a link fixed to one, is held against
+//! that link at each state, as MoveIt holds a constraint whose frame is a link of the robot;
+//! every other record is placed in the robot frame by the planner's tree at its timestamp. A
+//! request that does not parse is refused with `rejected`, and the message says what to send
+//! instead; a record the tree cannot place is refused with the failure of its placement.
 
 use std::borrow::Borrow;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use chain_kinematics::nalgebra::{Isometry3, Vector3};
+use chain_kinematics::ChainFrame;
+use chain_kinematics::nalgebra::{Isometry3, UnitQuaternion, Vector3};
 use collision_geometry::chain::Rider;
+use control_core::geometry::{GeometryError, Point, Pose, Stamped};
 use control_core::positive_finite::PositiveFinite;
 use control_core::requested_arms::{common_waypoint_count, place_of_arm, places_in_order};
+use control_core::robot_tree::PlaceError;
+use frame_tree::FrameName;
 use motion_planning_core::{
     Axis, FollowedFrame, Frame, Goal, GoalError, JointTarget, OrientationTarget, PositionTarget,
-    orientation_from_parts, pose_from_parts, poses_in_range,
+    Reference,
 };
 use peppygen::exposed_actions::motion_planning::plan_cartesian_path;
 use peppygen::exposed_actions::motion_planning::plan_joint_path::{
-    GoalGoalJointConstraintsItem, GoalGoalPositionConstraintsItem, GoalRequestData,
+    GoalGoalJointConstraintsItem, GoalRequestData,
 };
 use peppygen::exposed_services::motion_planning::check_joint_path;
 use robot_description::{ArmId, PerArm};
@@ -128,6 +137,37 @@ pub fn listed<S: Borrow<str>>(names: &[S], conjunction: &str) -> String {
     }
 }
 
+/// Why a request is refused: it does not parse, or the planner's tree cannot place a record of
+/// it at its timestamp.
+#[derive(Debug)]
+pub enum RequestError {
+    /// Refused with `rejected`, the message saying what to send instead.
+    Rejected(String),
+    /// Refused with the failure kind of the placement of a record (`PlaceError::failure_kind`).
+    Unplaced(PlaceError),
+}
+
+impl From<String> for RequestError {
+    fn from(message: String) -> Self {
+        Self::Rejected(message)
+    }
+}
+
+impl From<PlaceError> for RequestError {
+    fn from(error: PlaceError) -> Self {
+        Self::Unplaced(error)
+    }
+}
+
+/// What places a value `T` of a request, in the frame it names at its timestamp, in the robot
+/// frame: the planner's tree.
+pub type Placer<'p, T> = dyn Fn(&Stamped<T>) -> Result<T, PlaceError> + 'p;
+
+/// The frame a record names: `frame`, or the robot frame `robot` for a record that names none.
+pub fn frame_or_robot<'f>(frame: Option<&'f str>, robot: &'f FrameName) -> &'f str {
+    frame.unwrap_or(robot.as_str())
+}
+
 /// A plan_joint_path goal that parses.
 #[derive(Debug)]
 pub struct PlanQuery<const N: usize, const K: usize> {
@@ -142,7 +182,8 @@ pub struct PlanQuery<const N: usize, const K: usize> {
     /// The arms the plan moves, each to its goal; every other arm of `order` stays where
     /// it starts.
     pub arm_goals: ArmGoals<K>,
-    /// The orientations each arm's path holds.
+    /// The orientations each arm's path holds, each in a frame of an arm the plan moves at
+    /// that arm's place in the plan's arms, or in the robot frame.
     pub path_orientations: PerArm<Vec<HeldOrientation>, K>,
     /// How long the plan may take.
     pub time_limit: Duration,
@@ -158,7 +199,11 @@ pub struct HeldOrientation {
 /// The arms a plan moves, each with its goal: one, or every arm of a robot of more than one.
 #[derive(Debug)]
 pub enum ArmGoals<const K: usize> {
-    One { arm: ArmId, goal: Box<Goal> },
+    One {
+        arm: ArmId,
+        goal: Box<Goal>,
+    },
+    /// Every arm, which a state of the plan holds in the robot's order.
     Every(Box<PerArm<Goal, K>>),
 }
 
@@ -181,8 +226,37 @@ pub struct CartesianQuery<const N: usize, const K: usize> {
     /// What follows the lines.
     pub frame: FollowedFrame,
     /// The poses it passes through.
-    pub poses: Vec<Isometry3<f64>>,
+    pub poses: CartesianPoses,
     pub avoid_collisions: bool,
+}
+
+/// The poses a Cartesian path passes through: placed in the robot frame by the planner's
+/// tree, or in a link of the path's arm, placed where that link stands at the path's start,
+/// as MoveIt's Cartesian path places a target in its link's frame.
+#[derive(Debug)]
+pub enum CartesianPoses {
+    Robot(Vec<Isometry3<f64>>),
+    Link {
+        frame: Frame,
+        poses: Vec<Isometry3<f64>>,
+    },
+}
+
+impl CartesianPoses {
+    /// The poses in the robot frame, the arm of `chain` at `start`.
+    pub fn at_start<const N: usize>(
+        &self,
+        chain: &chain_kinematics::Chain<N>,
+        start: &[f64; N],
+    ) -> Vec<Isometry3<f64>> {
+        match self {
+            Self::Robot(poses) => poses.clone(),
+            Self::Link { frame, poses } => {
+                let link = ChainFrame::from(*frame).pose_at(&chain.at(start));
+                poses.iter().map(|pose| link * pose).collect()
+            }
+        }
+    }
 }
 
 /// The waypoints of a check: one arm's, or every arm's of a robot of more than one, as many
@@ -209,13 +283,63 @@ impl<const N: usize, const K: usize> Checked<N, K> {
     }
 }
 
+/// A position or an orientation constraint of a request: the arm whose link it holds, the
+/// link as sent and its frame of the arm, the pose its record gives in the frame it names
+/// at its time, and what it holds of the link.
+struct Constraint<'r, H> {
+    arm: ArmId,
+    name: &'r str,
+    link: Frame,
+    stamped: Stamped<Pose>,
+    held: H,
+}
+
+/// What an orientation constraint holds of its link.
+#[derive(Clone, Copy)]
+struct Turn {
+    tolerance_rad: PositiveFinite,
+    free_axis: Option<Axis>,
+}
+
+/// Where a constraint's pose is: in a frame of an arm the plan moves, held against that
+/// frame at each state, or placed in the robot frame by the planner's tree.
+#[derive(Clone, Copy)]
+enum Located {
+    Mobile {
+        arm: ArmId,
+        frame: Frame,
+        pose: Pose,
+    },
+    Robot(Pose),
+}
+
+impl Located {
+    /// The reference of the pose, an arm at its place in the plan's arms `group`, and the
+    /// pose in it.
+    fn in_group(self, group: &[ArmId]) -> (Reference, Pose) {
+        match self {
+            Self::Robot(pose) => (Reference::Robot, pose),
+            Self::Mobile { arm, frame, pose } => {
+                let arm = group
+                    .iter()
+                    .position(|named| *named == arm)
+                    .expect("a frame of an arm the plan moves is a frame of its arms");
+                (Reference::Arm { arm, frame }, pose)
+            }
+        }
+    }
+}
+
 /// Parses a plan_joint_path goal against `arms`, whose fingers hang as `fingers` hold
-/// them.
+/// them, each constraint with no frame in the robot frame `robot`, and each in a frame of no arm
+/// the plan moves placed by `place`.
 pub fn parse_plan<const N: usize, const K: usize>(
     raw: &GoalRequestData,
     arms: &PerArm<ArmModel<N>, K>,
     fingers: &PerArm<Vec<Rider>, K>,
-) -> Result<PlanQuery<N, K>, String> {
+    robot: &FrameName,
+    place: &Placer<Pose>,
+) -> Result<PlanQuery<N, K>, RequestError> {
     let (order, starts) = named_arms(
         arms,
         raw.arms
@@ -252,59 +376,86 @@ pub fn parse_plan<const N: usize, const K: usize>(
         .iter()
         .map(|c| joint_target(&named, c))
         .collect::<Result<Vec<_>, String>>()?;
-    let positions = raw
-        .goal_position_constraints
-        .iter()
-        .map(|c| position_target(&named, fingers, c))
+    let positions = (raw.goal_position_constraints.iter())
+        .map(|c| {
+            let within = tolerance("tolerance_m", &c.link_name, c.tolerance_m)?;
+            let point = Point::parse(c.position)
+                .map_err(|e| of_record("goal_position_constraints", &c.link_name, &e))?;
+            let record = Record {
+                link_name: &c.link_name,
+                frame: frame_or_robot(c.frame.as_deref(), robot),
+                timestamp: c.timestamp,
+                pose: Pose::new(point, control_core::geometry::UnitQuaternion::IDENTITY),
+            };
+            constraint(&named, fingers, "goal_position_constraints", record, within)
+        })
         .collect::<Result<Vec<_>, String>>()?;
-    let target_of = |link_name, orientation, tolerance_rad, free_axis| {
-        orientation_target(
-            &named,
-            fingers,
-            link_name,
-            orientation,
-            tolerance_rad,
-            free_axis,
-        )
-    };
     let orientations = (raw.goal_orientation_constraints.iter())
-        .map(|c| target_of(&c.link_name, c.orientation, c.tolerance_rad, &c.free_axis))
+        .map(|c| {
+            let record = OrientationRecord {
+                link_name: &c.link_name,
+                frame: frame_or_robot(c.frame.as_deref(), robot),
+                timestamp: c.timestamp,
+                orientation: c.orientation,
+                tolerance_rad: c.tolerance_rad,
+                free_axis: &c.free_axis,
+            };
+            orientation_constraint(&named, fingers, "goal_orientation_constraints", record)
+        })
         .collect::<Result<Vec<_>, String>>()?;
-    let path_orientations = (raw.path_orientation_constraints.iter())
-        .map(|c| target_of(&c.link_name, c.orientation, c.tolerance_rad, &c.free_axis))
+    let paths = (raw.path_orientation_constraints.iter())
+        .map(|c| {
+            let record = OrientationRecord {
+                link_name: &c.link_name,
+                frame: frame_or_robot(c.frame.as_deref(), robot),
+                timestamp: c.timestamp,
+                orientation: c.orientation,
+                tolerance_rad: c.tolerance_rad,
+                free_axis: &c.free_axis,
+            };
+            orientation_constraint(&named, fingers, "path_orientation_constraints", record)
+        })
         .collect::<Result<Vec<_>, String>>()?;
-    let goals = PerArm::from_fn(|arm| {
-        let model = &arms[arm];
-        let (joints, positions, orientations) = (
-            of_the_arm(&joints, arm),
-            of_the_arm(&positions, arm),
-            of_the_arm(&orientations, arm),
-        );
-        let constrained = !(joints.is_empty() && positions.is_empty() && orientations.is_empty());
-        constrained
-            .then(|| {
-                let links = (names(&positions), names(&orientations));
-                Goal::new(
-                    N,
-                    targets(joints),
-                    targets(positions),
-                    targets(orientations),
-                )
-                .map_err(|e| goal_refusal(model, e, links))
-            })
-            .transpose()
-    })
-    .transpose()?;
-    let arm_goals = arm_goals(goals).ok_or_else(|| GoalError::Empty.to_string())?;
+    goals_of(
+        arms,
+        &joints,
+        &unplaced(&positions),
+        &unplaced(&orientations),
+        &[],
+    )?;
     let planner = Planner::named(&raw.planner)?;
     let refiner = Refiner::named(&raw.refiner)?;
     let time = raw.allowed_planning_time_s;
     if !(time > 0.0 && time <= MAX_PLANNING_TIME_S) {
-        return Err(format!(
+        return Err(RequestError::Rejected(format!(
             "allowed_planning_time_s is {time}; send the seconds the plan may take, more than 0 \
              and at most {MAX_PLANNING_TIME_S}"
-        ));
+        )));
     }
+    let moving: Vec<ArmId> = PerArm::<(), K>::ids()
+        .filter(|arm| {
+            joints.iter().any(|c| c.arm == *arm)
+                || positions.iter().any(|c| c.arm == *arm)
+                || orientations.iter().any(|c| c.arm == *arm)
+        })
+        .collect();
+    let moving_models: Vec<&ArmModel<N>> = moving.iter().map(|arm| &arms[*arm]).collect();
+    let carrier = |stamped: &Stamped<Pose>| carrier_of(stamped, &moving_models, fingers);
+    let locator = |stamped: &Stamped<Pose>| -> Result<Located, PlaceError> {
+        Ok(match carrier(stamped) {
+            Some((arm, frame)) => Located::Mobile {
+                arm,
+                frame,
+                pose: *stamped.value(),
+            },
+            None => Located::Robot(place(stamped)?),
+        })
+    };
+    let positions = located(&positions, &locator)?;
+    let orientations = located(&orientations, &locator)?;
+    let paths = located(&paths, &locator)?;
+    let goals = goals_of(arms, &joints, &positions, &orientations, &moving)?;
+    let arm_goals = arm_goals(goals, &moving).ok_or_else(|| GoalError::Empty.to_string())?;
     Ok(PlanQuery {
         planner,
         refiner,
@@ -312,11 +463,11 @@ pub fn parse_plan<const N: usize, const K: usize>(
         starts,
         arm_goals,
         path_orientations: PerArm::from_fn(|arm| {
-            of_the_arm(&path_orientations, arm)
-                .into_iter()
-                .map(|routed| HeldOrientation {
-                    link_name: routed.name.to_string(),
-                    target: routed.target,
+            (paths.iter())
+                .filter(|(c, _)| c.arm == arm)
+                .map(|(c, located)| HeldOrientation {
+                    link_name: c.name.to_string(),
+                    target: orientation_target(c, *located, &moving),
                 })
                 .collect()
         }),
@@ -324,18 +475,203 @@ pub fn parse_plan<const N: usize, const K: usize>(
     })
 }
 
-/// The goal of the arms that goals constrain: one, or every arm, or none when no arm has a
-/// goal. An arm of a robot of more than one that a goal leaves out stays where it starts.
-fn arm_goals<const K: usize>(goals: PerArm<Option<Goal>, K>) -> Option<ArmGoals<K>> {
-    let named: Vec<ArmId> = PerArm::<(), K>::ids()
-        .filter(|arm| goals[*arm].is_some())
-        .collect();
-    match named[..] {
+/// Each arm's goal of `joints`, `positions` and `orientations`, each pose where its location
+/// puts it, an arm at its place in the plan's arms `group`; none for an arm no constraint
+/// names. A goal that mixes joints with poses, or names more than one link of its arm, is
+/// refused, saying what to send.
+fn goals_of<const N: usize, const K: usize>(
+    arms: &PerArm<ArmModel<N>, K>,
+    joints: &[JointConstraint],
+    positions: &[(&Constraint<'_, PositiveFinite>, Located)],
+    orientations: &[(&Constraint<'_, Turn>, Located)],
+    group: &[ArmId],
+) -> Result<PerArm<Option<Goal>, K>, String> {
+    PerArm::from_fn(|arm| {
+        let joints: Vec<JointTarget> = (joints.iter())
+            .filter(|c| c.arm == arm)
+            .map(|c| c.target)
+            .collect();
+        let positions: Vec<_> = (positions.iter())
+            .filter(|(c, _)| c.arm == arm)
+            .copied()
+            .collect();
+        let orientations: Vec<_> = (orientations.iter())
+            .filter(|(c, _)| c.arm == arm)
+            .copied()
+            .collect();
+        let constrained = !(joints.is_empty() && positions.is_empty() && orientations.is_empty());
+        constrained
+            .then(|| {
+                let links: (Vec<&str>, Vec<&str>) = (
+                    positions.iter().map(|(c, _)| c.name).collect(),
+                    orientations.iter().map(|(c, _)| c.name).collect(),
+                );
+                Goal::new(
+                    N,
+                    joints,
+                    (positions.into_iter())
+                        .map(|(c, located)| position_target(c, located, group))
+                        .collect(),
+                    (orientations.into_iter())
+                        .map(|(c, located)| orientation_target(c, located, group))
+                        .collect(),
+                )
+                .map_err(|e| goal_refusal(&arms[arm], e, links))
+            })
+            .transpose()
+    })
+    .transpose()
+}
+
+/// Each of `constraints` where its record gives its pose, unplaced, as a refusal of the
+/// goal's shape reads it.
+fn unplaced<'c, 'r, H>(
+    constraints: &'c [Constraint<'r, H>],
+) -> Vec<(&'c Constraint<'r, H>, Located)> {
+    (constraints.iter())
+        .map(|c| (c, Located::Robot(*c.stamped.value())))
+        .collect()
+}
+
+/// Each of `constraints` where `locate` puts its pose: in a frame of an arm the plan moves,
+/// or placed in the robot frame; the failure of the first it cannot place.
+fn located<'c, 'r, H>(
+    constraints: &'c [Constraint<'r, H>],
+    locate: &dyn Fn(&Stamped<Pose>) -> Result<Located, PlaceError>,
+) -> Result<Vec<(&'c Constraint<'r, H>, Located)>, PlaceError> {
+    (constraints.iter())
+        .map(|c| Ok((c, locate(&c.stamped)?)))
+        .collect()
+}
+
+/// A record of a constraint as a request gives it: the link it holds, as sent, the frame
+/// and the timestamp it names, none for the latest time, and its pose in that frame.
+struct Record<'r> {
+    link_name: &'r str,
+    frame: &'r str,
+    timestamp: Option<SystemTime>,
+    pose: Pose,
+}
+
+/// A record of an orientation constraint as a request gives it.
+struct OrientationRecord<'r> {
+    link_name: &'r str,
+    frame: &'r str,
+    timestamp: Option<SystemTime>,
+    orientation: [f64; 4],
+    tolerance_rad: f64,
+    free_axis: &'r str,
+}
+
+/// The constraint of `record` of `list`, a link of an arm of `named`, whose fingers hang as
+/// `fingers` hold them, holding `held`.
+fn constraint<'r, H, const N: usize, const K: usize>(
+    named: &[&ArmModel<N>],
+    fingers: &PerArm<Vec<Rider>, K>,
+    list: &str,
+    record: Record<'r>,
+    held: H,
+) -> Result<Constraint<'r, H>, String> {
+    let (arm, link) = frame(named, fingers, record.link_name)?;
+    let stamped = Stamped::parse(record.frame, record.timestamp, record.pose)
+        .map_err(|e| of_record(list, record.link_name, &e))?;
+    Ok(Constraint {
+        arm,
+        name: record.link_name,
+        link,
+        stamped,
+        held,
+    })
+}
+
+/// The orientation constraint of `record` of `list`, a link of an arm of `named`, whose
+/// fingers hang as `fingers` hold them.
+fn orientation_constraint<'r, const N: usize, const K: usize>(
+    named: &[&ArmModel<N>],
+    fingers: &PerArm<Vec<Rider>, K>,
+    list: &str,
+    record: OrientationRecord<'r>,
+) -> Result<Constraint<'r, Turn>, String> {
+    let turn = Turn {
+        tolerance_rad: tolerance("tolerance_rad", record.link_name, record.tolerance_rad)?,
+        free_axis: Axis::free_named(record.free_axis)?,
+    };
+    let pose = Pose::parse([0.0; 3], record.orientation)
+        .map_err(|e| of_record(list, record.link_name, &e))?;
+    let record = Record {
+        link_name: record.link_name,
+        frame: record.frame,
+        timestamp: record.timestamp,
+        pose,
+    };
+    constraint(named, fingers, list, record, turn)
+}
+
+/// The arm of `moving`, whose fingers hang as `fingers` hold them, whose frame `stamped`
+/// names, a link of it or a link fixed to one, and that frame; none for a frame of no arm of
+/// `moving`.
+fn carrier_of<const N: usize, const K: usize>(
+    stamped: &Stamped<Pose>,
+    moving: &[&ArmModel<N>],
+    fingers: &PerArm<Vec<Rider>, K>,
+) -> Option<(ArmId, Frame)> {
+    let name = stamped.frame().as_str();
+    moving
+        .iter()
+        .find_map(|arm| frame_of(arm, &fingers[arm.id], name).map(|frame| (arm.id, frame)))
+}
+
+/// The refusal of the record of `link_name` in `list` that holds `error`.
+fn of_record(list: &str, link_name: &str, error: &GeometryError) -> String {
+    format!("{list} of {link_name}: {error}")
+}
+
+/// The position target of `c`, its pose located at `located`, an arm of it at its place in
+/// the plan's arms `group`.
+fn position_target(
+    c: &Constraint<'_, PositiveFinite>,
+    located: Located,
+    group: &[ArmId],
+) -> PositionTarget {
+    let (reference, pose) = located.in_group(group);
+    PositionTarget {
+        frame: c.link,
+        reference,
+        position: Vector3::from(pose.position()),
+        tolerance_m: c.held,
+    }
+}
+
+/// The orientation target of `c`, its pose located at `located`, an arm of it at its place
+/// in the plan's arms `group`.
+fn orientation_target(
+    c: &Constraint<'_, Turn>,
+    located: Located,
+    group: &[ArmId],
+) -> OrientationTarget {
+    let (reference, pose) = located.in_group(group);
+    OrientationTarget {
+        frame: c.link,
+        reference,
+        orientation: UnitQuaternion::from(pose.orientation()),
+        tolerance_rad: c.held.tolerance_rad,
+        free_axis: c.held.free_axis,
+    }
+}
+
+/// The goal of the arms that goals constrain, the plan's arms `group` in the order a state
+/// holds their joints: one, or every arm, or none when no arm has a goal. An arm of a robot
+/// of more than one that a goal leaves out stays where it starts.
+fn arm_goals<const K: usize>(
+    goals: PerArm<Option<Goal>, K>,
+    group: &[ArmId],
+) -> Option<ArmGoals<K>> {
+    match group {
         [] => None,
         [arm] => {
             let goal = goals.into_iter().flatten().next()?;
             Some(ArmGoals::One {
-                arm,
+                arm: *arm,
                 goal: Box::new(goal),
             })
         }
@@ -349,12 +685,15 @@ fn robot_arms<const N: usize, const K: usize>(arms: &PerArm<ArmModel<N>, K>) -> 
 }
 
 /// Parses a plan_cartesian_path goal against `arms`, whose fingers hang as `fingers` hold
-/// them.
+/// them, its waypoints in the robot frame `robot` for a goal that names no frame, and in a frame
+/// of no link of its arm placed by `place`.
 pub fn parse_cartesian<const N: usize, const K: usize>(
     raw: &plan_cartesian_path::GoalRequestData,
     arms: &PerArm<ArmModel<N>, K>,
     fingers: &PerArm<Vec<Rider>, K>,
-) -> Result<CartesianQuery<N, K>, String> {
+    robot: &FrameName,
+    place: &Placer<Vec<Pose>>,
+) -> Result<CartesianQuery<N, K>, RequestError> {
     let id = place_of_arm("arm_name", &raw.arm_name, &robot_arms(arms)).map(ArmId::new)?;
     let arm = &arms[id];
     let mut starts = PerArm::from_fn(|_| None);
@@ -367,16 +706,26 @@ pub fn parse_cartesian<const N: usize, const K: usize>(
             raw.link_name, arm.grasp_link, arm.grasp_link
         )
     })?;
-    let poses = raw
-        .waypoints
-        .iter()
-        .enumerate()
+    if raw.waypoints.is_empty() {
+        return Err(RequestError::Rejected(
+            "waypoints holds no pose: send one or more".to_string(),
+        ));
+    }
+    let waypoints = (raw.waypoints.iter().enumerate())
         .map(|(k, w)| {
-            pose_from_parts(w.position, w.orientation)
-                .map_err(|e| format!("waypoint {}: {e}", k + 1))
+            Pose::parse(w.position, w.orientation).map_err(|e| format!("waypoint {}: {e}", k + 1))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    poses_in_range(&poses)?;
+    let named = frame_or_robot(raw.frame.as_deref(), robot);
+    let stamped = Stamped::parse(named, raw.timestamp, waypoints).map_err(|e| e.to_string())?;
+    let isometries = |poses: Vec<Pose>| poses.into_iter().map(Isometry3::from).collect();
+    let poses = match frame_of(arm, &fingers[id], named) {
+        Some(link) => CartesianPoses::Link {
+            frame: link,
+            poses: isometries(stamped.value().clone()),
+        },
+        None => CartesianPoses::Robot(isometries(place(&stamped)?)),
+    };
     Ok(CartesianQuery {
         arm: id,
         starts,
@@ -446,27 +795,10 @@ pub fn parse_check<const N: usize, const K: usize>(
     Ok(CheckQuery { starts, waypoints })
 }
 
-/// A target of a goal, the joint or link it names as sent, and the arm it constrains.
-#[derive(Clone, Copy)]
-struct Routed<'r, T> {
+/// A joint target of a goal, and the arm it constrains.
+struct JointConstraint {
     arm: ArmId,
-    name: &'r str,
-    target: T,
-}
-
-/// The targets of `routed` that constrain `arm`.
-fn of_the_arm<'r, T: Copy>(routed: &[Routed<'r, T>], arm: ArmId) -> Vec<Routed<'r, T>> {
-    routed.iter().filter(|r| r.arm == arm).copied().collect()
-}
-
-/// The names of `routed`, as sent.
-fn names<'r, T>(routed: &[Routed<'r, T>]) -> Vec<&'r str> {
-    routed.iter().map(|r| r.name).collect()
-}
-
-/// The targets of `routed`.
-fn targets<T>(routed: Vec<Routed<'_, T>>) -> Vec<T> {
-    routed.into_iter().map(|r| r.target).collect()
+    target: JointTarget,
 }
 
 /// The refusal of `error`, `arm`'s goal, whose position and orientation constraints name
@@ -647,10 +979,11 @@ fn tolerance(field: &str, named: &str, value: f64) -> Result<PositiveFinite, Str
         .map_err(|_| format!("{field} of {named} is {value}; send a finite number above 0"))
 }
 
-fn joint_target<'r, const N: usize>(
+/// The joint constraint `c` of a joint of an arm of `named`.
+fn joint_target<const N: usize>(
     named: &[&ArmModel<N>],
-    c: &'r GoalGoalJointConstraintsItem,
-) -> Result<Routed<'r, JointTarget>, String> {
+    c: &GoalGoalJointConstraintsItem,
+) -> Result<JointConstraint, String> {
     let (arm, joint) = named
         .iter()
         .find_map(|arm| {
@@ -659,15 +992,14 @@ fn joint_target<'r, const N: usize>(
         })
         .ok_or_else(|| none_has(named, "joint", &c.joint_name, |arm| &arm.joint_names))?;
     let limit = arm.geometry.chain().limits()[joint];
-    let Some(position) = limit.take_target(c.position) else {
+    let Some(position) = limit.take_target(c.joint_position) else {
         return Err(format!(
             "the target {} of {} lies outside its limits {} to {}",
-            c.position, c.joint_name, limit.lo, limit.hi
+            c.joint_position, c.joint_name, limit.lo, limit.hi
         ));
     };
-    Ok(Routed {
+    Ok(JointConstraint {
         arm: arm.id,
-        name: &c.joint_name,
         target: JointTarget {
             joint,
             position,
@@ -714,58 +1046,18 @@ fn frame_of<const N: usize>(arm: &ArmModel<N>, fingers: &[Rider], link: &str) ->
     })
 }
 
-fn position_target<'r, const N: usize, const K: usize>(
-    named: &[&ArmModel<N>],
-    fingers: &PerArm<Vec<Rider>, K>,
-    c: &'r GoalGoalPositionConstraintsItem,
-) -> Result<Routed<'r, PositionTarget>, String> {
-    let (arm, frame) = frame(named, fingers, &c.link_name)?;
-    if !c.position.iter().all(|v| v.is_finite()) {
-        return Err(format!(
-            "the position {:?} of {} is not finite; send three finite numbers (m)",
-            c.position, c.link_name
-        ));
-    }
-    Ok(Routed {
-        arm,
-        name: &c.link_name,
-        target: PositionTarget {
-            frame,
-            position: Vector3::from(c.position),
-            tolerance_m: tolerance("tolerance_m", &c.link_name, c.tolerance_m)?,
-        },
-    })
-}
-
-fn orientation_target<'r, const N: usize, const K: usize>(
-    named: &[&ArmModel<N>],
-    fingers: &PerArm<Vec<Rider>, K>,
-    link_name: &'r str,
-    orientation: [f64; 4],
-    tolerance_rad: f64,
-    free_axis: &str,
-) -> Result<Routed<'r, OrientationTarget>, String> {
-    let (arm, frame) = frame(named, fingers, link_name)?;
-    let orientation = orientation_from_parts(orientation)?;
-    let free_axis = Axis::free_named(free_axis)?;
-    Ok(Routed {
-        arm,
-        name: link_name,
-        target: OrientationTarget {
-            frame,
-            orientation,
-            tolerance_rad: tolerance("tolerance_rad", link_name, tolerance_rad)?,
-            free_axis,
-        },
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::time::UNIX_EPOCH;
+
+    use control_core::geometry::Placed;
+    use frame_tree::{FrameTree, LookupError};
+
     use peppygen::exposed_actions::motion_planning::plan_joint_path::{
-        GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalPathOrientationConstraintsItem,
+        GoalArmsItem, GoalGoalOrientationConstraintsItem, GoalGoalPositionConstraintsItem,
+        GoalPathOrientationConstraintsItem,
     };
     use peppygen::exposed_services::motion_planning::check_joint_path::{
         CheckJointPathArmsItem, CheckJointPathArmsItemWaypointsItem,
@@ -794,12 +1086,16 @@ mod tests {
             goal_joint_constraints: Vec::new(),
             goal_position_constraints: vec![GoalGoalPositionConstraintsItem {
                 link_name: "openarm_left_tcp".to_string(),
+                frame: Some(robot_frame()),
+                timestamp: None,
                 position: [0.4, 0.2, 0.5],
                 tolerance_m: 0.01,
             }],
             path_orientation_constraints: Vec::new(),
             goal_orientation_constraints: vec![GoalGoalOrientationConstraintsItem {
                 link_name: "openarm_left_tcp".to_string(),
+                frame: Some(robot_frame()),
+                timestamp: None,
                 orientation: [0.0, 0.0, 0.0, 1.0005],
                 tolerance_rad: 0.1,
                 free_axis: "z".to_string(),
@@ -813,7 +1109,7 @@ mod tests {
     fn joint_constraint(name: &str, position: f64) -> GoalGoalJointConstraintsItem {
         GoalGoalJointConstraintsItem {
             joint_name: name.to_string(),
-            position,
+            joint_position: position,
             tolerance_above: 0.01,
             tolerance_below: 0.01,
         }
@@ -829,9 +1125,30 @@ mod tests {
         }
     }
 
+    /// The robot frame of OpenArm v2, as a request names it.
+    fn robot_frame() -> String {
+        OPENARM_V2.frame.to_string()
+    }
+
+    /// Places a pose as a tree that holds no transform does: in the robot frame where it
+    /// is, and in any other frame refused as unknown.
+    fn in_an_empty_tree<T: Placed>(stamped: &Stamped<T>) -> Result<T, PlaceError> {
+        let tree = FrameTree::new(Duration::from_secs(10)).expect("a window");
+        let found = tree.lookup(&OPENARM_V2.frame, stamped.frame(), stamped.time())?;
+        Ok(stamped.value().placed_by(&found.placement)?)
+    }
+
+    /// The message of a refusal with rejected.
+    fn rejected(error: RequestError) -> String {
+        match error {
+            RequestError::Rejected(message) => message,
+            RequestError::Unplaced(error) => panic!("a refusal with rejected, not {error}"),
+        }
+    }
+
     fn parse(goal: &GoalRequestData) -> Result<PlanQuery<ARM_DOF, ARMS>, String> {
         let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
-        parse_plan(goal, arms(), &fingers)
+        parse_plan(goal, arms(), &fingers, &OPENARM_V2.frame, &in_an_empty_tree).map_err(rejected)
     }
 
     /// A Cartesian path of the left arm's grasp point through one pose, from where it stands.
@@ -840,6 +1157,8 @@ mod tests {
             arm_name: "left_arm".to_string(),
             start_joint_positions: Vec::new(),
             link_name: "openarm_left_tcp".to_string(),
+            frame: Some(robot_frame()),
+            timestamp: None,
             waypoints: vec![plan_cartesian_path::GoalWaypointsItem {
                 position: [0.4, 0.2, 0.5],
                 orientation: [0.0, 0.0, 0.0, 1.0005],
@@ -852,7 +1171,8 @@ mod tests {
         goal: &plan_cartesian_path::GoalRequestData,
     ) -> Result<CartesianQuery<ARM_DOF, ARMS>, String> {
         let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
-        parse_cartesian(goal, arms(), &fingers)
+        parse_cartesian(goal, arms(), &fingers, &OPENARM_V2.frame, &in_an_empty_tree)
+            .map_err(rejected)
     }
 
     // A Cartesian path names its arm, where it starts, the frame it follows, and each pose
@@ -868,8 +1188,11 @@ mod tests {
             FollowedFrame::of(arms()[LEFT].geometry.chain(), Frame::GraspPoint)
                 .expect("the grasp point")
         );
-        assert_eq!(query.poses.len(), 1);
-        assert_eq!(query.poses[0].rotation.w, 1.0);
+        let CartesianPoses::Robot(poses) = query.poses else {
+            panic!("waypoints in the robot frame are placed by the tree");
+        };
+        assert_eq!(poses.len(), 1);
+        assert_eq!(poses[0].rotation.w, 1.0);
     }
 
     // What a Cartesian path cannot take is refused, each refusal saying what to send: an
@@ -911,12 +1234,20 @@ mod tests {
             "waypoints holds no pose: send one or more"
         );
         assert!(
-            refusal(&|goal| goal.waypoints[0].orientation = [0.0, 0.0, 0.0, 2.0])
-                .starts_with("waypoint 1: an orientation is a unit quaternion"),
+            refusal(&|goal| goal.waypoints[0].orientation = [0.0, 0.0, 0.0, 2.0]).starts_with(
+                "waypoint 1: the orientation [0, 0, 0, 2] has a squared norm of 4, 0.01 or more \
+                 from 1"
+            ),
         );
+        let not_finite = refusal(&|goal| goal.waypoints[0].position[0] = f64::NAN);
         assert!(
-            refusal(&|goal| goal.waypoints[0].position[0] = f64::NAN)
-                .starts_with("waypoint 1: a position is finite"),
+            not_finite.starts_with("waypoint 1: ") && not_finite.contains("NaN"),
+            "{not_finite}"
+        );
+        assert_eq!(
+            refusal(&|goal| goal.frame = Some(String::new())),
+            "the frame is empty: name a frame of the robot's tree, such as the robot frame that \
+             sensor_mounts' describe_sensors names"
         );
     }
 
@@ -999,6 +1330,8 @@ mod tests {
     fn held(link: &str, free_axis: &str) -> GoalPathOrientationConstraintsItem {
         GoalPathOrientationConstraintsItem {
             link_name: link.to_string(),
+            frame: Some(robot_frame()),
+            timestamp: None,
             orientation: [0.0, 0.0, 0.0, 1.0],
             tolerance_rad: 0.1,
             free_axis: free_axis.to_string(),
@@ -1280,7 +1613,17 @@ mod tests {
         ));
         let mut skewed = goal();
         skewed.goal_orientation_constraints[0].orientation = [0.0, 0.0, 0.0, 1.01];
-        assert!(refusal(skewed).starts_with("an orientation is a unit quaternion"));
+        assert!(refusal(skewed).starts_with(
+            "goal_orientation_constraints of openarm_left_tcp: the orientation [0, 0, 0, 1.01] \
+             has a squared norm of"
+        ));
+        let mut unframed = goal();
+        unframed.goal_position_constraints[0].frame = Some(String::new());
+        assert_eq!(
+            refusal(unframed),
+            "goal_position_constraints of openarm_left_tcp: the frame is empty: name a frame of \
+             the robot's tree, such as the robot frame that sensor_mounts' describe_sensors names"
+        );
         let mut axis = goal();
         axis.goal_orientation_constraints[0].free_axis = "w".to_string();
         assert_eq!(
@@ -1430,6 +1773,7 @@ mod tests {
                 Vec::new(),
                 vec![PositionTarget {
                     frame,
+                    reference: Reference::Robot,
                     position: Vector3::new(0.4, 0.2, 0.5),
                     tolerance_m: PositiveFinite::parse(0.01).expect("a tolerance"),
                 }],
@@ -1461,5 +1805,286 @@ mod tests {
         for link in &arms()[LEFT].link_names {
             frame_of(link);
         }
+    }
+
+    /// The frame a test's tree places 1 m along the robot frame's x, turned half a turn about
+    /// z, which the arithmetic holds exactly.
+    const TABLE: &str = "table";
+
+    /// Places a pose as a tree that holds `TABLE` alone does, and refuses any frame it does
+    /// not hold as unknown.
+    fn in_a_tree_of_the_table<T: Placed>(stamped: &Stamped<T>) -> Result<T, PlaceError> {
+        let mut tree = FrameTree::new(Duration::from_secs(10)).expect("a window");
+        tree.take_static(
+            &frame_tree::Publisher {
+                core_node: "core".into(),
+                instance_id: "init".into(),
+            },
+            &frame_tree::StaticMessage {
+                transforms: vec![frame_tree::TransformRecord {
+                    frame: robot_frame(),
+                    child_frame: TABLE.into(),
+                    position: [1.0, 0.0, 0.0],
+                    orientation: [0.0, 0.0, 1.0, 0.0],
+                }],
+            },
+        )
+        .expect("taken");
+        let found = tree.lookup(&OPENARM_V2.frame, stamped.frame(), stamped.time())?;
+        Ok(stamped.value().placed_by(&found.placement)?)
+    }
+
+    /// The query of `goal` with the tree of `in_a_tree_of_the_table`, or its refusal.
+    fn parse_in_the_tree(goal: &GoalRequestData) -> Result<PlanQuery<ARM_DOF, ARMS>, RequestError> {
+        let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
+        parse_plan(
+            goal,
+            arms(),
+            &fingers,
+            &OPENARM_V2.frame,
+            &in_a_tree_of_the_table,
+        )
+    }
+
+    // A constraint in a frame of no arm the plan moves is placed in the robot frame by the
+    // tree: a position given in the table's frame lands where the table puts it, and an
+    // orientation turns by the table's turn. A frame the tree does not hold is refused with
+    // the lookup's failure.
+    #[test]
+    fn a_constraint_in_a_frame_of_the_tree_is_placed_in_the_robot_frame() {
+        let mut on_the_table = goal();
+        on_the_table.goal_position_constraints[0].frame = Some(TABLE.to_string());
+        on_the_table.goal_position_constraints[0].position = [0.0, 0.5, 0.2];
+        on_the_table.goal_orientation_constraints[0].frame = Some(TABLE.to_string());
+        on_the_table.goal_orientation_constraints[0].orientation = [0.0, 0.0, 0.0, 1.0];
+        let query = parse_in_the_tree(&on_the_table).expect("a query");
+        let ArmGoals::One { goal: placed, .. } = query.arm_goals else {
+            panic!("one arm moves");
+        };
+        let half_turn = UnitQuaternion::from(
+            control_core::geometry::UnitQuaternion::parse([0.0, 0.0, 1.0, 0.0])
+                .expect("a half turn about z"),
+        );
+        let expected = Goal::new(
+            ARM_DOF,
+            Vec::new(),
+            vec![PositionTarget {
+                frame: Frame::GraspPoint,
+                reference: Reference::Robot,
+                position: Vector3::new(1.0, -0.5, 0.2),
+                tolerance_m: PositiveFinite::parse(0.01).expect("a tolerance"),
+            }],
+            vec![OrientationTarget {
+                frame: Frame::GraspPoint,
+                reference: Reference::Robot,
+                orientation: half_turn,
+                tolerance_rad: PositiveFinite::parse(0.1).expect("a tolerance"),
+                free_axis: Some(Axis::Z),
+            }],
+        )
+        .expect("a goal");
+        assert_eq!(*placed, expected);
+
+        let mut nowhere = goal();
+        nowhere.goal_position_constraints[0].frame = Some("nowhere".to_string());
+        assert!(matches!(
+            parse_in_the_tree(&nowhere),
+            Err(RequestError::Unplaced(PlaceError::Lookup(
+                LookupError::UnknownFrame { .. }
+            )))
+        ));
+    }
+
+    // A constraint and a Cartesian path that name no frame lie in the robot frame: in a tree
+    // that holds the table's frame too, each places where the same record in the robot frame
+    // places.
+    #[test]
+    fn a_record_that_names_no_frame_lies_in_the_robot_frame() {
+        let goal_of =
+            |goal: &GoalRequestData| match parse_in_the_tree(goal).expect("a query").arm_goals {
+                ArmGoals::One { goal, .. } => goal,
+                ArmGoals::Every(_) => panic!("one arm moves"),
+            };
+        let mut unnamed = goal();
+        unnamed.goal_position_constraints[0].frame = None;
+        unnamed.goal_orientation_constraints[0].frame = None;
+        assert_eq!(goal_of(&unnamed), goal_of(&goal()));
+
+        let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
+        let poses_of = |goal: &plan_cartesian_path::GoalRequestData| {
+            let query = parse_cartesian(
+                goal,
+                arms(),
+                &fingers,
+                &OPENARM_V2.frame,
+                &in_a_tree_of_the_table,
+            )
+            .expect("a query");
+            match query.poses {
+                CartesianPoses::Robot(poses) => poses,
+                CartesianPoses::Link { .. } => panic!("the waypoints lie in no link"),
+            }
+        };
+        let unnamed_path = plan_cartesian_path::GoalRequestData {
+            frame: None,
+            ..cartesian_goal()
+        };
+        assert_eq!(poses_of(&unnamed_path), poses_of(&cartesian_goal()));
+    }
+
+    /// A goal of both arms: the right arm's joint `joint` to `position`, and the left
+    /// arm's grasp point at `position_in` in `frame`, from where they stand.
+    fn left_in(frame: &str, position_in: [f64; 3]) -> GoalRequestData {
+        let mut both = goal();
+        both.arms.push(arm("right_arm"));
+        both.goal_orientation_constraints.clear();
+        both.goal_position_constraints[0].frame = Some(frame.to_string());
+        both.goal_position_constraints[0].position = position_in;
+        both.goal_joint_constraints = vec![joint_constraint("openarm_right_joint4", 1.0)];
+        both
+    }
+
+    // A constraint in a link of an arm the plan moves stays in that link, held against it at
+    // each state, the arm at its place in the plan's arms; a constraint in a link of its own
+    // arm stays in that link too. Its timestamp names no time, and the tree places nothing.
+    #[test]
+    fn a_constraint_in_a_link_of_a_moving_arm_is_held_against_that_link() {
+        let query =
+            parse_in_the_tree(&left_in("openarm_right_tcp", [0.0, 0.1, 0.0])).expect("a query");
+        let ArmGoals::Every(goals) = query.arm_goals else {
+            panic!("both arms move");
+        };
+        let expected = Goal::new(
+            ARM_DOF,
+            Vec::new(),
+            vec![PositionTarget {
+                frame: Frame::GraspPoint,
+                reference: Reference::Arm {
+                    arm: RIGHT.place(),
+                    frame: Frame::GraspPoint,
+                },
+                position: Vector3::new(0.0, 0.1, 0.0),
+                tolerance_m: PositiveFinite::parse(0.01).expect("a tolerance"),
+            }],
+            Vec::new(),
+        )
+        .expect("a goal");
+        assert_eq!(goals[LEFT], expected);
+
+        let mut own = goal();
+        own.goal_orientation_constraints.clear();
+        own.goal_position_constraints[0].frame = Some("openarm_left_link4".to_string());
+        own.goal_position_constraints[0].timestamp = Some(UNIX_EPOCH + Duration::from_secs(5));
+        let query = parse_in_the_tree(&own).expect("a query");
+        let ArmGoals::One {
+            goal: in_its_link, ..
+        } = query.arm_goals
+        else {
+            panic!("one arm moves");
+        };
+        let expected = Goal::new(
+            ARM_DOF,
+            Vec::new(),
+            vec![PositionTarget {
+                frame: Frame::GraspPoint,
+                reference: Reference::Arm {
+                    arm: 0,
+                    frame: Frame::Link {
+                        segment: 3,
+                        offset: Isometry3::identity(),
+                    },
+                },
+                position: Vector3::new(0.4, 0.2, 0.5),
+                tolerance_m: PositiveFinite::parse(0.01).expect("a tolerance"),
+            }],
+            Vec::new(),
+        )
+        .expect("a goal");
+        assert_eq!(*in_its_link, expected);
+    }
+
+    // A link of an arm the plan leaves where it starts is placed by the tree, and a path
+    // orientation of such an arm in a frame of an arm the plan moves is held in that frame, at
+    // the moving arm's place in the plan.
+    #[test]
+    fn a_link_of_an_arm_that_stays_is_placed_by_the_tree_or_held_in_a_moving_frame() {
+        let mut beside = goal();
+        beside.arms.push(arm("right_arm"));
+        beside.goal_orientation_constraints.clear();
+        beside.goal_position_constraints[0].frame = Some("openarm_right_tcp".to_string());
+        assert!(matches!(
+            parse_in_the_tree(&beside),
+            Err(RequestError::Unplaced(PlaceError::Lookup(
+                LookupError::UnknownFrame { .. }
+            )))
+        ));
+        let mut standing_held = goal();
+        standing_held.arms.push(arm("right_arm"));
+        standing_held.path_orientation_constraints = vec![GoalPathOrientationConstraintsItem {
+            frame: Some("openarm_left_tcp".to_string()),
+            ..held("openarm_right_tcp", "none")
+        }];
+        let query = parse_in_the_tree(&standing_held).expect("a query");
+        assert!(matches!(query.arm_goals, ArmGoals::One { arm, .. } if arm == LEFT));
+        let [held_in_the_hand] = query.path_orientations[RIGHT].as_slice() else {
+            panic!("the right arm holds one orientation");
+        };
+        assert_eq!(
+            held_in_the_hand.target.reference,
+            Reference::Arm {
+                arm: 0,
+                frame: Frame::GraspPoint
+            },
+            "the standing arm's orientation is held in the moving hand's frame"
+        );
+    }
+
+    // Waypoints in a link of the path's arm are placed where that link stands at the path's
+    // start; in any other frame the tree places them.
+    #[test]
+    fn waypoints_in_a_link_of_the_arm_are_placed_where_it_stands_at_the_start() {
+        let mut in_the_hand = cartesian_goal();
+        in_the_hand.frame = Some("openarm_left_tcp".to_string());
+        in_the_hand.waypoints[0].position = [0.0, 0.0, 0.05];
+        in_the_hand.waypoints[0].orientation = [0.0, 0.0, 0.0, 1.0];
+        let query = parse_cartesian_goal(&in_the_hand).expect("a query");
+        let chain = arms()[LEFT].geometry.chain();
+        let start = [0.2; ARM_DOF];
+        let hand = chain.root_ee_pose(&start);
+        let [placed] = query.poses.at_start(chain, &start)[..] else {
+            panic!("one pose");
+        };
+        let expected = hand * Isometry3::translation(0.0, 0.0, 0.05);
+        assert!(
+            (placed.translation.vector - expected.translation.vector).norm() < 1e-12
+                && placed.rotation.angle_to(&expected.rotation) < 1e-12,
+            "{placed} against {expected}"
+        );
+        let mut on_the_table = cartesian_goal();
+        on_the_table.frame = Some(TABLE.to_string());
+        let fingers = riders_of_the_arms(&OPENARM_V2.own, arms()).expect("the arms' fingers");
+        let query = parse_cartesian(
+            &on_the_table,
+            arms(),
+            &fingers,
+            &OPENARM_V2.frame,
+            &in_a_tree_of_the_table,
+        )
+        .expect("a query");
+        assert!(matches!(query.poses, CartesianPoses::Robot(_)));
+        let mut nowhere = cartesian_goal();
+        nowhere.frame = Some("nowhere".to_string());
+        assert!(matches!(
+            parse_cartesian(
+                &nowhere,
+                arms(),
+                &fingers,
+                &OPENARM_V2.frame,
+                &in_a_tree_of_the_table
+            ),
+            Err(RequestError::Unplaced(PlaceError::Lookup(
+                LookupError::UnknownFrame { .. }
+            )))
+        ));
     }
 }

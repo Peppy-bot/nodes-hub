@@ -14,7 +14,7 @@ backbone solves its kinematics with placo.
 | `so101_follower` | The real arm. Pure follower: `joint_link` + `gripper_link` follower slots on one node (one process must own the serial port), `component_ready`, `motor_health`, `alert`. No motion logic. The initializer tells the follower the robot's model (`component_ready`'s `set_model`); a model other than `so101` gets an error reply naming it and ends the node. |
 | `so101_leader` | The passive leader arm as a teleop device. Open-loop `joint_link` + `gripper_link` leader; staleness is the deadman (the hardware has no engage button). |
 | [`robot_initializer`](../robot_initializer) | The node every robot uses, run with `model: "so101"`: answers who the robot is on `get_identity`, the URDF and SRDF of its model on `get_description`, and whether it is ready on `is_ready`, from the follower's readiness on hardware and from the simulation standing it in a simulation, which it joins as the `so101` model. |
-| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending cancelled with the reason `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing, and gives an error reply with the kind of the refusal to a check that `move_arm` would refuse), the `limb_state` readout, the `transforms` of the arm's and the gripper's joints at each `limb_states` snapshot's timestamp (the robot's initializer publishes the fixed joints'), and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up. A joints-led stream is clamped into the joint limits and rate-stepped per joint at the joint velocity limits, under the end-effector-speed governor; a pose-led stream is reach-clipped and solved first, then treated the same. Joint moves, postures and Cartesian moves are timed within the per-joint velocity and acceleration caps. A joint path (`execute_joint_path`) names the arm, `arm`, once in its `arms`, rounds its corners as `limb_motion` states, begins at the joints the follower measures as the move starts, clamped into the joint limits, where the arm holds while the path is planned, and is timed within the per-joint velocity and acceleration caps, its speed integrated over a grid of at least 1000 cells along the path, slowed evenly to a longer `duration_s`. A goal fails with `precondition_failed`, naming the joint, while a measured joint stands farther than the `start_tolerance_rad` parameter from its `expected_start_joint_positions`, when it names them, or, once the path is planned, while a measured joint, clamped into the joint limits, stands farther than `start_tolerance_rad` from where the arm holds, the arm having moved while the path was planned; and it fails with `rejected`, giving the time, when those caps need longer than 60 s for the path. A goal refused for its expected start moves nothing; a path that fails once the arm holds, before it plays, leaves the arm held at its measured joints, moved inside its joint limits where it stood past one, and runs none of the path; once the path plays, a failure holds the arm where it stands. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails with `timeout` at its settle timeout. A `move_arm_joints`, `execute_joint_path` or `move_arm` goal with `contact_gap_m` above 0 also completes on contact, with `ended_on_contact` true: on the tick the measured grasp point stands farther than the gap from the grasp point of the joints commanded last, as an arm that an object holds on its way does. An arm move that ended on contact, failed its settle, or was cancelled or stopped once it ran leaves the arm owed a hold where it stands: the backbone commands the joints the follower measures, clamped into the joint limits, on the tick of a contact or of a settle timeout and on the tick after a cancel or a stop, and again on each tick with fresh follower state, from the joints measured then, until the follower receives one such command. The follower then holds the arm there. A move that settled leaves the follower on its target, and a cancelled move's result says `ended_on_contact` false. A posture completes once each joint stands within 0.1 rad of the posture, with a settle timeout of 2 s, so an arm that an object stops short of the posture fails it. `move_to_ready` claims the arm and sends the gripper no command. `move_to_home` claims the gripper and the arm, and closes the gripper before the arm moves: the close ends as a gripper move ends, with a settle timeout of 2 s, so jaws that an item stops close on it and the arm goes home with it; the travel of the close has 8 s at the gripper rate cap, and a goal whose close would travel longer is refused with `rejected`; a gripper with no fresh state gets no close, and the goal moves the arm alone; the arm move is planned from where the arm stands once the close completed, and `duration_s` is its time alone; a cancel or a `stop` during the close ends the goal cancelled, a close that fails ends the goal with its failure, and in both cases the arm does not move. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state: a goal is refused with `resource_unavailable` without it, and a move fails with `resource_unavailable` when it goes stale. A goal on a limb a leader is streaming is refused with `leader_streaming` until the stream has been silent for the deadman timeout, and a goal on a limb that runs another goal with `precondition_failed`; an admitted goal owns its limb until it ends. |
+| `so101_backbone` | The motion authority in between. Follower role toward whatever leads (joint, pose, or gripper streams), leader role toward the follower; exposes the `limb_motion` and `postures` move actions, the `limb_motion` services (`stop` ends every planned move in flight, whoever started it, each goal then ending cancelled with the reason `stopped: <reason>`; `check_arm_move` runs a `move_arm` goal's solve from the same anchor and moves nothing, and gives an error reply with the kind of the refusal to a check that `move_arm` would refuse), the `limb_state` readout, the `transforms` of the arm's and the gripper's joints at each `limb_states` snapshot's timestamp (the robot's initializer publishes the fixed joints'), and the `workspace` services (`describe_workspace` and `check_positions`: where the arm reaches, from the design alone; see [Workspace](#workspace)). Every pose it plans and reports is in the URDF's `base_link` frame, the robot frame the contracts define: `+x` the way the robot faces, `+z` up, each report naming that frame and the capture time of its measurement. A pose or a point a command gives names its own frame and time, and the backbone places it in the robot frame through the robot's `transform_lookup` (see [Placement](#placement)). A joints-led stream is clamped into the joint limits and rate-stepped per joint at the joint velocity limits, under the end-effector-speed governor; a pose-led stream is reach-clipped and solved first, then treated the same. Joint moves, postures and Cartesian moves are timed within the per-joint velocity and acceleration caps. A joint path (`execute_joint_path`) names the arm, `arm`, once in its `arms`, rounds its corners as `limb_motion` states, begins at the joints the follower measures as the move starts, clamped into the joint limits, where the arm holds while the path is planned, and is timed within the per-joint velocity and acceleration caps, its speed integrated over a grid of at least 1000 cells along the path, slowed evenly to a longer `duration_s`. A goal fails with `precondition_failed`, naming the joint, while a measured joint stands farther than the `start_tolerance_rad` parameter from its `expected_start_joint_positions`, when it names them, or, once the path is planned, while a measured joint, clamped into the joint limits, stands farther than `start_tolerance_rad` from where the arm holds, the arm having moved while the path was planned; and it fails with `rejected`, giving the time, when those caps need longer than 60 s for the path. A goal refused for its expected start moves nothing; a path that fails once the arm holds, before it plays, leaves the arm held at its measured joints, moved inside its joint limits where it stood past one, and runs none of the path; once the path plays, a failure holds the arm where it stands. Each arm move completes once the measured arm stands within the settle tolerances its goal names, at or after the planned end, and fails with `timeout` at its settle timeout. A `move_arm_joints`, `execute_joint_path` or `move_arm` goal with `contact_gap_m` above 0 also completes on contact, with `ended_on_contact` true: on the tick the measured grasp point stands farther than the gap from the grasp point of the joints commanded last, as an arm that an object holds on its way does. An arm move that ended on contact, failed its settle, or was cancelled or stopped once it ran leaves the arm owed a hold where it stands: the backbone commands the joints the follower measures, clamped into the joint limits, on the tick of a contact or of a settle timeout and on the tick after a cancel or a stop, and again on each tick with fresh follower state, from the joints measured then, until the follower receives one such command. The follower then holds the arm there. A move that settled leaves the follower on its target, and a cancelled move's result says `ended_on_contact` false. A posture completes once each joint stands within 0.1 rad of the posture, with a settle timeout of 2 s, so an arm that an object stops short of the posture fails it. `move_to_ready` claims the arm and sends the gripper no command. `move_to_home` claims the gripper and the arm, and closes the gripper before the arm moves: the close ends as a gripper move ends, with a settle timeout of 2 s, so jaws that an item stops close on it and the arm goes home with it; the travel of the close has 8 s at the gripper rate cap, and a goal whose close would travel longer is refused with `rejected`; a gripper with no fresh state gets no close, and the goal moves the arm alone; the arm move is planned from where the arm stands once the close completed, and `duration_s` is its time alone; a cancel or a `stop` during the close ends the goal cancelled, a close that fails ends the goal with its failure, and in both cases the arm does not move. A gripper move ramps at the gripper rate cap and, from the planned end of that travel on, completes once the measured gripper stands still, on its target or short of it where an object holds the jaws, or at its settle timeout wherever the jaws stand. Everything gates on fresh follower state: a goal is refused with `resource_unavailable` without it, and a move fails with `resource_unavailable` when it goes stale. A goal on a limb a leader is streaming is refused with `leader_streaming` until the stream has been silent for the deadman timeout, and a goal on a limb that runs another goal with `precondition_failed`; an admitted goal owns its limb until it ends. |
 
 ```text
 so101_leader ──joint+gripper──▶ so101_backbone ──joint+gripper──▶ so101_follower
@@ -155,16 +155,53 @@ This is accepted for now. Teleop through `xr_commander` drives the streaming
 path, which is best effort and unverified by design, and is unaffected. The
 cost falls on scripted `move_arm` goals.
 
+## Placement
+
+The backbone holds no tree of its own: it asks the robot's `transform_lookup`
+(the `transform_lookup` link, one transform_server per robot) to place each
+command, waiting up to its `lookup_timeout_s` parameter, from 0 to 1 s, for
+the tree to answer.
+
+- A `move_arm` goal, a `check_arm_move` request and each point of
+  `check_positions` ask for their frame, the robot frame for a command with no
+  frame, at their timestamp in the robot frame at the latest time (no
+  `target_timestamp`): a target in the robot frame at the timestamp of a
+  report names where the robot frame stood then, on the floor, and one with no
+  timestamp where it stands now. Every value is parsed first
+  (`control_core_py.geometry`): a target or a point no contract takes is
+  refused with `rejected`, an orientation whose squared norm lies 0.01 or more
+  from 1 among them, and each orientation taken is normalized. A target or a
+  point the tree cannot place is refused with the failure kind of the lookup
+  (`unknown_frame`, `no_chain`, `extrapolation`, `broken_tree`), its message
+  naming the target or the points and the lookup's cause, before the arm is
+  claimed; a lookup the server does not answer refuses it with
+  `resource_unavailable`, a lookup that gives nothing the backbone can use,
+  such as a failure kind `transform_lookup` does not declare, with
+  `attempt_failed`, and a placement that carries a coordinate past the finite
+  numbers with `rejected`.
+- A `pose_setpoints` sample is placed by the same lookup, one with no frame in
+  the robot frame, as pose_link places a setpoint: one in the robot frame at a
+  time names where the robot frame stood then, and one in the robot frame with
+  no timestamp where it stands now, so it is taken as it comes. A setpoint
+  stamped at a time is gated on its age as every leader stream is, and keeps
+  its stamp downstream; one with no timestamp is stamped as it is taken. A
+  setpoint no contract takes, or that the tree cannot place, is dropped with a
+  log line, and so is one whose handling fails in any other way; the stream
+  goes on.
+
 ## Workspace
 
 The backbone implements `workspace:v1`. `describe_workspace` and
-`check_positions` tell where the robot can work, from its design alone, in
-the robot frame (the URDF's `base_link` frame). The answers know nothing of
-the room: a surface is a flat, level plane at the height that the request
-gives, the top of a block under it that stands from the front of the robot's
-base to the far end of the grid, and reaches as far to each side of the robot
-as it reaches ahead, with nothing on it; a point of `check_positions` stands
-on no surface.
+`check_positions` tell where the robot can work, from its design alone, in the
+robot frame (the URDF's `base_link` frame): `describe_workspace` names it, and
+its answer holds no timestamp, its bounds holding at every time, and each
+result of `check_positions` gives its point as the backbone placed it, at the
+time of the robot frame's place, or with no timestamp when that place holds at
+every time ([Placement](#placement)). The answers know nothing of the room: a
+surface is a flat, level plane at the height that the request gives, the top
+of a block under it that stands from the front of the robot's base to the far
+end of the grid, and reaches as far to each side of the robot as it reaches
+ahead, with nothing on it; a point of `check_positions` stands on no surface.
 
 - **Reach.** The arm `arm` reaches a point, by the reach rule of
   `workspace_core` over the backbone's `ApproachSolver` (`ApproachArm`), when
@@ -203,9 +240,9 @@ memo, and the composition of each answer and its messages come from
 answers read the same as the answers of the OpenArm and of a simulation. The
 backbone gives an error reply with `rejected` to a height that is not a
 finite number or that is more than 1000 m from the base point, an empty
-position list, a list that does not divide into points of 3 values, a value
-that is not a finite number, and a coordinate more than 1000 m from the base
-point.
+position list, before it places the points, a list that does not divide into
+points of 3 values, a value that is not a finite number, and a coordinate
+more than 1000 m from the base point.
 Both services read nothing of the arm and move nothing, so they answer from
 bringup, also when no follower state comes in.
 
@@ -251,12 +288,12 @@ repository, consumed as uv git dependencies like the Rust nodes consume
 `control_core`:
 
 - `control_core_py`: generic Python node plumbing (asyncio stream helpers,
-  parameter validators, the hardware device-thread skeleton). Nothing
-  SO-101-specific.
+  parameter validators, the hardware device-thread skeleton) and the
+  geometry types of the contracts with their rotation arithmetic, which the
+  backbone's kinematics and placement run on. Nothing SO-101-specific.
 - `so101`: the driver code the three nodes share: the servos' names on the
   bus, wire-unit conversions, STS3215-shaped setpoint parsing, the lerobot
-  device boundary, the staleness limits of the family's links, and pose
-  transforms.
+  device boundary, and the staleness limits of the family's links.
 - `robot_description_py`: the Python bindings of `robot_description`, for
   the backbone only: SO-101's model, its URDF and SRDF, with the names of
   the arm and the gripper, the joint limits, the postures and the transforms

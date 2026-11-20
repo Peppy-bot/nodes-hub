@@ -15,10 +15,11 @@ From: peppybot/python-uv-base:latest
     set -eux
     export DEBIAN_FRONTEND=noninteractive
 
-    # opencv-python links libGL and glib even when nothing is displayed; it is
-    # pulled in by teleop-xr regardless of our own import of it.
+    # uv resolves control_core_py as a git dependency; the base image has no
+    # git. opencv-python links libGL and glib even when nothing is displayed;
+    # it is pulled in by teleop-xr regardless of our own import of it.
     apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 libglib2.0-0 \
+        git libgl1 libglib2.0-0 \
         && rm -rf /var/lib/apt/lists/*
 
     # Keep the managed interpreter out of $HOME: at run time apptainer mounts

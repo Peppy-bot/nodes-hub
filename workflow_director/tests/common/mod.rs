@@ -57,6 +57,10 @@ pub const LOCATIONS: &str = include_str!("../fixtures/locations.json5");
 pub const LOCATIONS_PIN: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 /// The robot of the tests.
 pub const ROBOT: &str = "alpha";
+/// The robot frame of the arm, in which `find` gives the point of the block.
+pub const ROBOT_FRAME: &str = "base_link";
+/// The time at which `find` measured the block, on the clock of transforms.
+pub const FOUND_AT: &str = "2026-11-18T12:00:00.250000000Z";
 /// The instance of the robot that serves the arm.
 pub const ARM_INSTANCE: &str = "alpha_arm";
 /// The name of that instance in the copy of the robot.
@@ -576,14 +580,20 @@ pub enum Home {
 }
 
 /// The arm of `alpha` on the session of `harness`: it answers each `home` goal as `home` says, counts the goals, and
-/// tells `arrived` of each; it goes to each place a `go_to` goal names, and keeps the names in `visited`; it serves
-/// `locations:v1`, knowing the places of `known`, which a teach replaces; and it answers each `find` once the test
-/// gives `finds` a permit, with a block found.
+/// tells `arrived` of each; it goes to each place a `go_to` goal names, and keeps the names in `visited`; it grabs
+/// at each `grab` goal, and keeps the goals in `grabbed`; it serves `locations:v1`, knowing the locations of `known`,
+/// which a teach replaces, each one taught with no frame in its robot frame, and keeps the locations of the last teach
+/// request as it came in `taught`; and it answers each `find` once the test
+/// gives `finds` a permit, with a block found in its robot frame at `FOUND_AT`.
 pub struct ScriptedArm {
     pub goals: Arc<Mutex<u32>>,
     pub arrived: Arc<tokio::sync::Notify>,
     pub visited: Arc<Mutex<Vec<String>>>,
-    pub known: Arc<Mutex<Vec<String>>>,
+    pub grabbed: Arc<Mutex<Vec<Value>>>,
+    /// The locations the arm knows, as `list` gives them.
+    pub known: Arc<Mutex<Vec<Value>>>,
+    /// The locations of the last teach request, as the director sent them.
+    pub taught: Arc<Mutex<Vec<Value>>>,
     pub finds: Arc<tokio::sync::Semaphore>,
     /// The error reply, a failure kind and its message, that each answer of `find` gives while it is set.
     pub find_fails: Arc<Mutex<Option<(String, String)>>>,
@@ -591,18 +601,38 @@ pub struct ScriptedArm {
     pub cancelled: Arc<tokio::sync::Notify>,
 }
 
-/// The locations `known`, as `list` and `teach` of locations:v1 answer them.
-fn known_locations(known: &[String]) -> Value {
-    let locations: Vec<Value> = known
-        .iter()
-        .map(|name| {
-            json!({ "name": name, "kind": "surface", "position": [0.0, 0.0, 0.0], "orientation": [1.0, 0.0, 0.0, 0.0], "size": [0.0, 0.0, 0.0] })
-        })
-        .collect();
-    json!({ "locations": locations })
+/// The surface `name` in map, as `list` of locations:v1 gives it.
+fn surface_in_map(name: &str) -> Value {
+    json!({
+        "name": name,
+        "kind": "surface",
+        "frame": "map",
+        "position": [0.0, 0.0, 0.0],
+        "orientation": [0.0, 0.0, 0.0, 1.0],
+        "size": [0.0, 0.0, 0.0],
+    })
+}
+
+/// A location that teach of locations:v1 takes, as the arm knows it after: in [`ROBOT_FRAME`] when it gives no
+/// frame.
+fn taught_location(mut location: Value) -> Value {
+    if location.get("frame").is_none() {
+        location["frame"] = json!(ROBOT_FRAME);
+    }
+    location
 }
 
 impl ScriptedArm {
+    /// The name of each location the arm knows, in order.
+    pub fn known_names(&self) -> Vec<String> {
+        self.known
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|location| location["name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
     pub async fn serve(
         harness: &Harness,
         core_node: &str,
@@ -612,9 +642,10 @@ impl ScriptedArm {
         let known = Arc::new(Mutex::new(
             known
                 .iter()
-                .map(|place| (*place).to_owned())
+                .map(|place| surface_in_map(place))
                 .collect::<Vec<_>>(),
         ));
+        let taught = Arc::new(Mutex::new(Vec::new()));
         let visited = Arc::new(Mutex::new(Vec::new()));
         let places =
             PeppyContractParser::from_content(LOCATIONS).expect("the locations contract parses");
@@ -648,31 +679,29 @@ impl ScriptedArm {
             tokio::spawn(async move {
                 let codec = MessageCodec::new("list response", &listing).expect("a codec of list");
                 while let Ok((_, responder)) = list.next_request(IDLE).await {
-                    let answer = known_locations(&known.lock().unwrap());
+                    let answer = json!({ "locations": *known.lock().unwrap() });
                     let payload = codec.encode(&answer).expect("a list response encodes");
                     let _ = responder.respond(Payload::from(payload)).await;
                 }
             });
         }
         {
-            let known = Arc::clone(&known);
+            let (known, taught) = (Arc::clone(&known), Arc::clone(&taught));
             tokio::spawn(async move {
                 let request =
                     MessageCodec::new("teach request", &teaching).expect("a codec of teach");
                 let response =
                     MessageCodec::new("teach response", &listing).expect("a codec of teach");
                 while let Ok((context, responder)) = teach.next_request(IDLE).await {
-                    let taught = request
+                    let decoded = request
                         .decode(context.message().payload_bytes().as_ref())
                         .expect("a teach request decodes");
-                    let names: Vec<String> = taught["locations"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|location| location["name"].as_str().map(str::to_owned))
-                        .collect();
-                    *known.lock().unwrap() = names;
-                    let answer = known_locations(&known.lock().unwrap());
+                    let Value::Array(locations) = decoded["locations"].clone() else {
+                        panic!("a teach request gives a list of locations: {decoded}")
+                    };
+                    taught.lock().unwrap().clone_from(&locations);
+                    *known.lock().unwrap() = locations.into_iter().map(taught_location).collect();
+                    let answer = json!({ "locations": *known.lock().unwrap() });
                     let payload = response.encode(&answer).expect("a teach response encodes");
                     let _ = responder.respond(Payload::from(payload)).await;
                 }
@@ -712,7 +741,13 @@ impl ScriptedArm {
                         let _ = responder.respond_failure(Failure::new(kind, message)).await;
                         continue;
                     }
-                    let found = json!({ "found": true, "item_id": "b1", "position": [0.3, 0.0, 0.1], "kind": "block", "count": "1" });
+                    let found = json!({
+                        "found": true,
+                        "item_id": "b1",
+                        "item_point": { "frame": ROBOT_FRAME, "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] },
+                        "kind": "block",
+                        "count": "1",
+                    });
                     let payload = codec.encode(&found).expect("a find response encodes");
                     let _ = responder.respond(Payload::from(payload)).await;
                 }
@@ -758,6 +793,48 @@ impl ScriptedArm {
                         .encode(&json!({ "arrived": true }))
                         .expect("a result of go_to");
                     let _ = goal.complete(Payload::from(arrived)).await;
+                }
+            });
+        }
+        let grabbed = Arc::new(Mutex::new(Vec::new()));
+        let mut grabbing = MockActionServerCore::expose(
+            harness.session(),
+            core_node,
+            ARM_INSTANCE,
+            target.clone(),
+            "grab",
+            false,
+        )
+        .await?;
+        {
+            let arm =
+                PeppyContractParser::from_content(TEST_ARM).expect("the arm of the tests parses");
+            let goal = arm
+                .message_format(InterfaceKind::Action, "grab", MessageSide::Goal)
+                .expect("grab takes a goal")
+                .clone();
+            let result = arm
+                .message_format(InterfaceKind::Action, "grab", MessageSide::Result)
+                .expect("grab gives a result")
+                .clone();
+            let grabbed = Arc::clone(&grabbed);
+            tokio::spawn(async move {
+                let goal = MessageCodec::new("grab goal", &goal).expect("a codec of the goal");
+                let result =
+                    MessageCodec::new("grab result", &result).expect("a codec of the result");
+                while let Ok(pending) = grabbing.next_goal(IDLE).await {
+                    let asked = goal
+                        .decode(pending.request_bytes())
+                        .expect("a grab goal decodes");
+                    let item_id = asked["item_id"].clone();
+                    grabbed.lock().unwrap().push(asked);
+                    let Ok(goal) = pending.accept(Payload::new()).await else {
+                        continue;
+                    };
+                    let done = result
+                        .encode(&json!({ "success": true, "item_id": item_id }))
+                        .expect("a result of grab");
+                    let _ = goal.complete(Payload::from(done)).await;
                 }
             });
         }
@@ -825,7 +902,9 @@ impl ScriptedArm {
             goals,
             arrived,
             visited,
+            grabbed,
             known,
+            taught,
             finds,
             find_fails,
             cancelled,

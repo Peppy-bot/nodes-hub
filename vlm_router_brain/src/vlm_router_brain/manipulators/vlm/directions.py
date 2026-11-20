@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import math
 
-from brain_core.perception.camera import rotate
 from brain_core.ports import Quat, Vec3
+from control_core_py.geometry import inverse, rotate
 
 ROBOT_X: Vec3 = (1.0, 0.0, 0.0)
 ROBOT_Y: Vec3 = (0.0, 1.0, 0.0)
@@ -32,8 +32,7 @@ def picture_direction(camera_orientation: Quat, direction: Vec3) -> int:
     """The hour `direction`, a robot-frame direction, points toward in the
     picture of a camera whose optical frame has `camera_orientation` in the
     robot frame."""
-    x, y, z, w = camera_orientation
-    right, down, _along = rotate((-x, -y, -z, w), direction)
+    right, down, _along = rotate(inverse(camera_orientation), direction)
     return clock_hour(right, -down)
 
 

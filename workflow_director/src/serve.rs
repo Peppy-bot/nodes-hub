@@ -1112,12 +1112,7 @@ async fn work_locations(director: Arc<Director>, goal: locations::GoalContext) {
         return;
     };
     let teach = data.teach.as_ref().map(|items| {
-        let locations: Vec<Json> = items
-            .iter()
-            .map(|item| {
-                json!({ "name": item.name, "kind": item.kind, "position": item.position, "orientation": item.orientation, "size": item.size })
-            })
-            .collect();
+        let locations: Vec<Json> = items.iter().map(teach_location).collect();
         json!({ "locations": locations })
     });
     let held = match &teach {
@@ -1142,6 +1137,22 @@ async fn work_locations(director: Arc<Director>, goal: locations::GoalContext) {
     if let Err(error) = ended {
         tracing::warn!("locations: {error}");
     }
+}
+
+/// A location of a teach as teach of locations:v1 takes it, with no frame
+/// where `item` gives none, which the skill reads as its robot frame.
+fn teach_location(item: &locations::GoalTeachItem) -> Json {
+    let mut location = json!({
+        "name": item.name,
+        "kind": item.kind,
+        "position": item.position,
+        "orientation": item.orientation,
+        "size": item.size,
+    });
+    if let Some(frame) = &item.frame {
+        location["frame"] = json!(frame);
+    }
+    location
 }
 
 /// Why a goal of `locations` failed: its kind and its message.
@@ -1219,6 +1230,7 @@ fn result_location(location: &KnownLocation) -> locations::LocationsResultSkills
     locations::LocationsResultSkillsItemLocationsItem {
         name: location.name.to_string(),
         kind: location.kind.name().to_owned(),
+        frame: location.frame.to_string(),
         position: location.position,
         orientation: location.orientation,
         size: location.size,

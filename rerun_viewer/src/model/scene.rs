@@ -2,7 +2,7 @@
 //! arm carries, the pairs allowed to touch, and the shell of the clearance around each
 //! shape.
 
-use camera_core::pose::Pose;
+use frame_tree::Transform;
 
 use crate::model::placement::{Placement, translation};
 
@@ -93,7 +93,7 @@ impl PlanningScene {
 #[derive(Debug, Clone)]
 pub struct PlacedShape {
     pub kind: ShapeKind,
-    pub pose: Pose,
+    pub pose: Transform,
 }
 
 /// The shapes of `object`, each in the robot frame.

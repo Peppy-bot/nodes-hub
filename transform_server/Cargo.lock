@@ -529,7 +529,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#1ee184885f5d51a84ce52183e2386b5df3716cac"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
 dependencies = [
  "frame_tree",
  "thiserror 2.0.21",
@@ -1042,7 +1042,7 @@ dependencies = [
 [[package]]
 name = "frame_tree"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#1ee184885f5d51a84ce52183e2386b5df3716cac"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#0680f96af2b8c0c6f8a286b929388fedde6a41be"
 dependencies = [
  "thiserror 2.0.21",
 ]

@@ -43,6 +43,12 @@ impl JointTransforms {
         Self { description, start }
     }
 
+    /// The robot frame, the root link of the model, which the transforms are
+    /// composed from.
+    pub fn robot_frame(&self) -> &'static str {
+        self.description.root_link()
+    }
+
     /// The message of the transforms measured at `timestamp`: of every arm
     /// joint at `joints` and of every finger joint at the opening `openings`
     /// gives its gripper, in the URDF's order of joints. A joint whose
@@ -94,8 +100,10 @@ impl JointTransforms {
 mod tests {
     use std::time::Duration;
 
+    use control_core::geometry::Pose;
+    use frame_tree::TransformRecord;
     use robot_description::ArmId;
-    use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
+    use srs_model::nalgebra::Isometry3;
 
     use super::*;
     use crate::robot::LIMBS;
@@ -110,15 +118,9 @@ mod tests {
     /// When the snapshots of the tests are measured.
     const MEASURED: SystemTime = SystemTime::UNIX_EPOCH;
 
-    /// The place of the child frame of transform `index` of `message` in its
-    /// parent.
-    fn pose_in(message: &MovingMessage, index: usize) -> Isometry3<f64> {
-        let [x, y, z] = std::array::from_fn(|axis| message.positions[3 * index + axis]);
-        let [i, j, k, w] = std::array::from_fn(|axis| message.orientations[4 * index + axis]);
-        Isometry3::from_parts(
-            Translation3::new(x, y, z),
-            UnitQuaternion::from_quaternion(Quaternion::new(w, i, j, k)),
-        )
+    /// The place of the child frame of `record` in its parent.
+    fn pose_in(record: &TransformRecord) -> Isometry3<f64> {
+        Isometry3::from(Pose::parse(record.position, record.orientation).expect("a pose"))
     }
 
     /// Where `link` stands in the robot frame: the transforms of `message`
@@ -132,9 +134,9 @@ mod tests {
         let mut place = Isometry3::identity();
         let mut at = link.to_owned();
         loop {
-            if let Some(index) = message.child_frames.iter().position(|child| *child == at) {
-                place = pose_in(message, index) * place;
-                at = message.parent_frames[index].clone();
+            if let Some(record) = message.transforms.iter().find(|t| t.child_frame == at) {
+                place = pose_in(record) * place;
+                at = record.frame.clone();
                 continue;
             }
             let Some(transform) = fixed.iter().find(|transform| transform.child == at) else {
@@ -176,7 +178,7 @@ mod tests {
             .expect("the transforms of a measurement within the joints' limits");
         for arm in PerArm::<(), ARMS>::ids() {
             let built = bundled_arm(model, arm);
-            let reported = built.world_pose(&built.at(&joints[arm]).ee_pose());
+            let reported = built.root_pose(&built.at(&joints[arm]).ee_pose());
             let grasp_link = &description.arms()[arm.place()].grasp_link;
             let composed = place_of(grasp_link, &message, description);
             let miss = (composed.translation.vector - reported.translation.vector).norm();
@@ -214,7 +216,11 @@ mod tests {
                     &PerArm::from_fn(|_| 0.5),
                 )
                 .expect("a message");
-            let mut children: Vec<&str> = message.child_frames.iter().map(String::as_str).collect();
+            let mut children: Vec<&str> = message
+                .transforms
+                .iter()
+                .map(|t| t.child_frame.as_str())
+                .collect();
             let mut measured: Vec<&str> = description
                 .arms()
                 .iter()
@@ -259,12 +265,12 @@ mod tests {
             .message_at(MEASURED, &joints, &PerArm::new([1.0, 1.0]))
             .expect("a message");
         let pose_of = |message: &MovingMessage, link: &str| {
-            let index = message
-                .child_frames
+            let record = message
+                .transforms
                 .iter()
-                .position(|child| child == link)
+                .find(|t| t.child_frame == link)
                 .expect("a finger's transform");
-            pose_in(message, index)
+            pose_in(record)
         };
         for arm in PerArm::<(), ARMS>::ids() {
             for finger in &description.arms()[arm.place()].gripper.fingers {

@@ -11,11 +11,13 @@
 //! stream means no re-subscribe gap, so a message is never dropped between
 //! receives.
 
-use std::future::Future;
+use std::fmt::Display;
+use std::future::{Future, ready};
 use std::ops::ControlFlow;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use control_core::geometry::{Pose, Stamped};
 use control_core::receiving::{Tagged, receive, tagged};
 use control_core::throttle::Throttle;
 use peppygen::NodeRunner;
@@ -24,13 +26,14 @@ use peppygen::paired_topics::{
     leader_left_arm, leader_left_arm_pose, leader_left_gripper, leader_right_arm,
     leader_right_arm_pose, leader_right_gripper, left_arm, left_gripper, right_arm, right_gripper,
 };
+use peppylib::runtime::CancellationToken;
 use robot_description::{ArmId, PerArm};
 use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
+use crate::placement::Placer;
 use crate::robot::{ARMS, LIMBS};
-use crate::types::pose_from_wire;
 use crate::upstream::Upstream;
 
 /// At most one dropped-message warning per stream (and one build/timestamp error
@@ -51,11 +54,14 @@ pub struct GripperCommand {
 /// The latest measured joint state for one arm, fed by the joint_link
 /// pairing's `joint_states` back-channel. The backbone anchors trajectories and
 /// governor queries on position; the velocities ride along for the upstream
-/// state relay only.
+/// state relay only. `timestamp` is the time of the measurement, as its
+/// follower stamps it on the clock of transforms: the time of each pose the
+/// backbone reports from these joints.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArmState {
     pub positions: JointVec,
     pub velocities: JointVec,
+    pub timestamp: SystemTime,
 }
 
 /// The latest measured state of one gripper: the opening clamped at ingestion
@@ -74,7 +80,11 @@ pub struct GripperState {
 /// must carry exactly [`ARM_DOF`] positions with matching velocities,
 /// all finite; the generic contract's empty-velocities form is deliberately
 /// rejected here rather than half-accepted.
-fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmState, &'static str> {
+fn parse_joint_state(
+    timestamp: SystemTime,
+    positions: Vec<f64>,
+    velocities: Vec<f64>,
+) -> Result<ArmState, &'static str> {
     let finite = positions
         .iter()
         .chain(velocities.iter())
@@ -91,6 +101,7 @@ fn parse_joint_state(positions: Vec<f64>, velocities: Vec<f64>) -> Result<ArmSta
     Ok(ArmState {
         positions,
         velocities,
+        timestamp,
     })
 }
 
@@ -108,10 +119,34 @@ fn parse_joint_command(positions: Vec<f64>) -> Result<Upstream, &'static str> {
     Ok(Upstream::Joints(positions))
 }
 
-/// Parses one commanded end-effector pose through the shared wire decoder
-/// ([`pose_from_wire`]): finite components, quaternion normalized or refused.
-fn parse_pose_command(position: [f64; 3], orientation: [f64; 4]) -> Result<Upstream, &'static str> {
-    pose_from_wire(position, orientation).map(Upstream::Pose)
+/// One commanded end-effector pose of pose_link, field for field.
+struct PoseSetpoint {
+    frame: Option<String>,
+    timestamp: Option<SystemTime>,
+    position: [f64; 3],
+    orientation: [f64; 4],
+}
+
+/// Parses one commanded end-effector pose into the geometry types, in its
+/// frame or, with none, in the robot frame, and places it in the robot frame
+/// by the robot's tree, as pose_link places a setpoint; a pose no contract
+/// takes, as one whose orientation is no unit quaternion,
+/// and one the tree cannot place are refused, and the listener drops them.
+async fn place_pose_command(
+    placer: Arc<Placer>,
+    setpoint: PoseSetpoint,
+) -> Result<Upstream, String> {
+    let stamped = Pose::parse(setpoint.position, setpoint.orientation)
+        .and_then(|pose| {
+            let frame = placer.frame_of(setpoint.frame.as_deref());
+            Stamped::parse(frame, setpoint.timestamp, pose)
+        })
+        .map_err(|e| format!("a pose no contract takes: {e}"))?;
+    let placed = placer
+        .place(&stamped)
+        .await
+        .map_err(|e| format!("a pose the robot's tree cannot place: {e}"))?;
+    Ok(Upstream::Pose(placed.value.into()))
 }
 
 /// Parses one commanded gripper setpoint: finite fields, a non-negative effort
@@ -218,10 +253,12 @@ impl LeaderActivity {
     }
 }
 
-/// Receive a paired stream until `cancelled` resolves or either arm's
-/// subscription closes, keeping the latest well-formed message per arm:
-/// `next_message` selects over both arms' subscriptions, so whichever arm
-/// delivers next wins and the other stays queued in its own subscription.
+/// Receive a paired stream until `cancelled` resolves or a subscription
+/// `next_message` receives closes, keeping the latest well-formed message per
+/// arm: `next_message` gives the next message tagged with its arm, by a
+/// select over both arms' subscriptions, so whichever arm delivers next wins
+/// and the other stays queued in its own subscription, or from one arm's
+/// subscription alone ([`follow_pose_setpoints`]).
 ///
 /// This is the whole receive policy, in one place: a well-formed message
 /// replaces that arm's latest and, on a leader's stream, notes the leader's
@@ -229,14 +266,16 @@ impl LeaderActivity {
 /// drives no arm. Receive errors take control_core's receive policy. Each
 /// generated slot has its own message type and the subscriptions share no
 /// trait, so the select stays with its listener; everything after it is here.
-async fn follow_pair<Raw, Parsed>(
+async fn follow_pair<Raw, Parsed, Reason: Display, Parsing>(
     what: &'static str,
     cancelled: impl Future<Output = ()>,
     mut next_message: impl AsyncFnMut() -> Result<Option<(ArmId, Raw)>, Tagged<ArmId, peppygen::Error>>,
-    parse: impl Fn(Raw) -> Result<Parsed, &'static str>,
+    parse: impl Fn(Raw) -> Parsing,
     latest: PerArm<watch::Sender<Option<Parsed>>, ARMS>,
     activity: Option<PerArm<LeaderActivity, ARMS>>,
-) {
+) where
+    Parsing: Future<Output = Result<Parsed, Reason>>,
+{
     let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
     let stream = what.to_owned();
     let named_errors = async move || {
@@ -248,7 +287,7 @@ async fn follow_pair<Raw, Parsed>(
             })
     };
     receive(what, cancelled, named_errors, async move |(arm, raw)| {
-        match parse(raw) {
+        match parse(raw).await {
             Ok(parsed) => {
                 latest[arm].send_replace(Some(parsed));
                 if let Some(activity) = &activity {
@@ -270,11 +309,12 @@ async fn follow_pair<Raw, Parsed>(
 }
 
 /// Receive both arms' upstream pose streams forever, keeping the latest
-/// well-formed pose per arm. The Cartesian mirror of
-/// [`run_joint_command_listener`]; `upstream_mode` spawns exactly one of the
-/// two.
+/// well-formed pose per arm, placed in the robot frame by `placer`. The
+/// Cartesian mirror of [`run_joint_command_listener`]; `upstream_mode` spawns
+/// exactly one of the two.
 pub async fn run_pose_command_listener(
     runner: Arc<NodeRunner>,
+    placer: Arc<Placer>,
     latest: PerArm<watch::Sender<Option<Upstream>>, ARMS>,
     activity: PerArm<LeaderActivity, ARMS>,
 ) {
@@ -289,18 +329,77 @@ pub async fn run_pose_command_listener(
     else {
         return;
     };
-    follow_pair(
+    follow_pose_setpoints(
         WHAT,
-        runner.cancellation_token().cancelled(),
-        async move || tokio::select! {
-            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
-            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.position, msg.orientation)))),
+        runner.cancellation_token(),
+        async move || {
+            tagged(
+                left_arm,
+                left.next().await.map(|m| {
+                    m.map(|(_, msg)| PoseSetpoint {
+                        frame: msg.frame,
+                        timestamp: msg.timestamp,
+                        position: msg.position,
+                        orientation: msg.orientation,
+                    })
+                }),
+            )
         },
-        |(position, orientation)| parse_pose_command(position, orientation),
+        async move || {
+            tagged(
+                right_arm,
+                right.next().await.map(|m| {
+                    m.map(|(_, msg)| PoseSetpoint {
+                        frame: msg.frame,
+                        timestamp: msg.timestamp,
+                        position: msg.position,
+                        orientation: msg.orientation,
+                    })
+                }),
+            )
+        },
+        placer,
         latest,
-        Some(activity),
+        activity,
     )
     .await;
+}
+
+/// Follow both arms' pose setpoints as [`follow_pair`] follows a stream, each
+/// arm's on a loop of its own, until `stopped` cancels or either arm's
+/// subscription closes: `next_left` and `next_right` receive the next
+/// setpoint of each arm, and `placer` places it, waiting up to its lookup
+/// timeout for the tree, which holds back only the setpoints of that arm.
+async fn follow_pose_setpoints(
+    what: &'static str,
+    stopped: &CancellationToken,
+    next_left: impl AsyncFnMut()
+        -> Result<Option<(ArmId, PoseSetpoint)>, Tagged<ArmId, peppygen::Error>>,
+    next_right: impl AsyncFnMut()
+        -> Result<Option<(ArmId, PoseSetpoint)>, Tagged<ArmId, peppygen::Error>>,
+    placer: Arc<Placer>,
+    latest: PerArm<watch::Sender<Option<Upstream>>, ARMS>,
+    activity: PerArm<LeaderActivity, ARMS>,
+) {
+    let left_placer = placer.clone();
+    tokio::select! {
+        () = follow_pair(
+            what,
+            stopped.cancelled(),
+            next_left,
+            move |setpoint| place_pose_command(left_placer.clone(), setpoint),
+            latest.clone(),
+            Some(activity.clone()),
+        ) => {}
+        () = follow_pair(
+            what,
+            stopped.cancelled(),
+            next_right,
+            move |setpoint| place_pose_command(placer.clone(), setpoint),
+            latest,
+            Some(activity),
+        ) => {}
+    }
 }
 
 /// Receive both upstream arm setpoint streams forever (the leading node's
@@ -333,7 +432,7 @@ pub async fn run_joint_command_listener(
                 r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| msg.positions))),
             }
         },
-        parse_joint_command,
+        |positions| ready(parse_joint_command(positions)),
         latest,
         Some(activity),
     )
@@ -366,7 +465,7 @@ pub async fn run_gripper_command_listener(
             r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
             r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.max_effort)))),
         },
-        |(opening, max_effort)| parse_gripper_command(opening, max_effort),
+        |(opening, max_effort)| ready(parse_gripper_command(opening, max_effort)),
         latest,
         Some(activity),
     )
@@ -397,10 +496,10 @@ pub async fn run_joint_state_listener(
         WHAT,
         runner.cancellation_token().cancelled(),
         async move || tokio::select! {
-            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
-            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.positions, msg.velocities)))),
+            r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.timestamp, msg.positions, msg.velocities)))),
+            r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.timestamp, msg.positions, msg.velocities)))),
         },
-        |(positions, velocities)| parse_joint_state(positions, velocities),
+        |(timestamp, positions, velocities)| ready(parse_joint_state(timestamp, positions, velocities)),
         latest,
         None,
     )
@@ -433,7 +532,7 @@ pub async fn run_gripper_state_listener(
             r = left.next() => tagged(left_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
             r = right.next() => tagged(right_arm, r.map(|m| m.map(|(_, msg)| (msg.opening, msg.effort, msg.max_effort)))),
         },
-        |(opening, effort, max_effort)| parse_gripper_state(opening, effort, max_effort),
+        |(opening, effort, max_effort)| ready(parse_gripper_state(opening, effort, max_effort)),
         latest,
         None,
     )
@@ -486,8 +585,14 @@ pub async fn run_governor_config_listener(
 mod tests {
     use super::*;
 
+    use control_core::geometry::pose_arrays;
+    use control_core::node_clock::NodeClock;
+    use control_core::robot_tree::RobotTree;
+    use frame_tree::{FrameName, MovingMessage, Publisher, StaticMessage, TransformRecord};
     use srs_model::ARM_DOF;
     use srs_model::nalgebra::{Isometry3, Vector3};
+
+    use crate::test_support::{LEFT, RIGHT, measured_at};
 
     #[test]
     fn a_leader_streams_a_limb_for_the_window_after_its_last_command() {
@@ -501,12 +606,30 @@ mod tests {
 
     #[test]
     fn joint_state_requires_arm_dof_positions_with_matching_velocities() {
-        let state = parse_joint_state(vec![0.1; ARM_DOF], vec![0.0; ARM_DOF]).unwrap();
+        let state =
+            parse_joint_state(measured_at(), vec![0.1; ARM_DOF], vec![0.0; ARM_DOF]).unwrap();
         assert_eq!(state.positions, [0.1; ARM_DOF]);
-        assert!(parse_joint_state(vec![0.1; ARM_DOF - 1], vec![0.0; ARM_DOF - 1]).is_err());
-        assert!(parse_joint_state(vec![0.1; ARM_DOF + 1], vec![0.0; ARM_DOF + 1]).is_err());
-        assert!(parse_joint_state(vec![], vec![]).is_err());
-        assert!(parse_joint_state(vec![0.1; ARM_DOF], vec![0.0; ARM_DOF - 1]).is_err());
+        assert_eq!(state.timestamp, measured_at());
+        assert!(
+            parse_joint_state(
+                measured_at(),
+                vec![0.1; ARM_DOF - 1],
+                vec![0.0; ARM_DOF - 1]
+            )
+            .is_err()
+        );
+        assert!(
+            parse_joint_state(
+                measured_at(),
+                vec![0.1; ARM_DOF + 1],
+                vec![0.0; ARM_DOF + 1]
+            )
+            .is_err()
+        );
+        assert!(parse_joint_state(measured_at(), vec![], vec![]).is_err());
+        assert!(
+            parse_joint_state(measured_at(), vec![0.1; ARM_DOF], vec![0.0; ARM_DOF - 1]).is_err()
+        );
     }
 
     #[test]
@@ -515,7 +638,7 @@ mod tests {
         // velocity, so the generic contract's unmeasured (empty) form is
         // treated as malformed instead of half-accepted.
         assert_eq!(
-            parse_joint_state(vec![0.1; ARM_DOF], vec![]),
+            parse_joint_state(measured_at(), vec![0.1; ARM_DOF], vec![]),
             Err("a velocity count that does not match its joints")
         );
     }
@@ -525,65 +648,277 @@ mod tests {
         let mut positions = vec![0.1; ARM_DOF];
         positions[3] = f64::NAN;
         assert_eq!(
-            parse_joint_state(positions, vec![0.0; ARM_DOF]),
+            parse_joint_state(measured_at(), positions, vec![0.0; ARM_DOF]),
             Err("non-finite values")
         );
         let mut velocities = vec![0.0; ARM_DOF];
         velocities[6] = f64::INFINITY;
         assert_eq!(
-            parse_joint_state(vec![0.1; ARM_DOF], velocities),
+            parse_joint_state(measured_at(), vec![0.1; ARM_DOF], velocities),
             Err("non-finite values")
         );
     }
 
-    /// Extract the pose from an `Upstream` the parser was expected to accept.
-    fn parsed_pose(
+    fn frame(name: &str) -> FrameName {
+        FrameName::parse(name).expect("a frame name")
+    }
+
+    /// A placer whose tree holds the frame `mount` fixed 1 m above the robot
+    /// frame, `base_link`, and that waits `wait` for the tree.
+    fn placer_waiting(wait: Duration) -> Placer {
+        let tree = RobotTree::new(Duration::from_secs(10), NodeClock::wall()).expect("a window");
+        let fixed = StaticMessage {
+            transforms: vec![TransformRecord {
+                frame: "base_link".to_string(),
+                child_frame: "mount".to_string(),
+                position: [0.0, 0.0, 1.0],
+                orientation: [0.0, 0.0, 0.0, 1.0],
+            }],
+        };
+        let initializer = Publisher {
+            core_node: "core".to_string(),
+            instance_id: "init_inst".to_string(),
+        };
+        tree.take_static(&initializer, &fixed)
+            .expect("a fixed transform");
+        Placer::new(Arc::new(tree), frame("base_link"), wait)
+    }
+
+    /// A placer whose tree holds the frame `mount` fixed 1 m above the robot
+    /// frame, `base_link`, and that waits for nothing.
+    fn placer() -> Placer {
+        placer_waiting(Duration::ZERO)
+    }
+
+    /// The robot frame of the tests' base standing at `x, y` (m) on the floor
+    /// of odom, turned by `yaw` (rad) about +z.
+    fn base_in_odom(x: f64, y: f64, yaw: f64) -> Isometry3<f64> {
+        Isometry3::new(Vector3::new(x, y, 0.0), Vector3::new(0.0, 0.0, yaw))
+    }
+
+    /// A placer whose tree holds the robot frame, `base_link`, on a base that
+    /// odom places at `base_then` at `then` and at `base_now` at `now`, the
+    /// latest time it holds, on a clock that reads `now`, and that waits for
+    /// nothing.
+    fn placer_on_a_moving_base(
+        then: SystemTime,
+        base_then: &Isometry3<f64>,
+        now: SystemTime,
+        base_now: &Isometry3<f64>,
+    ) -> Placer {
+        let (clock, feed) = NodeClock::simulation();
+        let now_ns = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("a time after the epoch")
+            .as_nanos();
+        feed.tick(u64::try_from(now_ns).expect("a time within u64 nanoseconds"));
+        let tree = RobotTree::new(Duration::from_secs(10), clock).expect("a window");
+        let odometry = Publisher {
+            core_node: "core".to_string(),
+            instance_id: "base_inst".to_string(),
+        };
+        for (timestamp, base) in [(then, base_then), (now, base_now)] {
+            let (position, orientation) = pose_arrays(base);
+            let measured = MovingMessage {
+                timestamp,
+                transforms: vec![TransformRecord {
+                    frame: "odom".to_string(),
+                    child_frame: "base_link".to_string(),
+                    position,
+                    orientation,
+                }],
+                start_timestamp: then,
+            };
+            tree.take_moving(&odometry, &measured)
+                .expect("a transform of the base");
+        }
+        Placer::new(Arc::new(tree), frame("base_link"), Duration::ZERO)
+    }
+
+    /// A setpoint in `frame` at `timestamp`, or at the latest time for none, at
+    /// `position` with `orientation`.
+    fn setpoint(
+        frame: &str,
+        timestamp: Option<SystemTime>,
         position: [f64; 3],
         orientation: [f64; 4],
-    ) -> Result<Isometry3<f64>, &'static str> {
-        match parse_pose_command(position, orientation)? {
-            Upstream::Pose(pose) => Ok(pose),
-            Upstream::Joints(_) => panic!("the pose parser produced a joint command"),
+    ) -> PoseSetpoint {
+        PoseSetpoint {
+            frame: Some(frame.to_string()),
+            timestamp,
+            position,
+            orientation,
         }
     }
 
-    #[test]
-    fn pose_command_reads_the_wire_as_scalar_last() {
-        // A quarter turn about +Z, written the way the wire writes it. Reading
-        // it scalar-first instead would silently produce a different attitude,
-        // so pin the recovered axis and angle rather than the four components.
-        let half = std::f64::consts::FRAC_PI_4;
-        let pose = parsed_pose([0.4, -0.1, 0.3], [0.0, 0.0, half.sin(), half.cos()]).unwrap();
-        assert_eq!(pose.translation.vector, Vector3::new(0.4, -0.1, 0.3));
-        let (axis, angle) = pose.rotation.axis_angle().unwrap();
-        assert!((angle - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
-        assert!((axis.into_inner() - Vector3::z()).norm() < 1e-12);
+    /// The pose `placer` places a setpoint at.
+    async fn placed_by(
+        placer: &Arc<Placer>,
+        setpoint: PoseSetpoint,
+    ) -> Result<Isometry3<f64>, String> {
+        match place_pose_command(placer.clone(), setpoint).await? {
+            Upstream::Pose(pose) => Ok(pose),
+            Upstream::Joints(_) => panic!("the pose placement produced a joint command"),
+        }
     }
 
-    #[test]
-    fn pose_command_normalizes_a_non_unit_quaternion() {
-        // Four independent floats reach us; only unit ones name a rotation.
-        let pose = parsed_pose([0.0; 3], [0.0, 0.0, 0.0, 5.0]).unwrap();
+    /// The pose a setpoint the placer takes is placed at.
+    async fn placed(setpoint: PoseSetpoint) -> Result<Isometry3<f64>, String> {
+        placed_by(&Arc::new(placer()), setpoint).await
+    }
+
+    // A setpoint in the robot frame of a robot whose robot frame is the root of
+    // its tree is placed as it comes at any time; one in a frame of the tree is
+    // placed by that frame.
+    #[tokio::test]
+    async fn a_pose_setpoint_is_placed_in_the_robot_frame_by_its_frame() {
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let long_ago = Some(SystemTime::now() - Duration::from_secs(3600));
+        let in_robot = placed(setpoint("base_link", long_ago, [0.4, -0.1, 0.3], identity))
+            .await
+            .expect("a robot-frame setpoint");
+        assert_eq!(in_robot.translation.vector, Vector3::new(0.4, -0.1, 0.3));
+        let on_mount = placed(setpoint("mount", None, [0.4, -0.1, 0.3], identity))
+            .await
+            .expect("a setpoint in a frame of the tree");
+        assert_eq!(on_mount.translation.vector, Vector3::new(0.4, -0.1, 1.3));
+    }
+
+    // A setpoint in the robot frame at a time names where the robot frame
+    // stood then, as pose_link places one: on a base that moved since, it is
+    // placed where that place stands in the robot frame now. One with no
+    // timestamp names where the robot frame stands at the latest time. A
+    // setpoint with no frame lies in the robot frame.
+    #[tokio::test]
+    async fn a_robot_frame_setpoint_at_a_time_is_placed_where_the_robot_frame_stood_then() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let then = now - Duration::from_secs(2);
+        let base_then = base_in_odom(-0.05, 0.02, -0.1);
+        let base_now = base_in_odom(0.10, 0.05, 0.2);
+        let placer = Arc::new(placer_on_a_moving_base(then, &base_then, now, &base_now));
+        let pose = Isometry3::new(Vector3::new(0.4, -0.1, 0.3), Vector3::new(0.0, 0.0, 0.3));
+        let (position, orientation) = pose_arrays(&pose);
+
+        let stood_then = placed_by(
+            &placer,
+            setpoint("base_link", Some(then), position, orientation),
+        )
+        .await
+        .expect("a robot-frame setpoint at a time the tree holds");
+        let expected = base_now.inverse() * base_then * pose;
+        assert!(
+            (stood_then.translation.vector - expected.translation.vector).norm() < 1e-12,
+            "{stood_then} placed, {expected} expected"
+        );
+        assert!(stood_then.rotation.angle_to(&expected.rotation) < 1e-12);
+        assert!(
+            (stood_then.translation.vector - pose.translation.vector).norm() > 0.05,
+            "the base moves far enough between the two times to tell the places apart"
+        );
+        let no_frame = PoseSetpoint {
+            frame: None,
+            ..setpoint("", Some(then), position, orientation)
+        };
+        assert_eq!(placed_by(&placer, no_frame).await, Ok(stood_then));
+
+        let stands_now = placed_by(&placer, setpoint("base_link", None, position, orientation))
+            .await
+            .expect("a robot-frame setpoint at the latest time");
+        assert!((stands_now.translation.vector - pose.translation.vector).norm() < 1e-12);
+        assert!(stands_now.rotation.angle_to(&pose.rotation) < 1e-12);
+    }
+
+    // A setpoint that waits for the tree holds back only its own arm: the
+    // other arm's setpoint, which comes after it, is placed while it waits.
+    // Tokio's clock is paused and moves only while every task waits, so the
+    // left arm's wait and the bound on the right arm's placement end on it
+    // alone, the bound first.
+    #[tokio::test(start_paused = true)]
+    async fn a_setpoint_that_waits_for_the_tree_holds_back_only_its_own_arm() {
+        type Received = Result<Option<(ArmId, PoseSetpoint)>, Tagged<ArmId, peppygen::Error>>;
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let placer = Arc::new(placer_waiting(Duration::from_secs(3600)));
+        let latest = PerArm::from_fn(|_| watch::Sender::new(None));
+        let mut right_latest = latest[RIGHT].subscribe();
+        let left_taken = tokio::sync::Notify::new();
+        let mut left_sent = false;
+        let next_left = async || -> Received {
+            if left_sent {
+                return std::future::pending().await;
+            }
+            left_sent = true;
+            left_taken.notify_one();
+            Ok(Some((LEFT, setpoint("nowhere", None, [0.0; 3], identity))))
+        };
+        let mut right_sent = false;
+        let next_right = async || -> Received {
+            if right_sent {
+                return std::future::pending().await;
+            }
+            left_taken.notified().await;
+            right_sent = true;
+            Ok(Some((
+                RIGHT,
+                setpoint("base_link", None, [0.4, -0.1, 0.3], identity),
+            )))
+        };
+        let stopped = CancellationToken::new();
+        let following = follow_pose_setpoints(
+            "pose_setpoints",
+            &stopped,
+            next_left,
+            next_right,
+            placer,
+            latest.clone(),
+            PerArm::from_fn(|_| LeaderActivity::default()),
+        );
+        tokio::select! {
+            () = following => panic!("the setpoints stopped being followed"),
+            changed = tokio::time::timeout(Duration::from_secs(10), right_latest.changed()) => {
+                changed
+                    .expect("the right arm's setpoint is placed while the left arm's waits")
+                    .expect("the right arm's latest is open");
+            }
+        }
+        assert!(matches!(*right_latest.borrow(), Some(Upstream::Pose(_))));
+        assert_eq!(*latest[LEFT].borrow(), None);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::approx_constant,
+        reason = "a quarter turn typed to four places, as a caller types one"
+    )]
+    async fn a_pose_setpoint_typed_near_unit_is_normalized() {
+        let typed = setpoint("base_link", None, [0.0; 3], [0.0, 0.0, 0.7071, 0.7071]);
+        let pose = placed(typed)
+            .await
+            .expect("an orientation within tf2's tolerance");
         assert!((pose.rotation.quaternion().norm() - 1.0).abs() < 1e-12);
-        assert!(pose.rotation.angle() < 1e-12);
+        assert!((pose.rotation.angle() - std::f64::consts::FRAC_PI_2).abs() < 1e-3);
     }
 
-    #[test]
-    fn pose_command_rejects_the_shapes_the_governor_could_not_survive() {
-        // A non-finite component reaching the governor faults the whole tick,
-        // and a zero quaternion names no rotation to substitute for.
-        assert_eq!(
-            parse_pose_command([f64::NAN, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]),
-            Err("non-finite values")
+    // A setpoint no contract takes and one the tree cannot place are dropped,
+    // the reason naming why.
+    #[tokio::test]
+    async fn a_pose_setpoint_off_unit_or_in_a_frame_the_tree_lacks_is_dropped() {
+        let latest = None;
+        let refused = |orientation| placed(setpoint("base_link", latest, [0.0; 3], orientation));
+        for orientation in [[0.0, 0.0, 0.0, 1.006], [0.0; 4], [0.0, f64::NAN, 0.0, 1.0]] {
+            let reason = refused(orientation).await.expect_err("no unit quaternion");
+            assert!(reason.starts_with("a pose no contract takes: "), "{reason}");
+        }
+        let reason = placed(setpoint("odom", latest, [0.0; 3], [0.0, 0.0, 0.0, 1.0]))
+            .await
+            .expect_err("a frame the tree does not hold");
+        assert!(
+            reason.starts_with("a pose the robot's tree cannot place: no transform of the tree names the frame odom"),
+            "{reason}"
         );
-        assert_eq!(
-            parse_pose_command([0.0; 3], [0.0, f64::INFINITY, 0.0, 1.0]),
-            Err("non-finite values")
-        );
-        assert_eq!(
-            parse_pose_command([0.0; 3], [0.0, 0.0, 0.0, 0.0]),
-            Err("an unnormalizable orientation")
-        );
+        let reason = placed(setpoint("", latest, [0.0; 3], [0.0, 0.0, 0.0, 1.0]))
+            .await
+            .expect_err("no frame");
+        assert!(reason.starts_with("a pose no contract takes: "), "{reason}");
     }
 
     #[test]

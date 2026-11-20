@@ -1,13 +1,15 @@
 """Tests for the capture throttle state machine: warm, promote, read, disarm,
-and the consecutive-failure bound, and for where a model's cameras are hung
-on its robot. Fakes stand in for annotators and render products; the
-renderer's own behavior is exercised only in a live engine."""
+and the consecutive-failure bound, for the frame and the capture index each
+picture names, and for where a model's cameras are hung on its robot. Fakes
+stand in for annotators and render products; the renderer's own behavior is
+exercised only in a live engine."""
 
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
+import robot_description_py
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
@@ -16,10 +18,9 @@ sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 import _world
 import camera_sensor
 import isaac_models
-from camera_geometry import pinhole
 from camera_sensor import _MAX_CAPTURE_FAILURES, IsaacCameraSensor
 from entries import entry
-from sim_robot_core.cameras import CameraConfig, DepthSpec
+from sim_robot_core.cameras import DEPTH_TO_COLOR, CameraConfig, DepthSpec, pinhole
 
 _WIDTH, _HEIGHT = 4, 2
 _FPS = 10
@@ -61,12 +62,12 @@ class FakeIO:
     def timestamp_s(self):
         return 123.0
 
-    def publish_color_frame(self, robot, name, timestamp_s, frame_id, *rest):
-        self.frames.append((robot, name, frame_id))
+    def publish_color_frame(self, robot, name, timestamp_s, frame, capture_index, *rest):
+        self.frames.append((robot, name, frame, capture_index))
         return self.delivers
 
-    def publish_rgbd_frames(self, robot, name, timestamp_s, frame_id, align_mode, color, depth):
-        self.frames.append((robot, name, frame_id))
+    def publish_rgbd_frames(self, robot, name, timestamp_s, frame, capture_index, align_mode, color, depth):
+        self.frames.append((robot, name, frame, capture_index))
         self.depth_payloads.append(depth)
         return self.delivers
 
@@ -100,6 +101,7 @@ def clock(monkeypatch):
 def _sensor(throttled=True):
     camera = CameraConfig(
         name="cam",
+        frame="cam_optical_frame",
         parent_link="link",
         pos=(0.0, 0.0, 0.0),
         quat_wxyz=(1.0, 0.0, 0.0, 0.0),
@@ -133,7 +135,7 @@ class TestThrottledCycle:
         assert io.frames == []
 
         sensor.step()
-        assert io.frames == [("alpha", "cam", 0)]
+        assert io.frames == [("alpha", "cam", "cam_optical_frame", 0)]
         assert render_product.updates == [True, False]
 
     def test_empty_annotator_keeps_camera_armed(self, clock):
@@ -146,7 +148,7 @@ class TestThrottledCycle:
 
         annotator.make_valid()
         sensor.step()
-        assert io.frames == [("alpha", "cam", 0)]
+        assert io.frames == [("alpha", "cam", "cam_optical_frame", 0)]
         assert render_product.updates == [True, False]
 
     def test_next_cycle_waits_for_the_pacer(self, clock):
@@ -154,7 +156,7 @@ class TestThrottledCycle:
         annotator.make_valid()
         for _ in range(3):
             sensor.step()
-        assert io.frames == [("alpha", "cam", 0)]
+        assert io.frames == [("alpha", "cam", "cam_optical_frame", 0)]
 
         sensor.step()
         assert render_product.updates == [True, False]
@@ -162,7 +164,7 @@ class TestThrottledCycle:
         clock["t"] += 1.0 / _FPS
         for _ in range(3):
             sensor.step()
-        assert io.frames == [("alpha", "cam", 0), ("alpha", "cam", 1)]
+        assert io.frames == [("alpha", "cam", "cam_optical_frame", 0), ("alpha", "cam", "cam_optical_frame", 1)]
         assert render_product.updates == [True, False, True, False]
 
     def test_deadline_during_capture_does_not_double_arm(self, clock):
@@ -224,7 +226,7 @@ class TestUnthrottled:
         annotator.make_valid()
 
         sensor.step()
-        assert io.frames == [("alpha", "cam", 0)]
+        assert io.frames == [("alpha", "cam", "cam_optical_frame", 0)]
         assert render_product.updates == []
         assert sensor._armed == set() and sensor._warming == set()
 
@@ -233,6 +235,7 @@ class TestRgbdCapture:
     def test_throttled_cycle_publishes_subsampled_depth(self, clock):
         camera = CameraConfig(
             name="rgbd",
+            frame="rgbd_optical_frame",
             parent_link="link",
             pos=(0.0, 0.0, 0.0),
             quat_wxyz=(1.0, 0.0, 0.0, 0.0),
@@ -259,7 +262,7 @@ class TestRgbdCapture:
 
         for _ in range(3):
             sensor.step()
-        assert io.frames == [("alpha", "rgbd", 0)]
+        assert io.frames == [("alpha", "rgbd", "rgbd_optical_frame", 0)]
         assert render_product.updates == [True, False]
         (_, _, _, payload) = io.depth_payloads[0]
         assert len(payload) == (_WIDTH // 2) * (_HEIGHT // 2) * 2
@@ -275,6 +278,7 @@ class TestGeometry:
     def test_an_rgbd_cameras_depth_grid_is_a_centred_pinhole(self, clock):
         camera = CameraConfig(
             name="rgbd",
+            frame="rgbd_optical_frame",
             parent_link="link",
             pos=(0.0, 0.0, 0.0),
             quat_wxyz=(1.0, 0.0, 0.0, 0.0),
@@ -294,8 +298,10 @@ class TestGeometry:
         color = pinhole(60.0, _WIDTH, _HEIGHT)
         depth = pinhole(60.0, _WIDTH // 2, _HEIGHT // 2)
         assert io.geometries == [
-            ("alpha", "rgbd", color, depth, "z", 0.1, 1.0, "depth_to_color",
-             (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+            (
+                "alpha", "rgbd", color, depth, "z", 0.1, 1.0, "depth_to_color", "rgbd_optical_frame",
+                DEPTH_TO_COLOR,
+            )
         ]
         # The same field of view at the depth stream's size, centred.
         assert depth.fx == pytest.approx(color.fx / 2)
@@ -326,6 +332,19 @@ class TestWhereAModelsCamerasHang:
             sensor._define_camera_prim(stage, stage.GetPrimAtPath(root), camera)
             for camera in known.entry.cameras
         ]
+
+    def test_each_picture_names_the_optical_frame_the_robots_description_gives_its_camera(self, clock):
+        so101 = _world.known("so101")
+        sensor = IsaacCameraSensor("charlo", "/World/charlo", so101, FakeIO())
+        annotator = FakeAnnotator()
+        annotator.data = np.ones((so101.entry.cameras[0].height, so101.entry.cameras[0].width, 4), dtype=np.uint8)
+        sensor._annotators[("wrist", "color")] = annotator
+        sensor._ready = True
+
+        sensor.step()
+
+        (described,) = robot_description_py.model("so101").description().cameras
+        assert sensor._io.frames == [("charlo", "wrist", described.frame, 0)]
 
     def test_the_rig_is_the_cameras_of_the_robots_own_model(self):
         so101 = _world.known("so101")

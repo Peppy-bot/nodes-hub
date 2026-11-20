@@ -55,7 +55,11 @@ pub fn parse_scene(data: &get_planning_scene::ResponseData) -> Result<PlanningSc
             let shapes = object.shapes.iter().map(|shape| ShapeFields {
                 kind: &shape.kind,
                 dimensions: &shape.dimensions,
-                vertices: &shape.mesh_vertices,
+                vertices: shape
+                    .mesh_vertices
+                    .iter()
+                    .map(|vertex| vertex.position)
+                    .collect(),
                 triangles: &shape.mesh_triangles,
                 position: shape.position,
                 orientation: shape.orientation,
@@ -76,7 +80,11 @@ pub fn parse_scene(data: &get_planning_scene::ResponseData) -> Result<PlanningSc
             let shapes = attached.shapes.iter().map(|shape| ShapeFields {
                 kind: &shape.kind,
                 dimensions: &shape.dimensions,
-                vertices: &shape.mesh_vertices,
+                vertices: shape
+                    .mesh_vertices
+                    .iter()
+                    .map(|vertex| vertex.position)
+                    .collect(),
                 triangles: &shape.mesh_triangles,
                 position: shape.position,
                 orientation: shape.orientation,
@@ -89,7 +97,7 @@ pub fn parse_scene(data: &get_planning_scene::ResponseData) -> Result<PlanningSc
             )?;
             Ok(AttachedObject {
                 id: attached.id.clone(),
-                link: attached.link_name.clone(),
+                link: attached.frame.clone(),
                 placement,
                 shapes,
             })
@@ -112,7 +120,7 @@ pub fn parse_scene(data: &get_planning_scene::ResponseData) -> Result<PlanningSc
 struct ShapeFields<'a> {
     kind: &'a str,
     dimensions: &'a [f64],
-    vertices: &'a [f64],
+    vertices: Vec<[f64; 3]>,
     triangles: &'a [u32],
     position: [f64; 3],
     orientation: [f64; 4],
@@ -146,7 +154,7 @@ fn parse_shape(shape: &ShapeFields) -> Result<Shape, String> {
         ("cylinder", &[height, radius]) if lengths_are_valid(&[height, radius]) => {
             ShapeKind::Cylinder { height, radius }
         }
-        ("mesh", _) => parse_mesh(shape.vertices, shape.triangles)?,
+        ("mesh", _) => parse_mesh(&shape.vertices, shape.triangles)?,
         ("box", _) => return Err(lengths_error("box", 3, shape.dimensions)),
         ("sphere", _) => return Err(lengths_error("sphere", 1, shape.dimensions)),
         ("cylinder", _) => return Err(lengths_error("cylinder", 2, shape.dimensions)),
@@ -169,9 +177,8 @@ fn lengths_are_valid(lengths: &[f64]) -> bool {
         .all(|length| length.is_finite() && *length > 0.0)
 }
 
-fn parse_mesh(vertices: &[f64], triangles: &[u32]) -> Result<ShapeKind, String> {
-    let (vertices, rest) = vertices.as_chunks::<3>();
-    if !rest.is_empty() || vertices.iter().flatten().any(|c| !c.is_finite()) {
+fn parse_mesh(vertices: &[[f64; 3]], triangles: &[u32]) -> Result<ShapeKind, String> {
+    if vertices.iter().flatten().any(|c| !c.is_finite()) {
         return Err("a mesh takes three finite coordinates a vertex".to_string());
     }
     let (triangles, rest) = triangles.as_chunks::<3>();
@@ -194,7 +201,8 @@ fn parse_mesh(vertices: &[f64], triangles: &[u32]) -> Result<ShapeKind, String> 
 
 /// Asks the planner for its arms until it answers, then reads the scene every
 /// `poll_interval` and draws it at each read, until the node stops: a page that opens
-/// late shows the scene as it is within one read. The changes from the scene before are
+/// late shows the scene as it is within one read. A read in another frame than the robot
+/// frame is dropped, the first of a run logged. The changes from the scene before are
 /// logged only when there are some.
 pub async fn follow_scene(
     runner: Arc<NodeRunner>,
@@ -229,7 +237,7 @@ pub async fn follow_scene(
         let read = tokio::select! {
             biased;
             () = token.cancelled() => return,
-            read = sendable(read_scene(&runner, planner)) => read,
+            read = sendable(read_scene(&runner, planner, &shared)) => read,
         };
         let scene = match read {
             Ok(scene) => scene,
@@ -259,14 +267,16 @@ pub async fn follow_scene(
     }
 }
 
-/// One read of the planning scene.
+/// One read of the planning scene, held to the robot frame.
 async fn read_scene(
-    runner: &NodeRunner,
+    runner: &Arc<NodeRunner>,
     planner: &peppygen::ProducerRef,
+    shared: &Arc<Shared>,
 ) -> Result<PlanningScene, String> {
     let response = sendable(get_planning_scene::poll(runner, planner, SERVICE_TIMEOUT))
         .await
         .map_err(|e| format!("get_planning_scene: {e}"))?;
+    shared.hold_to_robot_frame(runner, "get_planning_scene", &response.data.frame)?;
     parse_scene(&response.data).map_err(|e| e.to_string())
 }
 
@@ -288,19 +298,20 @@ pub(crate) mod tests {
         ResponseDataAttachedObjectsItemShapesItem, ResponseDataObjectsItem,
         ResponseDataObjectsItemShapesItem,
     };
+    use std::time::SystemTime;
 
     const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 
     fn fields<'a>(
         kind: &'a str,
         dimensions: &'a [f64],
-        vertices: &'a [f64],
+        vertices: &[[f64; 3]],
         triangles: &'a [u32],
     ) -> ShapeFields<'a> {
         ShapeFields {
             kind,
             dimensions,
-            vertices,
+            vertices: vertices.to_vec(),
             triangles,
             position: [0.0; 3],
             orientation: IDENTITY,
@@ -328,7 +339,15 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn scene(objects: Vec<ResponseDataObjectsItem>) -> ResponseData {
-        ResponseData::new(objects, vec![], vec![], 0.04, 0.02)
+        ResponseData::new(
+            "base_link".to_string(),
+            SystemTime::UNIX_EPOCH,
+            objects,
+            vec![],
+            vec![],
+            0.04,
+            0.02,
+        )
     }
 
     #[test]
@@ -336,7 +355,7 @@ pub(crate) mod tests {
         let mut data = scene(vec![lime([0.4, -0.2, 0.1])]);
         data.attached_objects = vec![ResponseDataAttachedObjectsItem {
             id: "brain/apple_1".to_string(),
-            link_name: "openarm_right_tcp".to_string(),
+            frame: "openarm_right_tcp".to_string(),
             touch_links: vec![],
             position: [0.0, 0.0, 0.05],
             orientation: IDENTITY,
@@ -398,7 +417,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_mesh_takes_whole_vertices_and_triangles_within_them() {
-        let vertices = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
         let parsed =
             parse_shape(&fields("mesh", &[], &vertices, &[0, 1, 2])).expect("a valid mesh");
         assert_eq!(
@@ -408,7 +427,8 @@ pub(crate) mod tests {
                 triangles: vec![[0, 1, 2]],
             }
         );
-        assert!(parse_shape(&fields("mesh", &[], &vertices[..8], &[0, 1, 2])).is_err());
+        let unplaced = [[0.0, 0.0, 0.0], [1.0, f64::NAN, 0.0], [0.0, 1.0, 0.0]];
+        assert!(parse_shape(&fields("mesh", &[], &unplaced, &[0, 1, 2])).is_err());
         assert!(parse_shape(&fields("mesh", &[], &vertices, &[0, 1, 3])).is_err());
         assert!(parse_shape(&fields("mesh", &[], &vertices, &[0, 1])).is_err());
     }

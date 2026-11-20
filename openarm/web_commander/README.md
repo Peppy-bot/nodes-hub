@@ -9,13 +9,19 @@ interaction modes:
   and gripper setpoints continuously on its joint_link / gripper_link pairing
   slots. Per-arm controls: seven joint sliders, toward which the joint
   target ramps under the jog's speed and acceleration limits, and the gripper
-  slider. The world-frame x/y/z sliders and the orientation arcball read the
-  pose of the joint target here.
-- **Actions**: compose a target, either on the joint sliders or as a world-frame
-  pose on the x/y/z sliders and the arcball, then **Execute** fires a discrete
-  governed move on the `limb_motion` contract slot (`move_arm_joints` for a
-  joint target, `move_arm` for a pose, `move_gripper` for the jaw; the backbone
-  serves them), with **Home Pose** / **Ready Pose** presets. In Actions mode
+  slider. The x/y/z sliders and the orientation arcball read the pose of the
+  joint target here, in the robot frame, the root link of the robot's
+  description.
+- **Actions**: compose a target, either on the joint sliders or as a
+  robot-frame pose on the x/y/z sliders and the arcball, then **Execute** fires
+  a discrete governed move on the `limb_motion` contract slot
+  (`move_arm_joints` for a joint target, `move_arm` for a pose, `move_gripper`
+  for the jaw; the backbone serves them), with **Home Pose** / **Ready Pose**
+  presets. A `move_arm` target names the robot frame with no timestamp, at the
+  latest time, so the backbone places it where the robot frame stands when it
+  accepts the goal; a
+  pose whose orientation is no unit quaternion does not fire, and the status
+  line says what to send. In Actions mode
   each arm card shows its per-move inputs: **move time (s)** and **settle
   timeout (s)**; below them the **joint move** group, the **angle tolerance
   (rad)** every joint settles within; and below that the **pose move** group,

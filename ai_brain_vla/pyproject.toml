@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "ai_brain_vla"
 version = "0.1.0"
 description = "ai_brain_vla peppy node"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "peppygen",
     "peppylib",
@@ -51,4 +51,4 @@ peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 # brain_core lives in the public-peppy-libs repository, pinned to one commit
 # of it: the node image holds the node's own directory alone.
-brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "f8565c97a28d64ac3d4f977075fa52de1244e84d" }
+brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "afd4ea988216ece0f17ed13d9a58a4bab3e67922" }

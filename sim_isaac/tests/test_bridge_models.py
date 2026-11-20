@@ -120,7 +120,7 @@ def _robot(engine, instance: str, known):
     model, fingers first so no limb's rows are its entry's own order."""
     import world  # pylint: disable=C0415
 
-    robot = world.Robot(instance=instance, known=known, placement=world.Placement.of([0, 0, 0], 0.0))
+    robot = world.Robot(instance=instance, known=known, placement=_world.placement_at(0.0))
     entry = known.entry
     engine.views.dofs[robot.articulation()] = [*entry.finger_joints(), *entry.arm_joints()]
     return robot

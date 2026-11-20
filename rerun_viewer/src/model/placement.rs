@@ -1,7 +1,8 @@
 //! Where a frame sits in another, as the contracts carry it: a position in meters and a
 //! unit quaternion [x, y, z, w].
 
-use camera_core::pose::{Pose, PoseError};
+use control_core::geometry::{GeometryError, Pose};
+use frame_tree::Transform;
 
 /// A position and a unit quaternion, kept as they came so that two placements compare
 /// equal when the wire gave the same numbers, with the pose they make.
@@ -9,7 +10,7 @@ use camera_core::pose::{Pose, PoseError};
 pub struct Placement {
     pub position: [f64; 3],
     pub orientation: [f64; 4],
-    pub pose: Pose,
+    pub pose: Transform,
 }
 
 impl PartialEq for Placement {
@@ -19,9 +20,10 @@ impl PartialEq for Placement {
 }
 
 impl Placement {
-    /// The placement of `position` and `orientation`, a unit quaternion [x, y, z, w].
-    pub fn parse(position: [f64; 3], orientation: [f64; 4]) -> Result<Self, PoseError> {
-        let pose = Pose::new(position, orientation)?;
+    /// The placement of `position` and `orientation`, a unit quaternion [x, y, z, w], parsed
+    /// as control_core parses a pose of the contracts.
+    pub fn parse(position: [f64; 3], orientation: [f64; 4]) -> Result<Self, GeometryError> {
+        let pose = Pose::parse(position, orientation)?.transform();
         Ok(Self {
             position,
             orientation,
@@ -31,12 +33,13 @@ impl Placement {
 }
 
 /// The pose with no turn whose origin is `position`.
-pub fn translation(position: [f64; 3]) -> Pose {
-    Pose::new(position, [0.0, 0.0, 0.0, 1.0]).expect("a finite position and the unit quaternion")
+pub fn translation(position: [f64; 3]) -> Transform {
+    Transform::new(position, [0.0, 0.0, 0.0, 1.0])
+        .expect("a finite position and the unit quaternion")
 }
 
 /// The columns of the rotation of `pose`: where it takes the unit vectors x, y and z.
-pub fn rotation_columns(pose: &Pose) -> [[f64; 3]; 3] {
+pub fn rotation_columns(pose: &Transform) -> [[f64; 3]; 3] {
     let origin = pose.origin();
     let unit = |axis: usize| {
         let mut vector = [0.0; 3];
@@ -83,7 +86,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_columns_of_a_quarter_turn_about_z_take_x_to_y() {
-        let pose = Pose::new([5.0, 6.0, 7.0], quarter_turn_about_z()).unwrap();
+        let pose = Transform::new([5.0, 6.0, 7.0], quarter_turn_about_z()).unwrap();
         let [x, y, z] = rotation_columns(&pose);
         assert!(close(x, [0.0, 1.0, 0.0], 1e-12));
         assert!(close(y, [-1.0, 0.0, 0.0], 1e-12));

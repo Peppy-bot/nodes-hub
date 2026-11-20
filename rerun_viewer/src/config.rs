@@ -31,12 +31,10 @@ pub struct Config {
     pub scene_poll_interval: Duration,
     /// How many past grasp-point positions each arm's trail holds.
     pub trail_length: NonZeroUsize,
-    /// The camera of sensor_mounts that the camera link is.
-    pub camera_name: String,
     /// How long each moving transform's past stamps are kept, counted back from its
     /// newest.
     pub cache_window: Duration,
-    /// How long a depth frame waits for the tree to place the camera at its time.
+    /// How long a depth frame waits for the tree to place the frame it names at its time.
     pub lookup_timeout: Duration,
 }
 
@@ -94,13 +92,6 @@ impl Config {
         let trail_length = NonZeroUsize::new(params.trail_length as usize).ok_or_else(|| {
             ConfigError::new("trail_length", params.trail_length, "it is 1 or more")
         })?;
-        if params.camera_name.is_empty() {
-            return Err(ConfigError::new(
-                "camera_name",
-                "empty",
-                "it names a camera of sensor_mounts, such as chest",
-            ));
-        }
         Ok(Self {
             viewer,
             image_interval: interval_of("image_rate_hz", params.image_rate_hz)?,
@@ -111,7 +102,6 @@ impl Config {
             cloud_stride,
             scene_poll_interval: interval_of("scene_poll_hz", params.scene_poll_hz)?,
             trail_length,
-            camera_name: params.camera_name.clone(),
             cache_window: seconds_of("cache_window_s", params.cache_window_s, duration_from_secs)?,
             lookup_timeout: seconds_of(
                 "lookup_timeout_s",
@@ -151,7 +141,6 @@ pub fn default_parameters() -> Parameters {
         arms_rate_hz: 10.0,
         bind_ip: "127.0.0.1".to_string(),
         cache_window_s: 10.0,
-        camera_name: "chest".to_string(),
         cloud_rate_hz: 2.0,
         cloud_stride: 4,
         depth_image: false,
@@ -181,7 +170,6 @@ mod tests {
         assert_eq!(config.scene_poll_interval, Duration::from_millis(500));
         assert_eq!(config.cloud_stride.get(), 4);
         assert_eq!(config.trail_length.get(), 100);
-        assert_eq!(config.camera_name, "chest");
         assert!(!config.depth_image);
         assert_eq!(config.image_max_width.get(), 640);
         assert_eq!(config.arms_interval, Duration::from_millis(100));
@@ -283,12 +271,5 @@ mod tests {
         params.lookup_timeout_s = 1e30;
         let config = Config::parse(&params).expect("a wait past every clock is valid");
         assert_eq!(config.lookup_timeout, Duration::MAX);
-    }
-
-    #[test]
-    fn an_empty_camera_name_is_refused() {
-        let mut params = default_parameters();
-        params.camera_name = String::new();
-        assert_eq!(Config::parse(&params).unwrap_err().name(), "camera_name");
     }
 }

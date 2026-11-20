@@ -6,10 +6,20 @@
     description: [
       "A camera with no hardware, in Python: it replays a bundled video file as the video_stream of rgb_camera and acknowledges every camera control. It opens no device, so it runs on any machine.",
       "Use it to bring a consumer up without a camera or a simulation. It is not a simulation: the footage has no relationship to the pose of any robot. The controls echo the value they get and check nothing, so do not use it to test control semantics. uvc_camera_rust_mock is the same node in Rust.",
+      "Each picture names in its header's frame the camera's frame, which it reads once at its start and before its first picture: with the sensor_mounts link bound to the robot that carries the camera, whose robot_identity implementer serves it, the frame that sensor_mounts' describe_sensors gives for the name the camera runs under, its instance id in its copy; with the link vacant, for a camera that no robot carries, that name, a frame no robot's tree holds.",
     ],
     implements: [
       { name: "rgb_camera", tag: "v1", link_id: "camera" },
     ],
+    depends_on: {
+      contracts: [
+        // The robot that carries the camera, whose robot_identity implementer
+        // serves sensor_mounts: describe_sensors gives the frame each picture
+        // names. Vacant for a camera that no robot carries, whose pictures
+        // name the name it runs under.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
+      ],
+    },
     labels: [
       "uvc",
       "camera"
@@ -66,6 +76,9 @@
         { link_id: "camera", name: "set_gain" },
         { link_id: "camera", name: "set_brightness" },
         { link_id: "camera", name: "set_contrast" },
+      ],
+      consumes: [
+        { link_id: "sensor_mounts", name: "describe_sensors" },
       ],
     },
   }

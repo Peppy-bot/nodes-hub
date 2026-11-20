@@ -6,7 +6,8 @@ backbone's kinematics place the grasp point."""
 from __future__ import annotations
 
 import pytest
-from conftest import MEASURED, TREE_TOLERANCE, angle_between, place_in_robot_frame
+from conftest import MEASURED, TREE_TOLERANCE, place_in_robot_frame
+from control_core_py.geometry import angle_shortest_path
 
 # The decoder the harness reads the node's transforms with.
 from peppygen.fixtures.emitted_topics.transforms.transforms import (
@@ -32,8 +33,8 @@ def _transforms(message):
     """The transforms of a decoded message, one (parent, child, position,
     orientation) each."""
     return [
-        (parent, child, tuple(message.positions[3 * i : 3 * i + 3]), tuple(message.orientations[4 * i : 4 * i + 4]))
-        for i, (parent, child) in enumerate(zip(message.parent_frames, message.child_frames, strict=True))
+        (record.frame, record.child_frame, tuple(record.position), tuple(record.orientation))
+        for record in message.transforms
     ]
 
 
@@ -57,9 +58,11 @@ def test_a_message_carries_its_snapshots_time_the_process_start_and_each_moving_
 
     assert message.timestamp == pytest.approx(TIMESTAMP_S, abs=1e-9)
     assert message.start_timestamp == pytest.approx(STARTED_S, abs=1e-9)
-    assert message.child_frames == [transform.child for transform in moving]
-    assert len(set(message.child_frames)) == len(ARM.joints) + len(ARM.gripper.fingers)
-    assert not {transform.child for transform in DESCRIPTION.fixed_transforms()} & set(message.child_frames)
+    children = [record.child_frame for record in message.transforms]
+    assert children == [transform.child for transform in moving]
+    assert [record.frame for record in message.transforms] == [transform.parent for transform in moving]
+    assert len(set(children)) == len(ARM.joints) + len(ARM.gripper.fingers)
+    assert not {transform.child for transform in DESCRIPTION.fixed_transforms()} & set(children)
 
 
 @pytest.mark.parametrize("joints", CONFIGURATIONS)
@@ -70,7 +73,7 @@ def test_the_transforms_place_the_grasp_link_where_the_kinematics_place_the_gras
     expected_position, expected_orientation = kinematics.forward_kinematics(tuple(joints))
 
     assert max(abs(a - b) for a, b in zip(position, expected_position)) <= TREE_TOLERANCE
-    assert angle_between(orientation, expected_orientation) <= TREE_TOLERANCE
+    assert angle_shortest_path(orientation, expected_orientation) <= TREE_TOLERANCE
 
 
 def test_the_gripper_opening_moves_the_jaw_alone():

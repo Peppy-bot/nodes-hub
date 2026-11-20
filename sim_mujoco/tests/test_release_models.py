@@ -14,6 +14,7 @@ import mujoco
 import numpy as np
 import pytest
 import robot_description_py
+from control_core_py.geometry import normalized
 from entries import staged_release
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the bridge imports)
@@ -212,7 +213,7 @@ class TestTheOpenArmV2HeadCamera:
         position = frame.T @ (eye.xpos - carrier.xpos)
         rotation = frame.T @ eye.xmat.reshape(3, 3)
         described = np.zeros(9)
-        mujoco.mju_quat2Mat(described, np.array(chest.quat_wxyz) / np.linalg.norm(chest.quat_wxyz))
+        mujoco.mju_quat2Mat(described, np.array(normalized(chest.quat_wxyz)))
 
         assert position == pytest.approx(chest.pos, abs=POSITION_TOLERANCE_M)
         assert rotation == pytest.approx(described.reshape(3, 3), abs=ORIENTATION_TOLERANCE)

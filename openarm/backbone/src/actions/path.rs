@@ -35,7 +35,7 @@ use crate::actions::{
     move_seconds_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
-use crate::failure::{Failure, FailureKind};
+use crate::failure::{Failure, FailureKind, PathFailure};
 use crate::move_slot::MoveSlot;
 use crate::planner::{
     JointPath, Outcome, PathGoal, PathOrder, ShareReply, ShareReport, cancelled_reason,
@@ -178,7 +178,7 @@ fn admit_arms(
 enum PathEnd {
     Completed(Vec<ShareReport>),
     Cancelled(String, Vec<ShareReport>),
-    Failed(Failure),
+    Failed(PathFailure),
 }
 
 /// Judge the end of a goal of the arms `arms` names from the share reports
@@ -193,10 +193,9 @@ enum PathEnd {
 /// gives the reports in the order of `arms`.
 fn summarize(arms: &ArmOrder, reports: Vec<ShareReport>, cancel: Option<String>) -> PathEnd {
     if reports.len() < arms.ids().len() {
-        return PathEnd::Failed(Failure::new(
-            FailureKind::AttemptFailed,
-            "a planner dropped the move",
-        ));
+        return PathEnd::Failed(
+            Failure::new(FailureKind::AttemptFailed, "a planner dropped the move").into(),
+        );
     }
     let failure = reports.iter().find_map(|report| match &report.outcome {
         Outcome::Failed(failure) => Some(failure.clone()),
@@ -308,12 +307,12 @@ async fn run_path(
         .await
         .is_err()
     {
-        return PathEnd::Failed(gone());
+        return PathEnd::Failed(gone().into());
     }
     match answer.await {
         Ok(Ok(())) => {}
-        Ok(Err(refusal)) => return PathEnd::Failed(refusal),
-        Err(_) => return PathEnd::Failed(gone()),
+        Ok(Err(refusal)) => return PathEnd::Failed(refusal.into()),
+        Err(_) => return PathEnd::Failed(gone().into()),
     }
     let reports = collect_ends(shares, &mut done_rx, cancel_signal, &cancelled).await;
     summarize(&arms, reports, cancel_reason())
@@ -355,7 +354,10 @@ pub async fn run_execute_joint_path(
             })
             .await;
             let ended = match ending {
-                PathEnd::Failed(failure) => ctx.fail(failure.kind.into(), failure.message).await,
+                PathEnd::Failed(failure) => {
+                    let (kind, message) = failure.for_member();
+                    ctx.fail(kind, message).await
+                }
                 PathEnd::Completed(reports) => {
                     let (arms, action_time) = path_result(&reports);
                     ctx.complete(arms, action_time).await
@@ -387,7 +389,7 @@ mod tests {
     use srs_model::TARGET_SLACK;
 
     use crate::robot::arm_in;
-    use crate::test_support::{V1, bundled_arm};
+    use crate::test_support::{V1, bundled_arm, standing_at};
 
     /// Both arms' joints, the left arm's `left` in every joint and the right
     /// arm's `right`. From 0.05 to 0.17 rad, every joint of [`V1`] lies within
@@ -666,10 +668,10 @@ mod tests {
     fn report(arm: ArmId, outcome: Outcome, joints: JointVec, fresh: bool) -> ShareReport {
         ShareReport {
             arm,
-            outcome,
+            outcome: outcome.map_failure(PathFailure::from),
             joints,
             measured: if fresh {
-                Ok(joints)
+                Ok(standing_at(joints))
             } else {
                 Err(crate::planner::Unmeasured::Stale)
             },
@@ -690,7 +692,10 @@ mod tests {
             report(RIGHT, Outcome::Failed(stale.clone()), [0.2; ARM_DOF], false),
             report(LEFT, Outcome::Failed(caused), [0.1; ARM_DOF], true),
         ];
-        assert_eq!(summarize(&arms, arrived, None), PathEnd::Failed(stale));
+        assert_eq!(
+            summarize(&arms, arrived, None),
+            PathEnd::Failed(stale.into())
+        );
     }
 
     /// The goal of both arms completes once both shares complete, its
@@ -796,14 +801,13 @@ mod tests {
         ];
         assert_eq!(
             summarize(&right_first, one_failed, None),
-            PathEnd::Failed(failure)
+            PathEnd::Failed(failure.into())
         );
         assert_eq!(
             summarize(&right_first, completed[..1].to_vec(), None),
-            PathEnd::Failed(Failure::new(
-                FailureKind::AttemptFailed,
-                "a planner dropped the move"
-            ))
+            PathEnd::Failed(
+                Failure::new(FailureKind::AttemptFailed, "a planner dropped the move").into()
+            )
         );
     }
 }

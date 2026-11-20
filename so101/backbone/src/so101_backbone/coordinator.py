@@ -46,10 +46,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Generic, TypeVar
 
+from control_core_py.geometry import angle_shortest_path
 from control_core_py.runtime import Latch
 from path_timing_py import JointTrajectory
 from so101.staleness import COMMAND_SILENCE_LIMIT_S
-from so101.transforms import relative_rotation_rad
 
 from so101_backbone.failures import FailureKind
 from so101_backbone.governor import EEGovernor, rate_step
@@ -186,7 +186,7 @@ class PoseSettle:
             else self.orientation
         )
         distance_m = math.dist(position, self.position)
-        angle_rad = relative_rotation_rad(orientation, commanded)
+        angle_rad = angle_shortest_path(orientation, commanded)
         if (
             distance_m <= self.position_tolerance_m
             and angle_rad <= self.orientation_tolerance_rad

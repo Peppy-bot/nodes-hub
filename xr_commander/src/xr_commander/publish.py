@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 import peppygen.clock
+from control_core_py.geometry import Pose, Stamped
 
 from xr_commander.bus import (
     REAL_CLOCK,
@@ -27,7 +28,7 @@ from xr_commander.bus import (
     subscribe_or_log,
     ticks,
 )
-from xr_commander.clutch import HandClutch
+from xr_commander.clutch import HandClutch, Setpoint
 from xr_commander.config import Settings
 from xr_commander.devices import (
     FrameSource,
@@ -41,7 +42,6 @@ from xr_commander.drive import (
     Refusal,
     Withdrawn,
 )
-from xr_commander.frames import Pose
 from xr_commander.robots import PairedRobots
 
 
@@ -51,14 +51,14 @@ class MeasuredPoses:
 
     def __init__(self, clock: Clock = REAL_CLOCK) -> None:
         self._clock = clock
-        self._latest: dict[object, tuple[Pose, float]] = {}
+        self._latest: dict[object, tuple[Stamped[Pose], float]] = {}
 
-    def set(self, peer, pose: Pose) -> None:
+    def set(self, peer, pose: Stamped[Pose]) -> None:
         self._latest[peer] = (pose, self._clock.monotonic())
 
     def fresh(
         self, peer, stale_timeout_s: float, now_monotonic: float | None = None
-    ) -> Pose | None:
+    ) -> Stamped[Pose] | None:
         """`peer`'s measured pose, or None when it has reported none
         recently: a dead follower's last report is not a pose the arm is
         still at, and no peer has no pose."""
@@ -95,12 +95,16 @@ class ReleaseHold:
     def __init__(self, tick_period_s: float, hold_s: float = RELEASE_HOLD_S):
         self._hold_s = max(hold_s, RELEASE_HOLD_MESSAGES * tick_period_s)
         self._driving = False
-        self._pose: Pose | None = None
+        self._pose: Setpoint | None = None
         self._until = 0.0
 
     def step(
-        self, *, target: Pose | None, measured_ee: Pose | None, now_s: float
-    ) -> Pose | None:
+        self,
+        *,
+        target: Setpoint | None,
+        measured_ee: Stamped[Pose] | None,
+        now_s: float,
+    ) -> Setpoint | None:
         """This tick's pose to stream, or None for silence: the clutch's
         target while driving, then the latched measured pose for the burst
         that follows release. One call per tick, so no caller can arm the
@@ -113,7 +117,7 @@ class ReleaseHold:
         if self._driving:
             self._driving = False
             if measured_ee is not None:
-                self._pose = measured_ee
+                self._pose = Setpoint(measured_ee.frame, measured_ee.value)
                 self._until = now_s + self._hold_s
         if now_s < self._until:
             return self._pose
@@ -138,7 +142,8 @@ async def drain_pose_states(
     unusable = Latch()
     async for peer, message in messages(subscription, token, f"{label} pose_states"):
         try:
-            holder.set(peer, Pose.from_xyz_quat(message.position, message.orientation))
+            pose = Pose.parse(message.position, message.orientation)
+            holder.set(peer, Stamped.parse(message.frame, message.timestamp, pose))
             unusable.clear()
         except Exception as e:
             unusable.trip(f"{label} pose_states unusable: {e!r}")
@@ -208,7 +213,9 @@ async def stream_pose(
     follower stops where the robot is, and the hand keeps the robot until
     the burst ends. A change of robot is a release: the robot last driven
     gets the burst at its own measured pose, and the new robot engages on
-    the next squeeze."""
+    the next squeeze. Each setpoint gives the time of its tick on this
+    instance's clock, the clock of transforms, so the follower drops by its
+    age a setpoint that a stall held back."""
     # The one refusal an operator cannot see coming: squeezing while the
     # follower's measured pose is absent or stale does nothing. Say so once.
     waiting = Latch()
@@ -292,8 +299,13 @@ async def stream_pose(
             hand.robot = None
         if commanded is None or driven is None:
             return None
-        position, orientation = commanded.as_wire()
-        return driven, topic_module.build_message(timestamp, position, orientation)
+        pose = commanded.pose
+        return driven, topic_module.build_message(
+            commanded.frame,
+            timestamp,
+            list(pose.position.position),
+            list(pose.orientation.quaternion),
+        )
 
     await _run_stream(
         node_runner,

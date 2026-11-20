@@ -8,13 +8,24 @@
     name: "realsense_d4xx",
     tag: "v1",
     description: [
-      "An Intel RealSense D4xx RGB-D camera (D405, D435, D435i, D455 and others): it publishes synchronized colour and depth streams with a shared frame_id. It needs a RealSense D4xx device on its host.",
+      "An Intel RealSense D4xx RGB-D camera (D405, D435, D435i, D455 and others): it publishes synchronized colour and depth streams with a shared capture_index. It needs a RealSense D4xx device on its host.",
+      "Each picture names in its header's frame the camera's frame, read once at its start: with the sensor_mounts link bound to the robot that carries the camera, whose robot_identity implementer serves it, the frame that sensor_mounts' describe_sensors gives for the name the camera runs under; with the link vacant, for a camera that no robot carries, that name, a frame no robot's tree holds. get_depth_to_color_extrinsics names the same frame.",
       "It implements rgbd_camera and camera_geometry. camera_geometry answers from the calibration of the device, read from librealsense at startup, for the streams as the current align mode publishes them: unaligned, each stream has its own pinhole model and the depth-to-colour transform is that of the device; aligned, both streams share the model of the target stream and the transform is the identity. The stereo IR pair that gives the depth and the IMU streams (D435i, D455) are not published.",
     ],
     implements: [
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
       { name: "camera_geometry", tag: "v1", link_id: "geometry" },
     ],
+    depends_on: {
+      contracts: [
+        // The robot that carries this camera, whose robot_identity implementer
+        // serves sensor_mounts: describe_sensors gives the frame the camera
+        // names in each picture, read once at its start by the name it runs
+        // under. Vacant for a camera that no robot carries, whose pictures
+        // name the name it runs under.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
+      ],
+    },
     labels: [
       "realsense",
       "rgbd",
@@ -97,6 +108,9 @@
             current_mode: "string",
           },
         },
+      ],
+      consumes: [
+        { link_id: "sensor_mounts", name: "describe_sensors" },
       ],
     },
   }

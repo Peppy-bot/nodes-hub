@@ -134,7 +134,7 @@ async def record_video(
             if token.is_cancelled():
                 # Shutdown began; the finalize_video hook owns the flush/close.
                 return
-            encoder.encode_frame(message.frame)
+            encoder.encode_frame(message.data)
             if (frame_num + 1) % camera_info.frames_per_second == 0:
                 print(
                     f"Recorded {frame_num + 1}/{total_frames} frames "

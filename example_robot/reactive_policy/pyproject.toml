@@ -16,7 +16,11 @@ reactive_policy = "reactive_policy.__main__:main"
 packages = ["src/reactive_policy"]
 
 [dependency-groups]
-dev = []
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
 
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }

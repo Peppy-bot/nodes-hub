@@ -41,14 +41,15 @@
         // like it: without it no pixel can become a position, so both
         // searches are refused naming the slot until it answers.
         { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_one" },
-        // Where the robot carries that camera: the robot frame and the
-        // frame of the camera the `camera_name` parameter names, from the
-        // robot's model. Optional like the two above: without it no pixel
-        // can become a position, so both searches are refused naming the
-        // slot until it answers and names the camera.
+        // The robot frame, the frame the brain holds every place in, from
+        // the robot's model. Optional like the two above: without it no
+        // pixel can become a position, so both searches are refused naming
+        // the slot until it answers and names the robot frame.
         { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts", cardinality: "zero_or_one" },
-        // Where the frame of that camera stands in the robot frame at the
-        // time of each picture, from the robot's tree of frames.
+        // Where the frame each picture names stood in the robot frame when
+        // the picture was taken, and where each grab_item and place_item
+        // target's frame stood at its timestamp, from the robot's tree of
+        // frames.
         // Optional like sensor_mounts: without it no pixel can become a
         // position, so both searches are refused naming the slot.
         { name: "transform_lookup", tag: "v1", link_id: "transform_lookup", cardinality: "zero_or_one" },
@@ -133,12 +134,11 @@
       // "none" stops the node at its start, since nothing would read it.
       perception_gallery: { $type: "string", $default: "" },
       // The name the camera the brain looks through runs under on the
-      // robot, as the robot's sensor_mounts lists it: the brain places that
-      // camera in the robot frame at the time of each picture and reports
-      // every position in that frame.
+      // robot, which each search's result names beside the regions of the
+      // picture it looked at.
       camera_name: "string",
-      // How long a lookup of a camera's place waits for the robot's
-      // transforms of a picture's time (s), from 0 to 1, the longest wait
+      // How long a lookup in the robot's tree waits for the robot's
+      // transforms of its time (s), from 0 to 1, the longest wait
       // transform_lookup takes; the node stops at its start on any other.
       // They reach the brain after the picture by the robot's own latency,
       // so the launcher sets it for the robot.

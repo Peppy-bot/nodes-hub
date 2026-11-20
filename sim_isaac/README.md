@@ -39,7 +39,7 @@ nvcr.io/nvidia/isaac-sim:6.2.0.1
 
 The node builds on `peppybot/sim-isaac`, which
 `sim_base_images/build_base_images.sh` produces from that image with the robot
-assets, the NGX core library and `sim_robot_core` baked in. The robot assets
+assets, the NGX core library, `sim_robot_core` and `control_core_py` baked in. The robot assets
 sit one directory per robot under `/opt/robot_assets` (`openarm/`, `so101/`),
 which is the default of `PEPPY_ROBOT_ASSETS_DIR`.
 
@@ -95,12 +95,17 @@ its model has. A robot is ready once it stands and holds a pair for every limb
 of its model, so an SO-101 is ready with its one arm and its one gripper. Each
 robot on the stage is held to its own model.
 
-An `attach` goal is refused with `rejected` for a model with no entry, a name
-the stage cannot stand a robot under or a placement that is not finite, with
-`busy` for the robot of the caller while it still joins, and with
-`precondition_failed` for a name or a spot another robot holds, a second robot
-of the same caller, or another model for the robot the caller stands. A goal
-refused with `busy` takes the robot over once it stands, so
+An `attach` goal's `placement` is a pose in `world`, the one frame of the
+simulation, which a placement with no frame names, whose orientation turns
+about +z alone; its timestamp, given or left out, places it in `world` at any
+time. The goal is refused with `unknown_frame` for a placement in another
+frame, with `rejected` for a model with no entry, a name the stage cannot
+stand a robot under, or a placement that the shared parse of
+`control_core_py.geometry` refuses or that turns about another axis, with
+`busy` for the robot of the caller while it still joins,
+and with `precondition_failed` for a name or a spot another robot holds, a
+second robot of the same caller, or another model for the robot the caller
+stands. A goal refused with `busy` takes the robot over once it stands, so
 `robot_initializer` sends it again; any other refusal stays until someone
 changes the stage. A robot that leaves gives its name back as soon as its stay
 ends, before the stage lets it go, so a copy that joins straight back is never
@@ -124,8 +129,9 @@ model, shared with the MuJoCo node: its limbs under the names the robot
 answers to, the joints each limb moves, where the gripper's closed and open
 states put each finger, its cameras at their optical frames, and the posture
 it starts in, every arm at its home state with its gripper closed.
-`sim_robot_core` and `robot_description_py` are installed in the base image
-(`sim_base_images/requirements.isaac.txt`), pinned to one commit. An attach
+`sim_robot_core`, `robot_description_py` and `control_core_py` are installed
+in the base image (`sim_base_images/requirements.isaac.txt`), pinned to one
+commit. An attach
 whose description the engine's entry for the model does not fit is refused
 with `rejected`.
 
@@ -176,7 +182,12 @@ Everything downstream of `attach` takes the robot's own model:
 - the camera rig, which is the cameras of the robot's own model, each defined
   under the prim its parent link is on that robot. With `cameras_enabled` a rig
   is mounted on each robot holding a camera pair, and a model with no camera
-  renders none;
+  renders none. Each picture's header names the camera's frame, the optical
+  frame the robot's description gives the camera's name (the link
+  `<name>_optical_frame`, which sensor_mounts gives for it), its capture time
+  and its `capture_index`, which a colour and a depth picture of one capture
+  share; an rgbd camera's geometry gives `depth_to_color`, the identity in the
+  camera's frame with no timestamp, since it holds at every time;
 - the head camera pack, which is the business of the models whose entry says
   `head_camera: true`. The node reads no pack when no model draws it.
 
@@ -342,7 +353,8 @@ in radians about +Z:
 ```
 
 A robot's limbs are driven through its own backbone over the limb pairings;
-the scene commander's `move_robot` reaches the same command.
+the scene commander's `move_robot` moves the robot the same way, to a
+`target` in `world`.
 
 ## Runtime USD Loading
 
@@ -407,12 +419,30 @@ numbered `red_block_2`, `red_block_3` while that name is taken. The result
 reports the name with the object id. A `feeder` of another form is refused
 the same way, and an empty one names no feeder; Isaac keeps no setup record,
 so a `feeder` that is a name changes nothing. A `spawn_object` or
-`move_object` goal that carries an `orientation`, a unit quaternion
-`[x, y, z, w]`, stands the object turned to it, whatever the spawn's `yaw`;
-a move without one keeps the orientation the object has.
+`move_object` goal names its `target`, the pose of the object's origin in
+`world`: an orientation, a unit quaternion `[x, y, z, w]`, turns the object
+to it, and a target with no orientation stands a spawned object as authored
+and keeps the orientation a moved object has.
 Isaac keeps no landmark, so a `spawn_object` or `move_object` goal that
-carries a `snap_to` is refused, naming the position to give instead, and
-nothing is spawned or moved.
+carries a `snap_to` is refused, naming the target to give instead, and
+nothing is spawned or moved. A goal that gives neither a `target` nor a
+`snap_to` is refused with `rejected`, saying to give it a target.
+
+Every position, orientation and force of the scene is in `world`, the one
+frame of the simulation. `get_objects_list`, `get_object`, `get_robots_list`,
+`get_object_states` and the `object_states` stream give `frame` `world` and
+`timestamp`, the simulated instant of their values, on the timeline the joint
+states are stamped on; `get_robots_list` gives each robot's `orientation`, a
+turn about +z, and stamps the robots at the start of the timeline while the
+engine publishes a clock domain and has not stepped yet. A `spawn_object`,
+`move_object`, `move_robot` or `apply_force` goal with no frame is in `world`,
+one in another frame is refused with `unknown_frame` as it arrives, before
+anything changes, and its timestamp, given or left out, places its value in
+`world` at any time.
+An orientation whose squared norm lies 0.01 or more from 1 is refused with
+`rejected`, and each one taken is normalized; a `move_robot` target turns
+about +z alone, and a target with no orientation keeps the heading the base
+has.
 
 Each scene goal is checked as it arrives. A goal that names an asset or an
 object the stage does not hold, or a value it does not take, is refused with
@@ -604,11 +634,12 @@ uv run --project sim_isaac/tests --locked --group dev \
   --archive /tmp/so101-isaac-assets.tar.gz
 ```
 
-The command runs the builder on the `mujoco`, `usd-core`, `numpy` and
-`robot_description_py` that `sim_isaac/tests/uv.lock` pins, the tools
-`tests/test_so101_stage.py` builds the stage with. The description is the
-SO-101's model that `robot_description_py` bundles, its URDF and its SRDF,
-whose arm's grasp link places the tool frame.
+The command runs the builder on the `mujoco`, `usd-core`, `numpy`,
+`robot_description_py` and `control_core_py` that `sim_isaac/tests/uv.lock`
+pins, the tools `tests/test_so101_stage.py` builds the stage with. The
+description is the SO-101's model that `robot_description_py` bundles, its
+URDF and its SRDF, whose arm's grasp link places the tool frame at the pose
+its fixed transform gives.
 
 The archive is published under its own SHA-256, as the OpenArm bundle is, at
 `so101/<version>/<sha256>.tar.gz`, and pinned as `SO101_ASSETS_KEY` and

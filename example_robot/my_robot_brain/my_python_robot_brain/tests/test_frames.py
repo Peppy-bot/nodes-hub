@@ -13,8 +13,8 @@ class LatestValueMailboxTests(unittest.IsolatedAsyncioTestCase):
 
         # The consumer is busy while many frames arrive.  The hand-off stays
         # bounded and the next read skips the stale backlog.
-        for frame_id in range(1, 1000):
-            self.assertTrue(mailbox.offer(frame_id))
+        for capture_index in range(1, 1000):
+            self.assertTrue(mailbox.offer(capture_index))
 
         self.assertEqual(await mailbox.get(), 999)
 

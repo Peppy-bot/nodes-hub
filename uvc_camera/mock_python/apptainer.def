@@ -14,6 +14,10 @@ From: peppybot/python-uv-base:latest
 %post
     set -eux
     export DEBIAN_FRONTEND=noninteractive
+    # uv resolves camera_core_py as a git dependency; the base image has no git.
+    apt-get update -qq
+    apt-get install -qqy --no-install-recommends git
+    rm -rf /var/lib/apt/lists/*
 
     # Keep the interpreter out of the container user's home directory. uv
     # installs managed Pythons under $HOME, so this one would land in /root

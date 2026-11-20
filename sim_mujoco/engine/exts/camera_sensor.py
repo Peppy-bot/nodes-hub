@@ -9,21 +9,18 @@ from typing import Optional
 
 import numpy as np
 
-from camera_geometry import (
-    DEPTH_MODEL,
-    DEPTH_TO_COLOR_ORIENTATION,
-    DEPTH_TO_COLOR_POSITION,
-    pinhole,
-)
 from sim_robot_core.cameras import (
     ALIGN_MODE,
     COLOR_ENCODING,
     DEPTH_ENCODING,
+    DEPTH_MODEL,
+    DEPTH_TO_COLOR,
     DEPTH_UNIT_M_PER_LSB,
     CameraConfig,
-    FrameIdCounter,
+    CaptureIndexCounter,
     FramePacer,
     depth_to_z16,
+    pinhole,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,7 +181,7 @@ class _CameraStream:
     due, its capture counter, and when it last put a frame on the wire."""
 
     def __init__(
-        self, config: CameraConfig, robot: str, scene_name: str, frame_ids=None
+        self, config: CameraConfig, robot: str, scene_name: str, capture_indices=None
     ) -> None:
         self.config = config
         # The robot whose camera pair carries these frames.
@@ -194,7 +191,7 @@ class _CameraStream:
         self.scene_name = scene_name
         self.frames = FramePacer(config.fps)
         self.info = FramePacer(_STREAM_INFO_HZ)
-        self.frame_ids = frame_ids or FrameIdCounter()
+        self.capture_indices = capture_indices or CaptureIndexCounter()
         self.last_delivery_s: Optional[float] = None
 
     def gap_s(self, now: float) -> Optional[float]:
@@ -253,7 +250,7 @@ class MujocoCameraSensor:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         # Whether a render thread is still running after its stop gave up
-        # waiting for it, which is what the frame counters may not outlive.
+        # waiting for it, which is what the capture index counters may not outlive.
         self._outlived_its_stop = False
         self._failure: Optional[Exception] = None
         self._heartbeat_s: Optional[float] = None
@@ -275,13 +272,13 @@ class MujocoCameraSensor:
         )
 
     def counters(self) -> dict:
-        """Each camera's frame counter, for the scene composed next. A render
+        """Each camera's capture index counter, for the scene composed next. A render
         thread that outlived its stop is still counting on these, so a scene
         it may still be rendering hands none of them on and the cameras of
         the next one count from zero."""
         if self._outlived_its_stop:
             return {}
-        return {key: stream.frame_ids for key, stream in self._streams.items()}
+        return {key: stream.capture_indices for key, stream in self._streams.items()}
 
     def snapshot(self, qpos: np.ndarray) -> None:
         """Publish the just-stepped pose, and the time it holds for, to the
@@ -448,18 +445,20 @@ class MujocoCameraSensor:
     ) -> bool:
         """Render one camera and put it on the wire. False when the publish was
         dropped because the previous one is still in flight: the consumer never
-        sees that frame, so it counts against the camera's delivery rate."""
+        sees that frame, so it counts against the camera's delivery rate. Each
+        picture names the camera's frame."""
         camera = stream.config
         renderer = color_renderers[(camera.height, camera.width)]
         renderer.update_scene(data, camera=stream.scene_name)
         rgb = renderer.render()
-        frame_id = stream.frame_ids.next()
+        capture_index = stream.capture_indices.next()
         if camera.depth is None:
             return self._io.publish_color_frame(
                 stream.robot,
                 camera.name,
                 timestamp_s,
-                frame_id,
+                camera.frame,
+                capture_index,
                 COLOR_ENCODING,
                 camera.width,
                 camera.height,
@@ -472,7 +471,8 @@ class MujocoCameraSensor:
             stream.robot,
             camera.name,
             timestamp_s,
-            frame_id,
+            camera.frame,
+            capture_index,
             ALIGN_MODE,
             (COLOR_ENCODING, camera.width, camera.height, rgb.tobytes()),
             (
@@ -502,8 +502,8 @@ class MujocoCameraSensor:
             camera.depth.min_depth_m,
             camera.depth.max_range_m,
             ALIGN_MODE,
-            DEPTH_TO_COLOR_POSITION,
-            DEPTH_TO_COLOR_ORIENTATION,
+            camera.frame,
+            DEPTH_TO_COLOR,
         )
 
     def _publish_stream_info(self, stream: _CameraStream) -> None:

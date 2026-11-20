@@ -1,11 +1,11 @@
 use camera_core::encoding::ColorEncoding;
 use std::time::SystemTime;
 
-/// Frame identifier (wrapping counter)
+/// The capture counter of a picture, which wraps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct FrameId(u32);
+pub struct CaptureIndex(u32);
 
-impl FrameId {
+impl CaptureIndex {
     pub fn new(id: u32) -> Self {
         Self(id)
     }
@@ -25,7 +25,7 @@ pub struct Frame {
     data: Vec<u8>,
     width: u32,
     height: u32,
-    frame_id: FrameId,
+    capture_index: CaptureIndex,
     captured_at: SystemTime,
     encoding: ColorEncoding,
 }
@@ -50,7 +50,7 @@ impl Frame {
             data,
             width,
             height,
-            frame_id: FrameId::default(),
+            capture_index: CaptureIndex::default(),
             captured_at,
             encoding,
         }
@@ -68,8 +68,8 @@ impl Frame {
         self.height
     }
 
-    pub fn frame_id(&self) -> FrameId {
-        self.frame_id
+    pub fn capture_index(&self) -> CaptureIndex {
+        self.capture_index
     }
 
     pub fn captured_at(&self) -> SystemTime {
@@ -89,8 +89,11 @@ impl Frame {
         }
     }
 
-    /// Stamp the frame with its published sequence number.
-    pub fn with_frame_id(self, frame_id: FrameId) -> Self {
-        Self { frame_id, ..self }
+    /// Stamp the frame with its capture index.
+    pub fn with_capture_index(self, capture_index: CaptureIndex) -> Self {
+        Self {
+            capture_index,
+            ..self
+        }
     }
 }

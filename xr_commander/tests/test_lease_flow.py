@@ -15,7 +15,7 @@ import asyncio
 import contextlib
 from itertools import groupby
 
-import numpy as np
+import peppygen.clock
 import pytest
 from peppygen.consumed_actions.fleet import changes, lease
 from peppygen.consumed_actions.postures import move_to_home
@@ -31,7 +31,10 @@ from tests.helpers import (
     DIRECTOR,
     HALTED,
     HEADSET,
+    OTHER_FRAME,
     POSE,
+    REPORTED_AT_S,
+    ROBOT_FRAME,
     ManualClock,
     ScriptedHeadset,
     accept_both,
@@ -41,6 +44,9 @@ from tests.helpers import (
     eventually,
     fleet_view,
     lease_event,
+    pose_at,
+    posture_done,
+    reported,
     robots_of,
     running,
     settle,
@@ -50,7 +56,6 @@ from xr_commander.clutch import HandClutch
 from xr_commander.devices import primary_pressed
 from xr_commander.drive import Driver, LimbStops
 from xr_commander.fleet import LEASE_NAME, Fleet, FleetCalls, Following, Timing
-from xr_commander.frames import Pose
 
 ROBOT = "backbone_inst"
 SETTINGS = config.from_parameters(
@@ -61,10 +66,10 @@ TICK_S = SETTINGS.tick_period_s
 WIRE_TICKS = 50
 # Ticks a held grip gets to stream, where it must stream nothing.
 HELD_TICKS = 5
-ELSEWHERE = Pose(np.array([0.4, 0.0, 0.0]), POSE.orientation)
+ELSEWHERE = pose_at((0.4, 0.0, 0.0))
 # Where the hand drives the arm in the halt test: neither the arm's pose nor
 # the pose it moves to later.
-HAND_AWAY = Pose(np.array([0.1, 0.0, 0.0]), POSE.orientation)
+HAND_AWAY = pose_at((0.1, 0.0, 0.0))
 
 
 class Rig:
@@ -98,8 +103,10 @@ class Rig:
         self.session = ScriptedHeadset(clock)
         self.measured = publish.MeasuredPoses(clock)
         self.peer = robots.peer_for(right_arm_pose_setpoints)
-        # Where the follower measures the arm; it reports at every tick.
+        # Where the follower measures the arm, and the frame it reports it
+        # in; it reports at every tick.
         self.arm_at = POSE
+        self.arm_frame = ROBOT_FRAME
         self.daemon = h.mocks.deps.fleet
         self.stops = h.mocks.deps.limb_motion[0].limb_motion_stop
         self.postures = h.mocks.deps.postures[0].move_to_home
@@ -159,7 +166,7 @@ class Rig:
 
     async def tick(self, count=1):
         for _ in range(count):
-            self.measured.set(self.peer, self.arm_at)
+            self.measured.set(self.peer, reported(self.arm_at, self.arm_frame))
             await self.clock.advance(TICK_S, parked=self.loops)
 
     async def ticks_until(self, predicate, limit=WIRE_TICKS):
@@ -266,7 +273,9 @@ def runs(positions: list[float]) -> list[tuple[float, int]]:
     ]
 
 
-NO_RESULT = move_to_home.ResultResponseData(arm_names=[], positions=[], orientations=[])
+NO_RESULT = move_to_home.ResultResponseData(
+    frame=ROBOT_FRAME, timestamp=REPORTED_AT_S, arm_names=[], grasp_points=[]
+)
 
 
 def halt(r: "Rig") -> None:
@@ -335,6 +344,45 @@ async def test_a_release_before_the_take_returns_stops_nothing_streams_nothing_a
         assert position_of(await r.next_streamed()) == pytest.approx(0.4)
 
 
+async def test_each_setpoint_names_the_frame_the_arm_is_measured_in_at_the_time_of_its_tick():
+    """The hand's target and the release burst each name the frame of the
+    measured pose, at the time of its tick on the instance's clock, whatever
+    the time of the measurement: a setpoint a stall holds back carries the
+    time it was sent, by which the follower drops it."""
+    async with rig("pose_stream") as r:
+        before_s = peppygen.clock.now_ns() / 1e9
+        await r.squeeze_and_take()
+        r.hold(squeeze=True, hand=HAND_AWAY)
+        driving = [await r.next_streamed() for _ in range(HELD_TICKS)]
+        r.hold(squeeze=False)
+        burst = [await r.next_streamed() for _ in range(publish.RELEASE_HOLD_MESSAGES)]
+        after_s = peppygen.clock.now_ns() / 1e9
+        assert position_of(driving[-1]) == pytest.approx(0.1)
+        assert position_of(burst[-1]) == pytest.approx(0.0)
+        assert {m.frame for m in driving + burst} == {ROBOT_FRAME}
+        stamps = [m.timestamp for m in driving + burst]
+        assert stamps == sorted(stamps)
+        assert before_s <= stamps[0] and stamps[-1] <= after_s
+
+
+async def test_a_change_of_the_measured_frame_re_anchors_the_hand_where_the_arm_is():
+    """The follower reports in another frame mid-squeeze: the hand's target in
+    the old frame stops, and the hand drives on from the arm's measured pose,
+    in the new frame, keeping the robot."""
+    async with rig("pose_stream") as r:
+        await r.squeeze_and_take()
+        r.hold(squeeze=True, hand=HAND_AWAY)
+        await r.streamed_until(0.1)
+        r.arm_frame = OTHER_FRAME
+        streamed = [await r.next_streamed() for _ in range(HELD_TICKS)]
+        frames = [m.frame for m in streamed]
+        assert OTHER_FRAME in frames
+        changed = frames.index(OTHER_FRAME)
+        assert set(frames[changed:]) == {OTHER_FRAME}
+        assert all(position_of(m) == pytest.approx(0.0) for m in streamed[changed:])
+        assert r.hand.engaged and r.driver.holds(ROBOT)
+
+
 async def test_the_lease_is_released_only_after_the_release_burst():
     async with rig("pose_stream") as r:
         await r.squeeze_and_take()
@@ -386,13 +434,7 @@ async def test_a_posture_press_takes_the_robot_asks_the_daemon_and_holds_it_for_
         await r.answer_check_move()
         goal = await (await r.postures.next_goal(CALL_S)).accept()
         assert r.driver.holds(ROBOT)
-        await goal.complete(
-            move_to_home.ResultResponseData(
-                arm_names=["right_arm"],
-                positions=[0.3, -0.2, 0.3],
-                orientations=[0.0, 0.0, 0.0, 1.0],
-            )
-        )
+        await goal.complete(posture_done(move_to_home))
         await r.answer_release()
         await eventually(lambda: r.status.state() == "move to home completed")
 
@@ -561,13 +603,7 @@ async def test_a_press_during_a_posture_move_does_nothing_and_says_why():
         await r.ticks_until(lambda: r.status.state() != "moving to home...")
         assert r.status.state() == "move to home ignored: still moving to home"
         assert len(r.daemon.take.captured()) == 1
-        await goal.complete(
-            move_to_home.ResultResponseData(
-                arm_names=["right_arm"],
-                positions=[0.3, -0.2, 0.3],
-                orientations=[0.0, 0.0, 0.0, 1.0],
-            )
-        )
+        await goal.complete(posture_done(move_to_home))
         await r.answer_release()
 
 

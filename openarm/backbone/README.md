@@ -69,7 +69,9 @@ fingers identically.
    whole, and their planners play the path's clock on by the share of the
    step they got.
 8. **Publish** - governed setpoints to the follower slots, measured states
-   relayed up the leader slots, and the proximity readout at ~20 Hz.
+   relayed up the leader slots (in pose mode each arm's grasp point as
+   `pose_states`, in the robot frame at the time its follower stamped the
+   joints), and the proximity readout at ~20 Hz.
 
 The action handlers admit goals before the loop runs them, and refuse each
 goal with a failure kind of the limb_motion and postures contracts. A goal on
@@ -160,7 +162,7 @@ field pose.
 |---|---|---|
 | `move_arm_joints` | `arm_name`, 7 joint positions (rad), `duration_s`, `settle_tolerances_rad` (one per joint), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, a duration or timeout outside 0 to 60 s, a joint more than 0.001 rad outside its limits (one closer runs at the limit), a tolerance that is not positive or not one per joint, a negative contact gap, a leader streaming the arm, the arm busy |
 | `execute_joint_path` | `arms` (one arm or both, each once), each with its `arm_name`, one or more `waypoints` of 7 joint positions (rad), `expected_start_joint_positions` (empty, or 7 joint positions) and `settle_tolerances_rad` (one per joint); `duration_s`, `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | an unknown or repeated arm name, no waypoint, arms with different numbers of waypoints, an array that does not hold 7 values, a non-finite value, a waypoint joint more than 0.001 rad outside its arm's joint limits (one closer runs at the limit), a tolerance that is not positive, a duration or timeout outside 0 to 60 s, a negative contact gap, a leader streaming a named arm, a named arm busy |
-| `move_arm` | `arm_name`, robot-frame position (m) and optional quaternion `[x, y, z, w]`, `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, degenerate quaternion, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a negative contact gap, a leader streaming the arm, the arm busy |
+| `move_arm` | `arm_name`, a `target` in its `frame` (absent for the robot frame) at its `timestamp` (absent for the latest time): a position (m) and a quaternion `[x, y, z, w]`, or none; `duration_s`, the settle tolerances (position m, orientation rad), `settle_timeout_s`, `contact_gap_m` (the limb_motion contract) | non-finite, an empty frame, an orientation whose squared norm lies 0.01 or more from 1, a duration or timeout outside 0 to 60 s, a tolerance that is not positive, a negative contact gap; a target the robot's tree cannot place (`unknown_frame`, `no_chain`, `extrapolation`, `broken_tree`); a leader streaming the arm, the arm busy |
 | `move_gripper` | `gripper_name`, opening fraction in [0, 1], `max_effort`, `settle_timeout_s` (the limb_motion contract) | non-finite, out of range, negative effort cap, a timeout outside 0 to 60 s, a leader streaming the gripper, the gripper busy |
 | `move_to_ready` | `duration_s` (the postures contract; both arms to the Ready posture, and no command to the grippers) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm, either arm busy |
 | `move_to_home` | `duration_s`, the time of the arm move alone (the postures contract; both grippers closed, then both arms to the Home rest) | non-finite, a duration outside 0 to 60 s, a leader streaming either arm or either gripper, either arm or either gripper busy |
@@ -172,10 +174,13 @@ straight arm, which settles a hair on either side of its lower limit.
 
 `arm_name`/`gripper_name`: `left_arm`/`right_arm` and `left_gripper`/`right_gripper`,
 the names the robot's description gives its arms and grippers, an unknown
-name refused with `rejected` naming the robot's arms or grippers. Every pose here, commanded or
-reported, is in the robot frame the contracts define, which for this robot
+name refused with `rejected` naming the robot's arms or grippers. Every pose here
+is planned and reported in the robot frame the contracts define, which for this robot
 is the root link of the URDF: the bottom of the pedestal's base plate on the
-column axis, `+x` to the robot's front, `+y` to its left, `+z` up. It is the
+column axis, `+x` to the robot's front, `+y` to its left, `+z` up. A pose a
+command gives names its own frame and time: the backbone places it in the
+robot frame by the robot's tree, which it follows on its `other_transforms` link (see
+[Placement](#placement)). Every pose is the
 gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `+z` out of the gripper), not the wrist flange they mount on: the description
 names it as each arm's grasp link, and each arm's model mounts its tool there,
@@ -208,7 +213,11 @@ fails with `timeout` and the remaining error, `still 0.031 rad from the target
 at joint 4, 2.0 s after the planned end` or `still 8.0 mm / 0.02 rad from the
 target, 2.0 s after the planned end`. A failed goal gives no result. A goal
 that completes or ends cancelled reports the measured state at that moment; a
-cancel of its caller ends it for the reason `cancelled by its caller`.
+cancel of its caller ends it for the reason `cancelled by its caller`. A
+`move_arm` result's `final_pose` is the grasp point of the measured joints in
+the robot frame, at the time the arm's follower stamped them; an arm with no
+fresh measurement reports the grasp point of the joints commanded last, at
+the time on the backbone's clock it reports them.
 
 A `move_arm_joints`, `execute_joint_path` or `move_arm` goal with
 `contact_gap_m` above 0 also ends on contact. On each tick of the move the
@@ -462,9 +471,12 @@ that holds both jaws fully open included.
 
 A goal that completes or ends cancelled gives the pose of each arm:
 
+- `frame`: the robot frame, and `timestamp`: the newest of the times the
+  arms' followers stamped their joints with, as MoveIt's CurrentStateMonitor
+  stamps the robot state with its latest joint update.
 - `arm_names`: `left_arm` and `right_arm`, in the order of limb_state.
-- `positions`: 3 values per arm, in metres, in the order of `arm_names`.
-- `orientations`: 4 values per arm, `[x, y, z, w]`, in the same order.
+- `grasp_points`: one per arm, in the order of `arm_names`, each a
+  `position` in metres and an `orientation`, `[x, y, z, w]`.
 
 Each pose is the grasp point of the arm in the robot frame. The
 coordinator measures both arms when the posture goal completes, after the
@@ -472,9 +484,12 @@ moves of both arms ended. limb_state gives the same pose for the same
 joints. After a cancel or a stop, the pose is where the arm stood on that
 tick, and the arm's command moves there and holds it.
 
-When an arm has no fresh measurement when the goal ends, the three arrays
-are empty, and the log says why: the follower of the arm stopped reporting,
-so its last measurement is stale, or the coordinator did not answer.
+When an arm has no fresh measurement when the goal ends, `arm_names` and
+`grasp_points` are empty and the timestamp is the time on the backbone's
+clock of that check, and the log says why: the follower of the arm stopped
+reporting, so its last measurement is stale, or the coordinator did not
+answer. A backbone clock that has not ticked then gives no time, and the goal
+fails with `attempt_failed`.
 
 ### Services of limb_motion
 
@@ -498,13 +513,15 @@ A leader's streamed setpoints are not stopped.
 A coordinator that does not answer cannot carry the stop out: the stop then
 gives an error reply with `attempt_failed`.
 
-`check_arm_move` takes the pose and the duration of a
-`move_arm` goal and answers whether a plan reaches the pose from the arm's held
+`check_arm_move` takes the target and the duration of a
+`move_arm` goal, places the target as the goal's is placed, and answers whether
+a plan reaches it from the arm's held
 setpoint, without moving: `reachable` and the time the move would take, or
 `reachable` false and the `reason` that the goal's failure gives (`goal pose not
 planned: ...`), with the same validation and the same planner as the goal. A
 request the goal would refuse gets an error reply of the same kind and words:
-`rejected` for a value the goal does not take, `resource_unavailable`,
+`rejected` for a value the goal does not take, the failure kind of the lookup
+for a target the tree cannot place, `resource_unavailable`,
 `leader_streaming`, and `precondition_failed` while the arm executes a move.
 It checks no collision with the robot or the room.
 
@@ -515,7 +532,8 @@ wait stops nothing and a check then gets an error reply with
 
 ### transforms
 
-Right after each `limb_states` snapshot, the backbone publishes on
+Each `limb_states` snapshot holds at the newest of the arms' joint-state
+times, as a posture result does. Right after it, the backbone publishes on
 `transforms`, under the snapshot's timestamp, the transform of every joint it
 measures, each from the joint's parent link to its child link as the
 description's URDF places it: each arm joint at the snapshot's joint
@@ -531,6 +549,37 @@ number, gets no transforms message, and the log names the joint's links. The
 backbone publishes nothing on `static_transforms`. Where a camera stands is
 the tree's: the robot's initializer names each camera's frame on
 `sensor_mounts`, and a lookup in the tree places it.
+
+### Placement
+
+The backbone holds the robot's tree: on its `other_transforms` link it takes
+every message of `transforms` and `static_transforms` of the publishers bound
+to it (the robot's initializer, and the base where the robot has one), and it
+takes each message of the transforms of the joints it measures as it publishes
+it, each moving transform kept for `cache_window_s`, as
+`control_core::robot_tree` keeps them. Each command that gives a pose or a
+point, in its `frame` at its `timestamp`, the robot frame for a command with
+no frame, is placed in the robot frame by that tree when the backbone takes
+it, waiting up to `lookup_timeout_s` on the backbone's clock for the tree to
+answer. A `move_arm` goal and a `check_arm_move` request are placed once, when
+the backbone decides on the goal or takes the request; the points of a
+`check_positions` request together, in its one `frame` at its one `timestamp`;
+and each `pose_setpoints` sample as it comes, each arm's on a loop of its own,
+so a sample that waits for the tree holds back only its own arm. Each is
+placed by `RobotTree::place`: with no timestamp, where its frame stands at the
+latest time; at a time, where its frame stood then, through the root of its
+frame's chain (odom or map on a mobile base, the robot frame on a fixed one),
+so a robot-frame pose from before a base move names the same place on the
+floor after it, as limb_motion places a target and pose_link a setpoint.
+
+A goal or a request the tree cannot place is refused with the failure kind of
+the lookup (`unknown_frame`, `no_chain`, `extrapolation`, `broken_tree`), or
+with `rejected` where a coordinate it places leaves the finite numbers, its
+message naming the target or the points (`the points: ...`), then the
+cause, before anything moves; a setpoint the tree cannot place is dropped,
+with a throttled log line. An orientation whose squared norm lies 0.01 or
+more from 1 is refused with `rejected`, a setpoint with one dropped, and each
+orientation taken is normalized (`control_core::geometry`).
 
 ### workspace
 
@@ -590,9 +639,14 @@ each grid point's reach at a target 4 cm above it, and keeps the reach grids
 of the last 32 heights it measured (the one stored first goes past that), so
 a repeated height answers from the stored grid. A height that is not a
 finite number or that is more than 1000 m from the robot's base point, an
-empty position list, one that does not split into points of 3 values, a
-value that is not a finite number, and a coordinate more than 1000 m from
-the robot's base point get an error reply with `rejected`. Both services read nothing of the arms
+empty list of points, a value that is not a finite number, and a point that,
+placed in the robot frame, has a coordinate more than 1000 m from the
+robot's base point get an error reply with `rejected`; points the tree
+cannot place get the failure kind of the lookup ([Placement](#placement)).
+`describe_workspace` gives its bounds in the robot frame, which it names in
+`frame`; they hold at every time, so the answer holds no timestamp; each
+result of `check_positions` gives its point as the backbone placed it, in the robot
+frame, at the time of the robot frame's place. Both services read nothing of the arms
 and move nothing, so they answer from bringup, ahead of the readiness gate.
 The robot's own body is not checked for hiding a point from the camera.
 
@@ -623,11 +677,14 @@ The robot's own body is not checked for hiding a point from the camera.
 | `governor/path_check.rs` | `PathChecker`, a joint path walked against the step floor before the move starts on a copy of the governor's collision model, and `GuardAt`, the guard it is walked against | the floor scan's resolution and floor, over a whole path |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
 | `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
-| `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal |
+| `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, the kinds of a placement in the robot's tree, given to the members that place a frame (`TargetFailure`), and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal; a placement's kind reaches no member that places nothing |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: its arms as `workspace_core`'s reach rule asks them, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `transforms.rs` | `JointTransforms`: the transform of every arm and finger joint at a snapshot's joints and openings, from the description, and the start of every transform | the publisher of a measured joint is the node that measures it; the fixed joints are the initializer's |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
-| `types.rs` | the limb tables, the world-pose wire codec, every arm's joints in one vector | shared primitives; `ArmId` and `PerArm` come from `robot_description`, `ARM_DOF` and `JointVec` from `srs_model` |
+| `types.rs` | the limb tables, every arm's joints in one vector | shared primitives; `ArmId` and `PerArm` come from `robot_description`, `ARM_DOF` and `JointVec` from `srs_model` |
+| `placement.rs` | `Placer`: the robot's tree, the robot frame and the wait of a placement; a command's pose or point placed in the robot frame | one placement for every command that gives a pose |
+| `follow.rs` | the followers of the `other_transforms` link, which take each message of `transforms` and `static_transforms` of the other publishers into the robot's tree | the tree is `control_core::robot_tree`'s; each topic's message converts to frame_tree's field for field |
+| `clock.rs` | the node's clock, the wall clock or the simulation clock it is bound to, which every wait of a placement reads | a simulation clock that closes ends the node |
 | `robot.rs` | the robot this node is built for (`ARMS` arms of `ARM_DOF` joints, each arm's and gripper's name, `LIMBS`), a request's arm or gripper by name, the postures of a named state | a model of another shape ends the node, naming the models of this shape |
 | `arm_order.rs` | `ArmOrder`, the arms a request names in its order, on `control_core::requested_arms` | one reading of a request's `arms` for `execute_joint_path` |
 
@@ -640,6 +697,14 @@ initializer answers. A model whose arms are not `left_arm` and `right_arm` of
 seven joints, each with its gripper, ends the node with an error that names the
 served model and the models of this shape, as does an initializer that serves
 another build of the model's description.
+
+The `other_transforms` link takes one or more publishers of `transforms`: bind it to the
+robot's initializer and, where the robot has one, to the base. The backbone
+takes the transforms it publishes into its tree itself. `cache_window_s`
+(above 0) is how long the tree keeps each moving transform, by default tf2's
+default cache time, which MoveIt's planning scene monitor keeps.
+`lookup_timeout_s` (0 or above) is required: how long a placement waits for
+the tree ([Placement](#placement)).
 
 See `peppy.json5` for the full commented list. The operational governor
 parameters (`d_stop_m`, `d_safe_m`, `collision_governor_enabled`,

@@ -42,9 +42,10 @@
         // Optional: action-only sessions boot with these unbound.
         // Subscribed only under upstream_mode "joints".
         { name: "joint_link", tag: "v1", role: "follower", link_id: "leader_arm", cardinality: "zero_or_one" },
-        // The Cartesian alternative: a world-frame end-effector pose streams
-        // in and the measured pose relays back. Subscribed only under
-        // upstream_mode "pose".
+        // The Cartesian alternative: an end-effector pose in a frame of the
+        // robot's tree streams in, placed into the robot frame, and the
+        // measured pose relays back in the robot frame. Subscribed only
+        // under upstream_mode "pose".
         { name: "pose_link", tag: "v1", role: "follower", link_id: "leader_pose", cardinality: "zero_or_one" },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "leader_gripper", cardinality: "zero_or_one" },
         // Downstream: the exclusive command loops with the follower. The
@@ -62,6 +63,10 @@
         // answers, and ends when the model is not so101 or the description's
         // digest is not the one it was built with.
         { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
+        // The robot's tree of frames, which places each move_arm goal,
+        // check_arm_move request, check_positions point and pose setpoint
+        // given in another frame into the robot frame, at its timestamp.
+        { name: "transform_lookup", tag: "v1", link_id: "transform_lookup" },
       ],
     },
   },
@@ -184,6 +189,7 @@
       consumes: [
         { link_id: "robot_identity", name: "get_identity" },
         { link_id: "robot_identity", name: "get_description" },
+        { link_id: "transform_lookup", name: "lookup_transform" },
       ],
     },
   },
@@ -244,6 +250,12 @@
       // operational choice with no safe universal value, so the launcher
       // states it.
       start_tolerance_rad: "f64",
+      // How long (s) the placement of a command waits for the robot's tree
+      // to place it at its timestamp, from 0 to 1, the longest wait
+      // transform_lookup takes; the node stops at its start on any other. A
+      // goal or a request whose wait runs out is refused with the failure of
+      // the lookup, and a pose setpoint is dropped.
+      lookup_timeout_s: "f64",
     },
   },
 }

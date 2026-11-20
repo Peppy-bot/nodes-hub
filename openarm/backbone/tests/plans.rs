@@ -8,7 +8,7 @@ use hegel::TestCase;
 use hegel::generators as gs;
 use robot_description::states;
 use srs_model::chain_kinematics::{interpolate, pose_miss};
-use srs_model::nalgebra::{Isometry3, Quaternion, Translation3, Unit, UnitQuaternion, Vector3};
+use srs_model::nalgebra::{Isometry3, Translation3, Unit, UnitQuaternion, Vector3};
 use srs_model::{Arm, ArmAnglePolicy, ELBOW, JointVec, plan_line};
 
 mod helpers;
@@ -41,7 +41,7 @@ fn strays(
     let ab = end.translation.vector - start.translation.vector;
     (0..=400u32)
         .map(|k| {
-            let ee = model.world_ee_pose(&traj.sample(t0 + duration * k / 400));
+            let ee = model.root_ee_pose(&traj.sample(t0 + duration * k / 400));
             let from_start = ee.translation.vector - start.translation.vector;
             let along = if ab.norm_squared() > 0.0 {
                 (from_start.dot(&ab) / ab.norm_squared()).clamp(0.0, 1.0)
@@ -99,7 +99,7 @@ fn the_reported_pull_to_x_minus_02_plans_a_line() {
     let model = v2_right_arm();
     // The recorded pull is a tip coordinate, so -0.2 is placed there and carried to the
     // tool: the same physical motion, in the frame commanded.
-    let mut end_tip = tip_world(&model, &REPORTED_START);
+    let mut end_tip = tip_in_root(&model, &REPORTED_START);
     end_tip.translation.vector.x = -0.2;
     let end = end_tip * model.tool();
     let walk = plan_line(&model, &end, REPORTED_START).expect("the pull tracks as a line");
@@ -114,7 +114,7 @@ fn small_nudge_after_the_cross_body_pull_stays_a_quiet_line() {
     let (_, end, seed) = cross_body_pull(&model);
     let pull = plan_line(&model, &end, seed).expect("the pull tracks as a line");
     let parked = pull[pull.len() - 1];
-    let mut nudge_end = model.world_ee_pose(&parked);
+    let mut nudge_end = model.root_ee_pose(&parked);
     nudge_end.translation.vector.x += 0.03;
     let walk = plan_line(&model, &nudge_end, parked).expect("an ordinary nudge must stay a line");
     let swing = swing_of(&walk);
@@ -138,7 +138,7 @@ fn an_easy_move_sweeps_no_joint() {
 #[test]
 fn the_field_lift_stays_on_the_line_inside_the_limits() {
     let model = v2_left_arm();
-    let mut end = model.world_ee_pose(&REPORTED_START_LEFT);
+    let mut end = model.root_ee_pose(&REPORTED_START_LEFT);
     end.translation.vector.z += 0.25;
     let walk = plan_line(&model, &end, REPORTED_START_LEFT).expect("the lift must stay a line");
     let limits = model.limits();
@@ -153,7 +153,7 @@ fn the_field_lift_stays_on_the_line_inside_the_limits() {
     let (off_m, off_rad) = strays(
         &model,
         &walk,
-        &model.world_ee_pose(&REPORTED_START_LEFT),
+        &model.root_ee_pose(&REPORTED_START_LEFT),
         &end,
     );
     assert!(
@@ -180,7 +180,7 @@ fn a_pure_reorientation_plans_a_line() {
 fn an_unreachable_goal_has_no_line() {
     let arm = v1_left_arm();
     let seed = [0.0, 0.3, 0.0, 0.8, 0.0, 0.5, 0.0];
-    let mut unreachable = arm.world_pose(&arm.at(&seed).ee_pose());
+    let mut unreachable = arm.root_pose(&arm.at(&seed).ee_pose());
     unreachable.translation.vector.x += 10.0;
     assert_eq!(
         plan_line(&arm, &unreachable, seed),
@@ -203,24 +203,24 @@ fn a_turn_in_place_on_a_joint_limit_takes_the_time_of_its_walk() {
         0.0,
         0.01953125,
     ];
-    let end = Isometry3::from_parts(
-        Translation3::new(
+    let end = contract_pose(
+        [
             0.22708814676410083,
             -0.16227560836854987,
             0.5360335470985803,
-        ),
-        UnitQuaternion::from_quaternion(Quaternion::new(
-            0.35492938102695715,
+        ],
+        [
             -0.8141879802039343,
             0.4594481026635893,
             0.005523434989812087,
-        )),
+            0.35492938102695715,
+        ],
     );
     let walk = plan_line(&model, &end, seed).expect("the turn tracks");
     let time_s = time_of(&walk);
     // 2.34 s at the launcher's limits.
     assert!(time_s < 3.0, "the walk takes {time_s} s");
-    let (off_m, off_rad) = strays(&model, &walk, &model.world_ee_pose(&seed), &end);
+    let (off_m, off_rad) = strays(&model, &walk, &model.root_ee_pose(&seed), &end);
     assert!(
         off_m <= STRAY_M && off_rad <= STRAY_RAD,
         "{off_m} m, {off_rad} rad"
@@ -241,18 +241,18 @@ fn a_line_past_the_shoulders_near_gimbal_sweeps_no_joint_out_and_back() {
         -0.4483644938931237,
         -0.3831886672587488,
     ];
-    let end = Isometry3::from_parts(
-        Translation3::new(
+    let end = contract_pose(
+        [
             -0.02075165570287052,
             -0.7003013061991421,
             0.8784807024580981,
-        ),
-        UnitQuaternion::from_quaternion(Quaternion::new(
-            0.44957322108241293,
+        ],
+        [
             0.19680448605906553,
             0.3446837531922017,
             -0.8002156105937623,
-        )),
+            0.44957322108241293,
+        ],
     );
     let walk = plan_line(&model, &end, seed).expect("the line tracks");
     let swing = swing_of(&walk);
@@ -273,18 +273,18 @@ fn a_line_no_descent_continues_has_no_plan() {
         -0.15439797023539903,
         -0.06501276773723075,
     ];
-    let end = Isometry3::from_parts(
-        Translation3::new(
+    let end = contract_pose(
+        [
             -0.06948327918718664,
             -0.7426881708286679,
             0.7202940376338689,
-        ),
-        UnitQuaternion::from_quaternion(Quaternion::new(
-            0.6215032972114822,
+        ],
+        [
             0.584661916495689,
             0.2716032202436591,
             -0.445124460918649,
-        )),
+            0.6215032972114822,
+        ],
     );
     assert!(
         model
@@ -309,21 +309,21 @@ fn a_line_halves_the_steps_that_leave_the_line() {
         0.18239601407670425,
         0.00530395842377529,
     ];
-    let end = Isometry3::from_parts(
-        Translation3::new(
+    let end = contract_pose(
+        [
             -0.19096469789186654,
             -0.37974457088305036,
             0.899612817452504,
-        ),
-        UnitQuaternion::from_quaternion(Quaternion::new(
-            0.18270058971218298,
+        ],
+        [
             0.3174263631020636,
             0.44440760712646815,
             -0.8175346336729374,
-        )),
+            0.18270058971218298,
+        ],
     );
     let walk = plan_line(&model, &end, seed).expect("the line tracks");
-    let (off_m, off_rad) = strays(&model, &walk, &model.world_ee_pose(&seed), &end);
+    let (off_m, off_rad) = strays(&model, &walk, &model.root_ee_pose(&seed), &end);
     assert!(
         off_m <= STRAY_M && off_rad <= STRAY_RAD,
         "the hand strays {off_m} m and {off_rad} rad"
@@ -366,7 +366,7 @@ fn drawn_move(tc: &TestCase) -> (Arm, JointVec, Isometry3<f64>) {
     let (direction, axis) = (drawn_unit(tc), drawn_unit(tc));
     let travel: f64 = tc.draw(gs::floats().min_value(0.0).max_value(0.5));
     let turn: f64 = tc.draw(gs::floats().min_value(0.0).max_value(0.8));
-    let start = model.world_ee_pose(&seed);
+    let start = model.root_ee_pose(&seed);
     let end = Isometry3::from_parts(
         Translation3::from(start.translation.vector + direction.into_inner() * travel),
         UnitQuaternion::from_axis_angle(&axis, turn) * start.rotation,
@@ -383,7 +383,7 @@ fn a_played_line_keeps_the_hand_on_the_line(tc: TestCase) {
         tc.event("no line");
         return;
     };
-    let (off_m, off_rad) = strays(&model, &walk, &model.world_ee_pose(&seed), &end);
+    let (off_m, off_rad) = strays(&model, &walk, &model.root_ee_pose(&seed), &end);
     tc.target(off_m);
     assert!(
         off_m <= STRAY_M,
@@ -396,7 +396,7 @@ fn a_played_line_keeps_the_hand_on_the_line(tc: TestCase) {
     let t0 = Instant::now();
     let traj = played(&walk, t0);
     let landed =
-        model.world_ee_pose(&traj.sample(t0 + traj.clock().duration() + Duration::from_secs(1)));
+        model.root_ee_pose(&traj.sample(t0 + traj.clock().duration() + Duration::from_secs(1)));
     let miss = pose_miss(&landed, &end);
     assert!(
         miss.position_m <= 1e-5 && miss.orientation_rad <= 1e-5,

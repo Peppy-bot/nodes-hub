@@ -11,6 +11,7 @@ from tests.helpers import (
     boot,
     default_settings,
     eventually,
+    posture_done,
     press_until_goal,
     robots_of,
     scripted_driver,
@@ -18,16 +19,6 @@ from tests.helpers import (
 from xr_commander import postures
 from xr_commander.devices import primary_pressed, secondary_pressed
 from xr_commander.drive import POSTURE
-
-
-def done(module):
-    """A posture result as a robot sends it. The commander reads only how the
-    goal ended, thus the arm pose in it is a fixed value."""
-    return module.ResultResponseData(
-        arm_names=["right_arm"],
-        positions=[0.3, -0.2, 0.3],
-        orientations=[0.0, 0.0, 0.0, 1.0],
-    )
 
 
 def boot_postures():
@@ -80,7 +71,7 @@ async def test_a_posture_move_shows_in_flight_then_its_outcome():
             pending = await mock.next_goal(10.0)
             active = await pending.accept()
             await eventually(lambda: status.state() == "moving to home...")
-            await active.complete(done(move_to_home))
+            await active.complete(posture_done(move_to_home))
             await eventually(lambda: status.state() == "move to home completed")
             assert status.moving is None
 
@@ -155,7 +146,7 @@ async def test_the_button_fires_once_per_rising_edge():
             # Still held: one edge, one goal.
             with pytest.raises(TimeoutError):
                 await mock.next_goal(0.4)
-            await active.complete(done(move_to_home))
+            await active.complete(posture_done(move_to_home))
 
 
 async def test_a_button_already_held_at_first_tracking_does_not_fire():
@@ -173,7 +164,7 @@ async def test_a_button_already_held_at_first_tracking_does_not_fire():
             await asyncio.sleep(0.05)
             session.press(right=(True, False, False))
             pending = await mock.next_goal(10.0)
-            await (await pending.accept()).complete(done(move_to_home))
+            await (await pending.accept()).complete(posture_done(move_to_home))
 
 
 async def test_a_stale_gap_does_not_refire_a_held_button():
@@ -188,7 +179,7 @@ async def test_a_stale_gap_does_not_refire_a_held_button():
             await asyncio.sleep(0.05)
             session.press(right=(True, False, False))
             pending = await mock.next_goal(10.0)
-            await (await pending.accept()).complete(done(move_to_home))
+            await (await pending.accept()).complete(posture_done(move_to_home))
             # The headset drops out while the thumb stays down...
             session.hands = {}
             await asyncio.sleep(0.05)
@@ -203,7 +194,7 @@ async def test_a_stale_gap_does_not_refire_a_held_button():
                 {"right": (False, False, False)},
                 {"right": (True, False, False)},
             )
-            await (await pending.accept()).complete(done(move_to_home))
+            await (await pending.accept()).complete(posture_done(move_to_home))
 
 
 async def test_the_selector_decides_which_button_fires_the_action():
@@ -223,7 +214,7 @@ async def test_the_selector_decides_which_button_fires_the_action():
             await asyncio.sleep(0.05)
             session.press(right=(False, True, False))
             pending = await ready.next_goal(10.0)
-            await (await pending.accept()).complete(done(move_to_ready))
+            await (await pending.accept()).complete(posture_done(move_to_ready))
 
 
 async def test_a_posture_press_is_inert_while_the_chosen_robot_offers_none(capsys):

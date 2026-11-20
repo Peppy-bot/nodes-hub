@@ -25,9 +25,14 @@ def transforms_message(
     moving = DESCRIPTION.transforms_at(positions)
     return transforms.build_message(
         timestamp_s,
-        [transform.child for transform in moving],
-        [transform.parent for transform in moving],
-        [value for transform in moving for value in transform.position],
-        [value for transform in moving for value in transform.orientation],
+        [
+            transforms.MessageTransformsItem(
+                frame=transform.parent,
+                child_frame=transform.child,
+                position=list(transform.position),
+                orientation=list(transform.orientation),
+            )
+            for transform in moving
+        ],
         started_s,
     )

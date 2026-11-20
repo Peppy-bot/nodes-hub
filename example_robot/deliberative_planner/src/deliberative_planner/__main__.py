@@ -23,10 +23,10 @@ from peppygen.paired_topics.deliberation import situation, subgoal
 from peppygen.parameters import Parameters
 from peppylib import CancellationToken
 
-# How far each planning step nudges the executor toward the goal. A real
-# planner would run a world model; a mock only has to produce subgoals that
-# move, and move visibly.
-STEP = 0.25
+# Where each subgoal's target stands in the frame of the latest picture, the
+# camera's optical frame, which looks along +Z: on the optical axis, this far
+# (m) ahead of the camera, in the middle of the view.
+TARGET_AHEAD_M = 0.5
 
 
 class Scene:
@@ -34,7 +34,10 @@ class Scene:
 
     def __init__(self) -> None:
         self.frames_seen = 0
-        self.executor_positions = [0.0, 0.0, 0.0]
+        # The header of the latest picture, None before the first: a subgoal
+        # planned from the scene names its frame and its time, and the executor
+        # places its target by its own tree at that time.
+        self.latest_picture: video_stream.MessageHeader | None = None
         self.escalations = 0
         # Which subgoal the executor last reported servoing on. Read from its
         # own echo rather than assumed from what was published: a subgoal that
@@ -59,6 +62,7 @@ async def watch_scene(node_runner: NodeRunner, scene: Scene) -> None:
             break
         producer, message = received
         scene.frames_seen += 1
+        scene.latest_picture = message.header
         if scene.frames_seen == 1:
             print(
                 f"[deliberative_planner] first frame received across the boundary "
@@ -83,7 +87,6 @@ async def watch_executor(node_runner: NodeRunner, scene: Scene) -> None:
         if received is None:
             break
         _peer, message = received
-        scene.executor_positions = list(message.joint_positions)
         scene.adopted_subgoal_id = message.active_subgoal_id
         if message.escalated:
             scene.escalations += 1
@@ -92,9 +95,11 @@ async def watch_executor(node_runner: NodeRunner, scene: Scene) -> None:
 async def plan(
     params: Parameters, node_runner: NodeRunner, scene: Scene, token: CancellationToken
 ) -> None:
-    """Publishes a subgoal per planning cycle.
+    """Publishes a subgoal per planning cycle, once a picture has arrived.
 
-    Planning starts before the first frame arrives and before the pair is
+    Each subgoal's target is a point in the frame of the latest picture, at
+    that picture's time, as a planner that reasons from the scene gives it:
+    TARGET_AHEAD_M along the camera's view. Planning starts before the pair is
     established. Publishing on an unpaired slot is a legal no-op, so there is
     nothing to synchronize here: the executor receives every subgoal published
     while the pair is live, and none published before it.
@@ -113,14 +118,23 @@ async def plan(
     # adopted subgoal from a redelivery of the previous one.
     subgoal_id = 0
     while not token.is_cancelled():
+        picture = scene.latest_picture
+        if picture is None:
+            await asyncio.sleep(interval)
+            continue
         subgoal_id += 1
-        target = [round(position + STEP, 3) for position in scene.executor_positions]
+        target = subgoal.MessageTarget(
+            frame=picture.frame,
+            timestamp=picture.timestamp,
+            position=[0.0, 0.0, TARGET_AHEAD_M],
+        )
         await publisher.publish(
             subgoal.build_message(time.time(), subgoal_id, target, params.horizon_s)
         )
         print(
-            f"[deliberative_planner] subgoal {subgoal_id} target={target} "
-            f"(frames={scene.frames_seen}, escalations={scene.escalations}, "
+            f"[deliberative_planner] subgoal {subgoal_id} target={target.position} "
+            f"in {target.frame} (frames={scene.frames_seen}, "
+            f"escalations={scene.escalations}, "
             f"executor_on={scene.adopted_subgoal_id or 'none'})",
             flush=True,
         )

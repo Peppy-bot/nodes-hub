@@ -76,9 +76,9 @@ async def ai_process(node_runner: NodeRunner, latest_frame: LatestValueMailbox):
 
         # Process the frame and generate fake arm positions
         fake_position = [
-            frame.frame[0],
-            frame.frame[1],
-            frame.frame[2],
+            frame.data[0],
+            frame.data[1],
+            frame.data[2],
         ]
         print(f"[brain] Generated arm position: {fake_position}")
 

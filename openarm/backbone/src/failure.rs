@@ -1,16 +1,25 @@
 //! Why the backbone refuses or fails a move, or gives an error reply on a
-//! plan check: a failure kind that peppy or the limb_motion and postures
-//! contracts declare, and a message for a person. Each generated member has
-//! a `FailureKind` of its own with these names, and the moves pass one
-//! failure between them (a posture share ends its posture goal, and a share
-//! of a joint path its execute_joint_path goal), so the backbone keeps its
-//! own kind and gives each member its own.
+//! plan check or a check of points: a failure kind that peppy or the
+//! limb_motion, postures and workspace contracts declare, and a message for a
+//! person. Each generated member has a `FailureKind` of its own with these
+//! names, and the moves pass one failure between them (a posture share ends
+//! its posture goal, and a share of a joint path its execute_joint_path goal),
+//! so the backbone keeps its own kind and gives each member its own. A
+//! command the robot's tree cannot place fails with the kind of the placement
+//! ([`Unplaced`]), which only the members that place a frame take:
+//! `move_arm` and `check_arm_move` through [`TargetFailure`], and
+//! `check_positions`. A move along a path the backbone plans or judges fails
+//! with `unreachable` where no path reaches its target, which only the
+//! members that run such a path take: `move_arm` and `execute_joint_path`
+//! through [`PathFailure`].
 
+use control_core::robot_tree::PlaceError;
 use peppygen::exposed_actions::limb_motion::{
     execute_joint_path, move_arm, move_arm_joints, move_gripper,
 };
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::exposed_services::limb_motion::check_arm_move;
+use peppygen::exposed_services::workspace::check_positions;
 
 /// A failure kind of the moves and of `check_arm_move`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,10 +40,21 @@ pub enum FailureKind {
     AttemptFailed,
     /// An arm move did not settle by its timeout.
     Timeout,
-    /// No plan reaches the target.
-    Unreachable,
     /// A leader streams a limb of the goal.
     LeaderStreaming,
+}
+
+/// The failure kind of a placement in the robot's tree, as control_core's
+/// [`PlaceError::failure_kind`] names it: the kind of the lookup, as
+/// transform_lookup names the failures of a lookup, or `rejected` for a
+/// placed value no contract takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaceKind(&'static str);
+
+impl PlaceKind {
+    pub fn of(error: &PlaceError) -> Self {
+        Self(error.failure_kind())
+    }
 }
 
 /// Why a move is refused or failed.
@@ -63,6 +83,89 @@ impl Failure {
     }
 }
 
+/// Why the robot's tree cannot place a command: the kind of the placement,
+/// and a message that names the command, then the cause as transform_lookup's
+/// message does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unplaced {
+    pub kind: PlaceKind,
+    pub message: String,
+}
+
+impl Unplaced {
+    /// The failure of the placement `error` of the command `what` names.
+    pub fn of(what: impl std::fmt::Display, error: &PlaceError) -> Self {
+        Self {
+            kind: PlaceKind::of(error),
+            message: format!("{what}: {error}"),
+        }
+    }
+}
+
+/// Why the backbone refuses a `move_arm` goal or gives an error reply on a
+/// `check_arm_move` request, the moves that place a target: a failure of the
+/// moves, or a target the robot's tree cannot place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetFailure {
+    Failed(Failure),
+    Unplaced(Unplaced),
+}
+
+impl From<Failure> for TargetFailure {
+    fn from(failure: Failure) -> Self {
+        Self::Failed(failure)
+    }
+}
+
+impl From<Unplaced> for TargetFailure {
+    fn from(unplaced: Unplaced) -> Self {
+        Self::Unplaced(unplaced)
+    }
+}
+
+impl TargetFailure {
+    /// The kind `Member`, the generated kind of a member that places a
+    /// target, gives this failure, and its message.
+    pub fn for_member<Member: From<FailureKind> + From<PlaceKind>>(self) -> (Member, String) {
+        match self {
+            Self::Failed(failure) => (failure.kind.into(), failure.message),
+            Self::Unplaced(unplaced) => (unplaced.kind.into(), unplaced.message),
+        }
+    }
+}
+
+/// The failure kind `unreachable` of a move along a path the backbone plans
+/// or judges: no path it planned or judged reaches the target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnreachableKind;
+
+/// Why the backbone fails a move along a path it plans or judges, the moves
+/// of `move_arm` and `execute_joint_path`: a failure of the moves, or
+/// `unreachable`, with the message that says why no path it planned or
+/// judged reaches the target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathFailure {
+    Failed(Failure),
+    Unreachable(String),
+}
+
+impl From<Failure> for PathFailure {
+    fn from(failure: Failure) -> Self {
+        Self::Failed(failure)
+    }
+}
+
+impl PathFailure {
+    /// The kind `Member`, the generated kind of a member that runs a path the
+    /// backbone plans or judges, gives this failure, and its message.
+    pub fn for_member<Member: From<FailureKind> + From<UnreachableKind>>(self) -> (Member, String) {
+        match self {
+            Self::Failed(failure) => (failure.kind.into(), failure.message),
+            Self::Unreachable(message) => (UnreachableKind.into(), message),
+        }
+    }
+}
+
 /// The failure of a goal that reaches a limb whose follower stream has gone
 /// stale, and of a move whose follower goes stale while it runs.
 pub fn stale_failure() -> Failure {
@@ -72,10 +175,44 @@ pub fn stale_failure() -> Failure {
     )
 }
 
-/// Gives the generated `FailureKind` of `member` the kind of the same name,
-/// and `unreachable` the kind `$unreachable` of the member.
+/// Gives the generated `FailureKind` of `member` each kind of a placement by
+/// the same name, for a member whose contract lists them.
+macro_rules! place_kinds {
+    ($member:ty) => {
+        impl From<PlaceKind> for $member {
+            fn from(kind: PlaceKind) -> Self {
+                Self::parse(kind.0)
+                    .expect("a member that places a frame lists each failure kind of a placement")
+            }
+        }
+    };
+}
+
+// The members that place a frame list the kinds of a lookup and `rejected`.
+place_kinds!(move_arm::FailureKind);
+place_kinds!(check_arm_move::FailureKind);
+place_kinds!(check_positions::FailureKind);
+
+/// Gives the generated `FailureKind` of `member` its `unreachable`, for a
+/// member that runs a path the backbone plans or judges.
+macro_rules! unreachable_kind {
+    ($member:ty) => {
+        impl From<UnreachableKind> for $member {
+            fn from(_: UnreachableKind) -> Self {
+                Self::Unreachable
+            }
+        }
+    };
+}
+
+// The Cartesian move and the joint path run a path the backbone plans or
+// judges, and list `unreachable`.
+unreachable_kind!(move_arm::FailureKind);
+unreachable_kind!(execute_joint_path::FailureKind);
+
+/// Gives the generated `FailureKind` of `member` the kind of the same name.
 macro_rules! member_failure_kinds {
-    ($member:ty, unreachable => $unreachable:ident) => {
+    ($member:ty) => {
         impl From<FailureKind> for $member {
             fn from(kind: FailureKind) -> Self {
                 match kind {
@@ -84,7 +221,6 @@ macro_rules! member_failure_kinds {
                     FailureKind::ResourceUnavailable => Self::ResourceUnavailable,
                     FailureKind::AttemptFailed => Self::AttemptFailed,
                     FailureKind::Timeout => Self::Timeout,
-                    FailureKind::Unreachable => Self::$unreachable,
                     FailureKind::LeaderStreaming => Self::LeaderStreaming,
                 }
             }
@@ -92,26 +228,26 @@ macro_rules! member_failure_kinds {
     };
 }
 
-// The joint path, the Cartesian move and the postures list `unreachable`.
-member_failure_kinds!(execute_joint_path::FailureKind, unreachable => Unreachable);
-member_failure_kinds!(move_arm::FailureKind, unreachable => Unreachable);
-member_failure_kinds!(move_to_ready::FailureKind, unreachable => Unreachable);
-member_failure_kinds!(move_to_home::FailureKind, unreachable => Unreachable);
-// The backbone plans no path for these members, so no plan failure reaches
-// them, and their contract lists no `unreachable` for them: a plan failure
-// that did would be an attempt that failed, and its message says why.
-member_failure_kinds!(move_arm_joints::FailureKind, unreachable => AttemptFailed);
-member_failure_kinds!(move_gripper::FailureKind, unreachable => AttemptFailed);
-member_failure_kinds!(check_arm_move::FailureKind, unreachable => AttemptFailed);
+member_failure_kinds!(execute_joint_path::FailureKind);
+member_failure_kinds!(move_arm::FailureKind);
+member_failure_kinds!(move_to_ready::FailureKind);
+member_failure_kinds!(move_to_home::FailureKind);
+member_failure_kinds!(move_arm_joints::FailureKind);
+member_failure_kinds!(move_gripper::FailureKind);
+member_failure_kinds!(check_arm_move::FailureKind);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_core::geometry::GeometryError;
+    use frame_tree::{
+        BrokenTree, FrameName, HeldStamps, LookupError, LookupTime, Stamp, TransformName,
+    };
+
     use crate::robot::LIMBS;
     use crate::test_support::LEFT;
 
-    /// Each member gets the kind of the same name, and a member whose
-    /// contract lists no `unreachable` gets `attempt_failed` for it.
+    /// Each member gets the kind of the same name.
     #[test]
     fn each_member_gets_the_kind_of_the_same_name() {
         let kinds = [
@@ -120,28 +256,123 @@ mod tests {
             (FailureKind::ResourceUnavailable, "resource_unavailable"),
             (FailureKind::AttemptFailed, "attempt_failed"),
             (FailureKind::Timeout, "timeout"),
-            (FailureKind::Unreachable, "unreachable"),
             (FailureKind::LeaderStreaming, "leader_streaming"),
         ];
         for (kind, name) in kinds {
-            let planning = [
+            let members = [
+                execute_joint_path::FailureKind::from(kind).as_str(),
                 move_arm::FailureKind::from(kind).as_str(),
                 move_to_ready::FailureKind::from(kind).as_str(),
                 move_to_home::FailureKind::from(kind).as_str(),
-            ];
-            assert_eq!(planning, [name; 3], "{kind:?}");
-            let unplanned = if kind == FailureKind::Unreachable {
-                "attempt_failed"
-            } else {
-                name
-            };
-            let others = [
                 move_arm_joints::FailureKind::from(kind).as_str(),
                 move_gripper::FailureKind::from(kind).as_str(),
                 check_arm_move::FailureKind::from(kind).as_str(),
             ];
-            assert_eq!(others, [unplanned; 3], "{kind:?}");
+            assert_eq!(members, [name; 7], "{kind:?}");
         }
+    }
+
+    /// A member that runs a path the backbone plans or judges gets
+    /// `unreachable`, with the message that says why no path reaches the
+    /// target.
+    #[test]
+    fn a_member_that_runs_a_path_gets_unreachable() {
+        let unreachable = PathFailure::Unreachable("blocked".to_string());
+        let (moving, moving_message) = unreachable.clone().for_member::<move_arm::FailureKind>();
+        let (path, path_message) = unreachable.for_member::<execute_joint_path::FailureKind>();
+        assert_eq!([moving.as_str(), path.as_str()], ["unreachable"; 2]);
+        assert_eq!([moving_message, path_message], ["blocked", "blocked"]);
+    }
+
+    /// A failure of the moves reaches a member that runs a path with the kind
+    /// of the same name.
+    #[test]
+    fn a_failure_of_the_moves_reaches_a_member_that_runs_a_path_by_its_name() {
+        let failed = PathFailure::from(Failure::new(FailureKind::Timeout, "unsettled"));
+        let (kind, message) = failed.for_member::<execute_joint_path::FailureKind>();
+        assert_eq!(
+            (kind, message.as_str()),
+            (execute_joint_path::FailureKind::Timeout, "unsettled")
+        );
+    }
+
+    fn frame(name: &str) -> FrameName {
+        FrameName::parse(name).expect("a frame name")
+    }
+
+    /// A failure of each kind of a placement, with the name the contracts give it.
+    fn each_place_error() -> [(PlaceError, &'static str); 5] {
+        let transform = TransformName {
+            parent: frame("odom"),
+            child: frame("base_footprint"),
+        };
+        [
+            (
+                PlaceError::Lookup(LookupError::UnknownFrame {
+                    frame: frame("gripper"),
+                    held: Vec::new(),
+                }),
+                "unknown_frame",
+            ),
+            (
+                PlaceError::Lookup(LookupError::NoChain {
+                    target_frame: frame("base_link"),
+                    source_frame: frame("odom"),
+                }),
+                "no_chain",
+            ),
+            (
+                PlaceError::Lookup(LookupError::Extrapolation {
+                    transform: transform.clone(),
+                    requested: LookupTime::At(Stamp::from_nanos(5)),
+                    held: HeldStamps::Empty,
+                }),
+                "extrapolation",
+            ),
+            (
+                PlaceError::Lookup(LookupError::BrokenTree(BrokenTree::Cycle {
+                    transforms: vec![transform],
+                })),
+                "broken_tree",
+            ),
+            (PlaceError::Value(GeometryError::NoFrame), "rejected"),
+        ]
+    }
+
+    /// A member that places a frame gets each kind of a placement by the same
+    /// name, and the message that names the command, then the placement's
+    /// cause.
+    #[test]
+    fn a_member_that_places_a_frame_gets_each_kind_of_a_placement() {
+        for (error, name) in each_place_error() {
+            let unplaced = TargetFailure::from(Unplaced::of("the target", &error));
+            let (move_arm, moving) = unplaced.clone().for_member::<move_arm::FailureKind>();
+            let (check_arm_move, checking) = unplaced.for_member::<check_arm_move::FailureKind>();
+            let check_positions = check_positions::FailureKind::from(PlaceKind::of(&error));
+            assert_eq!(
+                [
+                    move_arm.as_str(),
+                    check_arm_move.as_str(),
+                    check_positions.as_str()
+                ],
+                [name; 3],
+                "{error}"
+            );
+            let cause = format!("the target: {error}");
+            assert_eq!([moving, checking], [cause.clone(), cause]);
+        }
+    }
+
+    /// A failure of the moves reaches a member that places a target with the
+    /// kind of the same name.
+    #[test]
+    fn a_failure_of_the_moves_reaches_a_member_that_places_a_target_by_its_name() {
+        let failed = TargetFailure::from(Failure::new(FailureKind::LeaderStreaming, "streaming"));
+        let (kind, message) = failed.for_member::<move_arm::FailureKind>();
+        assert_eq!(
+            (kind, message.as_str()),
+            (move_arm::FailureKind::LeaderStreaming, "streaming")
+        );
     }
 
     #[test]
@@ -154,23 +385,5 @@ mod tests {
                 format!("{}: still 0.2 rad from the target", LIMBS.arm_name(LEFT))
             )
         );
-    }
-
-    /// execute_joint_path gets the kind of the same name for each kind, and
-    /// lists `unreachable`.
-    #[test]
-    fn execute_joint_path_gets_the_kind_of_the_same_name() {
-        let kinds = [
-            (FailureKind::Rejected, "rejected"),
-            (FailureKind::PreconditionFailed, "precondition_failed"),
-            (FailureKind::ResourceUnavailable, "resource_unavailable"),
-            (FailureKind::AttemptFailed, "attempt_failed"),
-            (FailureKind::Timeout, "timeout"),
-            (FailureKind::Unreachable, "unreachable"),
-            (FailureKind::LeaderStreaming, "leader_streaming"),
-        ];
-        for (kind, name) in kinds {
-            assert_eq!(execute_joint_path::FailureKind::from(kind).as_str(), name);
-        }
     }
 }

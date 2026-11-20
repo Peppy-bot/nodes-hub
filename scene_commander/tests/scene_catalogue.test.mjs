@@ -204,6 +204,8 @@ const PROVIDER_BUSY = 'Isaac is still discovering its asset catalogue';
 const NO_OBJECT_STATE = 'Isaac has not loaded its stage yet';
 const NO_SCENE = 'no scene is loaded';
 const CAPTURED = 1757944800.25;
+// The frame of every position the simulation reports.
+const WORLD = 'world';
 
 // unavailable: how many catalogue requests the provider refuses first, as the
 // node answers while the engine has no catalogue yet (HTTP 503).
@@ -289,8 +291,8 @@ async function page(catalogue = [staticScene, dynamicScene, cage], objects = [],
         }
         const data = path === '/api/assets' ? { assets: currentCatalogue }
             : path === '/api/objects'
-                ? { objects: currentObjects, count: currentObjects.length, timestamp: CAPTURED }
-            : path === '/api/robots' ? { robots, count: robots.length }
+                ? { objects: currentObjects, count: currentObjects.length, frame: WORLD, timestamp: CAPTURED }
+            : path === '/api/robots' ? { robots, count: robots.length, frame: WORLD, timestamp: CAPTURED }
             : path === '/api/capabilities'
                 ? { lighting: false, daylight: false, materials: false, cameras: false, ...capabilities }
             : path === '/api/lighting' ? { lighting: currentLighting }
@@ -616,7 +618,7 @@ test('the robot picker lists what the scene stands and a move carries the one ch
         'bravo (openarm_v1)',
     ]);
     assert.equal(select.disabled, false);
-    assert.equal(ui.element('robotCount').textContent, '2 robots standing');
+    assert.equal(ui.element('robotCount').textContent, '2 robots standing, positions in world');
 
     // Choosing a robot offers that robot's own position and yaw, not the
     // last one's.
@@ -664,14 +666,14 @@ const panel = ui => ui.element('objects').children.map(child => child.attributes
 
 test('an empty scene lists no runtime objects', async () => {
     const ui = await page([block], []);
-    assert.equal(ui.element('objectCount').textContent, '0 objects');
+    assert.equal(ui.element('objectCount').textContent, '0 objects, positions in world');
     assert.match(ui.element('objects').innerHTML, /No runtime objects\./);
     assert.deepEqual(panel(ui), []);
 });
 
 test('runtime objects show their physics, mass and scale as spawned', async () => {
     const ui = await page([block, carton], [redBlock, staticCarton]);
-    assert.equal(ui.element('objectCount').textContent, '2 objects');
+    assert.equal(ui.element('objectCount').textContent, '2 objects, positions in world');
     const markup = ui.element('objects').innerHTML;
     assert.match(markup, /physics=dynamic\s*&nbsp;\|&nbsp;\s*mass=0\.2 kg\s*&nbsp;\|&nbsp;\s*scale=1\.5/);
     assert.match(markup, /physics=static\s*&nbsp;\|&nbsp;\s*mass=2 kg\s*&nbsp;\|&nbsp;\s*scale=1\b/);
@@ -692,7 +694,7 @@ test('unavailable object state is shown as such, never as an empty scene', async
 
     ui.setObjects([]);
     await ui.run('refreshObjects()');
-    assert.equal(ui.element('objectCount').textContent, '0 objects');
+    assert.equal(ui.element('objectCount').textContent, '0 objects, positions in world');
     assert.match(ui.element('objects').innerHTML, /No runtime objects\./);
     assert.deepEqual(panel(ui), []);
 });

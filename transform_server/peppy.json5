@@ -44,8 +44,9 @@
     parameters: {
       // How long (s) the node keeps each moving transform's stamps, counted
       // back from the newest stamp of its child frame: finite and above 0. A
-      // lookup at a time older than that finds no value.
-      cache_window_s: "f64",
+      // lookup at a time older than that finds no value. The default is the
+      // buffer_size of tf2_ros's buffer server.
+      cache_window_s: { $type: "f64", $default: 120.0 },
     },
   },
 }

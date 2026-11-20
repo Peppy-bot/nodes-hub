@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use control_core::robot_tree::{RobotTree, follow_moving, follow_static};
-use frame_tree::{MovingMessage, Publisher, StaticMessage};
+use frame_tree::{MovingMessage, Publisher, StaticMessage, TransformRecord};
 use peppygen::consumed_topics::transforms::{static_transforms, transforms};
 use peppygen::{NodeRunner, ProducerRef};
 
@@ -53,24 +53,40 @@ fn publisher_of(producer: ProducerRef) -> Publisher {
     }
 }
 
+/// The record of the tree for a transform record of the wire, field for field.
+macro_rules! record_of {
+    ($item:expr) => {{
+        let item = $item;
+        TransformRecord {
+            frame: item.frame,
+            child_frame: item.child_frame,
+            position: item.position,
+            orientation: item.orientation,
+        }
+    }};
+}
+
 /// A message of transforms as the tree takes it, field for field.
 fn moving_message(message: transforms::Message) -> MovingMessage {
     MovingMessage {
         timestamp: message.timestamp,
-        child_frames: message.child_frames,
-        parent_frames: message.parent_frames,
-        positions: message.positions,
-        orientations: message.orientations,
+        transforms: message
+            .transforms
+            .into_iter()
+            .map(|item| record_of!(item))
+            .collect(),
         start_timestamp: message.start_timestamp,
     }
 }
 
-/// A message of static_transforms as the tree takes it, field for field.
+/// A message of static_transforms as the tree takes it: its transforms, field for field,
+/// each holding at every time.
 fn static_message(message: static_transforms::Message) -> StaticMessage {
     StaticMessage {
-        child_frames: message.child_frames,
-        parent_frames: message.parent_frames,
-        positions: message.positions,
-        orientations: message.orientations,
+        transforms: message
+            .transforms
+            .into_iter()
+            .map(|item| record_of!(item))
+            .collect(),
     }
 }

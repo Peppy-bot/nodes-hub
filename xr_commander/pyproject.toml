@@ -10,10 +10,11 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "peppygen",
     "peppylib",
+    "control_core_py",
     # The WebXR server, its prebuilt frontend, and the WebRTC video path.
     "teleop-xr>=1.3.5,<2",
-    # Imported directly (pose algebra, frame decode, the self-signed TLS
-    # identity, the task page's routes), not just via teleop-xr.
+    # Imported directly (frame decode, the self-signed TLS identity, the task
+    # page's routes), not just via teleop-xr.
     "cryptography>=42",
     "fastapi>=0.110",
     "numpy>=1.26",
@@ -41,6 +42,9 @@ asyncio_mode = "auto"
 [tool.uv.sources]
 peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
+# The shared libs live in the public-peppy-libs repository, followed on its
+# default branch like the Rust nodes' control_core.
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py" }
 # The WebXR server and its page come from Peppy's fork of teleop_xr, as the
 # wheel its release attaches: the page is built into the wheel, so uv
 # installs it as any wheel.
