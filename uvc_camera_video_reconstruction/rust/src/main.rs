@@ -87,7 +87,7 @@ async fn record_video(node_runner: Arc<NodeRunner>, video_duration_seconds: u32)
         };
         match received {
             Ok(Some((_producer, message))) => {
-                frames.push(message.frame);
+                frames.push(message.data);
                 if (frame_num + 1) % camera_info.frames_per_second as u32 == 0 {
                     println!(
                         "Recorded {}/{} frames ({} seconds)",
