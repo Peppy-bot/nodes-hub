@@ -5,7 +5,7 @@
 //! camera_geometry answers, [`modes`] parses the colour format, the align
 //! mode and the auto/manual mode, [`stream`] names the two streams and holds
 //! a value per stream, and [`node`] wires them to the generated contract
-//! members.
+//! members and reads the frame each picture names from sensor_mounts.
 
 mod frame;
 mod geometry;

@@ -22,6 +22,8 @@
 
 use camera_core::geometry::depth_unit_is_valid;
 use camera_core::pinhole::{Intrinsics, Pinhole};
+use control_core::geometry::Pose;
+use frame_tree::arithmetic::{self, Rotation};
 
 use crate::modes::AlignMode;
 use crate::stream::{Stream, StreamPair};
@@ -30,8 +32,8 @@ use crate::stream::{Stream, StreamPair};
 /// image is an ideal pinhole, whatever model the device names.
 const NEGLIGIBLE_COEFFICIENT: f32 = 1e-6;
 
-/// How far a reported rotation may be from orthonormal, per element. The SDK
-/// reports single precision.
+/// How far a reported rotation may lie from the rotation of its quaternion, per
+/// element. The SDK reports single precision.
 const ROTATION_TOLERANCE: f64 = 1e-4;
 
 /// The largest sample a z16 depth frame carries.
@@ -86,19 +88,10 @@ pub struct Calibration {
     pub depth_unit: f32,
 }
 
-/// The depth optical frame in the colour optical frame: a position in metres
-/// and a unit quaternion [x, y, z, w].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Pose {
-    pub position: [f64; 3],
-    pub orientation: [f64; 4],
-}
-
-impl Pose {
-    pub const IDENTITY: Self = Self {
-        position: [0.0, 0.0, 0.0],
-        orientation: [0.0, 0.0, 0.0, 1.0],
-    };
+/// The pose of a frame in itself: where aligned streams put the depth optical
+/// frame in the colour one.
+fn identity() -> Pose {
+    Pose::parse([0.0; 3], arithmetic::IDENTITY).expect("the origin and the identity make a pose")
 }
 
 /// What the node answers while `align_mode` is the mode its frames carry.
@@ -109,6 +102,7 @@ impl Pose {
 pub struct Published {
     pub align_mode: AlignMode,
     pub pinholes: StreamPair<Result<Pinhole, String>>,
+    /// The depth optical frame in the colour optical frame.
     pub depth_to_color: Result<Pose, String>,
     /// The depths a sample can carry, metres; refused with the depth unit.
     pub depth_range_m: Result<(f64, f64), String>,
@@ -125,7 +119,7 @@ impl Calibration {
             AlignMode::None => pose(&self.depth_to_color),
             // One stream is warped into the other's viewpoint, so both
             // frames are the target's.
-            AlignMode::DepthToColor | AlignMode::ColorToDepth => Ok(Pose::IDENTITY),
+            AlignMode::DepthToColor | AlignMode::ColorToDepth => Ok(identity()),
         };
         Published {
             align_mode,
@@ -220,10 +214,9 @@ fn distortion(stream: &str, sdk: &StreamIntrinsics) -> Result<(&'static str, Vec
     }
 }
 
-/// The SDK's extrinsics as a position and a unit quaternion. The rotation is
-/// column-major: element (row, column) is `rotation[row + 3 * column]`.
+/// The SDK's extrinsics as a pose. The rotation is column-major: element
+/// (row, column) is `rotation[row + 3 * column]`.
 fn pose(sdk: &StreamExtrinsics) -> Result<Pose, String> {
-    let r = |row: usize, column: usize| f64::from(sdk.rotation[row + 3 * column]);
     if sdk
         .rotation
         .iter()
@@ -234,71 +227,39 @@ fn pose(sdk: &StreamExtrinsics) -> Result<Pose, String> {
             "the device's depth-to-colour extrinsics are not numbers: {sdk:?}"
         ));
     }
-    // A rotation's columns are unit length and square to each other, and it
-    // keeps handedness. Anything else turned into a quaternion would place
-    // every depth sample wrongly without saying so.
-    for a in 0..3 {
-        for b in 0..3 {
-            let dot: f64 = (0..3).map(|row| r(row, a) * r(row, b)).sum();
-            let expected = if a == b { 1.0 } else { 0.0 };
-            if (dot - expected).abs() > ROTATION_TOLERANCE {
-                return Err(format!(
-                    "the device's depth-to-colour rotation is not a rotation: {:?}",
-                    sdk.rotation
-                ));
-            }
-        }
-    }
-    let determinant = r(0, 0) * (r(1, 1) * r(2, 2) - r(1, 2) * r(2, 1))
-        - r(0, 1) * (r(1, 0) * r(2, 2) - r(1, 2) * r(2, 0))
-        + r(0, 2) * (r(1, 0) * r(2, 1) - r(1, 1) * r(2, 0));
-    if determinant < 0.0 {
+    let rotation: Rotation = std::array::from_fn(|row| {
+        std::array::from_fn(|column| f64::from(sdk.rotation[row + 3 * column]))
+    });
+    // A rotation is the rotation of its own quaternion, and a mirror the
+    // negation of a rotation; no quaternion turns a point as nine numbers
+    // that are neither do.
+    if !is_rotation(&rotation) {
+        let negated = rotation.map(|row| row.map(|value| -value));
+        let why = if is_rotation(&negated) {
+            "mirrors"
+        } else {
+            "is not a rotation"
+        };
         return Err(format!(
-            "the device's depth-to-colour rotation mirrors: {:?}",
+            "the device's depth-to-colour rotation {why}: {:?}",
             sdk.rotation
         ));
     }
+    Pose::parse(
+        sdk.translation.map(f64::from),
+        arithmetic::quaternion_of(&rotation),
+    )
+    .map_err(|error| format!("the device's depth-to-colour extrinsics: {error}"))
+}
 
-    // The branch with the largest divisor, so no case divides by nearly zero.
-    let trace = r(0, 0) + r(1, 1) + r(2, 2);
-    let (x, y, z, w) = if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        (
-            (r(2, 1) - r(1, 2)) / s,
-            (r(0, 2) - r(2, 0)) / s,
-            (r(1, 0) - r(0, 1)) / s,
-            s / 4.0,
-        )
-    } else if r(0, 0) >= r(1, 1) && r(0, 0) >= r(2, 2) {
-        let s = (1.0 + r(0, 0) - r(1, 1) - r(2, 2)).sqrt() * 2.0;
-        (
-            s / 4.0,
-            (r(0, 1) + r(1, 0)) / s,
-            (r(0, 2) + r(2, 0)) / s,
-            (r(2, 1) - r(1, 2)) / s,
-        )
-    } else if r(1, 1) >= r(2, 2) {
-        let s = (1.0 + r(1, 1) - r(0, 0) - r(2, 2)).sqrt() * 2.0;
-        (
-            (r(0, 1) + r(1, 0)) / s,
-            s / 4.0,
-            (r(1, 2) + r(2, 1)) / s,
-            (r(0, 2) - r(2, 0)) / s,
-        )
-    } else {
-        let s = (1.0 + r(2, 2) - r(0, 0) - r(1, 1)).sqrt() * 2.0;
-        (
-            (r(0, 2) + r(2, 0)) / s,
-            (r(1, 2) + r(2, 1)) / s,
-            s / 4.0,
-            (r(1, 0) - r(0, 1)) / s,
-        )
-    };
-    let length = (x * x + y * y + z * z + w * w).sqrt();
-    Ok(Pose {
-        position: sdk.translation.map(f64::from),
-        orientation: [x / length, y / length, z / length, w / length],
-    })
+/// Whether `m` lies within [`ROTATION_TOLERANCE`] of the rotation of its own
+/// quaternion, element by element.
+fn is_rotation(m: &Rotation) -> bool {
+    let rebuilt = arithmetic::rotation_of(arithmetic::quaternion_of(m));
+    m.iter()
+        .flatten()
+        .zip(rebuilt.iter().flatten())
+        .all(|(given, rebuilt)| (given - rebuilt).abs() <= ROTATION_TOLERANCE)
 }
 
 #[cfg(test)]
@@ -357,26 +318,6 @@ pub(crate) mod tests {
         out
     }
 
-    /// q * p * q^-1 for a unit quaternion [x, y, z, w].
-    fn rotate(q: [f64; 4], p: [f64; 3]) -> [f64; 3] {
-        let [x, y, z, w] = q;
-        let cross = |a: [f64; 3], b: [f64; 3]| {
-            [
-                a[1] * b[2] - a[2] * b[1],
-                a[2] * b[0] - a[0] * b[2],
-                a[0] * b[1] - a[1] * b[0],
-            ]
-        };
-        let v = [x, y, z];
-        let t = cross(v, p).map(|c| 2.0 * c);
-        let u = cross(v, t);
-        [
-            p[0] + w * t[0] + u[0],
-            p[1] + w * t[1] + u[1],
-            p[2] + w * t[2] + u[2],
-        ]
-    }
-
     #[test]
     fn unaligned_each_stream_keeps_its_own_model_and_the_sdk_values_cross_unchanged() {
         let p = d435().published(AlignMode::None);
@@ -396,8 +337,11 @@ pub(crate) mod tests {
         );
         // The device's own transform, translation as reported.
         let pose = p.depth_to_color.unwrap();
-        assert_eq!(pose.position, [0.015_f32, 0.0001, -0.0002].map(f64::from));
-        assert_ne!(pose.orientation, Pose::IDENTITY.orientation);
+        assert_eq!(
+            pose.position().position(),
+            [0.015_f32, 0.0001, -0.0002].map(f64::from)
+        );
+        assert_ne!(pose.orientation(), identity().orientation());
     }
 
     #[test]
@@ -405,7 +349,7 @@ pub(crate) mod tests {
         let p = d435().published(AlignMode::DepthToColor);
         assert_eq!(p.pinholes.depth, p.pinholes.color);
         assert_eq!(p.pinholes.depth.unwrap().width(), 1280);
-        assert_eq!(p.depth_to_color.unwrap(), Pose::IDENTITY);
+        assert_eq!(p.depth_to_color.unwrap(), identity());
     }
 
     #[test]
@@ -414,7 +358,7 @@ pub(crate) mod tests {
         assert_eq!(p.pinholes.color, p.pinholes.depth);
         let color = p.pinholes.color.unwrap();
         assert_eq!((color.width(), color.intrinsics().fx), (848, 423.5));
-        assert_eq!(p.depth_to_color.unwrap(), Pose::IDENTITY);
+        assert_eq!(p.depth_to_color.unwrap(), identity());
     }
 
     #[test]
@@ -602,8 +546,8 @@ pub(crate) mod tests {
             rotation: column_major(rotation_about_z(90_f64.to_radians())),
             translation: [0.0; 3],
         };
-        let q = pose(&quarter).unwrap().orientation;
-        let turned = rotate(q, [1.0, 0.0, 0.0]);
+        let q = pose(&quarter).unwrap().orientation().quaternion();
+        let turned = arithmetic::rotate(q, [1.0, 0.0, 0.0]);
         assert!(
             (turned[0]).abs() < 1e-6 && (turned[1] - 1.0).abs() < 1e-6,
             "{turned:?}"
@@ -633,15 +577,7 @@ pub(crate) mod tests {
             [-b.sin(), 0.0, b.cos()],
         ];
         let rz = rotation_about_z(c);
-        let mul = |m: [[f64; 3]; 3], n: [[f64; 3]; 3]| {
-            let mut out = [[0.0; 3]; 3];
-            for i in 0..3 {
-                for j in 0..3 {
-                    out[i][j] = (0..3).map(|k| m[i][k] * n[k][j]).sum();
-                }
-            }
-            out
-        };
+        let mul = |m: [[f64; 3]; 3], n: [[f64; 3]; 3]| arithmetic::rotation_product(&m, &n);
         // Includes a turn past 120 degrees, where the trace goes negative and
         // the other branches of the conversion are the ones that run.
         for m in [rx, ry, rz, mul(rz, mul(ry, rx)), mul(rx, rz)] {
@@ -650,13 +586,13 @@ pub(crate) mod tests {
                 translation: [0.0; 3],
             })
             .unwrap()
-            .orientation;
+            .orientation()
+            .quaternion();
             let length: f64 = q.iter().map(|c| c * c).sum::<f64>().sqrt();
             assert!((length - 1.0).abs() < 1e-9);
             for p in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.3, -0.2, 1.5]] {
-                let by_matrix: [f64; 3] =
-                    std::array::from_fn(|i| (0..3).map(|k| m[i][k] * p[k]).sum());
-                let by_quaternion = rotate(q, p);
+                let by_matrix = arithmetic::rotated(&m, p);
+                let by_quaternion = arithmetic::rotate(q, p);
                 for i in 0..3 {
                     assert!(
                         (by_matrix[i] - by_quaternion[i]).abs() < 1e-5,
@@ -669,11 +605,11 @@ pub(crate) mod tests {
 
     #[test]
     fn an_identity_rotation_is_the_identity_quaternion() {
-        let identity = StreamExtrinsics {
+        let unturned = StreamExtrinsics {
             rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             translation: [0.0; 3],
         };
-        assert_eq!(pose(&identity).unwrap(), Pose::IDENTITY);
+        assert_eq!(pose(&unturned).unwrap(), identity());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::modes::AlignMode;
 use crate::stream::StreamPair;
 
 pub struct FrameSet {
-    pub frame_id: u32,
+    pub capture_index: u32,
     pub timestamp: SystemTime,
     /// Alignment the payload was captured under, so each emitted frame is
     /// self-describing even as `set_align_mode` is toggled at runtime.
@@ -21,7 +21,7 @@ pub struct FrameSet {
 }
 
 pub struct Image {
-    pub bytes: Vec<u8>,
+    pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }

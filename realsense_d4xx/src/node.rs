@@ -4,7 +4,9 @@
 
 use std::num::NonZeroU8;
 use std::sync::Arc;
+use std::time::SystemTime;
 
+use peppygen::consumed_services::sensor_mounts::describe_sensors;
 use peppygen::emitted_topics::camera::{depth_stream, video_stream};
 use peppygen::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
@@ -22,6 +24,7 @@ use tracing::{error, info};
 use camera_core::encoding::DEPTH_ENCODING;
 use camera_core::geometry::Z_DEPTH_MODEL;
 use camera_core::pinhole::Intrinsics;
+use camera_core::sensor_mounts::{CAMERA, DESCRIBE_SENSORS_TIMEOUT, DescribedSensors, read_sensor};
 use control_core::serving;
 
 use crate::frame::FrameSet;
@@ -96,6 +99,40 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     // the domain's instant under a clock domain.
     peppygen::clock::init(&node_runner).await?;
 
+    // The frame every picture names, read once before the device opens: with
+    // the sensor_mounts link bound, the one the robot's sensor_mounts gives
+    // the camera's name, and a name it does not list fails the node here;
+    // with the link vacant, the camera's name.
+    let asker = Arc::clone(&node_runner);
+    let describe = describe_sensors::bound_producer(&node_runner)
+        .cloned()
+        .map(|mounts| {
+            async move || {
+                describe_sensors::poll(&asker, &mounts, DESCRIBE_SENSORS_TIMEOUT)
+                    .await
+                    .map(|answer| DescribedSensors {
+                        sensor_names: answer.data.sensor_names,
+                        sensor_kinds: answer.data.sensor_kinds,
+                        sensor_frames: answer.data.sensor_frames,
+                        carried_by: answer.data.carried_by,
+                    })
+            }
+        });
+    let Some(camera) = read_sensor(
+        CAMERA,
+        node_runner.copy(),
+        node_runner.processor().bound_instance_id(),
+        describe,
+        node_runner.cancellation_token().cancelled(),
+    )
+    .await
+    .map_err(std::io::Error::other)?
+    else {
+        return Ok(());
+    };
+    let camera_frame = camera.frame.to_string();
+    info!("each picture names frame {camera_frame}");
+
     let capture =
         open(cfg).map_err(|e| std::io::Error::other(format!("open realsense pipeline: {e}")))?;
     let handle = capture.handle();
@@ -117,6 +154,7 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
         frame_rx,
         color_encoding.clone(),
         depth_encoding.clone(),
+        camera_frame.clone(),
     );
 
     // Services
@@ -141,7 +179,7 @@ pub async fn setup(params: Parameters, node_runner: Arc<NodeRunner>) -> Result<(
     );
     spawn_get_color_intrinsics(node_runner.clone(), handle.clone());
     spawn_get_depth_intrinsics(node_runner.clone(), handle.clone());
-    spawn_get_depth_to_color_extrinsics(node_runner.clone(), handle.clone());
+    spawn_get_depth_to_color_extrinsics(node_runner.clone(), handle.clone(), camera_frame);
     spawn_set_color_exposure(node_runner.clone(), handle.clone());
     spawn_set_color_white_balance(node_runner.clone(), handle.clone());
     spawn_set_color_gain(node_runner.clone(), handle.clone());
@@ -196,12 +234,13 @@ fn spawn_capture(
     done_rx
 }
 
-// Read from capture and emit to topic
+// Read from capture and emit to topic, each picture naming `camera_frame`
 fn spawn_emit_task(
     runner: Arc<NodeRunner>,
     mut frame_rx: mpsc::Receiver<FrameSet>,
     color_encoding: String,
     depth_encoding: String,
+    camera_frame: String,
 ) {
     tokio::spawn(async move {
         let color_publisher = match video_stream::declare_publisher(&runner).await {
@@ -220,24 +259,19 @@ fn spawn_emit_task(
         };
         while let Some(frameset) = frame_rx.recv().await {
             let FrameSet {
-                frame_id,
+                capture_index,
                 timestamp,
                 align_mode,
                 images: StreamPair { color, depth },
             } = frameset;
-            let align_mode = align_mode.as_str();
-
-            let color_header = video_stream::MessageHeader {
-                timestamp,
-                frame_id,
-                align_mode: align_mode.to_string(),
-            };
+            let (color_header, depth_header) =
+                picture_headers(&camera_frame, capture_index, timestamp, align_mode);
             match video_stream::build_message(
                 color_header,
                 color_encoding.clone(),
                 color.width,
                 color.height,
-                color.bytes,
+                color.data,
             ) {
                 Ok(payload) => {
                     if let Err(e) = color_publisher.publish(payload).await {
@@ -247,17 +281,12 @@ fn spawn_emit_task(
                 Err(e) => error!("video_stream build_message: {e}"),
             }
 
-            let depth_header = depth_stream::MessageHeader {
-                timestamp,
-                frame_id,
-                align_mode: align_mode.to_string(),
-            };
             match depth_stream::build_message(
                 depth_header,
                 depth_encoding.clone(),
                 depth.width,
                 depth.height,
-                depth.bytes,
+                depth.data,
             ) {
                 Ok(payload) => {
                     if let Err(e) = depth_publisher.publish(payload).await {
@@ -269,6 +298,30 @@ fn spawn_emit_task(
         }
         info!("emit task stopped");
     });
+}
+
+/// The headers of a frameset's colour and depth pictures: the camera's frame, the capture
+/// time, the capture index and the alignment, the same in both.
+fn picture_headers(
+    camera_frame: &str,
+    capture_index: u32,
+    timestamp: SystemTime,
+    align_mode: AlignMode,
+) -> (video_stream::MessageHeader, depth_stream::MessageHeader) {
+    (
+        video_stream::MessageHeader {
+            timestamp,
+            frame: camera_frame.to_owned(),
+            capture_index,
+            align_mode: align_mode.as_str().to_owned(),
+        },
+        depth_stream::MessageHeader {
+            timestamp,
+            frame: camera_frame.to_owned(),
+            capture_index,
+            align_mode: align_mode.as_str().to_owned(),
+        },
+    )
 }
 
 /// video_stream_info answers the size the colour frames have under the
@@ -416,10 +469,11 @@ fn depth_intrinsics(
 }
 
 /// get_depth_to_color_extrinsics: the device's transform while the streams
-/// are unaligned, the identity while one is warped into the other. Refused
-/// as get_color_intrinsics is.
+/// are unaligned, the identity while one is warped into the other, in
+/// `camera_frame`, holding at every time. Refused as get_color_intrinsics is.
 fn depth_to_color_extrinsics(
     published: &PublishedGeometry,
+    camera_frame: &str,
 ) -> std::result::Result<
     get_depth_to_color_extrinsics::Response,
     get_depth_to_color_extrinsics::Failure,
@@ -434,23 +488,27 @@ fn depth_to_color_extrinsics(
     let pose = published.depth_to_color.as_ref().map_err(refuse)?;
     Ok(get_depth_to_color_extrinsics::Response::new(
         published.align_mode.as_str().to_string(),
-        pose.position,
-        pose.orientation,
+        get_depth_to_color_extrinsics::ResponseDepthToColor {
+            frame: camera_frame.to_owned(),
+            position: pose.position().position(),
+            orientation: pose.orientation().quaternion(),
+        },
     ))
 }
 
 /// One camera_geometry service. The geometry is worked out per request,
-/// because set_align_mode changes what the node publishes while it runs.
+/// because set_align_mode changes what the node publishes while it runs. A
+/// service whose answer names the camera's frame takes it as `$frame`.
 macro_rules! spawn_geometry_service {
-    ($fn_name:ident, $service:ident, $respond:ident) => {
-        fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle>) {
+    ($fn_name:ident, $service:ident, $respond:ident $(, $frame:ident)?) => {
+        fn $fn_name(runner: Arc<NodeRunner>, handle: Arc<PipelineHandle> $(, $frame: String)?) {
             tokio::spawn(async move {
                 serving::serve(
                     stringify!($service),
                     runner.cancellation_token().cancelled(),
                     || {
                         $service::handle_requests(&runner, |_req| {
-                            $respond(&handle.published_geometry())
+                            $respond(&handle.published_geometry() $(, &$frame)?)
                         })
                     },
                 )
@@ -473,7 +531,8 @@ spawn_geometry_service!(
 spawn_geometry_service!(
     spawn_get_depth_to_color_extrinsics,
     get_depth_to_color_extrinsics,
-    depth_to_color_extrinsics
+    depth_to_color_extrinsics,
+    camera_frame
 );
 
 /// One service that writes a device option in an auto or a manual mode,
@@ -615,6 +674,34 @@ mod tests {
     use crate::geometry::tests::d435;
     use crate::geometry::{Calibration, Distortion, StreamExtrinsics};
 
+    /// The frame sensor_mounts gives the camera.
+    const CAMERA_FRAME: &str = "chest_color_optical_frame";
+
+    #[test]
+    fn both_pictures_of_a_frameset_name_the_camera_frame_and_one_capture_index() {
+        let timestamp = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_780_000_000);
+        let (color, depth) = picture_headers(CAMERA_FRAME, 7, timestamp, AlignMode::DepthToColor);
+        for (frame, capture_index, at, align_mode) in [
+            (
+                color.frame,
+                color.capture_index,
+                color.timestamp,
+                color.align_mode,
+            ),
+            (
+                depth.frame,
+                depth.capture_index,
+                depth.timestamp,
+                depth.align_mode,
+            ),
+        ] {
+            assert_eq!(frame, CAMERA_FRAME);
+            assert_eq!(capture_index, 7);
+            assert_eq!(at, timestamp);
+            assert_eq!(align_mode, "depth_to_color");
+        }
+    }
+
     /// The D435 of the geometry tests, its depth imager straight beside the
     /// colour one.
     fn calibration() -> Calibration {
@@ -636,7 +723,7 @@ mod tests {
         ] {
             let published = Ok(calibration().published(mode));
             let depth = depth_intrinsics(&published).unwrap();
-            let pose = depth_to_color_extrinsics(&published).unwrap();
+            let pose = depth_to_color_extrinsics(&published, CAMERA_FRAME).unwrap();
             // The spelling the frame headers use.
             assert_eq!(depth.align_mode, mode.as_str());
             assert_eq!(pose.align_mode, mode.as_str());
@@ -650,20 +737,22 @@ mod tests {
         assert_eq!((depth.width, depth.height, depth.fx), (848, 480, 423.5));
         assert_eq!(depth.depth_model, "z");
         assert_eq!(depth.distortion_model, "none");
-        let pose = depth_to_color_extrinsics(&unaligned).unwrap();
+        let pose = depth_to_color_extrinsics(&unaligned, CAMERA_FRAME).unwrap();
         assert_eq!(
-            pose.depth_to_color_position,
+            pose.depth_to_color.position,
             [f64::from(0.015_f32), 0.0, 0.0]
         );
-        assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pose.depth_to_color.orientation, [0.0, 0.0, 0.0, 1.0]);
+        // The pose of the depth optical frame in the camera's frame, holding at every time.
+        assert_eq!(pose.depth_to_color.frame, CAMERA_FRAME);
 
         // Aligned to colour, the depth frames are colour-shaped and there is
         // nothing left between the two frames.
         let aligned = Ok(calibration().published(AlignMode::DepthToColor));
         let depth = depth_intrinsics(&aligned).unwrap();
         assert_eq!((depth.width, depth.height, depth.fx), (1280, 720, 915.25));
-        let pose = depth_to_color_extrinsics(&aligned).unwrap();
-        assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
+        let pose = depth_to_color_extrinsics(&aligned, CAMERA_FRAME).unwrap();
+        assert_eq!(pose.depth_to_color.position, [0.0, 0.0, 0.0]);
 
         // Aligned to depth, it is the colour frames that change shape.
         let color =
@@ -679,7 +768,7 @@ mod tests {
         assert_eq!(color.kind, get_color_intrinsics::FailureKind::Rejected);
         let depth = depth_intrinsics(&unread).unwrap_err();
         assert_eq!(depth.kind, get_depth_intrinsics::FailureKind::Rejected);
-        let pose = depth_to_color_extrinsics(&unread).unwrap_err();
+        let pose = depth_to_color_extrinsics(&unread, CAMERA_FRAME).unwrap_err();
         assert_eq!(
             pose.kind,
             get_depth_to_color_extrinsics::FailureKind::Rejected
@@ -703,7 +792,7 @@ mod tests {
             color.message
         );
         assert!(depth_intrinsics(&unaligned).is_ok());
-        assert!(depth_to_color_extrinsics(&unaligned).is_ok());
+        assert!(depth_to_color_extrinsics(&unaligned, CAMERA_FRAME).is_ok());
         // Warped into the colour image, depth carries the colour distortion.
         let depth =
             depth_intrinsics(&Ok(distorted.published(AlignMode::DepthToColor))).unwrap_err();
