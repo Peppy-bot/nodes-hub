@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from so101.transforms import matrix_from_pose
+from control_core_py.geometry import rotation_of
 from workspace_core_py import (
     GRASP_ANGLE_TOLERANCE,
     GRASP_DIRECTIONS,
@@ -60,7 +60,7 @@ def grasp_frame(kinematics, joints):
     """The grasp point and the approach axis (the grasp frame's +Z) of
     `joints`, by forward kinematics."""
     position, orientation = kinematics.forward_kinematics(joints)
-    return np.array(position), matrix_from_pose(position, orientation)[:3, 2]
+    return np.array(position), np.array(rotation_of(orientation))[:, 2]
 
 
 def angle_between(a, b):

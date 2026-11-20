@@ -9,7 +9,7 @@ from string import Template
 import numpy as np
 import pytest
 from conftest import WIDE_LIMITS
-from so101.transforms import relative_rotation_rad
+from control_core_py.geometry import angle_shortest_path, normalized, product
 
 from so101_backbone.kinematics import (
     LINE_ORIENTATION_BAR_RAD,
@@ -120,15 +120,8 @@ def rotated(orientation, axis, degrees):
     """`orientation` turned about one of its own axes."""
     half = math.radians(degrees) / 2.0
     unit = np.array(axis, float) / np.linalg.norm(axis)
-    d = np.array([*(unit * math.sin(half)), math.cos(half)])
-    x1, y1, z1, w1 = orientation
-    x2, y2, z2, w2 = d
-    return (
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-    )
+    turn = (*(float(c) * math.sin(half) for c in unit), math.cos(half))
+    return product(tuple(orientation), turn)
 
 
 def test_an_impossible_orientation_does_not_cost_the_position(kinematics):
@@ -167,7 +160,7 @@ def test_a_reachable_orientation_is_still_honoured(kinematics):
     solution = kinematics.inverse_kinematics(seed, position, target, position_tolerance_m=0.01, orientation_tolerance_rad=math.pi)
     assert solution is not None
     _, reached = kinematics.forward_kinematics(solution)
-    assert math.degrees(relative_rotation_rad(reached, target)) < 1.0
+    assert math.degrees(angle_shortest_path(reached, target)) < 1.0
 
 
 def test_the_deployed_arm_still_reaches_an_orientation_it_can_hold():
@@ -182,7 +175,7 @@ def test_the_deployed_arm_still_reaches_an_orientation_it_can_hold():
     solution = kinematics.inverse_kinematics(seed, position, target, position_tolerance_m=0.01, orientation_tolerance_rad=math.pi)
     assert solution is not None
     reached_position, reached_orientation = kinematics.forward_kinematics(solution)
-    assert math.degrees(relative_rotation_rad(reached_orientation, target)) < 1.0
+    assert math.degrees(angle_shortest_path(reached_orientation, target)) < 1.0
     assert math.dist(reached_position, position) < 0.001
 
 
@@ -210,18 +203,18 @@ def test_an_orientation_bar_refuses_what_the_wrist_cannot_reach(kinematics):
         position = kinematics.forward_kinematics(
             (0.2, 0.3 - angle / 8, angle / 2, 0.1, 0.0)
         )[0]
-        turned = (
-            math.sin(angle),
-            math.cos(angle) * math.sin(angle),
-            math.cos(angle),
-            math.sin(angle / 2),
+        turned = normalized(
+            (
+                math.sin(angle),
+                math.cos(angle) * math.sin(angle),
+                math.cos(angle),
+                math.sin(angle / 2),
+            )
         )
-        norm = math.sqrt(sum(c * c for c in turned))
-        turned = tuple(c / norm for c in turned)
         solution = kinematics.inverse_kinematics(HOME, position, turned, position_tolerance_m=0.01, orientation_tolerance_rad=math.pi)
         if solution is None:
             continue
-        missed = relative_rotation_rad(
+        missed = angle_shortest_path(
             kinematics.forward_kinematics(solution)[1], turned
         )
         if missed > 0.1:
@@ -353,7 +346,7 @@ def test_a_walk_keeps_the_grasp_point_on_the_line_and_lands_on_the_pose(kinemati
         assert max(abs(x - y) for x, y in zip(a, b, strict=True)) <= MAX_LINE_STEP_RAD
     landed, turned = kinematics.forward_kinematics(walk[-1])
     assert math.dist(landed, position) <= LINE_POSITION_BAR_M
-    assert relative_rotation_rad(turned, orientation) <= LINE_ORIENTATION_BAR_RAD
+    assert angle_shortest_path(turned, orientation) <= LINE_ORIENTATION_BAR_RAD
 
 
 def test_a_position_out_of_reach_has_no_walk(kinematics):
@@ -369,9 +362,8 @@ def test_an_orientation_a_little_past_the_bar_has_no_walk(kinematics):
     # The pose's own orientation walks; turned 0.05 rad about the world's x axis, the
     # end stands past the 0.01 rad bar, and the arm's joints cannot take it up.
     position, orientation = kinematics.forward_kinematics(OTHER_BENT)
-    s, c = math.sin(0.025), math.cos(0.025)
-    x, y, z, w = orientation
-    turned = (c * x + s * w, c * y - s * z, c * z + s * y, c * w - s * x)
+    about_world_x = (math.sin(0.025), 0.0, 0.0, math.cos(0.025))
+    turned = product(about_world_x, tuple(orientation))
     assert kinematics.walk_line(BENT, position, turned, WIDE_LIMITS) is None
 
 
@@ -380,7 +372,7 @@ def test_a_position_alone_ends_near_the_turn_the_line_starts_with(kinematics):
     position, _ = kinematics.forward_kinematics(OTHER_BENT)
     walk = kinematics.walk_line(BENT, position, None, WIDE_LIMITS)
     assert walk is not None
-    assert relative_rotation_rad(kinematics.forward_kinematics(walk[-1])[1], start_orientation) < 1.0
+    assert angle_shortest_path(kinematics.forward_kinematics(walk[-1])[1], start_orientation) < 1.0
 
 
 def test_a_solution_past_the_limits_has_no_walk(kinematics):

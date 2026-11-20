@@ -25,6 +25,16 @@ if ARM.joints != units.JOINT_NAMES:
         f"{list(units.JOINT_NAMES)}: build the backbone from one public-peppy-libs commit"
     )
 
+# The robot frame, the root link of the URDF: the frame every pose this node
+# plans and reports is in, and every command is placed in.
+ROBOT_FRAME = DESCRIPTION.root_link
+
+
+def frame_of(frame: str | None) -> str:
+    """The frame a command names: `frame`, or the robot frame for a command
+    that names none, as the contracts read a command with no frame."""
+    return ROBOT_FRAME if frame is None else frame
+
 # A fixed frame on the fixed-jaw body near the jaw region; on this
 # single-moving-jaw gripper the pad midpoint shifts with the opening, so no
 # static frame is exactly the contracts' grasp point.

@@ -8,20 +8,26 @@
 - one gripper control tick;
 - an execute_joint_path goal, and the joints of its result;
 - the targets and checks of the workspace tests;
-- a link's pose in the robot frame, composed from the robot's transforms.
+- a link's pose in the robot frame, composed from the robot's transforms;
+- a placer whose tree holds the robot frame alone.
 """
 
 from __future__ import annotations
 
 import math
+import time
 
 import pytest
+from control_core_py.geometry import product, rotate
 from peppygen.exposed_actions.limb_motion import execute_joint_path
 
 from so101_backbone.actions import ActionLayer
 from so101_backbone.coordinator import Coordinator
+from so101_backbone.failures import FailureKind, Refusal
 from so101_backbone.limits import JointLimits
+from so101_backbone.model import ROBOT_FRAME
 from so101_backbone.params import Config, UpstreamMode
+from so101_backbone.placement import Placed
 from so101_backbone.reach import ReachBall
 
 WIDE_LIMITS = JointLimits(lower=(-3.1,) * 5, upper=(3.1,) * 5)
@@ -109,8 +115,26 @@ class FakeKinematics:
         )
 
 
+class RobotFramePlacer:
+    """A placer whose tree holds the robot frame alone: a value in the robot
+    frame stands where it is given, at the time it gives, and one in any
+    other frame is refused with unknown_frame, as transform_lookup refuses a
+    frame no transform names."""
+
+    robot_frame = ROBOT_FRAME
+
+    async def place(self, stamped, what: str) -> Placed:
+        if stamped.frame != ROBOT_FRAME:
+            raise Refusal(
+                FailureKind.UNKNOWN_FRAME,
+                f"{what}: no transform of the tree names the frame {stamped.frame}",
+            )
+        return Placed(stamped.value, stamped.timestamp)
+
+
 def make_config(**overrides) -> Config:
     base = {
+        "lookup_timeout_s": 0.1,
         "upstream_mode": UpstreamMode.JOINTS,
         "control_rate_hz": 100,
         "max_joint_velocity_rad_s": (2.0,) * 5,
@@ -139,13 +163,14 @@ def make_coordinator(kinematics=None, limits=WIDE_LIMITS, reach=WIDE_REACH, **co
     return _coordinator_on(config, kinematics, limits, reach)
 
 
-def make_layer(kinematics=None, limits=WIDE_LIMITS, **config_overrides):
+def make_layer(kinematics=None, limits=WIDE_LIMITS, now_s=time.time, **config_overrides):
     """A coordinator and the action layer over it, both on one
     make_config(**config_overrides) config, with a FakeKinematics unless
-    `kinematics` is given, wide limits and an unbounded reach."""
+    `kinematics` is given, wide limits, an unbounded reach, and `now_s` the
+    node's clock."""
     config = make_config(**config_overrides)
     coordinator = _coordinator_on(config, kinematics, limits, WIDE_REACH)
-    return coordinator, ActionLayer(coordinator, config, limits)
+    return coordinator, ActionLayer(coordinator, config, limits, RobotFramePlacer(), now_s)
 
 
 def assert_rectangle_inside_reach(answer) -> None:
@@ -229,29 +254,6 @@ def follower_never_stale(monkeypatch):
 TREE_TOLERANCE = 1e-9
 
 
-def _rotate(q, v):
-    """`v` rotated by the unit quaternion `q` = [x, y, z, w]."""
-    x, y, z, w = q
-    tx, ty, tz = 2.0 * (y * v[2] - z * v[1]), 2.0 * (z * v[0] - x * v[2]), 2.0 * (x * v[1] - y * v[0])
-    return (
-        v[0] + w * tx + (y * tz - z * ty),
-        v[1] + w * ty + (z * tx - x * tz),
-        v[2] + w * tz + (x * ty - y * tx),
-    )
-
-
-def _multiply(a, b):
-    """The quaternion product a * b, both [x, y, z, w]."""
-    ax, ay, az, aw = a
-    bx, by, bz, bw = b
-    return (
-        aw * bx + ax * bw + ay * bz - az * by,
-        aw * by - ax * bz + ay * bw + az * bx,
-        aw * bz + ax * by - ay * bx + az * bw,
-        aw * bw - ax * bx - ay * by - az * bz,
-    )
-
-
 def place_in_robot_frame(transforms, link: str):
     """The pose (position, quaternion [x, y, z, w]) of `link` in the root of
     `transforms`, each a (parent, child, position, orientation) of one joint,
@@ -264,15 +266,8 @@ def place_in_robot_frame(transforms, link: str):
         link = parent
     position, orientation = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
     for step_position, step_orientation in reversed(chain):
-        moved = _rotate(orientation, step_position)
+        moved = rotate(orientation, step_position)
         position = tuple(p + m for p, m in zip(position, moved))
-        orientation = _multiply(orientation, step_orientation)
+        orientation = product(orientation, step_orientation)
     return position, orientation
-
-
-def angle_between(a, b) -> float:
-    """The angle (rad) of the rotation from the unit quaternion `a` to `b`."""
-    ax, ay, az, aw = a
-    relative = _multiply((-ax, -ay, -az, aw), b)
-    return 2.0 * math.atan2(math.hypot(*relative[:3]), abs(relative[3]))
 

@@ -13,10 +13,7 @@ from peppygen import NodeRunner
 from peppygen.consumed_services.robot_identity import get_description, get_identity
 
 from so101_backbone.model import MODEL
-
-# How long the initializer may take to answer each question: the description
-# carries the collision meshes.
-ANSWER_TIMEOUT_S = 10.0
+from so101_backbone.wire import ANSWER_WAIT_S
 
 
 @dataclass(frozen=True)
@@ -30,10 +27,10 @@ class _Served:
 
 async def _served(node_runner: NodeRunner) -> _Served:
     identity = await get_identity.poll(
-        node_runner, get_identity.bound_producer(node_runner), ANSWER_TIMEOUT_S
+        node_runner, get_identity.bound_producer(node_runner), ANSWER_WAIT_S
     )
     description = await get_description.poll(
-        node_runner, get_description.bound_producer(node_runner), ANSWER_TIMEOUT_S
+        node_runner, get_description.bound_producer(node_runner), ANSWER_WAIT_S
     )
     return _Served(model=identity.data.model, digest=description.data.digest)
 

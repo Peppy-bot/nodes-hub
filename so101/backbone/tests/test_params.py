@@ -22,6 +22,7 @@ GOOD = {
     "max_stream_ee_velocity_m_s": 1.5,
     "max_gripper_rate_frac_s": 10.0,
     "start_tolerance_rad": 0.05,
+    "lookup_timeout_s": 0.1,
 }
 
 
@@ -43,6 +44,17 @@ def test_the_joint_path_parameters_parse():
 
 def test_pose_mode_parses():
     assert parse(upstream_mode="pose").upstream_mode is UpstreamMode.POSE
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, 0.1, 1.0])
+def test_a_lookup_timeout_from_0_to_1_s_parses(timeout_s):
+    assert parse(lookup_timeout_s=timeout_s).lookup_timeout_s == timeout_s
+
+
+@pytest.mark.parametrize("timeout_s", [-0.1, 1.5, float("nan"), float("inf")])
+def test_a_lookup_timeout_transform_lookup_does_not_take_is_refused_naming_it(timeout_s):
+    with pytest.raises(ValueError, match="^lookup_timeout_s is .*: set it from 0 to 1 s"):
+        parse(lookup_timeout_s=timeout_s)
 
 
 @pytest.mark.parametrize(

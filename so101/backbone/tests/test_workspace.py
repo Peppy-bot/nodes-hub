@@ -7,6 +7,7 @@ import ctypes
 import math
 import multiprocessing
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -251,10 +252,10 @@ async def test_a_reach_not_measured_refuses_the_request_and_stores_nothing():
 
 async def test_check_measures_the_points_in_the_requests_order():
     reaches = FakeReaches(reached_near_the_middle)
-    wire = [0.2, 0.0, 0.04, 0.5, 0.0, 0.04, 0.1, -0.05, 0.3]
-    answer = await Workspace(reaches).check(wire)
+    placed = [(0.2, 0.0, 0.04), (0.5, 0.0, 0.04), (0.1, -0.05, 0.3)]
+    answer = await Workspace(reaches).check(placed)
 
-    positions = Positions.from_wire(wire)
+    positions = Positions.parse(placed)
     assert reaches.calls == [positions.points]
     expected = check_without_perception_camera(
         positions, [reached_near_the_middle(p) for p in positions.points]
@@ -290,21 +291,20 @@ async def test_a_height_that_is_not_a_surface_height_of_a_request_is_refused_unm
 
 
 @pytest.mark.parametrize(
-    ("wire", "reason"),
+    ("placed", "reason"),
     [
-        ([], "positions must hold at least one point"),
-        ([0.2, 0.0], r"positions must hold 3 values \(x, y, z\) per point"),
-        ([0.2, 0.0, math.nan], "positions must hold finite numbers only"),
+        ([], "points must hold at least one point"),
         (
-            [1000.5, 0.0, 0.0],
-            "positions must hold coordinates within 1000 m of the robot's base point",
+            [(0.2, 0.0, 0.04), (1000.5, 0.0, 0.0)],
+            "points must lie within 1000 m of the robot's base point on each axis, placed in "
+            "the robot frame",
         ),
     ],
 )
-async def test_values_that_are_not_points_of_a_request_are_refused_unmeasured(wire, reason):
+async def test_points_that_are_not_points_of_a_request_are_refused_unmeasured(placed, reason):
     reaches = FakeReaches(reached_near_the_middle)
-    with pytest.raises(Refusal, match=f"^{reason}$") as raised:
-        await Workspace(reaches).check(wire)
+    with pytest.raises(Refusal, match=f"^{re.escape(reason)}$") as raised:
+        await Workspace(reaches).check(placed)
     assert raised.value.kind is FailureKind.REJECTED
     assert reaches.calls == []
 
@@ -675,5 +675,5 @@ async def test_describe_measures_on_its_surface_and_check_with_nothing_in_the_wa
     reaches = FakeReaches(reached_near_the_middle)
     workspace = Workspace(reaches)
     await workspace.describe(0.1)
-    await workspace.check([0.2, 0.0, 0.04])
+    await workspace.check([(0.2, 0.0, 0.04)])
     assert reaches.surfaces == [SurfaceHeight.from_wire(0.1), None]

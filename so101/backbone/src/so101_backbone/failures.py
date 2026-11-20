@@ -1,7 +1,8 @@
 """The failure kinds this node gives, and the refusal that carries one.
 
 The kinds are the kinds of peppy and the kinds that the limb_motion,
-postures and workspace contracts declare. Each generated member has a
+postures and workspace contracts declare, the failure kinds of a lookup in
+the robot's tree among them. Each generated member has a
 FailureKind of its own; its Failure takes each kind of this one by its name,
 and refuses a kind that the member does not declare."""
 
@@ -29,6 +30,12 @@ class FailureKind(StrEnum):
     UNREACHABLE = "unreachable"
     # A leader streams a limb of the goal.
     LEADER_STREAMING = "leader_streaming"
+    # The robot's tree cannot place a frame of the goal or the request, each
+    # kind as transform_lookup names the failures of a lookup.
+    UNKNOWN_FRAME = "unknown_frame"
+    NO_CHAIN = "no_chain"
+    EXTRAPOLATION = "extrapolation"
+    BROKEN_TREE = "broken_tree"
 
 
 class Refusal(Exception):

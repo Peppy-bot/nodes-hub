@@ -297,11 +297,11 @@ class Workspace:
         height = _parsed(SurfaceHeight.from_wire, surface_height)
         return describe_without_perception_camera(await self._surface_reach(height))
 
-    async def check(self, positions: Sequence[float]) -> PositionsAnswer:
-        """The check_positions answer of `positions`, 3 values (x, y, z, m)
-        per point. Raises Refusal for values that are not points of a
+    async def check(self, placed: Sequence[Target]) -> PositionsAnswer:
+        """The check_positions answer of the points of a request, each placed
+        in the robot frame. Raises Refusal for points that are not points of a
         request, and when the reach cannot be measured."""
-        points = _parsed(Positions.from_wire, positions)
+        points = _parsed(Positions.parse, placed)
         reaches = await self._measure_reaches(points.points, None)
         return check_without_perception_camera(points, reaches)
 

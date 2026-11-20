@@ -8,7 +8,6 @@ import math
 import re
 import time
 
-import peppylib
 import pytest
 import robot_description_py
 from conftest import (
@@ -20,11 +19,17 @@ from conftest import (
     NEAR,
     START_TOLERANCE_RAD,
     TREE_TOLERANCE,
-    angle_between,
     assert_rectangle_inside_reach,
     joint_path_goal,
     path_result_joints,
     place_in_robot_frame,
+)
+from control_core_py.geometry import (
+    angle_shortest_path,
+    inverse,
+    product,
+    quaternion_of_yaw,
+    rotate,
 )
 from path_timing_py import JointTrajectory
 from peppygen.exposed_actions.limb_motion import move_arm as move_arm_prod
@@ -45,6 +50,7 @@ from peppygen.fixtures.exposed_actions.limb_motion import (
 )
 from peppygen.fixtures.exposed_actions.postures import move_to_home as move_to_home_fx
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
+from peppygen.consumed_services.transform_lookup import lookup_transform
 from peppygen.exposed_services.limb_motion import check_arm_move as check_arm_move_prod
 from peppygen.exposed_services.limb_motion import stop as stop_prod
 from peppygen.exposed_services.workspace import check_positions as check_positions_prod
@@ -76,11 +82,13 @@ from peppygen.paired_topics.leader_pose import pose_setpoints as leader_pose_top
 from peppygen.parameters import Parameters
 from workspace_core_py import REACH_TOLERANCE
 
-from so101_backbone import description_check, postures
+from so101.staleness import WIRE_AGE_LIMIT_S
+
+from so101_backbone import description_check, placement, postures
 from so101_backbone.__main__ import setup
 from so101_backbone.coordinator import GRIPPER_STILL_WINDOW_S
-from so101_backbone.kinematics import Kinematics
-from so101_backbone.model import ARM, DESCRIPTION, MODEL, urdf_path
+from so101_backbone.kinematics import LINE_POSITION_BAR_M, Kinematics
+from so101_backbone.model import ARM, DESCRIPTION, MODEL, ROBOT_FRAME, urdf_path
 
 TIMEOUT_S = 10.0
 # The bound of an answer that measures reach: the first starts the worker
@@ -110,6 +118,7 @@ def make_parameters(**overrides) -> Parameters:
         "max_stream_ee_velocity_m_s": 1e9,
         "max_gripper_rate_frac_s": 8.0,
         "start_tolerance_rad": START_TOLERANCE_RAD,
+        "lookup_timeout_s": 0.1,
     }
     return Parameters(**{**base, **overrides})
 
@@ -157,17 +166,122 @@ async def answer_as_the_initializer_of(h, model):
     await asyncio.gather(identities(), descriptions())
 
 
+IDENTITY = (0.0, 0.0, 0.0, 1.0)
+
+
+class BaseTree:
+    """transform_lookup's answers from a robot's tree of the robot frame on a
+    base that odom places at each stamp of `base_at`, a mapping of a time (s)
+    to the robot frame's (position, orientation) in odom, as the contract
+    defines a lookup: where the source frame stood at source_timestamp in the
+    target frame as it stands at target_timestamp, each None for the newest stamp,
+    through odom, the root of the robot frame's chain; a frame in itself at
+    one time stands at the origin. A frame other than odom and the robot frame
+    is refused with unknown_frame, and a time the base holds no stamp of with
+    extrapolation. The answer's timestamp is that of the target frame's
+    place, None for one that holds at every time. An empty `base_at` is a robot
+    on no base: its robot frame alone, which holds at every time."""
+
+    def __init__(self, base_at=None):
+        self.base_at = dict(base_at or {})
+
+    def _resolved(self, timestamp: float | None) -> float | None:
+        if timestamp is not None or not self.base_at:
+            return timestamp
+        return max(self.base_at)
+
+    def _in_odom(self, frame: str, timestamp: float | None):
+        """Where `frame` stands in odom at `timestamp`."""
+        if frame == "odom" or not self.base_at:
+            return (0.0, 0.0, 0.0), IDENTITY
+        if timestamp not in self.base_at:
+            raise lookup_transform.Failure(
+                lookup_transform.FailureKind.EXTRAPOLATION,
+                f"the transform odom -> {ROBOT_FRAME} has no value at {timestamp}",
+            )
+        return self.base_at[timestamp]
+
+    def answer(self, request) -> lookup_transform.ResponseData:
+        for frame in (request.source_frame, request.target_frame):
+            if frame != ROBOT_FRAME and (frame != "odom" or not self.base_at):
+                raise lookup_transform.Failure(
+                    lookup_transform.FailureKind.UNKNOWN_FRAME,
+                    f"no transform of the tree names the frame {frame}",
+                )
+        source_at = self._resolved(request.source_timestamp)
+        target_at = self._resolved(request.target_timestamp)
+        source_position, source_orientation = self._in_odom(request.source_frame, source_at)
+        target_position, target_orientation = self._in_odom(request.target_frame, target_at)
+        turn_back = inverse(target_orientation)
+        offset = tuple(s - t for s, t in zip(source_position, target_position))
+        return lookup_transform.ResponseData(
+            frame=request.target_frame,
+            child_frame=request.source_frame,
+            timestamp=target_at if self.base_at else None,
+            position=list(rotate(turn_back, offset)),
+            orientation=list(product(turn_back, source_orientation)),
+        )
+
+
+async def serve_tree(h, tree: BaseTree) -> None:
+    """Answer every lookup_transform request of the node from `tree` until
+    cancelled."""
+    lookups = h.mocks.deps.transform_lookup.lookup_transform
+    while True:
+        try:
+            request, responder = await lookups.next_request(TIMEOUT_S)
+        except TimeoutError:
+            continue
+        try:
+            answer = tree.answer(request)
+        except lookup_transform.Failure as failure:
+            await responder.respond_failure(failure.kind, failure.message)
+            continue
+        await responder.respond(answer)
+
+
 @contextlib.asynccontextmanager
-async def started(parameters=None, **options):
+async def started(parameters=None, tree=None, **options):
     """The node booted on `parameters` (make_parameters() when None) and the
     harness `options`, its initializer serving the description this backbone
-    was built with."""
+    was built with, and its transform_lookup answering from `tree`, a robot
+    on no base when None."""
     if parameters is None:
         parameters = make_parameters()
     async with harness.start(setup, parameters=parameters, **options) as h:
-        await answer_identity(h, MODEL.id)
-        await answer_description(h, MODEL.digest)
-        yield h
+        server = asyncio.create_task(serve_tree(h, tree or BaseTree()))
+        try:
+            await answer_identity(h, MODEL.id)
+            await answer_description(h, MODEL.digest)
+            yield h
+        finally:
+            server.cancel()
+
+
+def robot_frame_target(position, orientation, target=move_arm_prod.GoalRequestDataTarget):
+    """A target of move_arm (or, with `target` its type, of check_arm_move) in
+    the robot frame at the latest time."""
+    return target(
+        frame=ROBOT_FRAME, timestamp=None, position=list(position), orientation=list(orientation)
+    )
+
+
+def points_in(frame, timestamp, positions) -> check_positions_prod.RequestData:
+    """A check_positions request of `positions` in `frame`, the robot frame for
+    None, at `timestamp`."""
+    return check_positions_prod.RequestData(
+        frame=frame,
+        timestamp=timestamp,
+        points=[
+            check_positions_prod.RequestDataPointsItem(position=list(position))
+            for position in positions
+        ],
+    )
+
+
+def in_robot_frame(positions) -> check_positions_prod.RequestData:
+    """A check_positions request of `positions` in the robot frame at the latest time."""
+    return points_in(ROBOT_FRAME, None, positions)
 
 
 async def setup_returned(h):
@@ -355,13 +469,12 @@ async def test_each_snapshot_goes_out_with_the_transforms_of_its_joints():
     assert before_start_s <= message.start_timestamp <= after_start_s
     assert later.start_timestamp == message.start_timestamp
     fixed = [(t.parent, t.child, t.position, t.orientation) for t in DESCRIPTION.fixed_transforms()]
-    moving = [
-        (parent, child, message.positions[3 * i : 3 * i + 3], message.orientations[4 * i : 4 * i + 4])
-        for i, (parent, child) in enumerate(zip(message.parent_frames, message.child_frames, strict=True))
-    ]
+    moving = [(t.frame, t.child_frame, t.position, t.orientation) for t in message.transforms]
     position, orientation = place_in_robot_frame(fixed + moving, ARM.grasp_link)
-    assert max(abs(a - b) for a, b in zip(position, snapshot.positions)) <= TREE_TOLERANCE
-    assert angle_between(orientation, snapshot.orientations) <= TREE_TOLERANCE
+    (grasp_point,) = snapshot.grasp_points
+    assert snapshot.frame == ROBOT_FRAME
+    assert max(abs(a - b) for a, b in zip(position, grasp_point.position)) <= TREE_TOLERANCE
+    assert angle_shortest_path(orientation, grasp_point.orientation) <= TREE_TOLERANCE
 
 
 async def test_malformed_follower_state_neither_anchors_nor_relays():
@@ -415,28 +528,16 @@ async def test_pose_mode_streams_downstream_under_the_leader_capture_stamp():
     ) as h:
         feeder = asyncio.create_task(keep_measured_fresh(h))
         stamps: list[float] = []
-
-        async def stream_pose():
-            while True:
-                stamp = time.time()
-                stamps.append(stamp)
-                await h.mocks.pairings.leader_pose.pose_setpoints.publish(
-                    leader_pose_topic.Message(
-                        timestamp=stamp,
-                        position=[0.15, 0.0, 0.2],
-                        orientation=[0.0, 0.0, 0.0, 1.0],
-                    )
-                )
-                await asyncio.sleep(0.02)
-
-        streamer = asyncio.create_task(stream_pose())
+        streamer = asyncio.create_task(
+            _stream_leader_pose(h, ROBOT_FRAME, ((0.15, 0.0, 0.2), IDENTITY), stamps)
+        )
         try:
             downstream = await asyncio.wait_for(
                 h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
             )
             assert len(downstream.positions) == 5
             assert downstream.efforts == []
-            assert any(abs(downstream.timestamp - s) < 1e-6 for s in stamps), (
+            assert _one_of(stamps, downstream.timestamp), (
                 "the pose stream published under this node's clock, not the leader's stamp"
             )
         finally:
@@ -454,6 +555,30 @@ async def _stream_leader_target(h, target, stamps: list[float]):
             )
         )
         await asyncio.sleep(0.02)
+
+
+async def _stream_leader_pose(h, frame, pose, stamps: list, timestamp_of=time.time):
+    """Publish `pose` (position, orientation) in `frame` on the leader's pose
+    stream every 20 ms until cancelled, each at the time `timestamp_of` gives
+    as it is sent, None for the latest time, appended to `stamps`."""
+    position, orientation = pose
+    while True:
+        stamp = timestamp_of()
+        stamps.append(stamp)
+        await h.mocks.pairings.leader_pose.pose_setpoints.publish(
+            leader_pose_topic.Message(
+                frame=frame,
+                timestamp=stamp,
+                position=list(position),
+                orientation=list(orientation),
+            )
+        )
+        await asyncio.sleep(0.02)
+
+
+def _one_of(stamps: list, timestamp: float) -> bool:
+    """Whether `timestamp`, as the wire carries it, is one of `stamps`."""
+    return any(abs(timestamp - stamp) < 1e-6 for stamp in stamps)
 
 
 async def test_move_arm_joints_completes_and_reports():
@@ -790,11 +915,13 @@ async def test_a_posture_result_names_the_arm_and_its_measured_grasp_point(
                 assert goal.accepted
                 result = await goal.get_result(TIMEOUT_S)
                 assert result.status == fixture.ResultStatus.COMPLETED
-                assert result.data.arm_names == ["arm"]
-                assert result.data.positions == pytest.approx(list(measured_position))
-                assert result.data.orientations == pytest.approx(list(measured_orientation))
+                assert (result.data.frame, result.data.arm_names) == (ROBOT_FRAME, ["arm"])
+                assert result.data.timestamp > 0.0, "the capture time of the measurement"
+                (grasp_point,) = result.data.grasp_points
+                assert grasp_point.position == pytest.approx(list(measured_position))
+                assert grasp_point.orientation == pytest.approx(list(measured_orientation))
                 posture_position, _orientation = kinematics.forward_kinematics(posture)
-                assert math.dist(result.data.positions, posture_position) > 1e-3
+                assert math.dist(grasp_point.position, posture_position) > 1e-3
             finally:
                 feeder.cancel()
 
@@ -945,8 +1072,7 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                 h,
                 move_arm_prod.GoalRequestData(
                     arm_name="arm",
-                    position=[0.1, 0.0, 0.2],
-                    orientation=[0.0, 0.0, 0.0, 0.0],
+                    target=robot_frame_target([0.1, 0.0, 0.2], [0.0, 0.0, 0.0, 0.0]),
                     duration_s=0.0,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
@@ -955,17 +1081,17 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                 ),
                 TIMEOUT_S,
             )
-            assert bad.refusal == move_arm_fx.Failure(
-                move_arm_fx.FailureKind.REJECTED, "goal pose has an unnormalizable orientation"
-            )
+            assert bad.refusal.kind is move_arm_fx.FailureKind.REJECTED
+            assert bad.refusal.message.startswith(
+                "the target: the orientation [0, 0, 0, 0] has a squared norm of 0,"
+            ), bad.refusal.message
             # The server must still decide the next goal (reachability of the
             # target pose is not the point; a decision is).
             again = await move_arm_fx.send_goal(
                 h,
                 move_arm_prod.GoalRequestData(
                     arm_name="arm",
-                    position=[0.0, 0.0, 0.42],
-                    orientation=[0.0, 0.0, 0.0, 1.0],
+                    target=robot_frame_target([0.0, 0.0, 0.42], [0.0, 0.0, 0.0, 1.0]),
                     duration_s=0.0,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
@@ -975,7 +1101,7 @@ async def test_malformed_pose_goal_is_refused_and_the_server_survives():
                 TIMEOUT_S,
             )
             if not again.accepted:
-                assert "unnormalizable" not in again.refusal.message
+                assert "squared norm" not in again.refusal.message
         finally:
             feeder.cancel()
 
@@ -1235,8 +1361,9 @@ async def test_the_plan_check_answers_without_moving(follower_never_stale):
         try:
             check = check_arm_move_prod.RequestData(
                 arm_name="arm",
-                position=[position[0], position[1], position[2] + 0.02],
-                orientation=list(orientation),
+                target=robot_frame_target(
+                    [position[0], position[1], position[2] + 0.02], list(orientation), check_arm_move_prod.RequestDataTarget
+                ),
                 duration_s=0.0,
             )
             answer = await check_arm_move_fx.poll(h, check, TIMEOUT_S)
@@ -1245,8 +1372,9 @@ async def test_the_plan_check_answers_without_moving(follower_never_stale):
 
             far = check_arm_move_prod.RequestData(
                 arm_name="arm",
-                position=[position[0] + 2.0, position[1], position[2]],
-                orientation=list(orientation),
+                target=robot_frame_target(
+                    [position[0] + 2.0, position[1], position[2]], list(orientation), check_arm_move_prod.RequestDataTarget
+                ),
                 duration_s=0.0,
             )
             answer = await check_arm_move_fx.poll(h, far, TIMEOUT_S)
@@ -1262,8 +1390,9 @@ async def test_the_plan_check_answers_without_moving(follower_never_stale):
             # kind of that refusal.
             unknown = check_arm_move_prod.RequestData(
                 arm_name="left_arm",
-                position=list(position),
-                orientation=list(orientation),
+                target=robot_frame_target(
+                    list(position), list(orientation), check_arm_move_prod.RequestDataTarget
+                ),
                 duration_s=0.0,
             )
             with pytest.raises(check_arm_move_fx.Failure) as raised:
@@ -1285,8 +1414,7 @@ async def test_a_move_arm_goal_with_no_plan_fails_with_unreachable(follower_neve
                 h,
                 move_arm_prod.GoalRequestData(
                     arm_name="arm",
-                    position=[position[0] + 2.0, position[1], position[2]],
-                    orientation=list(orientation),
+                    target=robot_frame_target([position[0] + 2.0, position[1], position[2]], list(orientation)),
                     duration_s=0.0,
                     settle_position_tolerance_m=0.01,
                     settle_orientation_tolerance_rad=0.5,
@@ -1328,8 +1456,9 @@ async def test_a_streaming_leader_refuses_goals_and_checks_with_leader_streaming
 
             check = check_arm_move_prod.RequestData(
                 arm_name="arm",
-                position=list(position),
-                orientation=list(orientation),
+                target=robot_frame_target(
+                    list(position), list(orientation), check_arm_move_prod.RequestDataTarget
+                ),
                 duration_s=0.0,
             )
             with pytest.raises(check_arm_move_fx.Failure) as raised:
@@ -1368,16 +1497,16 @@ async def test_the_workspace_answers_on_reach_alone_from_bringup():
         assert surface.area >= 0.03
         assert_rectangle_inside_reach(surface)
         assert surface.view is None
+        assert surface.frame == ROBOT_FRAME
 
-        wire = [*NEAR, *CLOSE, *FAR]
-        points = await check_positions_fx.poll(
-            h, check_positions_prod.RequestData(positions=wire), WORKSPACE_TIMEOUT_S
-        )
+        request = in_robot_frame((NEAR, CLOSE, FAR))
+        points = await check_positions_fx.poll(h, request, WORKSPACE_TIMEOUT_S)
         assert points.perception_camera == ""
         assert not points.all_workable
         near, close, far = points.results
         for result, asked in zip(points.results, (NEAR, CLOSE, FAR), strict=True):
             assert result.position == pytest.approx(list(asked))
+            assert (result.frame, result.timestamp) == (ROBOT_FRAME, None)
         assert (near.workable, near.reachable, near.arm, near.short_by) == (True, True, "arm", 0.0)
         assert (close.workable, close.reachable, close.arm) == (False, False, "")
         assert 0.0 <= close.short_by <= REACH_TOLERANCE
@@ -1398,11 +1527,404 @@ async def test_the_workspace_gives_an_error_reply_to_what_is_not_a_request():
             describe_workspace_fx.FailureKind.REJECTED, "surface_height must be a finite number"
         )
 
-        with pytest.raises(check_positions_fx.Failure) as raised:
-            await check_positions_fx.poll(
-                h, check_positions_prod.RequestData(positions=[0.2, 0.0]), TIMEOUT_S
+        # An empty list is refused before its frame is placed, a point that is
+        # not finite by its place in the request, from 1, and a request with
+        # no frame, each with `rejected`.
+        for request, message in (
+            (in_robot_frame(()), "points must hold at least one point"),
+            (points_in("nowhere", None, ()), "points must hold at least one point"),
+            (
+                in_robot_frame((NEAR, (math.nan, 0.0, 0.0))),
+                (
+                    "point 2: a position must be finite: got x NaN, y 0, z 0; give a finite "
+                    "number of meters on each axis"
+                ),
+            ),
+            (
+                points_in("", None, (NEAR,)),
+                (
+                    "the frame is empty: name a frame of the robot's tree, such as the robot "
+                    "frame that sensor_mounts' describe_sensors names"
+                ),
+            ),
+        ):
+            with pytest.raises(check_positions_fx.Failure) as raised:
+                await check_positions_fx.poll(h, request, TIMEOUT_S)
+            assert raised.value == check_positions_fx.Failure(
+                check_positions_fx.FailureKind.REJECTED, message
             )
-        assert raised.value == check_positions_fx.Failure(
-            check_positions_fx.FailureKind.REJECTED,
-            "positions must hold 3 values (x, y, z) per point",
+
+
+# ---- Placement by the robot's tree -----------------------------------------------
+
+# The tests' base: where odom places the robot frame at `THEN` and, after a
+# move of the base, at `NOW`, the latest time its tree holds.
+THEN = 1_700_000_100.0
+NOW = 1_700_000_102.0
+BASE_THEN = ((0.0, 0.0, 0.0), IDENTITY)
+BASE_NOW = ((0.10, 0.05, 0.0), quaternion_of_yaw(0.2))
+
+
+def placed_by(base, pose):
+    """`pose` (position, orientation), given in the robot frame of `base`,
+    in the frame `base` is placed in."""
+    (base_position, base_orientation), (position, orientation) = base, pose
+    moved = rotate(base_orientation, position)
+    return (
+        tuple(m + b for m, b in zip(moved, base_position)),
+        product(base_orientation, orientation),
+    )
+
+
+def seen_from(base, pose):
+    """`pose`, given in the frame `base` is placed in, in the robot frame of
+    `base`."""
+    (base_position, base_orientation), (position, orientation) = base, pose
+    turn_back = inverse(base_orientation)
+    offset = tuple(p - b for p, b in zip(position, base_position))
+    return rotate(turn_back, offset), product(turn_back, orientation)
+
+
+def the_place():
+    """The place the goals of the tests name, 2 cm above the grasp point of
+    MEASURED: in the robot frame where it stands at NOW; in odom; and in the
+    robot frame as it stood at THEN."""
+    position, orientation = MEASURED_POSE
+    in_robot = ((position[0], position[1], position[2] + 0.02), tuple(orientation))
+    in_odom = placed_by(BASE_NOW, in_robot)
+    return in_robot, in_odom, seen_from(BASE_THEN, in_odom)
+
+
+async def grasp_point_commanded_to(h, kinematics, place) -> None:
+    """Read the downstream arm setpoints until one puts the grasp point
+    within the line's precision of `place`, failing after TIMEOUT_S."""
+
+    def at_the_place(positions) -> bool:
+        reached, _orientation = kinematics.forward_kinematics(tuple(positions))
+        return math.dist(reached, place) <= 2 * LINE_POSITION_BAR_M
+
+    await asyncio.wait_for(next_arm_setpoint_where(h, at_the_place), TIMEOUT_S)
+
+
+async def commands_the_grasp_point_to(h, kinematics, goal_data, place) -> None:
+    """Send the move_arm goal `goal_data` and read its downstream setpoints
+    until one puts the grasp point within the line's precision of `place`,
+    failing after TIMEOUT_S; the goal is cancelled then."""
+    goal = await move_arm_fx.send_goal(h, goal_data, TIMEOUT_S)
+    assert goal.accepted, goal.refusal
+    try:
+        await grasp_point_commanded_to(h, kinematics, place)
+    finally:
+        await goal.cancel_goal(TIMEOUT_S)
+        await goal.get_result(TIMEOUT_S)
+
+
+def pose_goal(frame, timestamp, pose):
+    """A move_arm goal of the arm to `pose` in `frame` at `timestamp`."""
+    position, orientation = pose
+    return move_arm_prod.GoalRequestData(
+        arm_name="arm",
+        target=move_arm_prod.GoalRequestDataTarget(
+            frame=frame, timestamp=timestamp, position=list(position), orientation=list(orientation)
+        ),
+        duration_s=0.0,
+        settle_position_tolerance_m=0.01,
+        settle_orientation_tolerance_rad=0.5,
+        settle_timeout_s=2.0,
+        contact_gap_m=0.0,
+    )
+
+
+async def test_a_goal_is_placed_where_its_frame_stood_at_its_time_as_the_base_moves(
+    follower_never_stale,
+):
+    # Against a tree whose odom to robot frame moves between a pose's time
+    # and its goal's acceptance, the backbone places a pose given in odom,
+    # and the same pose in the robot frame with the time of that pose, at one
+    # place in odom, and a robot-frame pose with no timestamp where the robot
+    # frame stands at acceptance: it asks transform_lookup for the target's
+    # frame at the target's time in the robot frame at the latest time.
+    in_robot, in_odom, in_robot_then = the_place()
+    tree = BaseTree({THEN: BASE_THEN, NOW: BASE_NOW})
+    kinematics = Kinematics(urdf_path())
+    async with started(tree=tree) as h:
+        feeder = await feeding_measured(h)
+        try:
+            checked = []
+            for frame, timestamp, pose in (
+                ("odom", None, in_odom),
+                ("odom", THEN, in_odom),
+                (ROBOT_FRAME, THEN, in_robot_then),
+                (ROBOT_FRAME, None, in_robot_then),
+            ):
+                request = points_in(frame, timestamp, (pose[0],))
+                answer = await check_positions_fx.poll(h, request, WORKSPACE_TIMEOUT_S)
+                checked.extend(answer.results)
+            odom_latest, odom_then, robot_then, robot_latest = checked
+            for result in (odom_latest, odom_then, robot_then):
+                assert result.position == pytest.approx(list(in_robot[0]), abs=1e-9)
+                assert (result.frame, result.timestamp) == (ROBOT_FRAME, NOW)
+            assert robot_latest.position == pytest.approx(list(in_robot_then[0]), abs=1e-9)
+            assert math.dist(in_robot_then[0], in_robot[0]) > 0.05, (
+                "the base moves far enough between the two times to tell the places apart"
+            )
+
+            for frame, timestamp, pose in (
+                (ROBOT_FRAME, THEN, in_robot_then),
+                ("odom", None, in_odom),
+                (ROBOT_FRAME, None, in_robot),
+            ):
+                await commands_the_grasp_point_to(
+                    h, kinematics, pose_goal(frame, timestamp, pose), in_robot[0]
+                )
+            asked = [
+                (r.source_frame, r.source_timestamp, r.target_frame, r.target_timestamp)
+                for r in h.mocks.deps.transform_lookup.lookup_transform.captured()
+            ][-3:]
+            assert asked == [
+                (ROBOT_FRAME, THEN, ROBOT_FRAME, None),
+                ("odom", None, ROBOT_FRAME, None),
+                (ROBOT_FRAME, None, ROBOT_FRAME, None),
+            ]
+        finally:
+            feeder.cancel()
+
+
+async def test_a_goal_the_tree_cannot_place_is_refused_before_the_arm_moves(
+    follower_never_stale,
+):
+    # A goal in a frame the tree does not hold is refused with unknown_frame,
+    # and one in the robot frame at a time older than the tree holds with
+    # extrapolation, each when the backbone decides on the goal, before
+    # anything moves; a plan check and a check of points get the same kind as
+    # an error reply, naming what they could not place. A target and points
+    # with no frame lie in the robot frame, so at that time they get
+    # extrapolation too.
+    in_robot, _in_odom, _in_robot_then = the_place()
+    tree = BaseTree({THEN: BASE_THEN, NOW: BASE_NOW})
+    async with started(tree=tree) as h:
+        feeder = await feeding_measured(h)
+        try:
+            for frame, timestamp, kind, cause in (
+                ("nowhere", None, move_arm_fx.FailureKind.UNKNOWN_FRAME,
+                 "the target: no transform of the tree names the frame nowhere"),
+                (ROBOT_FRAME, THEN - 20.0, move_arm_fx.FailureKind.EXTRAPOLATION,
+                 f"the target: the transform odom -> {ROBOT_FRAME} has no value"),
+                (None, THEN - 20.0, move_arm_fx.FailureKind.EXTRAPOLATION,
+                 f"the target: the transform odom -> {ROBOT_FRAME} has no value"),
+            ):
+                goal = await move_arm_fx.send_goal(h, pose_goal(frame, timestamp, in_robot), TIMEOUT_S)
+                assert goal.refusal is not None, "a goal the tree cannot place is refused"
+                assert goal.refusal.kind is kind, goal.refusal
+                assert goal.refusal.message.startswith(cause), goal.refusal.message
+
+            for frame, timestamp, kind in (
+                ("nowhere", None, check_arm_move_fx.FailureKind.UNKNOWN_FRAME),
+                (None, THEN - 20.0, check_arm_move_fx.FailureKind.EXTRAPOLATION),
+            ):
+                check = check_arm_move_prod.RequestData(
+                    arm_name="arm",
+                    target=check_arm_move_prod.RequestDataTarget(
+                        frame=frame,
+                        timestamp=timestamp,
+                        position=list(in_robot[0]),
+                        orientation=list(in_robot[1]),
+                    ),
+                    duration_s=0.0,
+                )
+                with pytest.raises(check_arm_move_fx.Failure) as raised:
+                    await check_arm_move_fx.poll(h, check, TIMEOUT_S)
+                assert raised.value.kind is kind, raised.value
+
+            with pytest.raises(check_positions_fx.Failure) as raised:
+                await check_positions_fx.poll(h, points_in(None, THEN - 20.0, (NEAR,)), TIMEOUT_S)
+            assert raised.value.kind is check_positions_fx.FailureKind.EXTRAPOLATION, raised.value
+
+            points = points_in("nowhere", None, (NEAR, CLOSE))
+            with pytest.raises(check_positions_fx.Failure) as raised:
+                await check_positions_fx.poll(h, points, TIMEOUT_S)
+            assert raised.value.kind is check_positions_fx.FailureKind.UNKNOWN_FRAME
+            assert raised.value.message.startswith(
+                "the points: no transform of the tree names the frame nowhere"
+            ), raised.value.message
+
+            # The refusals commanded nothing: the first setpoint downstream
+            # after them is the leader's.
+            stamps: list[float] = []
+            leader = asyncio.create_task(_stream_leader_target(h, MEASURED, stamps))
+            try:
+                first = await asyncio.wait_for(
+                    h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S
+                )
+            finally:
+                leader.cancel()
+            assert _one_of(stamps, first.timestamp), "a refused goal commanded the arm"
+        finally:
+            feeder.cancel()
+
+
+async def asked_to_place(h, frame) -> None:
+    """Wait until the node asked transform_lookup to place `frame`, failing
+    after TIMEOUT_S."""
+    lookups = h.mocks.deps.transform_lookup.lookup_transform
+    deadline = time.monotonic() + TIMEOUT_S
+    while not any(r.source_frame == frame for r in lookups.captured()):
+        assert time.monotonic() < deadline, f"the node did not ask to place {frame}"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_pose_setpoint_is_placed_by_its_frame_and_one_the_tree_cannot_place_is_dropped():
+    # A setpoint in a frame the tree does not hold counts as no setpoint: the
+    # first setpoint downstream after it is one of the setpoints in odom that
+    # follow it. A setpoint in odom at a time is placed by where odom stood
+    # then in the robot frame at the latest time, and the arm is commanded
+    # onto the placed pose.
+    in_robot, in_odom, _in_robot_then = the_place()
+    assert math.dist(in_odom[0], in_robot[0]) > 0.05, (
+        "odom stands far enough from the robot frame to tell a placed setpoint from one taken as it comes"
+    )
+    tree = BaseTree({THEN: BASE_THEN, NOW: BASE_NOW})
+    kinematics = Kinematics(urdf_path())
+    async with started(
+        parameters=make_parameters(upstream_mode="pose"), leader_arm_vacant=True, tree=tree
+    ) as h:
+        feeder = asyncio.create_task(keep_measured_fresh(h))
+        unplaced: list[float] = []
+        streamer = asyncio.create_task(_stream_leader_pose(h, "nowhere", in_robot, unplaced))
+        try:
+            await asked_to_place(h, "nowhere")
+            streamer.cancel()
+            in_odom_at: list[float] = []
+            streamer = asyncio.create_task(_stream_leader_pose(h, "odom", in_odom, in_odom_at))
+            first = await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+            assert _one_of(in_odom_at, first.timestamp), "a setpoint the tree cannot place moved the arm"
+            await grasp_point_commanded_to(h, kinematics, in_robot[0])
+            asked = h.mocks.deps.transform_lookup.lookup_transform.captured()[-1]
+            assert asked.source_frame == "odom" and _one_of(in_odom_at, asked.source_timestamp)
+            assert (asked.target_frame, asked.target_timestamp) == (ROBOT_FRAME, None)
+        finally:
+            streamer.cancel()
+            feeder.cancel()
+
+
+async def test_a_robot_frame_setpoint_at_a_time_is_placed_where_the_robot_frame_stood_then():
+    # Against a tree whose odom to robot frame moves between a setpoint's time
+    # and the latest time, a setpoint in the robot frame at its time names
+    # where the robot frame stood then, as pose_link places one: the arm is
+    # commanded onto that place as the robot frame stands at the latest time.
+    in_robot, _in_odom, in_robot_then = the_place()
+    assert math.dist(in_robot_then[0], in_robot[0]) > 0.05, (
+        "the base moves far enough between the two times to tell the places apart"
+    )
+    # The tree holds the base at BASE_THEN at each time a setpoint is sent,
+    # and at BASE_NOW at its latest time, past every one of them.
+    tree = BaseTree({time.time() + 3600.0: BASE_NOW})
+
+    def a_time_the_base_stood_then() -> float:
+        stamp = time.time()
+        tree.base_at[stamp] = BASE_THEN
+        return stamp
+
+    kinematics = Kinematics(urdf_path())
+    async with started(
+        parameters=make_parameters(upstream_mode="pose"), leader_arm_vacant=True, tree=tree
+    ) as h:
+        feeder = asyncio.create_task(keep_measured_fresh(h))
+        sent_at: list[float] = []
+        streamer = asyncio.create_task(
+            _stream_leader_pose(h, ROBOT_FRAME, in_robot_then, sent_at, a_time_the_base_stood_then)
         )
+        try:
+            await grasp_point_commanded_to(h, kinematics, in_robot[0])
+            asked = h.mocks.deps.transform_lookup.lookup_transform.captured()[-1]
+            assert asked.source_frame == ROBOT_FRAME and _one_of(sent_at, asked.source_timestamp)
+            assert (asked.target_frame, asked.target_timestamp) == (ROBOT_FRAME, None)
+        finally:
+            streamer.cancel()
+            feeder.cancel()
+
+
+async def test_a_robot_frame_setpoint_with_no_timestamp_is_taken_as_it_comes_and_stamped_then():
+    # A setpoint in the robot frame with no timestamp, at the latest time, has
+    # no age: the gate passes it, the backbone asks the tree nothing, and the
+    # arm is commanded onto it under the time it was taken, which lies
+    # between the two clock readings around the stream.
+    in_robot, _in_odom, _in_robot_then = the_place()
+    kinematics = Kinematics(urdf_path())
+    async with started(
+        parameters=make_parameters(upstream_mode="pose"), leader_arm_vacant=True
+    ) as h:
+        feeder = asyncio.create_task(keep_measured_fresh(h))
+        before_s = time.time()
+        streamer = asyncio.create_task(
+            _stream_leader_pose(h, ROBOT_FRAME, in_robot, [], lambda: None)
+        )
+        try:
+            first = await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+            after_s = time.time()
+            assert before_s <= first.timestamp <= after_s
+            await grasp_point_commanded_to(h, kinematics, in_robot[0])
+            assert h.mocks.deps.transform_lookup.lookup_transform.captured() == []
+        finally:
+            streamer.cancel()
+            feeder.cancel()
+
+
+async def test_a_pose_setpoint_backlog_replayed_after_a_stall_is_dropped_by_age():
+    # Setpoints stamped past the wire age limit, as a stalled transport
+    # replays a held backlog, are dropped by their age: the first setpoint
+    # downstream is one of the fresh setpoints that follow them.
+    in_robot, _in_odom, _in_robot_then = the_place()
+    async with started(
+        parameters=make_parameters(upstream_mode="pose"), leader_arm_vacant=True
+    ) as h:
+        feeder = asyncio.create_task(keep_measured_fresh(h))
+        held: list[float] = []
+        streamer = asyncio.create_task(
+            _stream_leader_pose(
+                h, ROBOT_FRAME, in_robot, held, lambda: time.time() - 2 * WIRE_AGE_LIMIT_S
+            )
+        )
+        try:
+            while len(held) < 5:
+                await asyncio.sleep(0.01)
+            streamer.cancel()
+            fresh: list[float] = []
+            streamer = asyncio.create_task(_stream_leader_pose(h, ROBOT_FRAME, in_robot, fresh))
+            first = await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+            assert _one_of(fresh, first.timestamp), "a setpoint of the backlog moved the arm"
+        finally:
+            streamer.cancel()
+            feeder.cancel()
+
+
+async def test_a_pose_setpoint_whose_handling_fails_is_dropped_and_the_stream_goes_on(monkeypatch):
+    # A failure that is neither a refusal nor a setpoint no contract takes,
+    # here a fault of the lookup's call, drops its setpoint with a log line,
+    # and the stream takes the setpoints that follow it.
+    in_robot, _in_odom, _in_robot_then = the_place()
+    look_up = placement.lookup_transform.poll
+    faulted = asyncio.Event()
+
+    async def poll(node_runner, producer, request, timeout):
+        if request.source_frame == "faulty":
+            faulted.set()
+            raise TypeError("a fault of the call")
+        return await look_up(node_runner, producer, request, timeout)
+
+    monkeypatch.setattr(placement.lookup_transform, "poll", poll)
+    async with started(
+        parameters=make_parameters(upstream_mode="pose"), leader_arm_vacant=True
+    ) as h:
+        feeder = asyncio.create_task(keep_measured_fresh(h))
+        streamer = asyncio.create_task(_stream_leader_pose(h, "faulty", in_robot, []))
+        try:
+            await asyncio.wait_for(faulted.wait(), TIMEOUT_S)
+            streamer.cancel()
+            taken: list[float] = []
+            streamer = asyncio.create_task(_stream_leader_pose(h, ROBOT_FRAME, in_robot, taken))
+            first = await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
+            assert _one_of(taken, first.timestamp)
+        finally:
+            streamer.cancel()
+            feeder.cancel()
