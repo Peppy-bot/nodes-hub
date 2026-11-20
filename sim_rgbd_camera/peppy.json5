@@ -9,8 +9,8 @@
     tag: "v1",
     description: [
       "A simulated RGB-D camera: a relay between the RGB-D camera slot of a simulation (the sim_rgbd_camera_link pairing) and the rgbd_camera contract. It opens no device: it needs a simulation that renders the camera, such as sim_mujoco, sim_isaac or Waldo.",
-      "Toward consumers it is a camera exactly like the real RGB-D nodes (colour and depth frames out, stream infos and control services answered) that also describes itself through camera_profile. When a launch links its control slot to the simulation, it forwards every colour control there under the name of the camera, so the device model of the simulation answers them; without that link every control refuses. Frames relay timestamps, frame_ids and align_mode untouched, so consumers age samples on the capture time and correlate pairs on the shared frame_id.",
-      "It also says where its pixels point, through camera_geometry: the simulation publishes the pinhole model of both streams and how the depth sits against the colour on the geometry topic of the pairing, and the three geometry services answer from the latest one, refusing until the first arrives.",
+      "Toward consumers it is a camera exactly like the real RGB-D nodes (colour and depth frames out, stream infos and control services answered) that also describes itself through camera_profile. When a launch links its control slot to the simulation, it forwards every colour control there under the name of the camera, so the device model of the simulation answers them; without that link every control refuses. Frames relay timestamps, capture_index and align_mode untouched, so consumers age samples on the capture time and pair a colour frame with its depth frame on the shared capture_index, and each names in its header's frame the camera's frame, which the relay reads from sensor_mounts' describe_sensors once at its start by the name it runs under; a frame the simulation names otherwise is dropped, with a log that names both frames. A simulation renders each camera on a robot, so the relay does not start without its sensor_mounts link bound to that robot.",
+      "It also says where its pixels point, through camera_geometry: the simulation publishes the pinhole model of both streams and how the depth sits against the colour on the geometry topic of the pairing, and the three geometry services answer from the latest one, refusing until the first arrives. get_depth_to_color_extrinsics gives the pose in the camera's frame, the frame its pictures name.",
     ],
     implements: [
       { name: "rgbd_camera", tag: "v1", link_id: "camera" },
@@ -31,6 +31,13 @@
         // this relay's name in its copy. A launch on a simulation without one
         // writes the slot vacant, and every control refuses.
         { name: "sim_camera_control", tag: "v1", link_id: "control", cardinality: "zero_or_one" },
+        // The robot that carries the camera, whose robot_identity implementer
+        // serves sensor_mounts: the frame of the camera this relay's name
+        // says, which the relay reads once at its start and holds every
+        // relayed picture to. Required: a simulation renders each camera on
+        // a robot, so a relay without that robot's sensor_mounts is a
+        // misconfiguration, and the launch fails naming the link.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts" },
       ],
     },
   },
@@ -70,6 +77,7 @@
         { link_id: "control", name: "set_camera_brightness" },
         { link_id: "control", name: "set_camera_contrast" },
         { link_id: "control", name: "reset_camera" },
+        { link_id: "sensor_mounts", name: "describe_sensors" },
       ],
     },
   },

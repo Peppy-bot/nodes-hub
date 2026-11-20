@@ -3,7 +3,10 @@
 //! the camera response model played by the generated control mock, and the
 //! contract surface observed the way a consumer sees it.
 
+use std::sync::{Mutex, Once, PoisonError};
 use std::time::{Duration, SystemTime};
+
+use frame_tree::arithmetic;
 
 use peppygen::fixtures::exposed_services::camera::{
     depth_stream_info, set_color_brightness, set_color_contrast, set_color_exposure,
@@ -13,24 +16,34 @@ use peppygen::fixtures::exposed_services::geometry::{
     get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics,
 };
 use peppygen::fixtures::exposed_services::profile::{get_camera_profile, reset_camera};
-use peppygen::fixtures::harness::{Config, Harness};
+use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::control as control_mock;
+use peppygen::mock::deps::sensor_mounts::describe_sensors;
 use peppygen::mock::pairings::simulation::{
     depth_stream as simulation_depth, geometry as simulation_geometry,
     stream_info as simulation_info, video_stream as simulation_video,
 };
 use peppygen::paired_topics::simulation::{
-    depth_stream::MessageHeader as DepthHeader, video_stream::MessageHeader as ColorHeader,
+    depth_stream::MessageHeader as DepthHeader, geometry::MessageDepthToColor as DepthToColor,
+    video_stream::MessageHeader as ColorHeader,
 };
 
 /// Bounds every poll and every wait for a relayed frame. Generous: the
 /// assertions are about what arrives, never about how fast.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The id the forwarding test runs the relay under. The harness runs a node
-/// outside any copy, so the id is the camera's name as it is; a copy's prefix
-/// coming off is covered by the node's own tests.
-const CAMERA: &str = "wrist_left";
+/// The id the forwarding, the frame and the geometry tests run the relay
+/// under. The harness runs a node outside any copy, so the id is the camera's
+/// name as it is; a copy's prefix coming off is covered by camera_core's own
+/// tests.
+const CAMERA: &str = "chest";
+
+/// The frame sensor_mounts gives the camera [`CAMERA`].
+const CAMERA_FRAME: &str = "chest_color_optical_frame";
+
+/// A frame that is not the camera's, which a simulation that renders another
+/// camera, or another robot, names.
+const OTHER_FRAME: &str = "wrist_left_color_optical_frame";
 
 /// The message of the error reply the node gives on every control while the
 /// control slot is vacant, verbatim: a caller reads it to learn there is no
@@ -103,9 +116,128 @@ fn geometry() -> simulation_geometry::Message {
         min_depth_m: 0.1,
         max_depth_m: 10.0,
         align_mode: ALIGN_MODE.to_string(),
-        depth_to_color_position: [0.0, 0.0, 0.0],
-        depth_to_color_orientation: [0.0, 0.0, 0.0, 1.0],
+        depth_to_color: DepthToColor {
+            frame: CAMERA_FRAME.to_string(),
+            position: [0.0, 0.0, 0.0],
+            orientation: [0.0, 0.0, 0.0, 1.0],
+        },
     }
+}
+
+/// [`geometry`] with the depth-to-colour pose turned to `orientation`.
+fn geometry_turned(orientation: [f64; 4]) -> simulation_geometry::Message {
+    simulation_geometry::Message {
+        depth_to_color: DepthToColor {
+            orientation,
+            ..geometry().depth_to_color
+        },
+        ..geometry()
+    }
+}
+
+/// Every line logged in this test binary, as an operator reads it.
+static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// One logged line on its way to [`LOGGED`]: the formatter writes an event whole, then
+/// drops the line.
+#[derive(Default)]
+struct Line(Vec<u8>);
+
+impl std::io::Write for Line {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        let line = String::from_utf8_lossy(&self.0).trim_end().to_owned();
+        LOGGED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(line);
+    }
+}
+
+/// Captures every line logged in this test binary from now on. Each test calls this
+/// before it starts the relay, so no relay logs before the capture holds.
+fn capture_logs() {
+    static CAPTURING: Once = Once::new();
+    CAPTURING.call_once(|| {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Line::default)
+            .init();
+    });
+}
+
+/// How many lines logged so far hold `text`.
+fn lines_holding(text: &str) -> usize {
+    LOGGED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|line| line.contains(text))
+        .count()
+}
+
+/// Waits until the node's setup has returned.
+async fn setup_returned(harness: &Harness) {
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while !harness.setup_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the setup never returned"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The answer of sensor_mounts for a robot with a chest camera and a camera
+/// on its left wrist.
+fn described_sensors() -> describe_sensors::ResponseData {
+    let strings = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect();
+    describe_sensors::ResponseData {
+        robot_frame: "base_link".to_owned(),
+        sensor_names: strings(&[CAMERA, "wrist_left"]),
+        sensor_kinds: strings(&["rgbd_camera", "rgb_camera"]),
+        sensor_frames: strings(&[CAMERA_FRAME, "wrist_left_color_optical_frame"]),
+        carried_by: strings(&["", "left_arm"]),
+    }
+}
+
+/// Answers the relay's ask of describe_sensors with `answer`.
+async fn answer_describe_sensors(
+    mocks: &Mocks,
+    answer: describe_sensors::ResponseData,
+) -> peppygen::Result<()> {
+    mocks
+        .deps
+        .sensor_mounts
+        .describe_sensors
+        .next_request(TIMEOUT)
+        .await?
+        .respond(answer)
+        .await
+}
+
+/// A boot of the relay as the camera [`CAMERA`] on the robot
+/// [`described_sensors`] describes, its ask of sensor_mounts answered;
+/// `config` gives the rest of the boot.
+async fn mounted(config: Config) -> peppygen::Result<(Harness, Mocks)> {
+    capture_logs();
+    let config = Config {
+        instance_id: Some(CAMERA.to_string()),
+        ..config
+    };
+    let (harness, mocks) = Harness::start_with(config, sim_rgbd_camera::setup).await?;
+    answer_describe_sensors(&mocks, described_sensors()).await?;
+    Ok((harness, mocks))
 }
 
 /// Polls `service` until `ready` accepts the response, so a test never assumes
@@ -139,117 +271,196 @@ macro_rules! poll_until {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relays_both_streams_verbatim_and_drops_invalid_timestamps() -> peppygen::Result<()> {
-    let (mut harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+async fn relays_both_streams_verbatim_at_any_timestamp() -> peppygen::Result<()> {
+    let (mut harness, mocks) = mounted(Config::default()).await?;
 
-    // A frame stamped at the epoch is what a simulation publishes before its
-    // clock resolves; both legs must drop it rather than forward a sample no
-    // consumer can age. Each leg publishes its bad frame first through the
-    // same mock publisher, so the first frame to surface proves the drop.
+    // A picture stamped at the epoch is a picture taken at that time, which
+    // the relay passes on like any other. Each leg publishes it first through
+    // the same mock publisher, so it is the first picture to surface.
     let timestamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000);
-
-    mocks
-        .pairings
-        .simulation
-        .video_stream
-        .publish(&simulation_video::Message {
-            header: ColorHeader {
-                timestamp: SystemTime::UNIX_EPOCH,
-                frame_id: 7,
-                align_mode: ALIGN_MODE.to_string(),
-            },
-            encoding: "rgb8".to_string(),
-            width: 4,
-            height: 2,
-            frame: vec![0x11; 4 * 2 * 3],
-        })
-        .await?;
-    let color = simulation_video::Message {
+    let color = |timestamp, capture_index, fill| simulation_video::Message {
         header: ColorHeader {
             timestamp,
-            frame_id: 42,
+            frame: CAMERA_FRAME.to_string(),
+            capture_index,
             align_mode: ALIGN_MODE.to_string(),
         },
         encoding: "rgb8".to_string(),
         width: 4,
         height: 2,
-        frame: vec![0xA5; 4 * 2 * 3],
+        data: vec![fill; 4 * 2 * 3],
     };
-    mocks
-        .pairings
-        .simulation
-        .video_stream
-        .publish(&color)
-        .await?;
-
-    mocks
-        .pairings
-        .simulation
-        .depth_stream
-        .publish(&simulation_depth::Message {
-            header: DepthHeader {
-                timestamp: SystemTime::UNIX_EPOCH,
-                frame_id: 7,
-                align_mode: ALIGN_MODE.to_string(),
-            },
-            encoding: "z16".to_string(),
-            width: 2,
-            height: 2,
-            frame: vec![0x00; 2 * 2 * 2],
-        })
-        .await?;
-    // Depth carries the same frame_id as the color frame it was captured
-    // with, which is what lets a consumer pair them.
-    let depth = simulation_depth::Message {
+    // Depth carries the same capture_index as the color picture it was
+    // captured with, which is what lets a consumer pair them.
+    let depth = |timestamp, capture_index, data| simulation_depth::Message {
         header: DepthHeader {
             timestamp,
-            frame_id: 42,
+            frame: CAMERA_FRAME.to_string(),
+            capture_index,
             align_mode: ALIGN_MODE.to_string(),
         },
         encoding: "z16".to_string(),
         width: 2,
         height: 2,
-        frame: vec![0x34, 0x12, 0x78, 0x56, 0xBC, 0x9A, 0xF0, 0xDE],
+        data,
     };
+    let colors = [
+        color(SystemTime::UNIX_EPOCH, 7, 0x11),
+        color(timestamp, 42, 0xA5),
+    ];
+    let depths = [
+        depth(SystemTime::UNIX_EPOCH, 7, vec![0x00; 2 * 2 * 2]),
+        depth(
+            timestamp,
+            42,
+            vec![0x34, 0x12, 0x78, 0x56, 0xBC, 0x9A, 0xF0, 0xDE],
+        ),
+    ];
+    for sent in &colors {
+        mocks.pairings.simulation.video_stream.publish(sent).await?;
+    }
+    for sent in &depths {
+        mocks.pairings.simulation.depth_stream.publish(sent).await?;
+    }
+
+    for sent in &colors {
+        let relayed = tokio::time::timeout(TIMEOUT, harness.emitted.camera_video_stream.next())
+            .await
+            .expect("no color frame reached the contract surface")?
+            .expect("video_stream subscription should be open");
+        assert_eq!(relayed.header.timestamp, sent.header.timestamp);
+        assert_eq!(relayed.header.frame, CAMERA_FRAME);
+        assert_eq!(relayed.header.capture_index, sent.header.capture_index);
+        assert_eq!(relayed.header.align_mode, ALIGN_MODE);
+        assert_eq!(relayed.encoding, sent.encoding);
+        assert_eq!(relayed.width, sent.width);
+        assert_eq!(relayed.height, sent.height);
+        assert_eq!(relayed.data, sent.data);
+    }
+
+    for sent in &depths {
+        let relayed = tokio::time::timeout(TIMEOUT, harness.emitted.camera_depth_stream.next())
+            .await
+            .expect("no depth frame reached the contract surface")?
+            .expect("depth_stream subscription should be open");
+        assert_eq!(relayed.header.timestamp, sent.header.timestamp);
+        assert_eq!(relayed.header.frame, CAMERA_FRAME);
+        assert_eq!(relayed.header.capture_index, sent.header.capture_index);
+        assert_eq!(relayed.header.align_mode, ALIGN_MODE);
+        assert_eq!(relayed.encoding, sent.encoding);
+        assert_eq!(relayed.width, sent.width);
+        assert_eq!(relayed.height, sent.height);
+        // Byte for byte: the depth wire format is little-endian u16, and a
+        // relay that reordered or rescaled would silently change every
+        // reading.
+        assert_eq!(relayed.data, sent.data);
+    }
+
+    // The depth stream's pose against the colour one is in the frame the
+    // simulation gives it.
     mocks
         .pairings
         .simulation
-        .depth_stream
-        .publish(&depth)
+        .geometry
+        .publish(&geometry())
         .await?;
-
-    let relayed_color = tokio::time::timeout(TIMEOUT, harness.emitted.camera_video_stream.next())
-        .await
-        .expect("no color frame reached the contract surface")?
-        .expect("video_stream subscription should be open");
-    assert_eq!(relayed_color.header.timestamp, timestamp);
-    assert_eq!(relayed_color.header.frame_id, 42);
-    assert_eq!(relayed_color.header.align_mode, ALIGN_MODE);
-    assert_eq!(relayed_color.encoding, color.encoding);
-    assert_eq!(relayed_color.width, color.width);
-    assert_eq!(relayed_color.height, color.height);
-    assert_eq!(relayed_color.frame, color.frame);
-
-    let relayed_depth = tokio::time::timeout(TIMEOUT, harness.emitted.camera_depth_stream.next())
-        .await
-        .expect("no depth frame reached the contract surface")?
-        .expect("depth_stream subscription should be open");
-    assert_eq!(relayed_depth.header.timestamp, timestamp);
-    assert_eq!(relayed_depth.header.frame_id, 42);
-    assert_eq!(relayed_depth.header.align_mode, ALIGN_MODE);
-    assert_eq!(relayed_depth.encoding, depth.encoding);
-    assert_eq!(relayed_depth.width, depth.width);
-    assert_eq!(relayed_depth.height, depth.height);
-    // Byte for byte: the depth wire format is little-endian u16, and a relay
-    // that reordered or rescaled would silently change every reading.
-    assert_eq!(relayed_depth.frame, depth.frame);
+    let pose = poll_until!(
+        get_depth_to_color_extrinsics,
+        &harness,
+        |_: &get_depth_to_color_extrinsics::Response| true
+    );
+    assert_eq!(pose.depth_to_color.frame, CAMERA_FRAME);
 
     harness.shutdown().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_picture_in_another_frame_than_the_cameras_is_dropped_and_the_first_of_a_run_logged()
+-> peppygen::Result<()> {
+    let (mut harness, mocks) = mounted(Config::default()).await?;
+    let depth = |frame: &str, capture_index| simulation_depth::Message {
+        header: DepthHeader {
+            timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1_780_000_000),
+            frame: frame.to_string(),
+            capture_index,
+            align_mode: ALIGN_MODE.to_string(),
+        },
+        encoding: "z16".to_string(),
+        width: 1,
+        height: 1,
+        data: vec![0x34, 0x12],
+    };
+    // The publishes share one mock publisher, so their order holds: each relayed
+    // picture proves the drops before it. Two runs of pictures in another frame,
+    // each ended by a picture in the camera's.
+    let published = [
+        depth(OTHER_FRAME, 8),
+        depth(OTHER_FRAME, 9),
+        depth(CAMERA_FRAME, 10),
+        depth(OTHER_FRAME, 11),
+        depth(CAMERA_FRAME, 12),
+    ];
+    for picture in &published {
+        mocks
+            .pairings
+            .simulation
+            .depth_stream
+            .publish(picture)
+            .await?;
+    }
+
+    for capture_index in [10, 12] {
+        let relayed = tokio::time::timeout(TIMEOUT, harness.emitted.camera_depth_stream.next())
+            .await
+            .expect("no depth frame reached the contract surface")?
+            .expect("depth_stream subscription should be open");
+        assert_eq!(relayed.header.frame, CAMERA_FRAME);
+        assert_eq!(relayed.header.capture_index, capture_index);
+    }
+    // The relay logs a dropped picture before it relays the next one, so both runs
+    // are logged by now: one line each, with both frames and what to fix.
+    let dropped = format!(
+        "relaying depth_stream failing, suppressing repeats: the simulation names the frame \
+         {OTHER_FRAME:?} where sensor_mounts gives camera {CAMERA:?} the frame \
+         {CAMERA_FRAME:?}, so the relay drops it: pair the relay with the simulation's camera \
+         {CAMERA:?}, or bind the relay's sensor_mounts link to the robot the simulation renders"
+    );
+    assert_eq!(lines_holding(&dropped), 2);
+
+    harness.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_camera_sensor_mounts_does_not_list_fails_its_start() -> peppygen::Result<()> {
+    let config = Config {
+        instance_id: Some("head".to_string()),
+        ..Config::default()
+    };
+    capture_logs();
+    let (harness, mocks) = Harness::start_with(config, sim_rgbd_camera::setup).await?;
+    answer_describe_sensors(&mocks, described_sensors()).await?;
+
+    setup_returned(&harness).await;
+    let refusal = harness
+        .shutdown()
+        .await
+        .expect_err("the start fails")
+        .to_string();
+    assert!(
+        refusal.contains(
+            "sensor_mounts' describe_sensors names no sensor \"head\" (its sensor_names: chest, \
+             wrist_left): run the camera under one of those names, or bind its sensor_mounts \
+             link to the robot that carries it, whose robot_identity implementer serves \
+             sensor_mounts"
+        ),
+        "{refusal}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn both_info_services_answer_from_the_simulation_description() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+    let (harness, mocks) = mounted(Config::default()).await?;
 
     // Before the simulation describes its stream, depth_unit is zero: a recorder
     // reading it refuses rather than scaling every depth reading by a guess.
@@ -293,7 +504,7 @@ async fn both_info_services_answer_from_the_simulation_description() -> peppygen
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_description_with_an_unusable_depth_unit_is_ignored() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+    let (harness, mocks) = mounted(Config::default()).await?;
 
     // Establish a usable description first, so a rejection can be told apart
     // from never having had one.
@@ -367,11 +578,11 @@ async fn a_description_with_an_unusable_depth_unit_is_ignored() -> peppygen::Res
 async fn every_control_refuses_without_a_response_model() -> peppygen::Result<()> {
     // A launch on a simulation without a camera response model writes the
     // control slot vacant; the pairing itself is established as ever.
-    let config = Config {
+    let (harness, mocks) = mounted(Config {
         control_vacant: true,
-        ..Default::default()
-    };
-    let (harness, mocks) = Harness::start_with(config, sim_rgbd_camera::setup).await?;
+        ..Config::default()
+    })
+    .await?;
     assert!(
         mocks.deps.control.is_none(),
         "a vacant boot must start no control mock"
@@ -457,11 +668,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
     // The default boot binds the control slot to the mock model, and the
     // relay runs under the camera's name, which is all a request's `camera`
     // comes from: the slot the relay views says nothing of it.
-    let config = Config {
-        instance_id: Some(CAMERA.to_string()),
-        ..Default::default()
-    };
-    let (harness, mocks) = Harness::start_with(config, sim_rgbd_camera::setup).await?;
+    let (harness, mocks) = mounted(Config::default()).await?;
     let control = mocks
         .deps
         .control
@@ -567,7 +774,7 @@ async fn every_control_forwards_to_the_response_model_under_the_camera_name() ->
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_error_reply_of_the_response_model_passes_on_with_its_kind_and_its_message()
 -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+    let (harness, mocks) = mounted(Config::default()).await?;
     let control = mocks
         .deps
         .control
@@ -642,7 +849,7 @@ async fn an_error_reply_of_the_response_model_passes_on_with_its_kind_and_its_me
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_geometry_services_answer_from_the_simulation_geometry() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+    let (harness, mocks) = mounted(Config::default()).await?;
 
     // Before the simulation says where the pixels point there is no model to
     // hand over. Zeros in a response would have a consumer divide by a focal
@@ -707,20 +914,23 @@ async fn the_geometry_services_answer_from_the_simulation_geometry() -> peppygen
         |_: &get_depth_to_color_extrinsics::Response| true
     );
     assert_eq!(pose.align_mode, ALIGN_MODE);
-    assert_eq!(pose.depth_to_color_position, [0.0, 0.0, 0.0]);
-    assert_eq!(pose.depth_to_color_orientation, [0.0, 0.0, 0.0, 1.0]);
+    assert_eq!(pose.depth_to_color.frame, CAMERA_FRAME);
+    assert_eq!(pose.depth_to_color.position, [0.0, 0.0, 0.0]);
+    assert_eq!(pose.depth_to_color.orientation, [0.0, 0.0, 0.0, 1.0]);
 
     // A camera that stops aligning publishes a different geometry, and the
     // answers follow it: the pose is the simulation's, not an identity the
     // relay assumes, and both depth answers name the alignment they hold
     // under.
-    // Ten degrees about the optical axis, as a unit quaternion.
-    let half_angle = 5f64.to_radians();
     let unaligned = simulation_geometry::Message {
         align_mode: "none".to_string(),
         depth_cx: 322.25,
-        depth_to_color_position: [-0.015, 0.0005, 0.0],
-        depth_to_color_orientation: [0.0, 0.0, half_angle.sin(), half_angle.cos()],
+        depth_to_color: DepthToColor {
+            position: [-0.015, 0.0005, 0.0],
+            // Ten degrees about the optical axis, +z.
+            orientation: arithmetic::quaternion_of_yaw(10f64.to_radians()),
+            ..geometry().depth_to_color
+        },
         ..geometry()
     };
     mocks
@@ -735,12 +945,12 @@ async fn the_geometry_services_answer_from_the_simulation_geometry() -> peppygen
         |r: &get_depth_to_color_extrinsics::Response| r.align_mode == "none"
     );
     assert_eq!(
-        pose.depth_to_color_position,
-        unaligned.depth_to_color_position
+        pose.depth_to_color.position,
+        unaligned.depth_to_color.position
     );
     assert_eq!(
-        pose.depth_to_color_orientation,
-        unaligned.depth_to_color_orientation
+        pose.depth_to_color.orientation,
+        unaligned.depth_to_color.orientation
     );
     let depth = get_depth_intrinsics::poll(&harness, TIMEOUT).await?;
     assert_eq!(depth.align_mode, "none");
@@ -751,7 +961,7 @@ async fn the_geometry_services_answer_from_the_simulation_geometry() -> peppygen
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
-    let (harness, mocks) = Harness::start(sim_rgbd_camera::setup).await?;
+    let (harness, mocks) = mounted(Config::default()).await?;
 
     // Establish a usable geometry first, so a rejection can be told apart
     // from never having had one.
@@ -792,14 +1002,8 @@ async fn an_unusable_geometry_is_ignored() -> peppygen::Result<()> {
             max_depth_m: 0.05,
             ..geometry()
         },
-        simulation_geometry::Message {
-            depth_to_color_orientation: [0.0; 4],
-            ..geometry()
-        },
-        simulation_geometry::Message {
-            depth_to_color_orientation: [0.0, 0.0, 0.0, 2.0],
-            ..geometry()
-        },
+        geometry_turned([0.0; 4]),
+        geometry_turned([0.0, 0.0, 0.0, 2.0]),
     ];
     for bad in unusable {
         mocks

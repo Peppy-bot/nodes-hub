@@ -18,3 +18,4 @@ path = "src/main.rs"
 
 [dev-dependencies]
 peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+frame_tree = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "frame_tree" }
