@@ -126,6 +126,11 @@
         path: "sim_isaac/peppy.json5"
       }
     },
+    sim_lidar: {
+      v1: {
+        path: "sim_lidar/peppy.json5"
+      }
+    },
     sim_mujoco: {
       v1: {
         path: "sim_mujoco/peppy.json5"
