@@ -41,6 +41,7 @@ import time
 from typing import Optional
 
 import peppylib
+from control_core_py.geometry import Pose
 from peppygen import clock
 from peppylib.clock import ClockPublisher
 from peppygen.emitted_topics.objects import object_states
@@ -55,7 +56,9 @@ from peppygen.paired_topics.rgbd_cameras import depth_stream as rgbd_depth
 from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
+from sim_robot_core.cameras import DISTORTION_MODEL
 from sim_robot_core.pairs import ARMS, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held, PairTable
+from sim_robot_core.world import WORLD
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +103,6 @@ class _LatestSlot:
 # is reported. Well past any real batch at these frame rates, so reaching it
 # means the publish is not going to complete on its own.
 _PUBLISH_STALL_S = 5.0
-
-# A rendered image is an ideal pinhole: the camera_geometry contract's "none".
-_RENDERED_DISTORTION = "none"
 
 
 class _PublishGuard:
@@ -444,18 +444,21 @@ class SimTopicIO:
         robot: str,
         name: str,
         timestamp_s: float,
-        frame_id: int,
+        frame: str,
+        capture_index: int,
         encoding: str,
         width: int,
         height: int,
-        frame: bytes,
+        data: bytes,
     ) -> bool:
+        """One colour picture, its header naming `frame`, the camera's
+        frame, its capture time and its capture counter."""
         payload = rgb_video.build_message(
-            rgb_video.MessageHeader(timestamp=timestamp_s, frame_id=frame_id),
+            rgb_video.MessageHeader(timestamp=timestamp_s, frame=frame, capture_index=capture_index),
             encoding,
             width,
             height,
-            frame,
+            data,
         )
         return self._publish_guarded(
             RGB_CAMERAS, robot, name, _FRAMES_SURFACE, [(_VIDEO_STREAM, payload)]
@@ -480,33 +483,35 @@ class SimTopicIO:
         robot: str,
         name: str,
         timestamp_s: float,
-        frame_id: int,
+        frame: str,
+        capture_index: int,
         align_mode: str,
         color: tuple[str, int, int, bytes],
         depth: tuple[str, int, int, bytes],
     ) -> bool:
         """One rgbd capture: color and depth (each an (encoding, width,
-        height, frame) tuple) publish as a single guarded batch sharing the
-        timestamp and frame_id, so a pair is dropped or delivered whole."""
-        color_encoding, color_width, color_height, color_frame = color
-        depth_encoding, depth_width, depth_height, depth_frame = depth
+        height, data) tuple) publish as a single guarded batch whose headers
+        share `frame`, the camera's frame, the timestamp and the
+        capture_index, so a pair is dropped or delivered whole."""
+        color_encoding, color_width, color_height, color_data = color
+        depth_encoding, depth_width, depth_height, depth_data = depth
         color_payload = rgbd_video.build_message(
             rgbd_video.MessageHeader(
-                timestamp=timestamp_s, frame_id=frame_id, align_mode=align_mode
+                timestamp=timestamp_s, frame=frame, capture_index=capture_index, align_mode=align_mode
             ),
             color_encoding,
             color_width,
             color_height,
-            color_frame,
+            color_data,
         )
         depth_payload = rgbd_depth.build_message(
             rgbd_depth.MessageHeader(
-                timestamp=timestamp_s, frame_id=frame_id, align_mode=align_mode
+                timestamp=timestamp_s, frame=frame, capture_index=capture_index, align_mode=align_mode
             ),
             depth_encoding,
             depth_width,
             depth_height,
-            depth_frame,
+            depth_data,
         )
         return self._publish_guarded(
             RGBD_CAMERAS,
@@ -552,14 +557,23 @@ class SimTopicIO:
             return None
         return self.timestamp_s()
 
+    def placement_timestamp_s(self) -> float:
+        """The instant of the robots' placements the stage records now, on
+        the timeline the joint states are stamped on: the start of the
+        timeline, the instant a timeline at zero carries, while this engine
+        publishes a clock domain and has not recorded a step."""
+        captured = self.capture_timestamp_s()
+        return _MIN_ENGINE_TIME_S if captured is None else captured
+
     def publish_object_states(self, snapshot) -> bool:
-        """Publish one object-state snapshot, stamped with the instant it was
-        captured. False when the previous snapshot is still in flight: this
-        one is dropped, and the next replaces it."""
+        """Publish one object-state snapshot, in world and stamped with the
+        instant it was captured. False when the previous snapshot is still in
+        flight: this one is dropped, and the next replaces it."""
         pub = self._object_states_pub
         if pub is None:
             return False
         payload = object_states.build_message(
+            WORLD,
             snapshot.timestamp_s,
             [object_states.MessageObjectsItem(**record.fields()) for record in snapshot.objects],
         )
@@ -578,7 +592,7 @@ class SimTopicIO:
             fy=color.fy,
             cx=color.cx,
             cy=color.cy,
-            distortion_model=_RENDERED_DISTORTION,
+            distortion_model=DISTORTION_MODEL,
             distortion=[],
         )
         self._publish_guarded(
@@ -595,12 +609,14 @@ class SimTopicIO:
         min_depth_m: float,
         max_depth_m: float,
         align_mode: str,
-        depth_to_color_position: tuple[float, float, float],
-        depth_to_color_orientation: tuple[float, float, float, float],
+        frame: str,
+        depth_to_color: Pose,
     ) -> None:
         """Where an rgbd camera's pixels point and how its depth sits against
         its colour: `color` and `depth` are the pinhole models of the two
-        streams, each at its own published size."""
+        streams, each at its own published size, and `depth_to_color` the
+        pose of the depth optical frame in `frame`, the camera's frame, which
+        holds at every time, so the record holds no timestamp."""
         payload = rgbd_geometry.build_message(
             width=color.width,
             height=color.height,
@@ -608,7 +624,7 @@ class SimTopicIO:
             fy=color.fy,
             cx=color.cx,
             cy=color.cy,
-            distortion_model=_RENDERED_DISTORTION,
+            distortion_model=DISTORTION_MODEL,
             distortion=[],
             depth_width=depth.width,
             depth_height=depth.height,
@@ -616,14 +632,17 @@ class SimTopicIO:
             depth_fy=depth.fy,
             depth_cx=depth.cx,
             depth_cy=depth.cy,
-            depth_distortion_model=_RENDERED_DISTORTION,
+            depth_distortion_model=DISTORTION_MODEL,
             depth_distortion=[],
             depth_model=depth_model,
             min_depth_m=min_depth_m,
             max_depth_m=max_depth_m,
             align_mode=align_mode,
-            depth_to_color_position=list(depth_to_color_position),
-            depth_to_color_orientation=list(depth_to_color_orientation),
+            depth_to_color=rgbd_geometry.MessageDepthToColor(
+                frame=frame,
+                position=list(depth_to_color.position.position),
+                orientation=list(depth_to_color.orientation.quaternion),
+            ),
         )
         self._publish_guarded(
             RGBD_CAMERAS, robot, name, _GEOMETRY_SURFACE, [(_GEOMETRY, payload)]

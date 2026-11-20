@@ -7,21 +7,18 @@ import time
 
 import numpy as np
 
-from camera_geometry import (
-    DEPTH_MODEL,
-    DEPTH_TO_COLOR_ORIENTATION,
-    DEPTH_TO_COLOR_POSITION,
-    pinhole,
-)
 from sim_robot_core.cameras import (
     ALIGN_MODE,
     COLOR_ENCODING,
     DEPTH_ENCODING,
+    DEPTH_MODEL,
+    DEPTH_TO_COLOR,
     DEPTH_UNIT_M_PER_LSB,
     CameraConfig,
-    FrameIdCounter,
+    CaptureIndexCounter,
     FramePacer,
     depth_to_z16,
+    pinhole,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,7 +88,7 @@ class IsaacCameraSensor:
         self._warming: set[str] = set()
         self._frame_pacers = {c.name: FramePacer(c.fps) for c in cameras}
         self._info_pacers = {c.name: FramePacer(_STREAM_INFO_HZ) for c in cameras}
-        self._frame_ids = {c.name: FrameIdCounter() for c in cameras}
+        self._capture_indices = {c.name: CaptureIndexCounter() for c in cameras}
         self._capture_failures = {c.name: 0 for c in cameras}
         self._dropping = False
 
@@ -292,20 +289,22 @@ class IsaacCameraSensor:
         return True
 
     def _capture(self, camera: CameraConfig) -> CaptureOutcome:
-        """Publish the camera's current annotator data."""
+        """Publish the camera's current annotator data, each picture naming
+        the camera's frame."""
         rgba = self._annotators[(camera.name, "color")].get_data()
         rgb = self._as_rgb(rgba, camera)
         if rgb is None:
             return CaptureOutcome.NO_FRAME
         timestamp_s = self._io.timestamp_s()
-        frame_id = self._frame_ids[camera.name].next()
+        capture_index = self._capture_indices[camera.name].next()
         if camera.depth is None:
             return _delivery(
                 self._io.publish_color_frame(
                     self._robot,
                     camera.name,
                     timestamp_s,
-                    frame_id,
+                    camera.frame,
+                    capture_index,
                     COLOR_ENCODING,
                     camera.width,
                     camera.height,
@@ -324,7 +323,8 @@ class IsaacCameraSensor:
                 self._robot,
                 camera.name,
                 timestamp_s,
-                frame_id,
+                camera.frame,
+                capture_index,
                 ALIGN_MODE,
                 (COLOR_ENCODING, camera.width, camera.height, rgb.tobytes()),
                 (
@@ -372,8 +372,8 @@ class IsaacCameraSensor:
             camera.depth.min_depth_m,
             camera.depth.max_range_m,
             ALIGN_MODE,
-            DEPTH_TO_COLOR_POSITION,
-            DEPTH_TO_COLOR_ORIENTATION,
+            camera.frame,
+            DEPTH_TO_COLOR,
         )
 
     def _publish_stream_info(self, camera: CameraConfig) -> None:

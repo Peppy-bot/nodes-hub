@@ -23,10 +23,12 @@ import pytest
 from unittest.mock import Mock
 
 import robot_description_py
+from control_core_py.geometry import Pose
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
+from sim_robot_core.world import UnknownFrame, attach_placement
 
-from _world import known
+from _world import known, placement_at, refusal_of
 import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
 
@@ -35,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from isaac_models import IsaacModels  # noqa: E402  pylint: disable=C0413
 from robots_io import Ending, RobotsIO, _Promise  # noqa: E402  pylint: disable=C0413
-from world import Placement, Robot, World  # noqa: E402  pylint: disable=C0413
+from world import Robot, World  # noqa: E402  pylint: disable=C0413
 
 MODELS = IsaacModels.read()
 
@@ -43,16 +45,16 @@ MODELS = IsaacModels.read()
 CORE_NODE = "sim16"
 # The spot a robot in the way stands on, and the one a copy coming straight
 # back is owed.
-ORIGIN = Placement.of((0.0, 0.0, 0.0), 0.0)
+ORIGIN = placement_at(0.0)
 
 
-def _promised(model: str = "openarm_v2", placement: Placement = ORIGIN) -> _Promise:
+def _promised(model: str = "openarm_v2", placement: Pose = ORIGIN) -> _Promise:
     """What the admission of a robot of `model` promises it: `placement` and
     its model."""
     return _Promise(placement=placement, known=known(model))
 
 
-def _stage(*standing: tuple[str, str, Placement]) -> World:
+def _stage(*standing: tuple[str, str, Pose]) -> World:
     """The stage as the thread that steps the scene leaves it, each robot
     given as the name it stands under, the model it is, and where."""
     world = World(head_camera_pack=None)
@@ -132,9 +134,11 @@ CANCELLED_BY_ITS_CALLER = "cancelled by its caller"
 HANDED_OVER = "another goal of the same caller holds the robot now"
 
 
-def _asks_for(x: float, yaw: float = 0.0):
-    """The placement a request carries, as the contract hands it over."""
-    return SimpleNamespace(position=[x, 0.0, 0.0], yaw=yaw)
+def _asks_for(x: float, orientation=(0.0, 0.0, 0.0, 1.0), frame: str = "world", timestamp: float | None = None):
+    """The placement a request carries, as the contract hands it over: a
+    pose in `frame` at `timestamp`, the latest time for None, facing as
+    authored unless `orientation` says otherwise."""
+    return SimpleNamespace(frame=frame, timestamp=timestamp, position=[x, 0.0, 0.0], orientation=list(orientation))
 
 
 def _done() -> concurrent.futures.Future:
@@ -636,17 +640,54 @@ class _HoldsEverything:
         )
 
 
-def test_a_placement_the_stage_cannot_stand_a_robot_on_is_rejected():
-    """A prim placed at NaN reports no error and simulates nothing, so the
-    placement is rejected as the robot is admitted, before its name is
+@pytest.mark.parametrize("placement", [
+    _asks_for(float("nan")),
+    _asks_for(0.0, orientation=(2 ** -0.5, 0.0, 0.0, 2 ** -0.5)),
+    _asks_for(0.0, orientation=(0.0, 0.0, 0.0, 1.0051)),
+    _asks_for(0.0, timestamp=-1.0),
+], ids=["not_finite", "turned_about_x", "no_unit_quaternion", "before_the_epoch"])
+def test_a_placement_no_contract_takes_is_rejected_before_anything_is_reserved(placement):
+    """A prim placed at NaN reports no error and simulates nothing, and a
+    base faces a turn about +z alone, so such a placement is rejected as the
+    robot is admitted, with the shared parse's message, before its name is
     reserved."""
-    io = _robots_io(_stage())
+    io = _robots_io(_ClosedStage())
 
-    decision = io._admit(_request(placement=_asks_for(float("nan"))))
+    decision = io._admit(_request(placement=placement))
 
-    assert "a placement is finite in every coordinate" in _refused(decision, FailureKind.REJECTED)
+    assert _refused(decision, FailureKind.REJECTED) == refusal_of(lambda: attach_placement(placement))
     assert io._robots.robots() == []
     assert io._promises == {}
+
+
+@pytest.mark.parametrize("frame", ["base_link", "odom"])
+def test_a_placement_in_a_frame_other_than_world_is_refused_with_unknown_frame_before_anything_changes(frame):
+    """world is the one frame of the simulation: an attach whose placement
+    names another frame is refused with `unknown_frame`, naming the frame and
+    saying to send world, and no name is reserved, no spot promised and the
+    stage is never read."""
+    io = _robots_io(_ClosedStage())
+    placement = _asks_for(3.0, frame=frame)
+
+    decision = io._admit(_request(placement=placement))
+
+    message = _refused(decision, FailureKind.UNKNOWN_FRAME)
+    assert message == refusal_of(lambda: attach_placement(placement), UnknownFrame)
+    assert frame in message and "world" in message
+    assert io._robots.robots() == []
+    assert io._promises == {}
+
+
+def test_a_placement_stands_the_base_turned_about_z_at_any_timestamp():
+    """The placement is a pose in world, its orientation normalized, and its
+    timestamp places it in world at any time."""
+    io = _robots_io(_stage())
+    quarter_turn = (0.0, 0.0, 2 ** -0.5, 2 ** -0.5)
+
+    decision = io._admit(_request(placement=_asks_for(3.0, orientation=quarter_turn, timestamp=12.5)))
+
+    assert _accepted(decision)
+    assert io._promises["alpha"].placement == Pose.parse((3.0, 0.0, 0.0), quarter_turn)
 
 
 def test_a_model_the_engine_has_no_entry_for_is_rejected():

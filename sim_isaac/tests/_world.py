@@ -7,7 +7,9 @@ from pathlib import Path
 from types import ModuleType
 
 import numpy as np
+import pytest
 import robot_description_py
+from control_core_py.geometry import IDENTITY, GeometryError, Pose
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 
@@ -24,6 +26,19 @@ def world_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def placement_at(x: float, y: float = 0.0, z: float = 0.0) -> Pose:
+    """A robot's placement at (x, y, z) in world, facing as authored."""
+    return Pose.parse((x, y, z), IDENTITY)
+
+
+def refusal_of(place, refusal=GeometryError) -> str:
+    """The message `place()`, the shared parse or placement of a value in
+    world, refuses it with: a GeometryError, or `refusal`."""
+    with pytest.raises(refusal) as refused:
+        place()
+    return str(refused.value)
 
 
 def known(model: str):

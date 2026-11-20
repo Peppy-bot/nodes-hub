@@ -13,7 +13,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from _world import known, stand_in_pack, world_module
+from _world import known, placement_at, stand_in_pack, world_module
 
 
 @pytest.fixture(name="world")
@@ -30,7 +30,7 @@ def _world(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "omni.usd", usd)
     # `import omni.usd` binds the package, so the submodule rides on it.
     monkeypatch.setattr(sys.modules["omni"], "usd", usd, raising=False)
-    monkeypatch.setattr(module.World, "place", staticmethod(lambda prim, position, yaw: None))
+    monkeypatch.setattr(module.World, "place", staticmethod(lambda prim, position, orientation: None))
     monkeypatch.setattr(module.World, "_hold_to_description", staticmethod(calls.hold_to_description))
     monkeypatch.setattr(module.World, "_start_in_posture", staticmethod(calls.start_in_posture))
     monkeypatch.setattr(module.World, "_couple_followers", staticmethod(calls.couple_followers))
@@ -51,10 +51,10 @@ def _world(monkeypatch, tmp_path):
 
 
 def test_each_v2_draws_its_head_camera_under_its_own_prim_once_referenced(world):
-    stood, calls, pack, module = world
+    stood, calls, pack, _ = world
 
-    bravo = stood.add("bravo", known("openarm_v2"), module.Placement.of([0.0, -1.5, 0.0], 0.0))
-    charlie = stood.add("charlie", known("openarm_v2"), module.Placement.of([1.5, 0.0, 0.0], 0.0))
+    bravo = stood.add("bravo", known("openarm_v2"), placement_at(0.0, -1.5))
+    charlie = stood.add("charlie", known("openarm_v2"), placement_at(1.5))
 
     assert calls.attach.call_args_list == [
         ((calls.stage, bravo.prim(), pack),),
@@ -75,18 +75,18 @@ def test_each_v2_draws_its_head_camera_under_its_own_prim_once_referenced(world)
 
 @pytest.mark.parametrize("model", ["openarm_v1", "so101"])
 def test_a_model_whose_entry_asks_for_no_head_camera_draws_none(world, model):
-    stood, calls, _, module = world
+    stood, calls, _, _ = world
 
-    stood.add("charlie", known(model), module.Placement.of([1.5, 0.0, 0.0], 0.0))
+    stood.add("charlie", known(model), placement_at(1.5))
 
     calls.check_chest_camera.assert_not_called()
     calls.attach.assert_not_called()
 
 
 def test_a_robot_whose_head_camera_cannot_be_seated_leaves_nothing_behind(world):
-    stood, calls, _, module = world
+    stood, calls, _, _ = world
     calls.attach.side_effect = RuntimeError("head camera link 'openarm_body_link0' is not under /World/bravo")
-    spot = module.Placement.of([0.0, -1.5, 0.0], 0.0)
+    spot = placement_at(0.0, -1.5)
 
     with pytest.raises(RuntimeError, match="openarm_body_link0"):
         stood.add("bravo", known("openarm_v2"), spot)
@@ -97,11 +97,11 @@ def test_a_robot_whose_head_camera_cannot_be_seated_leaves_nothing_behind(world)
 
 
 def test_a_robot_whose_chest_camera_is_off_the_packs_left_eye_leaves_nothing_behind(world):
-    stood, calls, _, module = world
+    stood, calls, _, _ = world
     calls.check_chest_camera.side_effect = RuntimeError(
         "the chest camera of the openarm_v2 entry sits off the head camera's left lens front"
     )
-    spot = module.Placement.of([0.0, -1.5, 0.0], 0.0)
+    spot = placement_at(0.0, -1.5)
 
     with pytest.raises(RuntimeError, match="left lens front"):
         stood.add("bravo", known("openarm_v2"), spot)
@@ -118,7 +118,7 @@ def test_a_model_that_draws_the_head_camera_is_not_stood_without_its_pack(world)
     stood = module.World(None)
 
     with pytest.raises(RuntimeError, match="openarm_v2 draws the head camera, and no pack was staged"):
-        stood.add("bravo", known("openarm_v2"), module.Placement.of([0.0, 0.0, 0.0], 0.0))
+        stood.add("bravo", known("openarm_v2"), placement_at(0.0))
 
     calls.stage.RemovePrim.assert_called_once_with("/World/bravo")
     assert stood.robots() == []
@@ -128,17 +128,17 @@ def test_a_world_with_no_pack_stands_the_models_that_draw_none(world):
     _, calls, _, module = world
     stood = module.World(None)
 
-    charlo = stood.add("charlo", known("so101"), module.Placement.of([0.0, 0.0, 0.0], 0.0))
+    charlo = stood.add("charlo", known("so101"), placement_at(0.0))
 
     assert (charlo.model, charlo.prim()) == ("so101", "/World/charlo")
     calls.attach.assert_not_called()
 
 
 def test_each_robot_references_the_stage_its_own_model_names(world, tmp_path):
-    stood, calls, _, module = world
+    stood, calls, _, _ = world
 
-    stood.add("alpha", known("openarm_v1"), module.Placement.of([0.0, 0.0, 0.0], 0.0))
-    stood.add("charlo", known("so101"), module.Placement.of([1.5, 0.0, 0.0], 0.0))
+    stood.add("alpha", known("openarm_v1"), placement_at(0.0))
+    stood.add("charlo", known("so101"), placement_at(1.5))
 
     references = calls.stage.DefinePrim.return_value.GetReferences.return_value.AddReference
     assert [args for args, _ in references.call_args_list] == [
@@ -152,34 +152,34 @@ def test_each_robot_references_the_stage_its_own_model_names(world, tmp_path):
 
 
 def test_a_model_whose_stage_is_not_baked_is_not_stood(world, tmp_path):
-    stood, calls, _, module = world
+    stood, *_ = world
     (tmp_path / "so101" / "so101.usd").unlink()
 
     with pytest.raises(FileNotFoundError, match=r"so101\.usd is missing"):
-        stood.add("charlo", known("so101"), module.Placement.of([0.0, 0.0, 0.0], 0.0))
+        stood.add("charlo", known("so101"), placement_at(0.0))
 
     assert stood.robots() == []
 
 
 def test_gravity_is_compensated_for_the_models_whose_entry_asks_for_it(world):
-    stood, calls, _, module = world
+    stood, calls, _, _ = world
     prim = calls.stage.DefinePrim.return_value
 
-    stood.add("alpha", known("openarm_v2"), module.Placement.of([0.0, 0.0, 0.0], 0.0))
+    stood.add("alpha", known("openarm_v2"), placement_at(0.0))
     calls.compensate_gravity.assert_called_once_with(prim)
 
     # The SO-101's drives hold it against gravity, as its servos do.
     calls.compensate_gravity.reset_mock()
-    stood.add("charlo", known("so101"), module.Placement.of([1.5, 0.0, 0.0], 0.0))
+    stood.add("charlo", known("so101"), placement_at(1.5))
     calls.compensate_gravity.assert_not_called()
 
 
 def test_every_robot_is_put_in_the_posture_its_own_model_starts_in(world):
-    stood, calls, _, module = world
+    stood, calls, _, _ = world
     prim = calls.stage.DefinePrim.return_value
 
-    stood.add("alpha", known("openarm_v2"), module.Placement.of([0.0, 0.0, 0.0], 0.0))
-    stood.add("charlo", known("so101"), module.Placement.of([1.5, 0.0, 0.0], 0.0))
+    stood.add("alpha", known("openarm_v2"), placement_at(0.0))
+    stood.add("charlo", known("so101"), placement_at(1.5))
 
     assert [args for args, _ in calls.start_in_posture.call_args_list] == [
         (prim, known("openarm_v2")),

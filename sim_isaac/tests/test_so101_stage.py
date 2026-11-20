@@ -29,6 +29,7 @@ from typing import Optional
 import numpy as np
 import pytest
 import robot_description_py
+from control_core_py.geometry import wxyz_of_xyzw
 
 from _base_images import IMAGES_DIR, shell_value
 
@@ -155,7 +156,7 @@ def urdf_tool_frame_in_world(
     mujoco.mj_forward(model, data)
     body = model.body("gripper_link").id
     tool = description.tool
-    fixed = _matrix(tool.xyz, build_so101.quat_from_rpy(tool.rpy))
+    fixed = _matrix(tool.position, wxyz_of_xyzw(tool.orientation))
     return _matrix(data.xpos[body], data.xquat[body]) @ fixed
 
 

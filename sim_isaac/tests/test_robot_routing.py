@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pyjson5
 import pytest
 from robot_description_py import model as bundled
+from sim_robot_core.cameras import DEPTH_TO_COLOR, pinhole
 from sim_robot_core.models import shipped_entry
 from sim_robot_core.pairs import ARMS, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held
 from sim_robot_core.registry import Caller, Registry
@@ -333,14 +334,16 @@ class TestCameras:
         return scene
 
     def test_a_color_frame_goes_to_the_relay_named_after_the_camera(self, rig):
-        assert rig.io.publish_color_frame("charlo", "wrist", 1.5, 7, "rgb8", 4, 2, b"wrist")
+        assert rig.io.publish_color_frame(
+            "charlo", "wrist", 1.5, "wrist_optical_frame", 7, "rgb8", 4, 2, b"wrist"
+        )
         _publishes(rig)
 
         ((peer, payload),) = _sent("rgb_cameras", "video_stream")
-        header, *frame = payload
+        header, *picture = payload
         assert peer == CHARLO_WRIST.info
-        assert (header.timestamp, header.frame_id) == (1.5, 7)
-        assert frame == ["rgb8", 4, 2, b"wrist"]
+        assert vars(header) == {"timestamp": 1.5, "frame": "wrist_optical_frame", "capture_index": 7}
+        assert picture == ["rgb8", 4, 2, b"wrist"]
 
     def test_a_color_stream_is_described_to_its_own_relay(self, rig):
         rig.io.publish_color_stream_info("alpha", "wrist_right", 960, 600, 15, "rgb8")
@@ -352,7 +355,8 @@ class TestCameras:
 
     def test_an_rgbd_capture_goes_whole_to_its_relay_on_the_rgbd_slot(self, rig):
         assert rig.io.publish_rgbd_frames(
-            "alpha", "chest", 2.5, 3, "depth_to_color", ("rgb8", 4, 2, b"color"), ("z16", 2, 1, b"depth")
+            "alpha", "chest", 2.5, "chest_optical_frame", 3, "depth_to_color", ("rgb8", 4, 2, b"color"),
+            ("z16", 2, 1, b"depth"),
         )
         rig.io.publish_rgbd_stream_info("alpha", "chest", 4, 2, 15, "rgb8", 2, 1, "z16", 0.001)
         _publishes(rig)
@@ -361,7 +365,9 @@ class TestCameras:
         ((depth_peer, depth),) = _sent("rgbd_cameras", "depth_stream")
         assert color_peer == depth_peer == ALPHA_CHEST.info
         for header in (color[0], depth[0]):
-            assert (header.timestamp, header.frame_id, header.align_mode) == (2.5, 3, "depth_to_color")
+            assert vars(header) == {
+                "timestamp": 2.5, "frame": "chest_optical_frame", "capture_index": 3, "align_mode": "depth_to_color",
+            }
         assert list(color[1:]) == ["rgb8", 4, 2, b"color"]
         assert list(depth[1:]) == ["z16", 2, 1, b"depth"]
         assert _sent("rgbd_cameras", "stream_info") == [
@@ -369,25 +375,56 @@ class TestCameras:
         ]
         assert _sent("rgb_cameras", "video_stream") == []
 
+    def test_an_rgbd_cameras_depth_pose_is_a_record_in_the_cameras_frame(self, rig):
+        color = pinhole(60.0, 4, 2)
+        depth = pinhole(60.0, 2, 1)
+
+        rig.io.publish_rgbd_geometry(
+            "alpha", "chest", color, depth, "z", 0.1, 1.0, "depth_to_color", "chest_optical_frame",
+            DEPTH_TO_COLOR,
+        )
+        _publishes(rig)
+
+        ((peer, payload),) = _sent("rgbd_cameras", "geometry")
+        assert peer == ALPHA_CHEST.info
+        assert vars(payload["depth_to_color"]) == {
+            "frame": "chest_optical_frame", "position": [0.0, 0.0, 0.0],
+            "orientation": [0.0, 0.0, 0.0, 1.0],
+        }
+
     def test_a_camera_is_its_robots_on_the_slot_of_its_kind(self, rig):
         """A camera nobody paired is delivered to nobody: another robot's
         relay of the same slot does not stand in, and neither does the same
         robot's relay on the other slot."""
-        assert not rig.io.publish_color_frame("charlo", "wrist_left", 1.0, 0, "rgb8", 4, 2, b"")
-        assert not rig.io.publish_color_frame("alpha", "wrist", 1.0, 0, "rgb8", 4, 2, b"")
-        assert not rig.io.publish_color_frame("alpha", "chest", 1.0, 0, "rgb8", 4, 2, b"")
+        assert not rig.io.publish_color_frame(
+            "charlo", "wrist_left", 1.0, "wrist_left_optical_frame", 0, "rgb8", 4, 2, b""
+        )
+        assert not rig.io.publish_color_frame(
+            "alpha", "wrist", 1.0, "wrist_optical_frame", 0, "rgb8", 4, 2, b""
+        )
+        assert not rig.io.publish_color_frame(
+            "alpha", "chest", 1.0, "chest_optical_frame", 0, "rgb8", 4, 2, b""
+        )
         _publishes(rig)
 
         assert _sent("rgb_cameras", "video_stream") == []
 
     def test_a_frame_behind_one_still_in_flight_is_dropped_for_that_camera_alone(self, rig):
-        assert rig.io.publish_color_frame("alpha", "wrist_left", 1.0, 0, "rgb8", 4, 2, b"first")
+        assert rig.io.publish_color_frame(
+            "alpha", "wrist_left", 1.0, "wrist_left_optical_frame", 0, "rgb8", 4, 2, b"first"
+        )
         # The loop has not run, so the first frame is still in flight.
-        assert not rig.io.publish_color_frame("alpha", "wrist_left", 1.1, 1, "rgb8", 4, 2, b"second")
-        assert rig.io.publish_color_frame("alpha", "wrist_right", 1.1, 0, "rgb8", 4, 2, b"other")
+        assert not rig.io.publish_color_frame(
+            "alpha", "wrist_left", 1.1, "wrist_left_optical_frame", 1, "rgb8", 4, 2, b"second"
+        )
+        assert rig.io.publish_color_frame(
+            "alpha", "wrist_right", 1.1, "wrist_right_optical_frame", 0, "rgb8", 4, 2, b"other"
+        )
         _publishes(rig)
 
-        assert rig.io.publish_color_frame("alpha", "wrist_left", 1.2, 2, "rgb8", 4, 2, b"third")
+        assert rig.io.publish_color_frame(
+            "alpha", "wrist_left", 1.2, "wrist_left_optical_frame", 2, "rgb8", 4, 2, b"third"
+        )
         _publishes(rig)
         delivered = [(peer, payload[-1]) for peer, payload in _sent("rgb_cameras", "video_stream")]
         assert delivered == [

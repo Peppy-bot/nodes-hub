@@ -92,10 +92,11 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
 
 
 def test_base_image_installs_the_packages_the_engines_share():
-    # The registry, the four slots, the model entries and the camera
-    # configuration come from sim_robot_core, and the robots' descriptions
-    # from robot_description_py, both pinned to the commit these suites run
-    # the engine against.
+    # The registry, the four slots, the model entries, the camera
+    # configuration and world come from sim_robot_core, the robots'
+    # descriptions from robot_description_py, and the geometry types from
+    # control_core_py, each pinned to the commit these suites run the engine
+    # against.
     pinned = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
     sources = pinned["tool"]["uv"]["sources"]
     requirements = (IMAGES_DIR / "requirements.isaac.txt").read_text().splitlines()
@@ -103,7 +104,7 @@ def test_base_image_installs_the_packages_the_engines_share():
         f"{package} @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
         f"@{sources[package]['rev']}"
         f"#subdirectory={package}"
-        for package in ("sim_robot_core", "robot_description_py")
+        for package in ("sim_robot_core", "robot_description_py", "control_core_py")
     ]
 
 

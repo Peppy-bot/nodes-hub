@@ -165,6 +165,21 @@ def test_a_capture_is_stamped_on_the_state_timeline_or_not_at_all(io, loop, monk
     assert follower.capture_timestamp_s() == 7.0
 
 
+def test_the_placements_stand_at_the_start_of_the_timeline_until_the_first_step(
+    io, loop, monkeypatch
+):
+    # A publisher that has not recorded a step stamps the robots' placements
+    # at the instant a timeline at zero carries, and at the engine clock once
+    # it steps.
+    assert io.placement_timestamp_s() == sim_topics._MIN_ENGINE_TIME_S
+    io.record_engine_time(3.25)
+    assert io.placement_timestamp_s() == 3.25
+
+    follower = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=_Robots())
+    monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 7_000_000_000)
+    assert follower.placement_timestamp_s() == 7.0
+
+
 class _GatedPublisher:
     """A topic publisher whose publishes stay in flight until the gate opens."""
 
@@ -177,10 +192,12 @@ class _GatedPublisher:
         await self.gate.wait()
 
 
-def test_object_snapshots_publish_whole_and_drop_while_one_is_in_flight(io, loop, monkeypatch):
+def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight(io, loop, monkeypatch):
     topic = sim_topics.object_states
     monkeypatch.setattr(topic, "MessageObjectsItem", lambda **fields: fields, raising=False)
-    monkeypatch.setattr(topic, "build_message", lambda timestamp, objects: (timestamp, objects), raising=False)
+    monkeypatch.setattr(
+        topic, "build_message", lambda frame, timestamp, objects: (frame, timestamp, objects), raising=False
+    )
     publisher = _GatedPublisher()
     io._object_states_pub = publisher
 
@@ -209,6 +226,6 @@ def test_object_snapshots_publish_whole_and_drop_while_one_is_in_flight(io, loop
 
     loop.run_until_complete(scenario())
     assert publisher.payloads == [
-        (1.5, [record.fields() for record in first.objects]),
-        (1.7, []),
+        ("world", 1.5, [record.fields() for record in first.objects]),
+        ("world", 1.7, []),
     ]

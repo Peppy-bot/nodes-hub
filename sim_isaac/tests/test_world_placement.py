@@ -1,16 +1,17 @@
 """Where a robot stands on the stage, against real USD: the order an xform's
 ops are listed in decides where a turned robot ends up, a referenced model
-brings its own ops, and a placement is a unit quaternion the prim turns
-to."""
+brings its own ops, and a placement is a pose in world whose unit quaternion
+the prim turns to."""
 
 import math
 import sys
 from types import ModuleType
 
 import pytest
+from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, quaternion_of_yaw
 from pxr import Gf, Usd, UsdGeom
 
-from _world import known
+from _world import known, placement_at
 from _world import world_module as _world_module
 
 QUARTER_TURN = math.pi / 2
@@ -19,11 +20,6 @@ QUARTER_TURN = math.pi / 2
 @pytest.fixture(name="place")
 def _place():
     return _world_module().World.place
-
-
-def _turned(yaw):
-    """The orientation of a turn of `yaw` radians about +z, as place takes it."""
-    return _world_module().yaw_orientation(yaw)
 
 
 def _prim(carries_orient: bool):
@@ -47,7 +43,7 @@ def _base_of(prim):
 def test_a_turned_robot_stands_where_it_was_placed(place, carries_orient):
     _stage, prim = _prim(carries_orient)
 
-    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
+    place(prim, (1.0, 0.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
 
     base = _base_of(prim)
     assert base[0] == pytest.approx(1.0, abs=1e-6), base
@@ -58,7 +54,7 @@ def test_a_turned_robot_stands_where_it_was_placed(place, carries_orient):
 def test_the_robot_turns_about_its_own_base(place, carries_orient):
     _stage, prim = _prim(carries_orient)
 
-    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
+    place(prim, (1.0, 0.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
 
     # A point a metre ahead of the base swings to a metre to its left.
     local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
@@ -74,7 +70,7 @@ def test_the_placement_ops_lead_whatever_the_model_carried(place):
     xform.AddOrientOp().Set(Gf.Quatf(1.0, Gf.Vec3f(0, 0, 0)))
     xform.AddScaleOp().Set(Gf.Vec3f(2.0, 2.0, 2.0))
 
-    place(prim, (0.0, 0.0, 0.0), _turned(0.0))
+    place(prim, (0.0, 0.0, 0.0), quaternion_of_yaw(0.0))
 
     assert [op.GetOpName() for op in xform.GetOrderedXformOps()] == [
         "xformOp:translate",
@@ -85,7 +81,7 @@ def test_the_placement_ops_lead_whatever_the_model_carried(place):
 
 def test_a_placement_naming_no_orientation_moves_the_prim_and_keeps_its_turn(place):
     _stage, prim = _prim(carries_orient=True)
-    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
+    place(prim, (1.0, 0.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
 
     place(prim, (0.0, 2.0, 0.0))
 
@@ -115,17 +111,18 @@ class _FakeStage:
         return self._prims[path]
 
 
-def test_a_move_carries_the_record_with_the_prim(monkeypatch, place):
-    world_module = _world_module()
+def _stage_of(monkeypatch, world_module, *placements):
+    """A world standing alpha and bravo at `placements`, on a live USD stage
+    the world reaches through omni.usd, with that stage and alpha's prim. The
+    stage comes back with them, because a prim outlives nothing."""
     stage = Usd.Stage.CreateInMemory()
     alpha = stage.DefinePrim("/World/alpha", "Xform")
     bravo = stage.DefinePrim("/World/bravo", "Xform")
 
     world = world_module.World(head_camera_pack=None)
-    at = world_module.Placement.of((0.0, 0.0, 0.0), 0.0)
     world._robots = {
-        "alpha": world_module.Robot(instance="alpha", known=known("openarm_v2"), placement=at),
-        "bravo": world_module.Robot(instance="bravo", known=known("so101"), placement=at),
+        name: world_module.Robot(instance=name, known=known(model), placement=at)
+        for (name, model), at in zip((("alpha", "openarm_v2"), ("bravo", "so101")), placements)
     }
     fake_usd = ModuleType("omni.usd")
     fake_usd.get_context = lambda: type(
@@ -134,19 +131,26 @@ def test_a_move_carries_the_record_with_the_prim(monkeypatch, place):
     monkeypatch.setitem(sys.modules, "omni.usd", fake_usd)
     # `import omni.usd` then reads it off the parent package.
     monkeypatch.setattr(sys.modules["omni"], "usd", fake_usd, raising=False)
+    return stage, world, alpha
 
-    moved = world.move("alpha", (2.0, -1.0, 0.0), QUARTER_TURN)
+
+def test_a_move_carries_the_record_with_the_prim(monkeypatch, place):
+    world_module = _world_module()
+    at = placement_at(0.0)
+    _stage, world, alpha = _stage_of(monkeypatch, world_module, at, at)
+
+    moved = world.move("alpha", PoseTarget.parse((2.0, -1.0, 0.0), quaternion_of_yaw(QUARTER_TURN)))
 
     # The listing follows the prim, so the scene does not report a stale spot
     # or a stale heading.
-    assert moved.placement == world_module.Placement.of((2.0, -1.0, 0.0), QUARTER_TURN)
+    assert moved.placement == Pose.parse((2.0, -1.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
     assert world._robots["alpha"].placement == moved.placement
     # It is the robot it was, of the model it joined as.
     assert (moved.instance, moved.model) == ("alpha", "openarm_v2")
     assert _base_of(alpha)[0] == pytest.approx(2.0, abs=1e-6)
     assert _base_of(alpha)[1] == pytest.approx(-1.0, abs=1e-6)
-    # The prim faces the yaw it was moved to: a point a metre ahead of the
-    # base swings to a metre to its left.
+    # The prim faces the heading it was moved to: a point a metre ahead of
+    # the base swings to a metre to its left.
     local = UsdGeom.Xformable(alpha).GetLocalTransformation(Usd.TimeCode.Default())
     ahead = local.Transform(Gf.Vec3d(1, 0, 0))
     assert ahead[0] == pytest.approx(2.0, abs=1e-6), ahead
@@ -155,11 +159,25 @@ def test_a_move_carries_the_record_with_the_prim(monkeypatch, place):
     assert world._robots["bravo"].placement == at
 
 
+def test_a_move_whose_target_gives_no_orientation_keeps_the_heading(monkeypatch, place):
+    world_module = _world_module()
+    facing = Pose.parse((0.0, 0.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
+    _stage, world, alpha = _stage_of(monkeypatch, world_module, facing)
+
+    moved = world.move("alpha", PoseTarget.parse((2.0, -1.0, 0.0), None))
+
+    assert moved.placement == Pose(Point((2.0, -1.0, 0.0)), facing.orientation)
+    local = UsdGeom.Xformable(alpha).GetLocalTransformation(Usd.TimeCode.Default())
+    ahead = local.Transform(Gf.Vec3d(1, 0, 0))
+    assert ahead[0] == pytest.approx(2.0, abs=1e-6), ahead
+    assert ahead[1] == pytest.approx(0.0, abs=1e-6), ahead
+
+
 def test_moving_a_robot_that_does_not_stand_says_so(monkeypatch):
     world_module = _world_module()
     world = world_module.World(head_camera_pack=None)
     with pytest.raises(KeyError, match="charlie"):
-        world.move("charlie", (0.0, 0.0, 0.0), 0.0)
+        world.move("charlie", PoseTarget.parse((0.0, 0.0, 0.0), None))
 
 
 def test_a_spot_promised_to_an_admitted_robot_is_not_offered_twice():
@@ -172,31 +190,10 @@ def test_a_spot_promised_to_an_admitted_robot_is_not_offered_twice():
     second = world.free_spot(promised=(first,))
 
     assert second.position != first.position
+    # A spot the engine lays out faces as authored.
+    assert first.orientation == second.orientation == UnitQuaternion(IDENTITY)
     assert world.occupied(first, promised=(first,))
     assert not world.occupied(second, promised=(first,))
-
-
-@pytest.mark.parametrize("position", [(float("nan"), 0.0, 0.0), (0.0, float("inf"), 0.0)])
-def test_a_placement_that_is_not_finite_is_refused(position):
-    """A prim placed at NaN reports no error and simulates nothing."""
-    world_module = _world_module()
-
-    with pytest.raises(ValueError, match="finite in every coordinate"):
-        world_module.Placement.of(position, 0.0)
-
-
-def test_a_placement_of_the_wrong_width_is_refused():
-    world_module = _world_module()
-
-    with pytest.raises(ValueError, match="3 coordinates"):
-        world_module.Placement.of((0.0, 0.0), 0.0)
-
-
-def test_a_yaw_that_is_not_finite_is_refused():
-    world_module = _world_module()
-
-    with pytest.raises(ValueError, match="finite in every coordinate"):
-        world_module.Placement.of((0.0, 0.0, 0.0), float("nan"))
 
 
 def test_a_robot_with_no_name_is_refused():
@@ -211,7 +208,7 @@ def test_a_name_standing_twice_is_refused():
     under it is the stage saying what the registry did not."""
     world_module = _world_module()
     world = world_module.World(head_camera_pack=None)
-    spot = world_module.Placement.of((0.0, 0.0, 0.0), 0.0)
+    spot = placement_at(0.0)
     world._robots["alpha"] = world_module.Robot(  # pylint: disable=W0212
         instance="alpha", known=known("openarm_v2"), placement=spot
     )
@@ -228,7 +225,7 @@ def test_taking_out_a_robot_that_stands_nowhere_changes_nothing():
     world._robots["alpha"] = world_module.Robot(  # pylint: disable=W0212
         instance="alpha",
         known=known("openarm_v2"),
-        placement=world_module.Placement.of((0.0, 0.0, 0.0), 0.0),
+        placement=placement_at(0.0),
     )
 
     world.remove("ghost")
@@ -245,7 +242,7 @@ def test_the_robots_of_a_stage_are_listed_in_the_order_they_joined():
         world._robots[name] = world_module.Robot(  # pylint: disable=W0212
             instance=name,
             known=known("openarm_v2"),
-            placement=world_module.Placement.of((spot, 0.0, 0.0), 0.0),
+            placement=placement_at(spot),
         )
 
     assert [robot.instance for robot in world.robots()] == ["alpha", "bravo", "charlo"]
@@ -258,15 +255,15 @@ def test_a_robot_nearer_than_the_lattice_leaves_them_counts_as_on_the_spot():
     world_module = _world_module()
     world = world_module.World(head_camera_pack=None)
     pitch = world_module.SPOT_PITCH_M
-    promised = world_module.Placement.of((pitch * 0.49, 0.0, 0.0), 0.0)
+    promised = placement_at(pitch * 0.49)
 
     # Hand-picked spots either side of a lattice line, 2 cm apart.
-    beside = world_module.Placement.of((pitch * 0.51, 0.0, 0.0), 0.0)
+    beside = placement_at(pitch * 0.51)
 
     assert world.occupied(beside, promised=(promised,))
     # A spot a whole pitch from the one promised is free, wherever the
     # lattice's own lines fall between them.
-    clear = world_module.Placement.of((pitch * 0.49 + pitch, 0.0, 0.0), 0.0)
+    clear = placement_at(pitch * 0.49 + pitch)
     assert not world.occupied(clear, promised=(promised,))
 
 
@@ -275,16 +272,14 @@ def test_the_robot_standing_in_the_way_is_the_one_named():
     it, and which of the two decides what the caller is told."""
     world_module = _world_module()
     world = world_module.World(head_camera_pack=None)
-    spot = world_module.Placement.of((0.0, 0.0, 0.0), 0.0)
+    spot = placement_at(0.0)
     world._robots["alpha"] = world_module.Robot(  # pylint: disable=W0212
         instance="alpha", known=known("openarm_v2"), placement=spot
     )
 
     assert world.standing_within(spot).instance == "alpha"
     assert world.occupied(spot)
-    assert world.standing_within(
-        world_module.Placement.of((world_module.SPOT_PITCH_M, 0.0, 0.0), 0.0)
-    ) is None
+    assert world.standing_within(placement_at(world_module.SPOT_PITCH_M)) is None
 
 
 def test_a_name_carrying_the_prim_separator_is_refused():
@@ -306,11 +301,7 @@ def test_a_full_stage_is_refused_the_way_a_taken_spot_is(monkeypatch):
     monkeypatch.setattr(world_module, "_MAX_RINGS", 2)
     world = world_module.World(head_camera_pack=None)
     pitch = world_module.SPOT_PITCH_M
-    taken = tuple(
-        world_module.Placement.of((row * pitch, column * pitch, 0.0), 0.0)
-        for row in (-1, 0, 1)
-        for column in (-1, 0, 1)
-    )
+    taken = tuple(placement_at(row * pitch, column * pitch) for row in (-1, 0, 1) for column in (-1, 0, 1))
 
     with pytest.raises(ValueError, match=r"every spot this stage lays out is taken"):
         world.free_spot(taken)
@@ -324,7 +315,7 @@ def test_the_listing_waits_while_a_robot_is_being_stood():
 
     world_module = _world_module()
     world = world_module.World(head_camera_pack=None)
-    at = world_module.Placement.of((0.0, 0.0, 0.0), 0.0)
+    at = placement_at(0.0)
 
     inside = threading.Event()
     finish = threading.Event()
@@ -369,7 +360,7 @@ def test_a_model_turns_whatever_width_its_orient_op_was_authored_at(place, preci
     prim = stage.DefinePrim("/openarm/alpha", "Xform")
     UsdGeom.Xformable(prim).AddOrientOp(precision)
 
-    place(prim, (1.0, 0.0, 0.0), _turned(QUARTER_TURN))
+    place(prim, (1.0, 0.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
 
     local = UsdGeom.Xformable(prim).GetLocalTransformation(Usd.TimeCode.Default())
     ahead = local.Transform(Gf.Vec3d(1, 0, 0))

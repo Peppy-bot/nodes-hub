@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Peppy scene_manipulation and object_state bridge for Isaac Sim.
 
-A goal this bridge cannot run is refused when it arrives, with a failure kind
-of peppy: `rejected` for a request that names an asset or an object the stage
-does not hold or a value it does not take, and for each load_template, as the
-stage holds no template; `resource_unavailable` for a robot that does not
-stand on the stage; and `precondition_failed` while the asset catalogue is not
-discovered yet. A goal it accepted runs its command on the Isaac main thread,
-which checks the request again against the stage as it is then: a command that
-cannot run fails its goal with the same kinds, and one that Isaac does not
-carry out fails it with `attempt_failed`. A service gives its response, or an
-error reply with the same kinds.
+Every position, orientation and force of the scene is in world, the one
+frame of the simulation: each answer names it with the simulated instant of
+its values, and each goal that places a value in a frame other than world is
+refused with `unknown_frame`. A goal this bridge cannot run otherwise is
+refused when it arrives, with a failure kind of peppy: `rejected` for a
+request that names an asset or an object the stage does not hold or a value
+it does not take, and for each load_template, as the stage holds no template;
+`resource_unavailable` for a robot that does not stand on the stage; and
+`precondition_failed` while the asset catalogue is not discovered yet. A goal
+it accepted runs its command on the Isaac main thread, which checks the
+request again against the stage as it is then: a command that cannot run
+fails its goal with the same kinds, and one that Isaac does not carry out
+fails it with `attempt_failed`. A service gives its response, or an error
+reply with the same kinds.
 """
 
 from __future__ import annotations
@@ -23,13 +27,16 @@ import math
 import re
 import threading
 import uuid
+from collections.abc import Iterator
 from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from queue import Empty, Queue
 from types import ModuleType
 from typing import Callable
 
+from control_core_py.geometry import IDENTITY, GeometryError, Pose, PoseTarget, UnitQuaternion
 from peppygen.exposed_actions.scene import (
     apply_force,
     clear_scene,
@@ -50,6 +57,7 @@ from peppygen.exposed_services.scene import (
     get_robots_list,
     get_scene,
 )
+from sim_robot_core.world import WORLD, UnknownFrame, base_target, failure_kind_of, in_world
 
 from object_state import IsaacObjectReader, ObjectStateSnapshot
 
@@ -112,14 +120,15 @@ _ASSET_KINDS = ("scene", "object", "template")
 # a scene and places no riser, so "scene" and "riser" list nothing.
 _OBJECT_SOURCES = ("spawned", "scene", "riser")
 
-# How far from 1 the length of an orientation may be before it is refused.
-_UNIT_TOLERANCE = 1e-3
-
 # The longest push apply_force schedules, in seconds.
 _LONGEST_PUSH_S = 30.0
 
 # The physics a spawned object may have, as spawn_object names them.
 _PHYSICS = ("none", "static", "dynamic")
+
+# How a spawned object stands when its target gives no orientation: as
+# authored.
+_AS_AUTHORED = UnitQuaternion(IDENTITY)
 
 # How a refusal names each kind of asset.
 _ASSET_KIND_WORDS = {"scene": "a scene", "object": "an object"}
@@ -163,11 +172,9 @@ class _Spawn:
 
     asset_id: str
     path: str
-    position: list[float]
-    yaw: float
-    # A unit quaternion [x, y, z, w], normalised, in place of yaw; None
-    # turns the object by yaw.
-    orientation: list[float] | None
+    # Where the object's origin stands in world, turned as authored when the
+    # goal gives no orientation.
+    pose: Pose
     scale: float
     physics: str
     mass: float
@@ -178,18 +185,17 @@ class _Spawn:
 
 @dataclass(frozen=True)
 class _Move:
-    """A move_object command, checked: the object, where it goes, and the
-    orientation it takes, or None to keep its own."""
+    """A move_object command, checked: the object, and where it goes in
+    world, with the orientation it takes or none to keep its own."""
 
     object_id: str
-    position: list[float]
-    orientation: list[float] | None
+    target: PoseTarget
 
 
 @dataclass(frozen=True)
 class _Push:
-    """An apply_force command, checked: a dynamic object, the world-frame
-    force in newtons, and how long it pushes."""
+    """An apply_force command, checked: a dynamic object, the force in
+    newtons in world, and how long it pushes."""
 
     object_id: str
     force: list[float]
@@ -198,12 +204,12 @@ class _Push:
 
 @dataclass(frozen=True)
 class _RobotMove:
-    """A move_robot command, checked: a robot the stage stands, where its
-    base goes and which way it faces."""
+    """A move_robot command, checked: a robot the stage stands, and where
+    its base goes in world, with the heading it takes, a turn about +z, or
+    none to keep its own."""
 
     robot: str
-    position: list[float]
-    yaw: float
+    target: PoseTarget
 
 
 def _refuse_snap(payload: dict) -> None:
@@ -214,7 +220,7 @@ def _refuse_snap(payload: dict) -> None:
     if payload.get("snap_to") is not None:
         raise _rejected(
             "this simulation keeps no landmark of an object, so it places "
-            "nothing by a snap: give the goal a position instead of snap_to"
+            "nothing by a snap: give the goal a target instead of snap_to"
         )
 
 
@@ -230,47 +236,48 @@ def _finite_vector(payload: dict, name: str, length: int, form: str) -> list[flo
     return values
 
 
-def _position_of(payload: dict) -> list[float]:
-    return _finite_vector(payload, "position", 3, "[x, y, z]")
+@contextmanager
+def _placing_in_world() -> Iterator[None]:
+    """Gives each refusal of placing a goal's value in world as the
+    SceneFailure of its kind: `unknown_frame` for a frame other than world,
+    and `rejected` for a value no contract takes, its message saying what
+    to send."""
+    try:
+        yield
+    except (UnknownFrame, GeometryError) as error:
+        raise SceneFailure(failure_kind_of(error), str(error)) from None
 
 
-def _orientation_of(payload: dict) -> list[float] | None:
-    """The orientation a goal names, a unit quaternion [x, y, z, w]
-    normalised, or None when the goal names none. A quaternion that is not
-    a unit one, within _UNIT_TOLERANCE, is refused: USD takes it and turns
-    the prim by something else."""
-    orientation = payload.get("orientation")
-
-    if orientation is None:
-        return None
-
-    values = [float(value) for value in orientation]
-
-    if len(values) != 4:
-        raise _rejected("orientation must contain exactly 4 values [x, y, z, w]")
-
-    norm = math.sqrt(sum(value * value for value in values))
-
-    if not math.isfinite(norm) or abs(norm - 1.0) > _UNIT_TOLERANCE:
-        raise _rejected(
-            "orientation must be a unit quaternion [x, y, z, w]"
+def _target_of(payload: dict) -> PoseTarget:
+    """The target a spawn_object or move_object goal names: the pose of the
+    object's origin in world, its orientation normalized or none. A goal
+    with no target is refused with `rejected`, as scene_manipulation:v1
+    refuses a goal that gives neither target nor snap_to."""
+    target = payload.get("target")
+    if target is None:
+        raise _rejected("the goal gives neither target nor snap_to: give the goal a target")
+    with _placing_in_world():
+        return in_world(
+            target.frame, target.timestamp, PoseTarget.parse(target.position, target.orientation)
         )
 
-    return [value / norm for value in values]
+
+def _base_target_of(payload: dict) -> PoseTarget:
+    """The target a move_robot goal names: where the robot's base stands in
+    world, its orientation a turn about +z or none."""
+    target = payload["target"]
+    with _placing_in_world():
+        return base_target(target.frame, target.timestamp, target.position, target.orientation)
 
 
-def _yaw_of(payload: dict) -> float:
-    """The heading a goal names, in radians about +z. A prim turned by a yaw
-    that is not a number reports no error and simulates nothing, so one is
-    refused here."""
-    yaw = float(payload["yaw"])
-
-    if not math.isfinite(yaw):
-        raise _rejected(
-            "yaw must be a finite number of radians"
+def _force_of(payload: dict) -> list[float]:
+    """The force an apply_force goal names, in newtons in world."""
+    with _placing_in_world():
+        return in_world(
+            payload["frame"],
+            payload["timestamp"],
+            _finite_vector(payload, "force", 3, "[Fx, Fy, Fz]"),
         )
-
-    return yaw
 
 
 def _positive_of(payload: dict, name: str) -> float:
@@ -541,11 +548,13 @@ class SceneActionIO:
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        # Stamps every object-state capture on the joint states' timeline.
+        # Stamps every object-state capture and every robots list on the
+        # joint states' timeline.
         self._io = io
 
         # The stage's own account of which robots stand in it, which
-        # get_robots_list reports and move_robot resolves a name against.
+        # get_robots_list reports, and which move_robot resolves a name
+        # against and moves the robot through on the Isaac main thread.
         self._world = world
 
         self._lock = threading.Lock()
@@ -874,6 +883,7 @@ class SceneActionIO:
                 )
 
         return get_objects_list.Response(
+            frame=WORLD,
             timestamp=snapshot.timestamp_s,
             objects=objects,
         )
@@ -896,6 +906,7 @@ class SceneActionIO:
             raise _rejected(f"Unknown object_id: {object_id}")
 
         return get_object.Response(
+            frame=WORLD,
             timestamp=snapshot.timestamp_s,
             object_id=record.object_id,
             name=record.name,
@@ -987,6 +998,7 @@ class SceneActionIO:
         snapshot = self._latest_snapshot()
 
         return get_object_states.Response(
+            frame=WORLD,
             timestamp=snapshot.timestamp_s,
             objects=[
                 get_object_states.ResponseObjectsItem(
@@ -1000,19 +1012,23 @@ class SceneActionIO:
         self,
         _request,
     ) -> get_robots_list.Response:
-        standing = self._world.robots()
+        """Every robot the stage stands, with the pose of its base in world
+        as of now, on the timeline the joint states are stamped on: at the
+        start of the timeline before the engine's first step."""
         robots = [
             get_robots_list.ResponseRobotsItem(
                 robot=robot.instance,
                 model=robot.model,
-                position=list(robot.placement.position),
-                yaw=robot.placement.yaw,
+                position=list(robot.placement.position.position),
+                orientation=list(robot.placement.orientation.quaternion),
                 # Every robot on this stage joined it by attaching.
                 attached=True,
             )
-            for robot in standing
+            for robot in self._world.robots()
         ]
         return get_robots_list.Response(
+            frame=WORLD,
+            timestamp=self._io.placement_timestamp_s(),
             robots=robots,
         )
 
@@ -1219,6 +1235,7 @@ class SceneActionIO:
 
     def _spawn_of(self, payload: dict) -> _Spawn:
         _refuse_snap(payload)
+        target = _target_of(payload)
         asset = self._catalogue_asset(payload["asset_id"], "object")
         feeder = payload.get("feeder")
 
@@ -1232,9 +1249,10 @@ class SceneActionIO:
         return _Spawn(
             asset_id=payload["asset_id"],
             path=asset["path"],
-            position=_position_of(payload),
-            yaw=_yaw_of(payload),
-            orientation=_orientation_of(payload),
+            pose=Pose(
+                target.position,
+                _AS_AUTHORED if target.orientation is None else target.orientation,
+            ),
             scale=_positive_of(payload, "scale"),
             physics=_physics_of(payload),
             mass=_positive_of(payload, "mass"),
@@ -1250,8 +1268,8 @@ class SceneActionIO:
         command = {
             "name": object_id,
             "path": spawn.path,
-            "position": spawn.position,
-            "yaw": spawn.yaw,
+            "position": list(spawn.pose.position.position),
+            "orientation": list(spawn.pose.orientation.quaternion),
             "scale": [
                 spawn.scale,
                 spawn.scale,
@@ -1260,9 +1278,6 @@ class SceneActionIO:
             "physics": spawn.physics,
             "mass": spawn.mass,
         }
-
-        if spawn.orientation is not None:
-            command["orientation"] = spawn.orientation
 
         launcher._runtime_spawn_isaac_asset(command)
 
@@ -1291,23 +1306,20 @@ class SceneActionIO:
 
     def _move_of(self, payload: dict) -> _Move:
         _refuse_snap(payload)
+        target = _target_of(payload)
         object_id = str(payload["object_id"])
         self._spawned_object(object_id)
 
-        return _Move(
-            object_id=object_id,
-            position=_position_of(payload),
-            orientation=_orientation_of(payload),
-        )
+        return _Move(object_id=object_id, target=target)
 
     def _move_object(self, launcher, move: _Move) -> dict:
         command = {
             "name": move.object_id,
-            "position": move.position,
+            "position": list(move.target.position.position),
         }
 
-        if move.orientation is not None:
-            command["orientation"] = move.orientation
+        if move.target.orientation is not None:
+            command["orientation"] = list(move.target.orientation.quaternion)
 
         launcher._runtime_move_object(command)
 
@@ -1338,6 +1350,7 @@ class SceneActionIO:
         """A push of a dynamic object: a static or visual-only object takes
         no force, so a push of one is refused."""
 
+        force = _force_of(payload)
         object_id = str(payload["object_id"])
         obj = self._spawned_object(object_id)
 
@@ -1348,7 +1361,7 @@ class SceneActionIO:
 
         return _Push(
             object_id=object_id,
-            force=_finite_vector(payload, "force", 3, "[Fx, Fy, Fz]"),
+            force=force,
             duration_s=_duration_of(payload),
         )
 
@@ -1365,9 +1378,9 @@ class SceneActionIO:
 
     def _robot_move_of(self, payload: dict) -> _RobotMove:
         """A move of a robot the stage stands. A robot that does not stand on
-        the stage is refused with `resource_unavailable`, and a position or a
-        yaw that is not finite with `rejected`."""
+        the stage is refused with `resource_unavailable`."""
 
+        target = _base_target_of(payload)
         robot = payload["robot"]
         names = [
             each.instance
@@ -1382,20 +1395,10 @@ class SceneActionIO:
                 f"{', '.join(names) or 'none'}",
             )
 
-        return _RobotMove(
-            robot=robot,
-            position=_position_of(payload),
-            yaw=_yaw_of(payload),
-        )
+        return _RobotMove(robot=robot, target=target)
 
-    def _move_robot(self, launcher, move: _RobotMove) -> dict:
-        launcher._runtime_move_robot_root(
-            {
-                "robot": move.robot,
-                "position": move.position,
-                "yaw": move.yaw,
-            }
-        )
+    def _move_robot(self, _launcher, move: _RobotMove) -> dict:
+        self._world.move(move.robot, move.target)
 
         return {}
 

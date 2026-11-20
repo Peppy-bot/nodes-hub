@@ -12,12 +12,12 @@ import time
 from pathlib import Path
 from typing import Optional, Protocol
 
+from control_core_py.geometry import PoseTarget, quaternion_of_yaw
 from sim_robot_core.cameras import FramePacer
 
 from bridge_extension import IsaacBridgeExtension
 from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
 from runtime_commander_server import RuntimeCommanderServer
-from world import yaw_orientation
 
 logger = logging.getLogger(__name__)
 
@@ -423,12 +423,15 @@ class SimLauncher:
         self,
         command: dict,
     ) -> None:
-        """Puts one robot somewhere else in the live stage, facing the yaw
-        the command names, leaving every other robot standing where it is.
-        The world's record moves with it, so the scene reports where the
-        robot now stands and the next robot the engine places is given room
-        from there."""
-        self._world.move(command["robot"], command["position"], command["yaw"])
+        """Puts one robot somewhere else in the live stage, at the position
+        the command names in world, facing the turn of its yaw about +z,
+        leaving every other robot standing where it is. The world's record
+        moves with it, so the scene reports where the robot now stands and
+        the next robot the engine places is given room from there."""
+        self._world.move(
+            command["robot"],
+            PoseTarget.parse(command["position"], quaternion_of_yaw(float(command["yaw"]))),
+        )
 
     # ------------------------------------------------------------------
     # Runtime scene control
@@ -987,7 +990,7 @@ class SimLauncher:
         orientation = command.get("orientation")
 
         if orientation is None:
-            orientation = yaw_orientation(
+            orientation = quaternion_of_yaw(
                 float(
                     command.get(
                         "yaw",
