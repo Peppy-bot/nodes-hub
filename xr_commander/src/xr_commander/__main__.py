@@ -29,10 +29,10 @@ from peppygen.consumed_actions.recorder import (
 from peppygen.consumed_services.fleet import check_move as fleet_check_move
 from peppygen.consumed_services.fleet import release as fleet_release
 from peppygen.consumed_services.fleet import take as fleet_take
-from peppygen.consumed_services.limb_motion import stop as limb_motion_stop
 from peppygen.consumed_services.recorder import (
     finish_session as recorder_finish_session,
 )
+from peppygen.consumed_services.robot_stop import stop as robot_stop_stop
 from peppygen.consumed_services.sensor_streams import hold as sensor_streams_hold
 from peppygen.consumed_services.sensor_streams import (
     release as sensor_streams_release,
@@ -203,7 +203,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             check_move_module=fleet_check_move,
             timing=fleet_timing,
         ),
-        drive.LimbStops(node_runner, robots, limb_motion_stop, fleet_timing),
+        drive.RobotStops(node_runner, robots, robot_stop_stop, fleet_timing),
         timing=fleet_timing,
         on_change=robot_states.refresh,
     )
