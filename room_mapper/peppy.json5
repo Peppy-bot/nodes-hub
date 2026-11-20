@@ -1,0 +1,173 @@
+// room_mapper: maps the rooms a robot's mobile base drives in with its 2-D
+// lidar, saves and loads the maps, and keeps the base localized in the loaded
+// one, as slam_toolbox maps and localizes and Nav2's AMCL localizes globally.
+// See README.md.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "room_mapper",
+    tag: "v1",
+    description: [
+      "Maps the rooms a robot's mobile base drives in with the base's 2-D lidar, saves each map under a name, loads a saved map, and keeps the base localized in the loaded map: it implements room_map on mapping_core, which ports slam_toolbox's mapping and localization and Nav2's AMCL global localization. It publishes the loaded map's grid on map_grids, the base's place in it on map_poses, and the transform map to odom on transforms.",
+      "It maps with one 2-D lidar fixed to the base, whose place in base_footprint it looks up once on transform_lookup, as slam_toolbox reads a laser's pose. It takes a scan once base_states of one odometry start enclose its whole sweep, each ray placed where the base stood at the ray's time, and leaves out each ray that ends within describe_base's footprint grown by footprint_padding_m.",
+    ],
+    implements: [
+      { name: "room_map", tag: "v1", link_id: "room_map" },
+      // map to odom at each map_poses; nothing on static_transforms.
+      { name: "transforms", tag: "v1", link_id: "transforms" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "lidar_2d", tag: "v1", link_id: "lidar" },
+        { name: "base_state", tag: "v1", link_id: "base" },
+        // The lidar is fixed to the base: its carried_by is empty.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts" },
+        // The lidar's place in base_footprint, once per lidar frame.
+        { name: "transform_lookup", tag: "v1", link_id: "transform_lookup" },
+      ],
+    },
+  },
+  interfaces: {
+    services: {
+      exposes: [
+        { link_id: "room_map", name: "get_map_state" },
+        { link_id: "room_map", name: "start_mapping" },
+        { link_id: "room_map", name: "finish_mapping" },
+        { link_id: "room_map", name: "list_maps" },
+        { link_id: "room_map", name: "remove_map" },
+        { link_id: "room_map", name: "load_map" },
+        { link_id: "room_map", name: "set_initial_pose" },
+        { link_id: "room_map", name: "reinitialize_global_localization" },
+      ],
+      consumes: [
+        { link_id: "base", name: "describe_base" },
+        { link_id: "sensor_mounts", name: "describe_sensors" },
+        { link_id: "transform_lookup", name: "lookup_transform" },
+      ],
+    },
+    topics: {
+      emits: [
+        { link_id: "room_map", name: "map_poses" },
+        { link_id: "room_map", name: "map_grids" },
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
+      ],
+      consumes: [
+        { link_id: "lidar", name: "scan_stream" },
+        { link_id: "base", name: "base_states" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+      // The maps outlive the container: the maps directory is bound at its
+      // own path.
+      mount_paths: [
+        "${parameters:maps_directory}",
+      ],
+    },
+    parameters: {
+      // The host directory the maps are saved in, each in a directory of its
+      // name: an absolute path, bound into the container at the same path.
+      maps_directory: "string",
+      // How far (m) the padded footprint reaches past describe_base's
+      // footprint along x and along y (Nav2's footprint_padding): a ray that
+      // ends within it is left out.
+      footprint_padding_m: "f64",
+      // room_map's source timeout (s): how long the lidar and base_states may
+      // stay silent, and how long a member waits for the read of
+      // describe_base or for a scan.
+      source_timeout_s: "f64",
+      // slam_toolbox's mapping, by the names of its parameters: the gate a
+      // scan passes, the laser's ranges (m), the grid's cell (m), karto's
+      // scan matching, links and loop closing, the grid's thresholds, and how
+      // often (s) the grid of the map being built is drawn again, on the
+      // node's clock (map_update_interval, room_map's grid period).
+      mapping: {
+        map_update_interval: "f64",
+        throttle_scans: "u32",
+        minimum_time_interval: "f64",
+        check_min_dist_and_heading_precisely: "bool",
+        min_laser_range: "f64",
+        max_laser_range: "f64",
+        resolution: "f64",
+        use_scan_barycenter: "bool",
+        minimum_travel_distance: "f64",
+        minimum_travel_heading: "f64",
+        scan_buffer_size: "u32",
+        scan_buffer_maximum_scan_distance: "f64",
+        link_match_minimum_response_fine: "f64",
+        link_scan_maximum_distance: "f64",
+        loop_search_maximum_distance: "f64",
+        do_loop_closing: "bool",
+        loop_match_minimum_chain_size: "u32",
+        loop_match_maximum_variance_coarse: "f64",
+        loop_match_minimum_response_coarse: "f64",
+        loop_match_minimum_response_fine: "f64",
+        correlation_search_space_dimension: "f64",
+        correlation_search_space_resolution: "f64",
+        correlation_search_space_smear_deviation: "f64",
+        loop_search_space_dimension: "f64",
+        loop_search_space_resolution: "f64",
+        loop_search_space_smear_deviation: "f64",
+        distance_variance_penalty: "f64",
+        angle_variance_penalty: "f64",
+        fine_search_angle_offset: "f64",
+        coarse_search_angle_offset: "f64",
+        coarse_angle_resolution: "f64",
+        minimum_angle_penalty: "f64",
+        minimum_distance_penalty: "f64",
+        use_response_expansion: "bool",
+        min_pass_through: "u32",
+        occupancy_threshold: "f64",
+      },
+      // slam_toolbox's localization mode: mapping's parameters with its own
+      // running buffer and loop chains.
+      localization: {
+        scan_buffer_size: "u32",
+        loop_match_minimum_chain_size: "u32",
+      },
+      // room_map's limits: the base is localized while its estimate's
+      // standard deviations (m, rad) lie within the search's limits while a
+      // search holds the estimate, and within the matching's otherwise.
+      matching_limits: {
+        position_std_m: "f64",
+        orientation_std_rad: "f64",
+      },
+      search_limits: {
+        position_std_m: "f64",
+        orientation_std_rad: "f64",
+      },
+      // Nav2's AMCL, by its parameters' names, which the search of
+      // reinitialize_global_localization runs; robot_model_type is its plugin
+      // name, "nav2_amcl::DifferentialMotionModel" or
+      // "nav2_amcl::OmniMotionModel". random_seed seeds the node's one drand48
+      // stream when the node starts, as AMCL's srand48(random_seed).
+      amcl: {
+        random_seed: "u32",
+        alpha1: "f64",
+        alpha2: "f64",
+        alpha3: "f64",
+        alpha4: "f64",
+        alpha5: "f64",
+        laser_likelihood_max_dist: "f64",
+        laser_max_range: "f64",
+        laser_min_range: "f64",
+        max_beams: "u32",
+        max_particles: "u32",
+        min_particles: "u32",
+        pf_err: "f64",
+        pf_z: "f64",
+        resample_interval: "u32",
+        robot_model_type: "string",
+        sigma_hit: "f64",
+        update_min_a: "f64",
+        update_min_d: "f64",
+        z_hit: "f64",
+        z_rand: "f64",
+      },
+    },
+  },
+}

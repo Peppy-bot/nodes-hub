@@ -1,0 +1,62 @@
+Bootstrap: docker
+From: peppybot/rust-cargo-base:latest
+
+%labels
+    Name room_mapper
+    Version v1
+
+%files
+    . /opt/room_mapper
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+
+    # qhull-sys, which navigation_core links through occupancy_map and
+    # collision_geometry, generates its bindings with bindgen, which reads
+    # libclang.
+    apt-get update -y
+    apt-get install -y --no-install-recommends libclang-dev
+
+    cd /opt/room_mapper
+    cargo build --release
+    # The directory of the one package of the host whose manifest path ends in
+    # `$1`, as cargo metadata names it, `$2` the package's name in the refusal.
+    # The metadata fetches the host's packages that the build did not, such as
+    # the dev-dependencies.
+    host=$(rustc -vV | sed -n 's/^host: //p')
+    cargo metadata --format-version 1 --locked --filter-platform "$host" \
+        > /tmp/metadata.json
+    package_dir() {
+        manifests=$(grep -o "\"manifest_path\":\"[^\"]*/$1/Cargo.toml\"" \
+            /tmp/metadata.json) || {
+            echo "the build resolved no $2 package, whose license the image ships" >&2
+            exit 1
+        }
+        if [ "$(printf '%s\n' "$manifests" | wc -l)" -ne 1 ]; then
+            echo "the build resolved more than one $2 package: $manifests" >&2
+            exit 1
+        fi
+        dir=${manifests#\"manifest_path\":\"}
+        echo "${dir%/Cargo.toml\"}"
+    }
+    # The binary is GPL-3.0-or-later and links mapping_core, so COPYING, NOTICE and
+    # mapping_core's NOTICE ship beside it.
+    mapping_core=$(package_dir mapping_core mapping_core)
+    cp COPYING NOTICE target/release/
+    cp "$mapping_core/NOTICE" target/release/MAPPING_CORE_NOTICE
+    # The binary links Qhull through qhull-sys, so Qhull's license ships beside
+    # it, led by where Qhull's source is.
+    qhull_sys=$(package_dir 'qhull-sys-[^/"]*' qhull-sys)
+    {
+        echo "room_mapper links Qhull. Its source is at http://www.qhull.org."
+        echo
+        cat "$qhull_sys/qhull/COPYING.txt"
+    } > target/release/QHULL_COPYING.txt
+    rm /tmp/metadata.json
+
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+%runscript
+    cd /opt/room_mapper
+    exec ./target/release/room_mapper "$@"
