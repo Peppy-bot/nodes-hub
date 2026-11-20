@@ -129,8 +129,8 @@ def test_requirements_without_one_mujoco_version_stop_the_publisher(tmp_path, pi
 
 def test_suites_run_on_what_the_image_installs():
     # The scene these suites compile is compiled by the mujoco the node runs
-    # on, with the numpy, the parser, the sim_robot_core and the
-    # robot_description_py the image carries.
+    # on, with the numpy, the parser, the sim_robot_core, the
+    # robot_description_py and the control_core_py the image carries.
     project = tomllib.loads((Path(__file__).parent / "pyproject.toml").read_text())
     installed = _REQUIREMENTS.splitlines()
     for package in ("mujoco", "numpy", "pyjson5"):
@@ -145,7 +145,7 @@ def test_suites_run_on_what_the_image_installs():
         f"{package} @ git+https://github.com/Peppy-bot/public-peppy-libs.git"
         f"@{sources[package]['rev']}"
         f"#subdirectory={package}"
-        for package in ("sim_robot_core", "robot_description_py")
+        for package in ("sim_robot_core", "robot_description_py", "control_core_py")
     ]
 
 

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
+from control_core_py.geometry import IDENTITY, Point, Pose, UnitQuaternion, wxyz_of_xyzw
 from exts.camera_sensor import add_cameras, add_light_rig, widen_offscreen
 from mujoco_models import MujocoModel
 
@@ -62,40 +63,14 @@ _FLOOR_LIGHT_POS = (0.0, 0.0, 3.5)
 
 
 @dataclass(frozen=True)
-class Placement:
-    """Where a robot's base stands: a world-frame position in metres and a
-    rotation about +z in radians."""
-
-    position: tuple[float, float, float]
-    yaw: float
-
-    @staticmethod
-    def of(position, yaw: float) -> "Placement":
-        """The placement a caller asked for, refusing anything the scene
-        cannot take: a robot attached at NaN compiles and simulates
-        nothing."""
-        values = tuple(float(value) for value in position)
-        if len(values) != 3:
-            raise ValueError(f"a placement is 3 coordinates, got {len(values)}")
-        for value in (*values, float(yaw)):
-            if not math.isfinite(value):
-                raise ValueError("a placement is finite in every coordinate")
-        return Placement(position=values, yaw=float(yaw))
-
-    def quat_wxyz(self) -> tuple[float, float, float, float]:
-        """The rotation as MuJoCo writes it: a quaternion about +z."""
-        half = self.yaw / 2.0
-        return (math.cos(half), 0.0, 0.0, math.sin(half))
-
-
-@dataclass(frozen=True)
 class Robot:
     """One robot in the scene: the name it stands under, the model it is,
-    and where."""
+    and where: the pose of its base in world, whose orientation turns about
+    +z alone."""
 
     instance: str
     known: MujocoModel
-    placement: Placement
+    placement: Pose
 
     @property
     def model(self) -> str:
@@ -157,8 +132,8 @@ class World:
             return list(self._robots.values())
 
     def free_spot(
-        self, promised: "tuple[Placement, ...]" = (), leaving: Optional[str] = None
-    ) -> Placement:
+        self, promised: "tuple[Pose, ...]" = (), leaving: Optional[str] = None
+    ) -> Pose:
         """A spot no robot stands on and none has been promised, walked out
         from the origin on a square lattice, so a fleet fills the floor. A
         robot admitted a moment ago has a spot and does not stand on it yet,
@@ -173,7 +148,9 @@ class World:
             # Along the axes before the diagonals, so a small fleet stands in
             # a cross around the origin.
             for row, column in sorted(square, key=lambda spot: (abs(spot[0]) + abs(spot[1]), spot)):
-                spot = Placement.of((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0), 0.0)
+                spot = Pose(
+                    Point((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)), UnitQuaternion(IDENTITY)
+                )
                 if not self.occupied(spot, promised, leaving):
                     return spot
         raise ValueError(
@@ -182,7 +159,7 @@ class World:
         )
 
     def standing_within(
-        self, placement: Placement, leaving: Optional[str] = None
+        self, placement: Pose, leaving: Optional[str] = None
     ) -> Optional[Robot]:
         """The robot standing within a spot of this placement, if one does.
         The robot named by `leaving` is on its way out, so the spot it stands
@@ -198,8 +175,8 @@ class World:
 
     def occupied(
         self,
-        placement: Placement,
-        promised: "tuple[Placement, ...]" = (),
+        placement: Pose,
+        promised: "tuple[Pose, ...]" = (),
         leaving: Optional[str] = None,
     ) -> bool:
         """Whether a robot stands within a spot of this placement, or has
@@ -210,7 +187,7 @@ class World:
         )
         return any(within_one_spot(placement, other) for other in (*standing, *promised))
 
-    def add(self, instance: str, known: MujocoModel, placement: Placement) -> Robot:
+    def add(self, instance: str, known: MujocoModel, placement: Pose) -> Robot:
         """Records a robot of the model `known` as standing. Admission has
         already found the caller a name and a spot, so this raises on
         either. The scene is composed again by whoever steps it."""
@@ -225,7 +202,10 @@ class World:
             robot = Robot(instance=instance, known=known, placement=placement)
             self._robots[instance] = robot
         logger.info(
-            "robot '%s' (%s) joins at %s", instance, known.model, list(placement.position)
+            "robot '%s' (%s) joins at %s",
+            instance,
+            known.model,
+            list(placement.position.position),
         )
         return robot
 
@@ -255,8 +235,8 @@ class World:
             self._fit_out_rendering(stage, robots)
         for robot, child in children:
             frame = stage.worldbody.add_frame()
-            frame.pos = list(robot.placement.position)
-            frame.quat = list(robot.placement.quat_wxyz())
+            frame.pos = list(robot.placement.position.position)
+            frame.quat = list(wxyz_of_xyzw(robot.placement.orientation.quaternion))
             frame.attach_body(child.body(robot.known.robot.mount_body), robot.prefix, "")
         return stage
 
@@ -279,12 +259,12 @@ class World:
         return spec
 
 
-def within_one_spot(one: Placement, other: Placement) -> bool:
+def within_one_spot(one: Pose, other: Pose) -> bool:
     """Whether two placements are too close for a robot to stand on both. It
     is the distance between them that counts: two robots closer together than
     the lattice leaves them resolve their overlap by throwing each other,
     wherever the lattice's own lines happen to fall."""
-    return math.dist(one.position, other.position) < SPOT_PITCH_M
+    return math.dist(one.position.position, other.position.position) < SPOT_PITCH_M
 
 
 def _lay_floor(stage) -> None:

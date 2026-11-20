@@ -83,7 +83,7 @@ class Subscription:
 
 
 class FailureKind(str, enum.Enum):
-    """The failure kinds of attach: the kinds of peppy, then the kind of
+    """The failure kinds of attach: the kinds of peppy, then the kinds of
     simulation_robot that attach lists, as the generated module names them."""
 
     ATTEMPT_FAILED = "attempt_failed"
@@ -92,6 +92,7 @@ class FailureKind(str, enum.Enum):
     RESOURCE_UNAVAILABLE = "resource_unavailable"
     REJECTED = "rejected"
     BUSY = "busy"
+    UNKNOWN_FRAME = "unknown_frame"
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,25 @@ class _ReadyResponse:
     ready: bool
 
 
+@dataclass
+class MessageDepthToColor:
+    """depth_to_color of an rgbd camera's geometry, with the fields the
+    generated record holds: the pose of the depth optical frame in `frame`,
+    which holds at every time."""
+
+    frame: str
+    position: list[float]
+    orientation: list[float]
+
+
+def _payload(*fields, **named):
+    """A payload is the fields it was built from, so a test reads them back:
+    the tuple of the fields given in order, or the namespace of the fields
+    given by name."""
+    assert not (fields and named), "a message is built from its fields in order or by name"
+    return types.SimpleNamespace(**named) if named else fields
+
+
 class _ClockPublisher:
     """No deployment names a test's engine the publisher of a clock domain."""
 
@@ -175,8 +195,7 @@ def _topic_module(slot_module: types.ModuleType, slot: str, topic: str) -> types
     module.arrivals = []
     module.publisher = Publisher()
     module.peers = lambda _runner: list(slot_module.members)
-    # A payload is the fields it was built from, so a test reads them back.
-    module.build_message = lambda *fields: fields
+    module.build_message = _payload
     module.MessageHeader = lambda **fields: types.SimpleNamespace(**fields)
 
     async def subscribe(_runner) -> Subscription:
@@ -245,6 +264,7 @@ def _install() -> None:
             setattr(slot_module, topic, _topic_module(slot_module, slot, topic))
         setattr(paired, slot, slot_module)
         modules[f"peppygen.paired_topics.{slot}"] = slot_module
+    paired.rgbd_cameras.geometry.MessageDepthToColor = MessageDepthToColor
     sys.modules.update(modules)
 
 

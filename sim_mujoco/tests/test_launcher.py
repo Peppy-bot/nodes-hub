@@ -136,8 +136,8 @@ def _watched(world: World, viewer_server: ViewerServer) -> SimLauncher:
     return SimLauncher(world, Edits(), threading.Event(), FakeIO(), _STATE_RATE_HZ, viewer_server)
 
 
-def _frame_ids(launcher: SimLauncher) -> dict:
-    """Each standing camera's frame counter in the scene the engine holds."""
+def _capture_indices(launcher: SimLauncher) -> dict:
+    """Each standing camera's capture index counter in the scene the engine holds."""
     return launcher._extension._camera_sensor.counters()  # pylint: disable=W0212
 
 
@@ -297,16 +297,16 @@ class TestTheThreadThatStepsTheScene:
         launcher = _launcher(world)
         world.add("alpha", _known(_CAMERA_ARM_ENTRY), world.free_spot())
         launcher.rebind()
-        counted = [_frame_ids(launcher)[("alpha", "wrist")].next() for _ in range(3)]
+        counted = [_capture_indices(launcher)[("alpha", "wrist")].next() for _ in range(3)]
 
         world.add("delta", _known(_CAMERA_ARM_ENTRY), world.free_spot())
         launcher.unbind()
         launcher.rebind()
 
         assert counted == [0, 1, 2]
-        assert _frame_ids(launcher)[("alpha", "wrist")].next() == 3
+        assert _capture_indices(launcher)[("alpha", "wrist")].next() == 3
         # The robot that just joined starts its own count.
-        assert _frame_ids(launcher)[("delta", "wrist")].next() == 0
+        assert _capture_indices(launcher)[("delta", "wrist")].next() == 0
 
     def test_a_scene_that_does_not_compose_takes_the_node_down(self, monkeypatch):
         """An engine holding no scene steps nothing and publishes no clock.

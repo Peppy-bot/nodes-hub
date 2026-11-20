@@ -69,7 +69,7 @@ class SimLauncher:
         self._view = _NoView()
         # The engine clock, carried from one scene to the next.
         self._time_base_s = 0.0
-        # Each standing camera's frame counter, carried the same way.
+        # Each standing camera's capture index counter, carried the same way.
         self._camera_counters: dict = {}
 
     def run(self) -> None:

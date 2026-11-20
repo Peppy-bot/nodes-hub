@@ -14,7 +14,7 @@ from pathlib import Path
 
 import mujoco
 import pytest
-from entries import camera, entry, known as known_model
+from entries import camera, entry, known as known_model, placement_at
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the world imports)
 
@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 import mujoco_models  # noqa: E402  pylint: disable=C0413
 from exts import camera_sensor  # noqa: E402  pylint: disable=C0413
 import world as world_module  # noqa: E402  pylint: disable=C0413
-from world import SPOT_PITCH_M, Placement, World, compile_spec  # noqa: E402  pylint: disable=C0413
+from world import SPOT_PITCH_M, World, compile_spec  # noqa: E402  pylint: disable=C0413
 
 _SCENE = "arm/arm.xml"
 _POSTURE = {"lift": 0.5, "flex": -0.8}
@@ -245,7 +245,7 @@ class TestComposingTheScene:
         assert [name.split("/")[0] for name in actuators] == ["alpha"] * 2 + ["bravo"] * 2
 
     def test_a_robot_stands_where_its_placement_puts_it(self):
-        spot = Placement.of((2.0, -1.0, 0.0), 0.0)
+        spot = placement_at(2.0, -1.0, 0.0)
         world, model = _standing(["alpha"], placements={"alpha": spot})
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
@@ -256,7 +256,7 @@ class TestComposingTheScene:
 
     def test_a_robot_turned_about_z_stands_turned(self):
         world = _world()
-        world.add("alpha", _known(), Placement.of((0.0, 0.0, 0.0), math.pi / 2))
+        world.add("alpha", _known(), placement_at(0.0, yaw=math.pi / 2))
         model = world.compose().compile()
         data = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
@@ -294,7 +294,7 @@ class TestComposingTheScene:
 
 class TestTheSpotsRobotsTake:
     def test_the_first_robot_stands_on_the_origin(self):
-        assert _world().free_spot().position == (0.0, 0.0, 0.0)
+        assert _world().free_spot() == placement_at(0.0)
 
     def test_the_next_robot_takes_a_spot_of_its_own(self):
         world, _ = _standing(["alpha"])
@@ -312,18 +312,18 @@ class TestTheSpotsRobotsTake:
         assert world.occupied(promised, promised=(promised,))
 
     def test_the_robot_standing_within_a_spot_is_the_one_it_names(self):
-        world, _ = _standing(["alpha"], placements={"alpha": Placement.of((0.0, 0.0, 0.0), 0.0)})
+        world, _ = _standing(["alpha"], placements={"alpha": placement_at(0.0, 0.0, 0.0)})
 
-        assert world.standing_within(Placement.of((0.1, 0.0, 0.0), 0.0)).instance == "alpha"
-        assert world.standing_within(Placement.of((SPOT_PITCH_M, 0.0, 0.0), 0.0)) is None
+        assert world.standing_within(placement_at(0.1, 0.0, 0.0)).instance == "alpha"
+        assert world.standing_within(placement_at(SPOT_PITCH_M, 0.0, 0.0)) is None
 
     def test_a_spot_is_taken_at_any_height(self):
         """A robot's placement carries its height, and two robots standing
         one above the other are still one inside the other."""
-        world, _ = _standing(["alpha"], placements={"alpha": Placement.of((0.0, 0.0, 0.0), 0.0)})
+        world, _ = _standing(["alpha"], placements={"alpha": placement_at(0.0, 0.0, 0.0)})
 
-        assert world.occupied(Placement.of((0.0, 0.0, SPOT_PITCH_M / 2), 0.0))
-        assert not world.occupied(Placement.of((0.0, 0.0, SPOT_PITCH_M), 0.0))
+        assert world.occupied(placement_at(0.0, 0.0, SPOT_PITCH_M / 2))
+        assert not world.occupied(placement_at(0.0, 0.0, SPOT_PITCH_M))
 
     def test_a_full_floor_is_refused_the_way_a_taken_spot_is(self, monkeypatch):
         """Admission answers the goal with the reason its robot was refused,
@@ -331,7 +331,7 @@ class TestTheSpotsRobotsTake:
         a robot on the origin and on the eight spots around it."""
         monkeypatch.setattr(world_module, "_MAX_RINGS", 2)
         taken = tuple(
-            Placement.of((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0), 0.0)
+            placement_at(row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)
             for row in (-1, 0, 1)
             for column in (-1, 0, 1)
         )
@@ -343,26 +343,14 @@ class TestTheSpotsRobotsTake:
         """It is the distance that counts, not which lattice square a spot
         falls in: two robots nearer than the lattice leaves them resolve
         their overlap by throwing each other."""
-        world, _ = _standing(["alpha"], placements={"alpha": Placement.of((0.0, 0.0, 0.0), 0.0)})
+        world, _ = _standing(["alpha"], placements={"alpha": placement_at(0.0, 0.0, 0.0)})
 
-        assert world.occupied(Placement.of((SPOT_PITCH_M / 4, 0.0, 0.0), 0.0))
+        assert world.occupied(placement_at(SPOT_PITCH_M / 4, 0.0, 0.0))
         # A hand-picked spot just the other side of a lattice line is still
         # within reach of the robot standing.
-        assert world.occupied(Placement.of((SPOT_PITCH_M * 0.51, 0.0, 0.0), 0.0))
-        assert not world.occupied(Placement.of((SPOT_PITCH_M, 0.0, 0.0), 0.0))
+        assert world.occupied(placement_at(SPOT_PITCH_M * 0.51, 0.0, 0.0))
+        assert not world.occupied(placement_at(SPOT_PITCH_M, 0.0, 0.0))
 
-    @pytest.mark.parametrize("position", [(float("nan"), 0.0, 0.0), (0.0, float("inf"), 0.0)])
-    def test_a_placement_that_is_not_finite_is_refused(self, position):
-        with pytest.raises(ValueError, match="finite in every coordinate"):
-            Placement.of(position, 0.0)
-
-    def test_a_placement_of_the_wrong_width_is_refused(self):
-        with pytest.raises(ValueError, match="3 coordinates"):
-            Placement.of((0.0, 0.0), 0.0)
-
-    def test_a_yaw_that_is_not_finite_is_refused(self):
-        with pytest.raises(ValueError, match="finite in every coordinate"):
-            Placement.of((0.0, 0.0, 0.0), float("nan"))
 
 
 class TestTheSettingsTheModelsShare:
@@ -471,17 +459,17 @@ class TestTheRecordOfWhoStands:
 
     def test_a_robot_with_no_name_is_refused(self):
         with pytest.raises(ValueError, match="stands under the name of the copy it runs as"):
-            _world().add("", _known(), Placement.of((0.0, 0.0, 0.0), 0.0))
+            _world().add("", _known(), placement_at(0.0, 0.0, 0.0))
 
     def test_a_name_carrying_the_prefix_separator_is_refused(self):
         """Every name a robot answers to in the scene is its own name and
         that separator, so a name carrying one names nothing it owns."""
         with pytest.raises(ValueError, match="carrying no '/'"):
-            _world().add("alpha/bravo", _known(), Placement.of((0.0, 0.0, 0.0), 0.0))
+            _world().add("alpha/bravo", _known(), placement_at(0.0, 0.0, 0.0))
 
     def test_a_name_carrying_the_separator_is_told_what_to_join_under(self):
         with pytest.raises(ValueError, match=r"peppy stack join LAUNCHER -i left_arm"):
-            _world().add("left/arm", _known(), Placement.of((0.0, 0.0, 0.0), 0.0))
+            _world().add("left/arm", _known(), placement_at(0.0, 0.0, 0.0))
 
     def test_taking_out_a_robot_that_stands_nowhere_changes_nothing(self):
         world, _ = _standing(["alpha"])
