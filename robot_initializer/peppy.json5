@@ -9,10 +9,10 @@
     tag: "v1",
     description: [
       "The node that brings one robot into being and says when it is ready, for a robot of any model, an OpenArm and an SO-101 alike, real or simulated. It opens no device: on a real robot it reads the readiness of the drivers of the limbs, and on a simulated robot it joins the simulation.",
-      "It exposes the robot-level is_ready the backbone gates on, true only once everything that answers for the robot reports ready: the drivers of its limbs on a real robot, and the simulation on a simulated one, which answers for every limb of the robot it stands.",
+      "It exposes the robot-level is_ready the backbone gates on, true only once everything that answers for the robot reports ready: the drivers of its limbs on a real robot, and the simulation on a simulated one, which answers for every part of the robot it stands.",
       "It also says who the robot is: get_identity answers the name the robot stands under, the model it is and the core node hosting it, and get_description answers the model's URDF, SRDF and collision meshes, for as long as the node runs. And it gives the robot's guide: get_guide answers the park state of each arm of the model's SRDF.",
       "It serves what the model alone says of the robot's frames: it publishes the transform of every fixed joint of the model on static_transforms once it holds the model, and describe_sensors answers the robot frame and each camera of the model with its frame and the arm that carries it. The robot's backbone publishes the transforms of the joints it measures.",
-      "In a simulation it also joins the scene: it attaches as this robot, naming the copy it runs as, the model to stand and where, and giving the model's URDF and SRDF, and holds that goal for as long as the robot is in the scene; the robot's limbs pair to the engine through the backbone. Its setup ends once the simulation stands the robot.",
+      "In a simulation it also joins the scene: it attaches as this robot, naming the copy it runs as, the model to stand and where, and giving the model's URDF and SRDF, and holds that goal for as long as the robot is in the scene; the robot's limbs, and a mobile base's wheels, pair to the engine through the backbone. Its setup ends once the simulation stands the robot.",
     ],
     implements: [
       { name: "robot_ready", tag: "v1", link_id: "robot_ready" },
