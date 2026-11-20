@@ -130,9 +130,9 @@ fn accepted_handle(side: &str, fired: Result<arm::ActionHandle>) -> Option<arm::
 async fn process_frame(node_runner: &NodeRunner, frame: &video_stream::Message) {
     // Process the frame and generate fake arm positions
     let fake_position = [
-        frame.frame[0] as i32,
-        frame.frame[1] as i32,
-        frame.frame[2] as i32,
+        frame.data[0] as i32,
+        frame.data[1] as i32,
+        frame.data[2] as i32,
     ];
     println!("[brain] Generated arm position: {:?}", fake_position);
 
