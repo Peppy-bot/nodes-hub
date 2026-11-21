@@ -2291,6 +2291,37 @@ async def test_a_stop_no_tick_takes_in_its_answer_time_fails_and_runs_once_taken
     assert plan.aborted
 
 
+async def test_a_stop_that_raises_answers_its_own_caller_and_the_stops_after_it_run(
+    follower_never_stale,
+):
+    coordinator, layer = make_layer()
+    coordinator.measured_joints.set((0.0,) * 5)
+    plan = admit_joints(layer, (0.5,) * 5, 1.0)
+    stop_all = coordinator.stop_all
+    reasons = []
+
+    def failing_first(message):
+        reasons.append(message)
+        if len(reasons) == 1:
+            raise RuntimeError("the plan lock is gone")
+        return stop_all(message)
+
+    coordinator.stop_all = failing_first
+    first = asyncio.create_task(layer.request_stop("the first"))
+    second = asyncio.create_task(layer.request_stop("the second"))
+    await asyncio.sleep(0)
+    layer.take_stops()
+
+    with pytest.raises(Refusal) as refused:
+        await first
+    assert refusal_of(refused) == (
+        FailureKind.ATTEMPT_FAILED,
+        "the robot stop failed: RuntimeError('the plan lock is gone')",
+    )
+    assert await second == ["arm"]
+    assert plan.stopped == "stopped: the second"
+
+
 async def test_a_goal_whose_sender_is_gone_ends_cancelled_with_that_reason(
     follower_never_stale,
 ):

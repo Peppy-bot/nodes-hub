@@ -106,7 +106,6 @@ async def _run_control(
     gripper_computing = runtime.Latch()
     arm_failing = runtime.Latch()
     gripper_failing = runtime.Latch()
-    stops_failing = runtime.Latch()
     rate = runtime.RateMeter("control loop", 1.0 / period_s)
 
     def stamped(stamp: float | None) -> float:
@@ -133,12 +132,9 @@ async def _run_control(
     async for _ in runtime.ticks(period_s, token):
         rate.tick()
         # The robot stops handed since the last tick run first, so the limbs'
-        # setpoints below are the ones the stops leave.
-        try:
-            layer.take_stops()
-            stops_failing.clear()
-        except Exception as e:
-            stops_failing.trip(f"robot stop failed: {e!r}")
+        # setpoints below are the ones the stops leave. A stop that raises
+        # answers its own caller.
+        layer.take_stops()
         now = time.monotonic()
         # Guarded per limb: the motion authority's loop must survive anything
         # one limb's tick computation (IK included) throws, holding that limb

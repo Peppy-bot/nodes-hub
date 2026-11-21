@@ -1189,11 +1189,21 @@ class ActionLayer:
     def take_stops(self) -> None:
         """Run each robot stop handed to the control loop since its last
         tick, in the order they came, as stop_moves does, and answer each one
-        whose caller still waits. The control loop calls it at the start of
-        each tick."""
+        whose caller still waits: with the limbs it stopped, or with Refusal
+        `attempt_failed` naming the error of a stop that raised, the stops
+        after it running on. The control loop calls it at the start of each
+        tick."""
         stops, self._stops = self._stops, []
         for reason, answer in stops:
-            stopped = self.stop_moves(reason)
+            try:
+                stopped = self.stop_moves(reason)
+            except Exception as e:  # pylint: disable=W0718
+                log(f"robot stop failed: {e!r}")
+                if not answer.done():
+                    answer.set_exception(
+                        Refusal(FailureKind.ATTEMPT_FAILED, f"the robot stop failed: {e!r}")
+                    )
+                continue
             if not answer.done():
                 answer.set_result(stopped)
 
