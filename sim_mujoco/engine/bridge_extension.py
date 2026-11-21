@@ -154,8 +154,28 @@ class _RobotLimbs:
                     f"the scene standing '{self.robot.instance}' has no free joint of that name, "
                     "which a robot that rolls hangs from the world on"
                 )
+            self._hold_mount_to_robot_frame()
             self.free_qpos = int(self._model.jnt_qposadr[free])
             self.free_dof = int(self._model.jnt_dofadr[free])
+
+    def _hold_mount_to_robot_frame(self) -> None:
+        """Refuses a robot that rolls whose mount body the compiled scene
+        places off the free body it hangs on, or turns in it, whatever its
+        MJCF writes the pose with (pos, quat, euler, axisangle, xyaxes,
+        zaxis, a frame around it): the free joint is its robot frame, which
+        the engine reports and places it by, and stands where the mount body
+        does only when the body sits at its origin unturned."""
+        mount = self.robot.known.robot.mount_body
+        body = self._model.body(self.scene_name(mount)).id
+        position = [float(value) for value in self._model.body_pos[body]]
+        turn = [float(value) for value in self._model.body_quat[body]]
+        if position == [0.0, 0.0, 0.0] and turn == [1.0, 0.0, 0.0, 0.0]:
+            return
+        raise RuntimeError(
+            f"the MJCF of {self.entry.model} places its mount body '{mount}' at {position}, "
+            f"turned by {turn} (w, x, y, z): a robot that rolls stands on its robot frame, so give "
+            "the mount body no pose of its own and no frame around it"
+        )
 
     def fits(self, arm: str, controls: dict[int, float]) -> bool:
         """Whether the controls a setpoint of `arm` gives its actuators, with

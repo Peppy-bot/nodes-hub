@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -874,6 +875,26 @@ class TestTheWheelsOfABase:
         broken = WHEELED.replace(old, new, 1) if "left" in old else WHEELED.replace(old, new)
         with pytest.raises(RuntimeError, match=rf"wheel '{ROBOT}/left_wheel'.*{refusal}"):
             _wheeled(xml=broken)
+
+
+@pytest.mark.parametrize(
+    ("mount", "placed"),
+    [
+        ('pos="0.1 0 0"', "at [0.1, 0.0, 0.0], turned by [1.0, 0.0, 0.0, 0.0]"),
+        ('quat="0 0 0 1"', "at [0.0, 0.0, 0.0], turned by [0.0, 0.0, 0.0, 1.0]"),
+        ('euler="0 0 1.57"', "at [0.0, 0.0, 0.0], turned by [0.70738"),
+    ],
+    ids=["pos", "quat", "euler"],
+)
+def test_a_rolling_robot_whose_mount_body_stands_off_its_free_body_is_refused(mount, placed):
+    """Its free joint is its robot frame, which the engine reports and
+    places it by: it stands where the mount body does only while that body
+    sits at the free body's origin unturned, however its MJCF writes it."""
+    xml = WHEELED.replace(f'<body name="{WHEELED_MOUNT}">', f'<body name="{WHEELED_MOUNT}" {mount}>')
+    assert xml != WHEELED
+
+    with pytest.raises(RuntimeError, match=f"places its mount body '{WHEELED_MOUNT}' {re.escape(placed)}"):
+        _wheeled(xml=xml)
 
 
 class TestTheRecordsOnObjectState:
