@@ -31,7 +31,7 @@ from entries import (
     placement_at,
 )
 from sim_robot_core.models import Arm, ModelEntry
-from sim_robot_core.setpoints import JointSetpoint
+from sim_robot_core.setpoints import MAX_VALUE, JointSetpoint
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the bridge imports)
 
@@ -515,6 +515,55 @@ class TestTheGainsAServoRuns:
             assert float(actuator.gainprm[0]) == pytest.approx(gain)
             assert float(actuator.biasprm[1]) == pytest.approx(-gain)
             assert float(actuator.biasprm[2]) == pytest.approx(-critical)
+
+
+class TestAControlMuJoCoCannotHold:
+    """A setpoint within what a simulation holds can still ask a control past
+    it once its velocities' feedforward, (kd/kp) times each velocity, is
+    added to its positions: it is dropped, as one that is not a number is,
+    and the arm holds the setpoint before it."""
+
+    @staticmethod
+    def _gained(io):
+        known = _known(
+            "jaw_arm", _JAW_ARM_ENTRY, _JAW_ARM, arm_gains={"arm": [(20.0, 4.0), (20.0, 4.0)]}
+        )
+        return _stand(_JAW_ARM, known, io, 0.0, (ROBOT,))
+
+    def test_the_setpoint_is_dropped_and_the_arm_holds_the_one_before_it(self, caplog):
+        io = FakeIO()
+        model, data, _, bridge = self._gained(io)
+        io.arm_commands[(ROBOT, "arm")] = ([0.3, -0.3], [])
+        bridge.step()
+        held = (_ctrl(model, data, "lift"), _ctrl(model, data, "flex"))
+        # Each value lies at the bound, so the setpoint parses, and the
+        # feedforward carries the control past it.
+        io.arm_commands[(ROBOT, "arm")] = ([MAX_VALUE, 0.0], [MAX_VALUE, 0.0])
+
+        with caplog.at_level(logging.WARNING, logger="bridge_extension"):
+            bridge.step()
+            bridge.step()
+
+        assert (_ctrl(model, data, "lift"), _ctrl(model, data, "flex")) == held == (0.3, -0.3)
+        dropped = [record.getMessage() for record in caplog.records if "dropping" in record.getMessage()]
+        assert len(dropped) == 1, "the arm is named once"
+        assert dropped[0].startswith(
+            f"dropping the setpoints for '{ROBOT}' arm until one fits: with the feedforward of its "
+            "velocities it asks a control of "
+        )
+        assert dropped[0].endswith("and a control is a number from -1e+10 to 1e+10")
+
+    def test_a_setpoint_that_fits_again_drives_the_arm_and_is_warned_of_anew(self, caplog):
+        io = FakeIO()
+        model, data, _, bridge = self._gained(io)
+        beyond = ([MAX_VALUE, 0.0], [MAX_VALUE, 0.0])
+        with caplog.at_level(logging.WARNING, logger="bridge_extension"):
+            for command in (beyond, ([0.2, 0.1], []), beyond):
+                io.arm_commands[(ROBOT, "arm")] = command
+                bridge.step()
+
+        assert (_ctrl(model, data, "lift"), _ctrl(model, data, "flex")) == (0.2, 0.1)
+        assert sum("dropping" in record.getMessage() for record in caplog.records) == 2
 
 
 def test_every_view_of_a_scene_closes_whatever_the_one_before_it_did():

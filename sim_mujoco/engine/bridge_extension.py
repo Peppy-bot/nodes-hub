@@ -24,6 +24,7 @@ import time
 
 from control_core_py.geometry import xyzw_of_wxyz
 from sim_robot_core.cameras import FramePacer
+from sim_robot_core.setpoints import MAX_VALUE
 from sim_robot_core.world import rolled_placement
 from robot_description_py import FingerSpan
 
@@ -72,6 +73,9 @@ class _RobotLimbs:
         # Last force limit written per gripper, so the cap is not re-sent per
         # tick.
         self.applied_effort: dict[str, float] = {}
+        # The arms whose setpoint's control lies past what MuJoCo holds, each
+        # warned of once until a setpoint of it fits.
+        self.refusing: set[str] = set()
         # Where each joint of this robot sits in the scene's joint order.
         self.joint_index: dict[str, int] = {}
         # The wheels of its base, by their scene names, left then right; none
@@ -141,6 +145,29 @@ class _RobotLimbs:
 
             free = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, self.robot.instance)
             self.free_qpos = int(self._model.jnt_qposadr[free])
+
+    def fits(self, arm: str, controls: dict[int, float]) -> bool:
+        """Whether the controls a setpoint of `arm` gives its actuators, with
+        the feedforward of its velocities, are each a number from -MAX_VALUE
+        to MAX_VALUE, which MuJoCo holds. One past it drops the setpoint, as
+        one that is not a number is dropped, and the arm holds the setpoint
+        before it; the log names the arm once, until a setpoint of it fits."""
+        beyond = [ctrl for ctrl in controls.values() if not abs(ctrl) <= MAX_VALUE]
+        if not beyond:
+            self.refusing.discard(arm)
+            return True
+        if arm not in self.refusing:
+            self.refusing.add(arm)
+            logger.warning(
+                "dropping the setpoints for '%s' %s until one fits: with the feedforward of "
+                "its velocities it asks a control of %g, and a control is a number from %g to %g",
+                self.robot.instance,
+                arm,
+                beyond[0],
+                -MAX_VALUE,
+                MAX_VALUE,
+            )
+        return False
 
     def measured(self, states, joints) -> tuple[list[float], list[float]]:
         """The positions and velocities of `joints` of this robot, out of
@@ -301,7 +328,9 @@ class MujocoBridgeExtension:
                 velocity_values = (
                     dict(zip(joints, velocities)) if len(velocities) == len(joints) else None
                 )
-                limbs.actuator.write_targets(dict(zip(joints, positions)), velocity_values)
+                controls = limbs.actuator.controls(dict(zip(joints, positions)), velocity_values)
+                if limbs.fits(arm.name, controls):
+                    limbs.actuator.write_controls(controls)
 
             if limbs.wheels is not None:
                 if self._io.take_base_release(robot):
