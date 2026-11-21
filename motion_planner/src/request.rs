@@ -161,7 +161,7 @@ impl From<PlaceError> for RequestError {
 
 /// What places a value `T` of a request, in the frame it names at its timestamp, in the robot
 /// frame: the planner's tree.
-pub type Placer<'p, T> = dyn Fn(&Stamped<T>) -> Result<T, PlaceError> + 'p;
+pub type ValuePlacer<'p, T> = dyn Fn(&Stamped<T>) -> Result<T, PlaceError> + 'p;
 
 /// The frame a record names: `frame`, or the robot frame `robot` for a record that names none.
 pub fn frame_or_robot<'f>(frame: Option<&'f str>, robot: &'f FrameName) -> &'f str {
@@ -338,7 +338,7 @@ pub fn parse_plan<const N: usize, const K: usize>(
     arms: &PerArm<ArmModel<N>, K>,
     fingers: &PerArm<Vec<Rider>, K>,
     robot: &FrameName,
-    place: &Placer<Pose>,
+    place: &ValuePlacer<Pose>,
 ) -> Result<PlanQuery<N, K>, RequestError> {
     let (order, starts) = named_arms(
         arms,
@@ -692,7 +692,7 @@ pub fn parse_cartesian<const N: usize, const K: usize>(
     arms: &PerArm<ArmModel<N>, K>,
     fingers: &PerArm<Vec<Rider>, K>,
     robot: &FrameName,
-    place: &Placer<Vec<Pose>>,
+    place: &ValuePlacer<Vec<Pose>>,
 ) -> Result<CartesianQuery<N, K>, RequestError> {
     let id = place_of_arm("arm_name", &raw.arm_name, &robot_arms(arms)).map(ArmId::new)?;
     let arm = &arms[id];
