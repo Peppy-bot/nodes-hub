@@ -67,15 +67,19 @@ fn movement(
     .map_err(rejected)
 }
 
-/// The goal's request parsed and placed, then the base's move slot claimed
-/// for it, or the refusal.
+/// The goal's request parsed and placed by `place`, then the base's move slot
+/// claimed for it, or the refusal. The odometry the robot's tree places by is
+/// read before the placement, and the goal is admitted on it: the control
+/// loop fails a goal whose odometry started over since
+/// ([`BaseStatus::odometry_start`]).
 fn admit<R>(
-    parsed: std::result::Result<R, TargetFailure>,
+    place: impl FnOnce() -> std::result::Result<R, TargetFailure>,
     status: &BaseStatus,
     slot: &MoveSlot,
 ) -> std::result::Result<(R, Admitted), TargetFailure> {
-    let request = parsed?;
-    let admitted = status.admit(clock::now_ns(), slot)?;
+    let placed_by = status.odometry_start();
+    let request = place()?;
+    let admitted = status.admit(clock::now_ns(), placed_by, slot)?;
     Ok((request, admitted))
 }
 
@@ -107,7 +111,7 @@ macro_rules! goal_runner {
                 let accepted = handle
                     .handle_goal_next_request(|request| {
                         Ok(
-                            match admit(parse(&request.data, &config, &placer), &status, &slot) {
+                            match admit(|| parse(&request.data, &config, &placer), &status, &slot) {
                                 Ok(goal) => {
                                     *lock_ignoring_poison(&admitted) = Some(goal);
                                     $action::GoalDecision::accept()

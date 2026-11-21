@@ -111,9 +111,9 @@ from its last command, the leader's newest setpoint and the robot stop, when
 they came after the new time, take it as their time, so the stream and the
 hold last on from it, and an odometry epoch whose last measurement is stamped
 after the new time ends. A goal admitted at a later time than the clock reads
-when it reaches the loop fails the same way, and so does a goal admitted by
-an odometry that started over before the loop takes it, its message `the
-base's odometry started over`.
+when it reaches the loop fails the same way, and so does a goal placed by an
+odometry that started over before the loop takes it, its message `the base's
+odometry started over`.
 
 ## The follower
 
@@ -184,15 +184,18 @@ whose stamp lies within 0.2 s of the newest lies within its rest bound,
 `x.rest_velocity`, 0 along y, and `angular.rest_rate` (`rest.rs`).
 
 The node publishes the transforms it measures on `transforms`, each set in a
-message of its own (`transforms.rs`). With each `base_states` goes the
+message of its own (`transforms.rs`). Before each `base_states` goes the
 transform odom to base_footprint at the pose the state reports, under the
 state's stamp and started at its `odometry_start_timestamp`, so it starts over
-with each epoch. At each measurement the odometry takes go the transforms of
-the two wheel joints, each wheel's link at its joint's origin turned about its
-axle by its measured angle, under the measurement's stamp and started when the
-node started, so an epoch that starts over leaves their start. The model's
-fixed joints are the robot initializer's: the node publishes nothing on
-`static_transforms`.
+with each epoch. The robot's tree takes it first, and the goals are placed by
+that odometry from then: a goal sent on a `base_states` is placed by the
+odometry it reports, and a goal placed by an odometry before a start-over
+fails as the loop takes it. At each measurement the odometry takes go the
+transforms of the two wheel joints, each wheel's link at its joint's origin
+turned about its axle by its measured angle, under the measurement's stamp and
+started when the node started, so an epoch that starts over leaves their
+start. The model's fixed joints are the robot initializer's: the node
+publishes nothing on `static_transforms`.
 
 ## Goals
 
@@ -206,7 +209,8 @@ along z or turns about x or y, and a velocity outside describe_base's limits,
 each message naming the value as placed and what to send; then admit it,
 claiming the base's move slot (control_core's `MoveSlot`):
 
-- `resource_unavailable` while the wheels are silent;
+- `resource_unavailable` while the wheels are silent, and before
+  `base_states` reports their odometry;
 - `leader_streaming` while the leader streams, followed or held;
 - `precondition_failed` while another goal holds the slot: while it runs, and
   while the base still comes to rest from it.

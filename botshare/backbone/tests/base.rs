@@ -1433,6 +1433,47 @@ async fn wheels_that_start_over_under_a_goal_take_the_next_goal_at_once_from_res
     rig.shutdown().await;
 }
 
+// The wheels start over at a measurement stamped a step past the node's
+// clock, whose report goes out once the clock reads its stamp. Until then the
+// robot's tree places by the odometry before: a move placed by it in that
+// time fails as the loop takes it, before the base steers to old odometry
+// coordinates in the new odometry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_goal_placed_by_the_odometry_before_a_start_over_fails_as_the_loop_takes_it() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    // The wheels roll the base one wheel radius ahead.
+    rig.wheels = [1.0, 1.0];
+    rig.step().await;
+    rig.wheels = [20.0, 20.0];
+    let later_ns = rig.now_ns + STEP_NS;
+    rig.publish_wheels_stamped(later_ns).await;
+    rig.transforms_at(later_ns, &WHEEL_LINKS).await;
+    let goal = rig.send_move(&move_goal(1.2, 0.0, 0.0, 1.0)).await;
+    assert!(goal.accepted, "{:?}", goal.refusal);
+    let result = goal.get_result(ANSWER_BUDGET).await.expect("a result");
+    let move_base::ResultOutcome::Failed(failure) = result.outcome else {
+        panic!(
+            "a move placed by the odometry before fails: {:?}",
+            result.outcome
+        );
+    };
+    assert_eq!(failure.kind, move_base::FailureKind::ResourceUnavailable);
+    assert_eq!(failure.message, "the base's odometry started over");
+    // The new odometry's first report goes out once the clock reads its
+    // stamp, and a goal placed by it runs.
+    rig.now_ns = later_ns;
+    rig.tick().await;
+    rig.state_at(later_ns).await;
+    let next = rig.send_move(&move_goal(1.2, 0.0, 0.0, 1.0)).await;
+    assert!(next.accepted, "{:?}", next.refusal);
+    rig.step().await;
+    assert!(
+        forward_speed(&rig.wheel_setpoint_at(rig.now_ns).await) > 0.0,
+        "the move placed by the new odometry drives"
+    );
+    rig.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clock_that_goes_back_fails_the_goal_brings_the_base_to_rest_and_starts_the_odometry_over()
  {

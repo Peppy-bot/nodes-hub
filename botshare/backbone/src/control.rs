@@ -868,7 +868,8 @@ impl Base {
     /// moves the base again before a goal or the leader asks it to, and
     /// base_states' rest and reports start over. When an open epoch ran, the
     /// wheels' positions started over, and a goal in flight fails with
-    /// `resource_unavailable`.
+    /// `resource_unavailable`. The goals are placed by the new odometry from
+    /// its first report on ([`Base::publish`]).
     async fn start_epoch(&mut self, state: WheelState) {
         if self.epoch.as_ref().is_some_and(|epoch| !epoch.closed) {
             warn!(
@@ -889,7 +890,6 @@ impl Base {
             .anchor_wheels(left, right)
             .expect("the wheel stream drops every measurement whose angles are not finite");
         let odometry_start = self.new_odometry_start();
-        self.status.set_odometry_start(odometry_start);
         let held_ns = clock::now_ns().unwrap_or(state.timestamp_ns);
         self.epoch = Some(Epoch {
             follower: state.follower.clone(),
@@ -954,7 +954,7 @@ impl Base {
         let refusal = refusal_at_start(
             self.slot.take_stop(),
             clock_went_back,
-            goal.claim.odometry_start() != odometry_start,
+            Some(goal.claim.odometry_start()) != odometry_start,
         );
         match refusal {
             None => self.goal = Some(goal),
@@ -1139,31 +1139,34 @@ impl Base {
         self.publishers.wheels.publish(message).await;
     }
 
-    /// Publish `message` on transforms, the log naming why a set of
-    /// transforms makes no message, and take it into the robot's tree.
+    /// Take `message` into the robot's tree and publish it on transforms, the
+    /// log naming why a set of transforms makes no message: whether the tree
+    /// took it.
     async fn publish_transforms(
         &mut self,
         message: std::result::Result<MovingMessage, TransformsError>,
-    ) {
+    ) -> bool {
         let publishers = &mut self.publishers;
         let message = match message {
             Ok(message) => message,
             Err(e) => {
-                return publishers
+                publishers
                     .transforms
                     .log_throttled(|| error!("transforms build: {e}"));
+                return false;
             }
         };
-        if let Err(e) = publishers
+        let taken = publishers
             .tree
-            .take_moving(&publishers.measured_by, &message)
-        {
+            .take_moving(&publishers.measured_by, &message);
+        if let Err(e) = &taken {
             publishers
                 .transforms
                 .log_throttled(|| error!("the robot's tree refused the transforms: {e}"));
         }
         let payload = transforms::payload(message);
         publishers.transforms.publish(payload).await;
+        taken.is_ok()
     }
 
     /// At `now_ns`, while the wheels report: publish the due report once the
@@ -1191,12 +1194,15 @@ impl Base {
         }
     }
 
-    /// Publish `report` at `now_ns` on base_states, on drive_states to the
-    /// leader, with its follow_state, and on transforms as the transform odom
-    /// to base_footprint. The mode is standing while the base rests by
-    /// base_state's rule as of the report and moving otherwise: the node
-    /// senses no state of the base's drives. The base carries no limb, so its
-    /// parts stand within its footprint.
+    /// Publish `report` at `now_ns`: first on transforms as the transform
+    /// odom to base_footprint, which the robot's tree takes, and from which
+    /// the goals are placed by the report's odometry
+    /// ([`BaseStatus::odometry_start`]), so a goal sent on a report is placed
+    /// by its odometry; then on base_states, and on drive_states to the
+    /// leader, with its follow_state. The mode is standing while the base
+    /// rests by base_state's rule as of the report and moving otherwise: the
+    /// node senses no state of the base's drives. The base carries no limb,
+    /// so its parts stand within its footprint.
     async fn publish(&mut self, report: StateReport, now_ns: i64) {
         self.published = Some(Published {
             report,
@@ -1210,6 +1216,10 @@ impl Base {
             angular,
         } = report;
         let timestamp = wire_from_ns(timestamp_ns);
+        let odometry = transforms::odometry_message(timestamp, pose, odometry_start);
+        if self.publish_transforms(odometry).await {
+            self.status.set_odometry_start(odometry_start);
+        }
         let (position, orientation) = transforms::position_and_orientation(pose);
         let (linear_velocity, angular_velocity) = ([linear, 0.0, 0.0], [0.0, 0.0, angular]);
         let mode = match self.rest.rests(self.config.axes.rest_bounds()) {
@@ -1252,8 +1262,6 @@ impl Base {
             follow_state.as_str().to_string(),
         );
         self.publishers.drive_states.publish(drive).await;
-        let odometry = transforms::odometry_message(timestamp, pose, odometry_start);
-        self.publish_transforms(odometry).await;
     }
 }
 
