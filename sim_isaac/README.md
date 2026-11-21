@@ -226,16 +226,19 @@ Everything downstream of `attach` takes the robot's own model:
   each wheel's loop cleared and its base's setpoint dropped;
 - for a robot that rolls, the rate loop of each wheel (`engine/wheel_loop.py`),
   as its driver runs the wheel in profile velocity mode. Its stage authors
-  the loop as the PD on the wheel's angle that the loop is: the integral
-  gain `ki` as the drive's stiffness, the proportional gain `kp` as its
-  damping and the motor's torque as its maximum force, which the engine
-  reads as the robot stands, refusing a wheel whose drive gives no positive
-  value of the three. PhysX drives a joint as a PD controller, implicit over
-  the step, capped at its maximum force: the engine runs each wheel's drive
-  with no stiffness, `kp` as its damping and the torque as its maximum force,
-  and each step sets its target velocity to the rate plus `ki` / `kp` times
-  the integral of the rate's error, so the drive's torque is `kp` times the
-  rate's error plus `ki` times that integral, capped together. The integral is the angle the target rates carry
+  the loop: a velocity drive with no stiffness, the proportional gain `kp`
+  as its damping and the motor's torque as its maximum force, which PhysX
+  applies as authored, and the integral gain `ki` as the joint's
+  `peppy:rateLoop:integralGain`. The engine reads the three as the robot
+  stands, refusing a wheel whose drive has a stiffness or whose three are no
+  positive numbers. PhysX drives a joint as a PD controller, implicit over
+  the step, capped at its maximum force, and each step the engine sets the
+  drive's target velocity to the rate plus `ki` / `kp` times the integral of
+  the rate's error, so the drive's torque is `kp` times the rate's error plus
+  `ki` times that integral, capped together. The integral rides the target
+  velocity: PhysX holds a revolute joint without limits wrapped at a full
+  turn and takes no target position past two turns on it, so a target
+  position cannot follow the angle the rates carry the wheel to. The integral is the angle the target rates carry
   the wheel to less the angle it turned, summed each step from the angles the
   articulation reads and clamped at the torque over `ki` either way. PhysX
   wraps the angle of a joint without limits at a full turn, so the loop
@@ -260,7 +263,8 @@ it through PhysX articulation views, so the USD:
   `PhysicsPrismaticJoint` with finite limits, which a gripper's span is read
   from, or a wheel's `PhysicsRevoluteJoint` without limits, and a
   `PhysicsDriveAPI`, which the gains and the start posture are written to,
-  and which a wheel's rate loop is read from;
+  and which a wheel's rate loop is read from with the joint's
+  `peppy:rateLoop:integralGain`;
 - keeps links and joints out of instanceable prims; visual and collision
   geometry below a link may be instanceable;
 - carries no physics scene of its own: the stage's one scene runs the CPU
@@ -741,11 +745,11 @@ is the robot frame, `base_footprint`, with the sum of the inertials of every
 link fixed to it, and each wheel a body of its own. Each link the URDF fixes
 to a body stands under it as a prim of its name, so the depth camera stands
 under `base_camera_link`. Each wheel turns on a revolute joint without limits
-whose drive is the rate loop the MJCF runs it with, as the PD on its angle
-that loop is: the `<intvelocity>` actuator's `kp` as its stiffness, the
-`<velocity>` actuator's `kv` as its damping, the joint's `actuatorfrcrange`
-as its maximum force, with the joint's armature. The engine reads them back
-as the loop it runs. A collider that takes no friction in the MJCF, a
+that carries the rate loop the MJCF runs it with: a velocity drive with no
+stiffness, the `<velocity>` actuator's `kv` as its damping and the joint's
+`actuatorfrcrange` as its maximum force, the `<intvelocity>` actuator's `kp`
+as the joint's `peppy:rateLoop:integralGain` (N m/rad), and the joint's
+armature. The engine reads the three back as the loop it runs. A collider that takes no friction in the MJCF, a
 caster's sphere, takes none on the stage, and each tire grips with the
 friction the MJCF gives it. Each mesh is drawn in a material named after
 it, of its MJCF colour. The robot's prim roots the articulation with no

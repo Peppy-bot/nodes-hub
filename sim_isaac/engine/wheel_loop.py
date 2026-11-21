@@ -7,12 +7,13 @@ with the integral clamped at what the cap holds.
 PhysX drives a joint as a PD controller, implicit over the step: a torque of
 stiffness * (target position - position) + damping * (target velocity -
 velocity), capped at the drive's maximum force. A wheel's stage authors its
-loop as the PD on its angle the loop is: the integral gain as the drive's
-stiffness, the proportional gain as its damping and the motor's torque as its
-maximum force (scripts/build_botshare_base.py), which the engine reads as the
-wheel's RateLoopGains when the robot stands. The engine runs the drive with no
-stiffness, the proportional gain as its damping, and each step sets its
-target velocity to the rate plus the integral term over that gain:
+drive as a velocity drive, no stiffness, the loop's proportional gain as its
+damping and the motor's torque as its maximum force, and the loop's integral
+gain as the joint's attribute INTEGRAL_GAIN_ATTRIBUTE
+(scripts/build_botshare_base.py); the engine reads the three as the wheel's
+RateLoopGains when the robot stands, and PhysX applies the drive as
+authored. Each step the engine sets the drive's target velocity to the rate
+plus the integral term over the damping:
 
     damping * (rate + ki / kp * integral - velocity)
         = kp * (rate - velocity) + ki * integral
@@ -22,6 +23,14 @@ torque. The integral of the rate's error is the angle the target rates carry
 the wheel to less the angle it turned; the engine sums it at each step from
 the angles the articulation reads, and clamps it at the cap over ki either
 way, as a drive clamps its integral at its current limit.
+
+The integral term rides the target velocity: as the stiffness of a PD on the
+angle, it would need the target position to follow the angle the target
+rates carry the wheel to without end, and PhysX holds a revolute joint
+without limits wrapped at a full turn, takes no target position past two
+turns on it, and drives toward a target by its plain difference from the
+position (PhysX's NpArticulationJointReducedCoordinate::setDriveTarget and
+FeatherstoneArticulation::setupInternalConstraintsRecursive).
 
 PhysX wraps the angle of a revolute joint without limits at a full turn, and
 sets every joint back to its stage's state when the timeline stops. The loop
@@ -35,6 +44,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, replace
 from typing import Optional
+
+
+# The attribute of a wheel's joint on its stage that holds its rate loop's
+# integral gain (N*m/rad).
+INTEGRAL_GAIN_ATTRIBUTE = "peppy:rateLoop:integralGain"
 
 
 @dataclass(frozen=True)

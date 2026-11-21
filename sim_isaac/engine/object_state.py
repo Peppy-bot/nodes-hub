@@ -22,15 +22,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from control_core_py.geometry import rotate, xyzw_of_wxyz
+from sim_robot_core.object_state import AT_REST, RobotRecord
 
 # The stage root of runtime objects. The launcher spawns, moves and removes
 # each scene_manipulation object at object_prim_path(object_id), the path the
 # reader reads it from.
 RUNTIME_OBJECTS_PATH = "/World/RuntimeObjects"
-
-# The velocities of a body at rest (m/s, rad/s).
-AT_REST = (0.0, 0.0, 0.0)
-
 
 @dataclass(frozen=True)
 class ObjectRecord:
@@ -58,32 +55,6 @@ class ObjectRecord:
             "physics": self.physics,
             "mass": self.mass,
             "scale": self.scale,
-            "position": list(self.position),
-            "orientation": list(self.orientation),
-            "linear_velocity": list(self.linear_velocity),
-            "angular_velocity": list(self.angular_velocity),
-        }
-
-
-@dataclass(frozen=True)
-class RobotRecord:
-    """One standing robot in a snapshot: the name it stands under, its model,
-    and the world pose of its robot frame, the root link of its description
-    (orientation a unit quaternion x, y, z, w), with its world-axis
-    velocities there."""
-
-    robot: str
-    model: str
-    position: tuple[float, float, float]
-    orientation: tuple[float, float, float, float]
-    linear_velocity: tuple[float, float, float]
-    angular_velocity: tuple[float, float, float]
-
-    def fields(self) -> dict:
-        """The record as the generated object_state item types take it."""
-        return {
-            "robot": self.robot,
-            "model": self.model,
             "position": list(self.position),
             "orientation": list(self.orientation),
             "linear_velocity": list(self.linear_velocity),

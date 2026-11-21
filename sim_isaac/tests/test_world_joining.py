@@ -400,18 +400,20 @@ class TestStageHeldToTheDescription:
 _WHEELS = {"left_wheel_joint": "left_wheel_link", "right_wheel_joint": "right_wheel_link"}
 
 
-# Each wheel's drive as a stage authors it, per degree: stiffness and damping
-# of 64 and 128 N m/rad, and of 32 and 96, and the cap.
-_DRIVES = {
-    "left_wheel_joint": (math.radians(64.0), math.radians(128.0), 16.0),
-    "right_wheel_joint": (math.radians(32.0), math.radians(96.0), 12.0),
+# Each wheel's rate loop as a stage authors it: a velocity drive of its
+# proportional gain, per degree, capped at its torque, and its integral gain:
+# 128 and 64, and 96 and 32 N m/rad.
+_LOOPS = {
+    "left_wheel_joint": (math.radians(128.0), 16.0, 64.0),
+    "right_wheel_joint": (math.radians(96.0), 12.0, 32.0),
 }
+_INTEGRAL_GAIN = "peppy:rateLoop:integralGain"
 
 
 def _rolling_stage():
     """A botshare base as its entry expects it on the stage: its robot frame,
     base_footprint, a rigid body no joint moves, and each wheel a rigid body
-    on a revolute joint without limits whose drive is its rate loop, kept
+    on a revolute joint without limits that carries its rate loop, kept
     under a scope."""
     stage = Usd.Stage.CreateInMemory()
     root = stage.DefinePrim("/World/delta", "Xform")
@@ -422,10 +424,11 @@ def _rolling_stage():
         revolute.CreateBody0Rel().SetTargets(["/World/delta/base_footprint"])
         revolute.CreateBody1Rel().SetTargets([f"/World/delta/{wheel}"])
         drive = UsdPhysics.DriveAPI.Apply(revolute.GetPrim(), "angular")
-        stiffness, damping, cap = _DRIVES[joint]
-        drive.CreateStiffnessAttr(stiffness)
+        damping, cap, integral = _LOOPS[joint]
+        drive.CreateStiffnessAttr(0.0)
         drive.CreateDampingAttr(damping)
         drive.CreateMaxForceAttr(cap)
+        revolute.GetPrim().CreateAttribute(_INTEGRAL_GAIN, Sdf.ValueTypeNames.Float, True).Set(integral)
     return stage, root, known("botshare_base")
 
 
@@ -478,12 +481,13 @@ class TestARollingStage:
 
 
 class TestAWheelsLoop:
-    def test_each_wheel_runs_the_loop_its_stage_authors_left_then_right(self):
+    def test_each_wheel_runs_the_loop_its_stage_carries_left_then_right(self):
         world = world_module()
         _, root, model_known = _rolling_stage()
 
         loops = world.World._wheel_loops(root, model_known)
 
+        assert world.INTEGRAL_GAIN_ATTRIBUTE == _INTEGRAL_GAIN
         assert [(loop.kp, loop.ki, loop.max_torque) for loop in loops] == [
             (pytest.approx(128.0), pytest.approx(64.0), pytest.approx(16.0)),
             (pytest.approx(96.0), pytest.approx(32.0), pytest.approx(12.0)),
@@ -495,14 +499,13 @@ class TestAWheelsLoop:
 
         assert world.World._wheel_loops(root, model_known) == ()
 
-    @pytest.mark.parametrize("attribute", ["stiffness", "damping", "maxForce"])
-    def test_a_wheel_whose_drive_gives_no_positive_value_is_refused(self, attribute):
+    def test_a_wheel_whose_drive_has_a_stiffness_is_refused(self):
         world = world_module()
         stage, root, model_known = _rolling_stage()
         prim = stage.GetPrimAtPath("/World/delta/joints/right_wheel_joint")
-        prim.GetAttribute(f"drive:angular:physics:{attribute}").Set(0.0)
+        UsdPhysics.DriveAPI(prim, "angular").GetStiffnessAttr().Set(1.0)
 
-        with pytest.raises(RuntimeError, match=r"drives the wheel 'right_wheel_joint' with stiffness, damping and maximum force"):
+        with pytest.raises(RuntimeError, match=r"drives the wheel 'right_wheel_joint' with no velocity drive"):
             world.World._wheel_loops(root, model_known)
 
     def test_a_wheel_with_no_drive_is_refused(self):
@@ -510,15 +513,41 @@ class TestAWheelsLoop:
         stage, root, model_known = _rolling_stage()
         stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").RemoveAPI(UsdPhysics.DriveAPI, "angular")
 
-        with pytest.raises(RuntimeError, match=r"drives the wheel 'left_wheel_joint' with stiffness, damping and maximum force \[\]"):
+        with pytest.raises(RuntimeError, match=r"drives the wheel 'left_wheel_joint' with no velocity drive"):
+            world.World._wheel_loops(root, model_known)
+
+    @pytest.mark.parametrize(
+        ("attribute", "named"),
+        [
+            ("drive:angular:physics:damping", "damping"),
+            ("drive:angular:physics:maxForce", "maximum force"),
+            (_INTEGRAL_GAIN, _INTEGRAL_GAIN),
+        ],
+    )
+    @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+    def test_a_wheel_whose_loop_takes_no_positive_number_is_refused(self, attribute, named, value):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/right_wheel_joint").GetAttribute(attribute).Set(value)
+
+        with pytest.raises(RuntimeError, match=rf"gives the wheel 'right_wheel_joint' \{{'{named}'"):
+            world.World._wheel_loops(root, model_known)
+
+    def test_a_wheel_with_no_integral_gain_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").RemoveProperty(_INTEGRAL_GAIN)
+
+        with pytest.raises(RuntimeError, match=rf"gives the wheel 'left_wheel_joint' \{{'{_INTEGRAL_GAIN}': None\}}"):
             world.World._wheel_loops(root, model_known)
 
     def test_a_wheels_drive_capped_at_nothing_is_refused(self):
         """A drive left at USD's default force has no cap."""
         world = world_module()
         stage, root, model_known = _rolling_stage()
-        prim = stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint")
-        prim.GetAttribute("drive:angular:physics:maxForce").Clear()
+        stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").GetAttribute(
+            "drive:angular:physics:maxForce"
+        ).Clear()
 
-        with pytest.raises(RuntimeError, match=r"'left_wheel_joint' with stiffness, damping and maximum force \[.*inf\]"):
+        with pytest.raises(RuntimeError, match=r"gives the wheel 'left_wheel_joint' \{'maximum force': inf\}"):
             world.World._wheel_loops(root, model_known)

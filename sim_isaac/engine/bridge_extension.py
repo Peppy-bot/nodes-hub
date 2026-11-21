@@ -93,10 +93,9 @@ class RobotLimbs:
             gripper.name: IsaacGripperSensor(prim, finger_joints=list(gripper.joints))
             for gripper in self.entry.grippers
         }
-        # The controller of the base's wheels, each on a velocity drive: no
-        # stiffness, its rate loop's proportional gain as its damping and its
-        # motor's torque as its maximum force, as its stage authors the loop;
-        # none for a robot that stands where it is placed.
+        # The controller of the base's wheels, each on the velocity drive its
+        # stage authors, which it keeps; none for a robot that stands where
+        # it is placed.
         base = self.entry.base
         self.base_actuator: Optional[IsaacActuatorCtrl] = (
             None
@@ -104,12 +103,7 @@ class RobotLimbs:
             else IsaacActuatorCtrl(
                 prim,
                 joint_names=list(base.wheels),
-                params={
-                    "joint_names": list(base.wheels),
-                    "kp": [0.0] * len(base.wheels),
-                    "kd": [loop.kp for loop in robot.wheel_loops],
-                    "max_efforts": [loop.max_torque for loop in robot.wheel_loops],
-                },
+                params={"joint_names": list(base.wheels), "kp": [], "kd": [], "max_efforts": []},
                 name=f"{base.name}_{view}",
             )
         )

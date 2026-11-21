@@ -475,14 +475,24 @@ def _step_at(rolling, now_s, left=0.0, right=0.0):
 
 
 class TestDrivingABase:
-    def test_the_wheels_drives_run_with_no_stiffness_on_the_loops_their_stage_authors(self, engine, rolling):
+    def test_the_wheels_keep_the_drives_their_stage_authors(self, engine, rolling):
+        """The engine applies no gain of its own to a wheel's drive."""
         prim, joints, params, _ = engine.views.actuators["base_delta"]
         assert (prim, joints) == ("/World/delta", list(_WHEELS))
-        assert params == {
-            "joint_names": list(_WHEELS),
-            "kp": [0.0, 0.0],
-            "kd": [128.0, 96.0],
-            "max_efforts": [16.0, 12.0],
+        assert params == {"joint_names": list(_WHEELS), "kp": [], "kd": [], "max_efforts": []}
+
+    def test_a_stalled_wheels_target_holds_at_its_cap_over_its_proportional_gain(self, engine, rolling):
+        """The integral clamps at the cap over ki, so the target velocity
+        stands at most the cap over kp above the rate, each wheel by its own
+        loop."""
+        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -2.0))
+        for step in range(120):
+            _step_at(rolling, step * _STEP_S)
+
+        (targets,) = _wheel_targets(engine).call_args.args
+        assert targets == {
+            "left_wheel_joint": pytest.approx(2.0 + 16.0 / 128.0),
+            "right_wheel_joint": pytest.approx(-2.0 - 12.0 / 96.0),
         }
 
     def test_each_wheel_follows_the_rate_of_its_setpoint_through_its_loop(self, engine, rolling):

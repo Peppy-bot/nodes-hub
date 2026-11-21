@@ -19,11 +19,11 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, wxyz_of_xyzw
+from sim_robot_core.object_state import AT_REST
 
 import head_camera
 from isaac_models import IsaacModel
-from object_state import AT_REST
-from wheel_loop import RateLoopGains
+from wheel_loop import INTEGRAL_GAIN_ATTRIBUTE, RateLoopGains
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,12 @@ def _stage_limits(prim) -> tuple[float, float]:
         return math.radians(lower), math.radians(upper)
     joint = UsdPhysics.PrismaticJoint(prim)
     return float(joint.GetLowerLimitAttr().Get()), float(joint.GetUpperLimitAttr().Get())
+
+
+# What a wheel's drive that is not its rate loop asks for.
+_REBUILD_THE_BUNDLE = (
+    "Pin the asset bundle scripts/build_botshare_base.py builds in sim_base_images/isaac_assets.env"
+)
 
 
 def _same_limit(stage: float, described: float) -> bool:
@@ -551,11 +557,13 @@ class World:
     @staticmethod
     def _wheel_loops(root, known: IsaacModel) -> tuple[RateLoopGains, ...]:
         """The rate loop of each wheel of the robot's base, left then right,
-        as its stage authors it: the PD on the wheel's angle the loop is, its
-        stiffness the integral gain and its damping the proportional gain,
-        per degree as USD writes an angular drive's, and its maximum force
-        the motor's torque. None for a robot with no base. A wheel whose drive
-        gives no positive finite value of the three is refused."""
+        as its stage authors it: a velocity drive, no stiffness, the
+        proportional gain as its damping, per degree as USD writes an
+        angular drive's, and the motor's torque as its maximum force, and the
+        integral gain as the joint's INTEGRAL_GAIN_ATTRIBUTE. None for a
+        robot with no base. A wheel whose drive has a stiffness, or whose
+        damping, maximum force or integral gain is no positive finite number,
+        is refused."""
         from pxr import UsdPhysics  # pylint: disable=C0415
 
         base = known.entry.base
@@ -565,24 +573,37 @@ class World:
         loops = []
         for wheel in base.wheels:
             prim = joints.get(wheel)
-            values = []
-            if prim is not None and prim.HasAPI(UsdPhysics.DriveAPI, ANGULAR):
-                drive = UsdPhysics.DriveAPI(prim, ANGULAR)
-                values = [
-                    attribute.Get()
-                    for attribute in (drive.GetStiffnessAttr(), drive.GetDampingAttr(), drive.GetMaxForceAttr())
-                ]
-            if len(values) != 3 or not all(
-                value is not None and math.isfinite(value) and value > 0.0 for value in values
-            ):
+            drive = (
+                UsdPhysics.DriveAPI(prim, ANGULAR)
+                if prim is not None and prim.HasAPI(UsdPhysics.DriveAPI, ANGULAR)
+                else None
+            )
+            if drive is None or drive.GetStiffnessAttr().Get() != 0.0:
                 raise RuntimeError(
-                    f"{known.stage} drives the wheel '{wheel}' with stiffness, damping and maximum force "
-                    f"{values}: a wheel's drive is its rate loop, each value positive. Pin the asset "
-                    "bundle scripts/build_botshare_base.py builds in sim_base_images/isaac_assets.env"
+                    f"{known.stage} drives the wheel '{wheel}' with no velocity drive: a wheel's drive "
+                    f"has no stiffness. {_REBUILD_THE_BUNDLE}"
                 )
-            stiffness, damping, max_force = values
+            values = {
+                "damping": drive.GetDampingAttr().Get(),
+                "maximum force": drive.GetMaxForceAttr().Get(),
+                INTEGRAL_GAIN_ATTRIBUTE: prim.GetAttribute(INTEGRAL_GAIN_ATTRIBUTE).Get(),
+            }
+            unusable = {
+                name: value
+                for name, value in values.items()
+                if value is None or not math.isfinite(value) or value <= 0.0
+            }
+            if unusable:
+                raise RuntimeError(
+                    f"{known.stage} gives the wheel '{wheel}' {unusable}: its rate loop takes a positive "
+                    f"number of each. {_REBUILD_THE_BUNDLE}"
+                )
             loops.append(
-                RateLoopGains(kp=math.degrees(damping), ki=math.degrees(stiffness), max_torque=float(max_force))
+                RateLoopGains(
+                    kp=math.degrees(values["damping"]),
+                    ki=float(values[INTEGRAL_GAIN_ATTRIBUTE]),
+                    max_torque=float(values["maximum force"]),
+                )
             )
         return tuple(loops)
 
