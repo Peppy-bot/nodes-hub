@@ -145,3 +145,67 @@ macro_rules! goal_runner {
 
 goal_runner!(run_drive_base, drive_base, drive, Drive);
 goal_runner!(run_move_base, move_base, movement, Move);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::f64::consts::FRAC_PI_2;
+    use std::time::{Duration, SystemTime};
+
+    use control_core::node_clock::NodeClock;
+    use control_core::robot_tree::RobotTree;
+    use frame_tree::arithmetic::quaternion_of_yaw;
+    use frame_tree::{Publisher, StaticMessage, TransformRecord};
+
+    use crate::config::BaseParameters;
+    use crate::test_rig::params;
+    use crate::transforms::robot_frame;
+
+    // A drive_base velocity in a frame turned a quarter turn about +z from the
+    // robot frame is placed in the robot frame before the base's limits judge
+    // it: 0.1 m/s along that frame's -y is 0.1 m/s ahead, and its turn about z
+    // keeps its rate.
+    #[test]
+    fn a_drive_in_a_turned_frame_is_placed_in_the_robot_frame() {
+        let tree =
+            RobotTree::new(Duration::from_secs(10), NodeClock::wall()).expect("a window above 0");
+        let initializer = Publisher {
+            core_node: "core".to_owned(),
+            instance_id: "initializer".to_owned(),
+        };
+        let turned = StaticMessage {
+            transforms: vec![TransformRecord::new(
+                "base_footprint",
+                "turned",
+                [0.2, 0.0, 0.3],
+                quaternion_of_yaw(FRAC_PI_2),
+            )],
+        };
+        tree.take_static(&initializer, &turned)
+            .expect("the turned frame");
+        let placer = Placer::new(Arc::new(tree), robot_frame(), Duration::ZERO);
+        let config = BaseParameters::parse(&params())
+            .expect("the rig's parameters")
+            .configure("botshare_base", SystemTime::UNIX_EPOCH)
+            .expect("the bundled base");
+        let data = drive_base::GoalRequestData {
+            velocity: drive_base::GoalVelocity {
+                frame: Some("turned".to_owned()),
+                timestamp: None,
+                linear_velocity: [0.0, -0.1, 0.0],
+                angular_velocity: [0.0, 0.0, 0.2],
+            },
+            hold_duration_s: 1.0,
+            settle_timeout_s: 1.0,
+        };
+        let request = drive(&data, &config, &placer).expect("a drive in the turned frame");
+        let velocity = request.velocity;
+        assert!(
+            (velocity.linear_x() - 0.1).abs() < 1e-12
+                && velocity.linear_y() == 0.0
+                && (velocity.angular_z() - 0.2).abs() < 1e-12,
+            "{velocity:?}"
+        );
+    }
+}
