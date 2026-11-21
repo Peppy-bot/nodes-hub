@@ -35,7 +35,9 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
+use control_core::chase::rate_limited;
 use control_core::filters::LowPassFilter;
+use control_core::move_slot::MoveSlot;
 use control_core::pacer::Pacer;
 use control_core::robot_tree::RobotTree;
 use control_core::stop_reason::stop_reason;
@@ -49,7 +51,6 @@ use crate::gripper_move::{
     service_gripper_move,
 };
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
-use crate::move_slot::MoveSlot;
 use crate::path_checks::PathChecks;
 use crate::planner::{
     self, ArmMoveRequest, Goal, Measurement, PathGoal, PathJudgment, PlanCheck, Planner,
@@ -60,7 +61,6 @@ use crate::robot::{ARMS, LIMBS};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
 use crate::transforms::JointTransforms;
 use crate::upstream::{Upstream, UpstreamMode};
-use control_core::chase::rate_limited;
 
 /// How long [`seed_all`] waits for an arm's first measured state before warning that
 /// the backbone is still blocked, so a silent arm is visible in the log instead of an
@@ -573,7 +573,7 @@ async fn serve_queued(
 ///   but not started. The planner ends an arm's move; the gripper's
 ///   terminal ends a gripper's move. A goal that holds a limb and that the
 ///   loop has not taken yet is marked on its move slot
-///   ([`MoveSlot::stop_unstarted`](crate::move_slot::MoveSlot::stop_unstarted)),
+///   ([`MoveSlot::stop_unstarted`](control_core::move_slot::MoveSlot::stop_unstarted)),
 ///   and ends when the loop takes it.
 /// - Each goal the stop ends is cancelled, for a reason that names the
 ///   stop. The answer names each limb whose move in flight, queued goal or

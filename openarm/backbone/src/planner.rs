@@ -27,6 +27,7 @@ use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 
 use control_core::chase::{chase_along, chase_step};
 use control_core::geometry::pose_arrays;
+use control_core::move_slot::{MoveSlot, SlotRelease};
 use control_core::path_timing::{JointTrajectory, distinct_joint_waypoints};
 use control_core::positive_finite::PositiveFinite;
 use control_core::time::{duration_from_secs, ticks_within};
@@ -39,9 +40,8 @@ use srs_model::{Arm, JointVec, Limit, plan_line};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-use crate::failure::{Failure, FailureKind, PathFailure};
+use crate::failure::{ARM_BUSY, Failure, FailureKind, PathFailure};
 use crate::governor::{HandBasis, PathArms};
-use crate::move_slot::{ARM_BUSY, MoveSlot, SlotRelease};
 use crate::publish::clock_now;
 use crate::robot::LIMBS;
 use crate::settle::{

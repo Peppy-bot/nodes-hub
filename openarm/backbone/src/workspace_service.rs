@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use camera_core::pinhole::{Intrinsics, Pinhole};
 use control_core::geometry::{Point, Stamped, report_timestamp};
-use control_core::robot_tree::PlacedValue;
+use control_core::robot_tree::{PlacedValue, Placer, Unplaced};
 use control_core::serving;
 use control_core::sync::wait_for;
 use peppygen::NodeRunner;
@@ -34,8 +34,6 @@ use tracing::info;
 use workspace_core::Camera;
 use workspace_core::design::{Positions, PositionsError, SurfaceHeight, ViewCheck};
 
-use crate::failure::Unplaced;
-use crate::placement::Placer;
 use crate::workspace::{CameraGeometryError, PerceptionCamera, Workspace, depth_from_wire};
 
 /// How long a request waits for each of the camera's answers: short, so a
@@ -197,7 +195,10 @@ fn placed_points(
         Stamped::parse(frame, request.timestamp, points).map_err(|e| rejected(e.to_string()))?;
     placer.place_now(&stamped).map_err(|e| {
         let unplaced = Unplaced::of("the points", &e);
-        Failure::new(unplaced.kind.into(), unplaced.message)
+        Failure::new(
+            unplaced.kind.of_member(check_positions::FailureKind::parse),
+            unplaced.message,
+        )
     })
 }
 

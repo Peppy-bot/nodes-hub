@@ -213,14 +213,16 @@ async fn a_non_positive_start_tolerance_is_refused_by_name() {
 }
 
 /// 0, a value that rounds to no time and one longer than a timer holds are
-/// each refused with the text that says what to give.
+/// each refused naming the parameter, then the text that says what to give.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_answer_timeout_no_timer_holds_is_refused_saying_what_to_give() {
-    for seconds in [0.0, 1e-10, 1e300] {
+    for (seconds, why) in [
+        (0.0, "must be a positive finite number of seconds, got 0"),
+        (1e-10, "1e-10 s rounds to no time at all"),
+        (1e300, "1e300 s is longer than a Duration holds"),
+    ] {
         let text = refusal(|p| p.stop_answer_timeout_s = seconds).await;
-        let expected = format!(
-            "parameter stop_answer_timeout_s must be a number of seconds a timer holds, got {seconds}"
-        );
+        let expected = format!("parameter stop_answer_timeout_s: {why}");
         assert!(text.contains(&expected), "got: {text}");
     }
 }

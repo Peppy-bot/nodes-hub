@@ -6,20 +6,20 @@
 //! its posture goal, and a share of a joint path its execute_joint_path goal),
 //! so the backbone keeps its own kind and gives each member its own. A
 //! command the robot's tree cannot place fails with the kind of the placement
-//! ([`Unplaced`]), which only the members that place a frame take:
+//! (control_core's [`Unplaced`](control_core::robot_tree::Unplaced)), which
+//! only the members that place a frame take:
 //! `move_arm` and `check_arm_move` through [`TargetFailure`], and
 //! `check_positions`. A move along a path the backbone plans or judges fails
 //! with `unreachable` where no path reaches its target, which only the
 //! members that run such a path take: `move_arm` and `execute_joint_path`
 //! through [`PathFailure`].
 
-use control_core::robot_tree::PlaceError;
+use control_core::robot_tree;
 use peppygen::exposed_actions::limb_motion::{
     execute_joint_path, move_arm, move_arm_joints, move_gripper,
 };
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::exposed_services::limb_motion::check_arm_move;
-use peppygen::exposed_services::workspace::check_positions;
 
 /// A failure kind of the moves and of `check_arm_move`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,95 +44,20 @@ pub enum FailureKind {
     LeaderStreaming,
 }
 
-/// The failure kind of a placement in the robot's tree, as control_core's
-/// [`PlaceError::failure_kind`] names it: the kind of the lookup, as
-/// transform_lookup names the failures of a lookup, or `rejected` for a
-/// placed value no contract takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlaceKind(&'static str);
-
-impl PlaceKind {
-    pub fn of(error: &PlaceError) -> Self {
-        Self(error.failure_kind())
-    }
-}
-
 /// Why a move is refused or failed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Failure {
-    pub kind: FailureKind,
-    pub message: String,
-}
-
-impl Failure {
-    pub fn new(kind: FailureKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    /// The same failure with `label` before its message: the name of the limb
-    /// whose share of a posture goal failed, or of the arm whose share of a
-    /// path of both arms failed, or that refused a path of both arms.
-    pub fn labelled(self, label: impl std::fmt::Display) -> Self {
-        Self {
-            message: format!("{label}: {}", self.message),
-            ..self
-        }
-    }
-}
-
-/// Why the robot's tree cannot place a command: the kind of the placement,
-/// and a message that names the command, then the cause as transform_lookup's
-/// message does.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Unplaced {
-    pub kind: PlaceKind,
-    pub message: String,
-}
-
-impl Unplaced {
-    /// The failure of the placement `error` of the command `what` names.
-    pub fn of(what: impl std::fmt::Display, error: &PlaceError) -> Self {
-        Self {
-            kind: PlaceKind::of(error),
-            message: format!("{what}: {error}"),
-        }
-    }
-}
+pub type Failure = robot_tree::Failure<FailureKind>;
 
 /// Why the backbone refuses a `move_arm` goal or gives an error reply on a
 /// `check_arm_move` request, the moves that place a target: a failure of the
 /// moves, or a target the robot's tree cannot place.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TargetFailure {
-    Failed(Failure),
-    Unplaced(Unplaced),
-}
+pub type TargetFailure = robot_tree::TargetFailure<FailureKind>;
 
-impl From<Failure> for TargetFailure {
-    fn from(failure: Failure) -> Self {
-        Self::Failed(failure)
-    }
-}
+/// The refusal of a goal, or a plan check, that reaches an arm executing a
+/// move: the one message for both, whichever gate answers it.
+pub const ARM_BUSY: &str = "arm is already executing a motion";
 
-impl From<Unplaced> for TargetFailure {
-    fn from(unplaced: Unplaced) -> Self {
-        Self::Unplaced(unplaced)
-    }
-}
-
-impl TargetFailure {
-    /// The kind `Member`, the generated kind of a member that places a
-    /// target, gives this failure, and its message.
-    pub fn for_member<Member: From<FailureKind> + From<PlaceKind>>(self) -> (Member, String) {
-        match self {
-            Self::Failed(failure) => (failure.kind.into(), failure.message),
-            Self::Unplaced(unplaced) => (unplaced.kind.into(), unplaced.message),
-        }
-    }
-}
+/// The refusal of a gripper goal that reaches a gripper executing a move.
+pub const GRIPPER_BUSY: &str = "gripper is already executing a move";
 
 /// The failure kind `unreachable` of a move along a path the backbone plans
 /// or judges: no path it planned or judged reaches the target.
@@ -175,24 +100,6 @@ pub fn stale_failure() -> Failure {
     )
 }
 
-/// Gives the generated `FailureKind` of `member` each kind of a placement by
-/// the same name, for a member whose contract lists them.
-macro_rules! place_kinds {
-    ($member:ty) => {
-        impl From<PlaceKind> for $member {
-            fn from(kind: PlaceKind) -> Self {
-                Self::parse(kind.0)
-                    .expect("a member that places a frame lists each failure kind of a placement")
-            }
-        }
-    };
-}
-
-// The members that place a frame list the kinds of a lookup and `rejected`.
-place_kinds!(move_arm::FailureKind);
-place_kinds!(check_arm_move::FailureKind);
-place_kinds!(check_positions::FailureKind);
-
 /// Gives the generated `FailureKind` of `member` its `unreachable`, for a
 /// member that runs a path the backbone plans or judges.
 macro_rules! unreachable_kind {
@@ -210,39 +117,32 @@ macro_rules! unreachable_kind {
 unreachable_kind!(move_arm::FailureKind);
 unreachable_kind!(execute_joint_path::FailureKind);
 
-/// Gives the generated `FailureKind` of `member` the kind of the same name.
-macro_rules! member_failure_kinds {
-    ($member:ty) => {
-        impl From<FailureKind> for $member {
-            fn from(kind: FailureKind) -> Self {
-                match kind {
-                    FailureKind::Rejected => Self::Rejected,
-                    FailureKind::PreconditionFailed => Self::PreconditionFailed,
-                    FailureKind::ResourceUnavailable => Self::ResourceUnavailable,
-                    FailureKind::AttemptFailed => Self::AttemptFailed,
-                    FailureKind::Timeout => Self::Timeout,
-                    FailureKind::LeaderStreaming => Self::LeaderStreaming,
-                }
-            }
-        }
-    };
-}
-
-member_failure_kinds!(execute_joint_path::FailureKind);
-member_failure_kinds!(move_arm::FailureKind);
-member_failure_kinds!(move_to_ready::FailureKind);
-member_failure_kinds!(move_to_home::FailureKind);
-member_failure_kinds!(move_arm_joints::FailureKind);
-member_failure_kinds!(move_gripper::FailureKind);
-member_failure_kinds!(check_arm_move::FailureKind);
+control_core::member_failure_kinds!(
+    FailureKind {
+        Rejected,
+        PreconditionFailed,
+        ResourceUnavailable,
+        AttemptFailed,
+        Timeout,
+        LeaderStreaming,
+    } => execute_joint_path::FailureKind,
+        move_arm::FailureKind,
+        move_to_ready::FailureKind,
+        move_to_home::FailureKind,
+        move_arm_joints::FailureKind,
+        move_gripper::FailureKind,
+        check_arm_move::FailureKind,
+);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use control_core::geometry::GeometryError;
+    use control_core::robot_tree::{PlaceError, PlaceKind, Unplaced};
     use frame_tree::{
         BrokenTree, FrameName, HeldStamps, LookupError, LookupTime, Stamp, TransformName,
     };
+    use peppygen::exposed_services::workspace::check_positions;
 
     use crate::robot::LIMBS;
     use crate::test_support::LEFT;
@@ -346,9 +246,11 @@ mod tests {
     fn a_member_that_places_a_frame_gets_each_kind_of_a_placement() {
         for (error, name) in each_place_error() {
             let unplaced = TargetFailure::from(Unplaced::of("the target", &error));
-            let (move_arm, moving) = unplaced.clone().for_member::<move_arm::FailureKind>();
-            let (check_arm_move, checking) = unplaced.for_member::<check_arm_move::FailureKind>();
-            let check_positions = check_positions::FailureKind::from(PlaceKind::of(&error));
+            let (move_arm, moving) = unplaced.clone().for_member(move_arm::FailureKind::parse);
+            let (check_arm_move, checking) =
+                unplaced.for_member(check_arm_move::FailureKind::parse);
+            let check_positions =
+                PlaceKind::of(&error).of_member(check_positions::FailureKind::parse);
             assert_eq!(
                 [
                     move_arm.as_str(),
@@ -368,7 +270,7 @@ mod tests {
     #[test]
     fn a_failure_of_the_moves_reaches_a_member_that_places_a_target_by_its_name() {
         let failed = TargetFailure::from(Failure::new(FailureKind::LeaderStreaming, "streaming"));
-        let (kind, message) = failed.for_member::<move_arm::FailureKind>();
+        let (kind, message) = failed.for_member(move_arm::FailureKind::parse);
         assert_eq!(
             (kind, message.as_str()),
             (move_arm::FailureKind::LeaderStreaming, "streaming")

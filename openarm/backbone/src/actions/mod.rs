@@ -18,14 +18,16 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use control_core::asking::ask_loop;
+use control_core::move_seconds::MoveSeconds;
+use control_core::move_slot::MoveSlot;
 use control_core::positive_finite::PositiveFinite;
 use control_core::sync::wait_for;
 use robot_description::{ArmId, PerArm};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coordinator::CoordinatorRequest;
-use crate::failure::{Failure, FailureKind};
-use crate::move_slot::{ARM_BUSY, GRIPPER_BUSY, MoveSlot};
+use crate::failure::{ARM_BUSY, Failure, FailureKind, GRIPPER_BUSY};
 use crate::robot::{ARMS, LIMBS};
 use crate::settle::ContactGap;
 use crate::streams::LeaderActivity;
@@ -42,23 +44,16 @@ const COORDINATOR_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_MOVE_DURATION_S: f64 = 60.0;
 
 /// Parse a tolerance off the wire: a positive finite number, or the refusal
-/// naming `field`.
+/// naming `field` and the value.
 fn tolerance_from_wire(field: &str, value: f64) -> Result<f64, String> {
-    PositiveFinite::parse(value)
-        .map(PositiveFinite::get)
-        .map_err(|_| format!("{field} must be a positive number"))
+    PositiveFinite::parse_field(field, value).map(PositiveFinite::get)
 }
 
 /// Parse a number of seconds a move may be asked for off the wire, `field`
 /// being `duration_s` or `settle_timeout_s`: from 0 to
-/// [`MAX_MOVE_DURATION_S`], or the refusal naming the field.
+/// [`MAX_MOVE_DURATION_S`], or the refusal naming the field and the value.
 fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, String> {
-    if value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value) {
-        return Ok(Duration::from_secs_f64(value));
-    }
-    Err(format!(
-        "{field} must be a number of seconds from 0 to {MAX_MOVE_DURATION_S:.0}"
-    ))
+    MoveSeconds::from_wire(field, value, MAX_MOVE_DURATION_S).map(MoveSeconds::duration)
 }
 
 /// Parse the `contact_gap_m` of an arm goal off the wire: 0 for no contact
@@ -155,28 +150,16 @@ fn admit_limb(
 }
 
 /// Hand `request` to the coordinator and wait for the answer it sends on
-/// `answer`, for at most `within`. The error names what went wrong:
-/// - the coordinator is not running;
-/// - it has too many requests queued;
-/// - it dropped the request;
-/// - it did not answer in time.
+/// `answer`, for at most `within` ([`ask_loop`]). The error names what went
+/// wrong: the coordinator is not running, it dropped the request, or it did
+/// not take and answer it in time.
 async fn ask_coordinator<T>(
     requests: &mpsc::Sender<CoordinatorRequest>,
     request: CoordinatorRequest,
     answer: oneshot::Receiver<T>,
     within: Duration,
 ) -> std::result::Result<T, String> {
-    requests.try_send(request).map_err(|e| match e {
-        mpsc::error::TrySendError::Full(_) => {
-            "the coordinator has too many requests queued".to_string()
-        }
-        mpsc::error::TrySendError::Closed(_) => "the coordinator is not running".to_string(),
-    })?;
-    match tokio::time::timeout(within, answer).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err("the coordinator dropped the request".to_string()),
-        Err(_) => Err(format!("the coordinator did not answer within {within:?}")),
-    }
+    ask_loop("coordinator", requests, request, answer, within).await
 }
 
 /// The ends the shares of a goal report on `ends`, once `pending` have
@@ -260,62 +243,8 @@ mod tests {
         assert!(!free.is_claimed(), "a refusal claims nothing");
     }
 
-    // --- Tolerances and times off the wire ---------------------------------
-
     use hegel::TestCase;
     use hegel::generators as gs;
-
-    fn admitted_tolerance(value: f64) -> bool {
-        value.is_finite() && value > 0.0
-    }
-
-    // A tolerance off the wire is exactly a positive finite number, kept as it
-    // came; anything else is refused naming the field.
-    #[hegel::test]
-    fn a_tolerance_is_accepted_exactly_when_positive_and_finite(tc: TestCase) {
-        let value: f64 = tc.draw(gs::floats());
-        match tolerance_from_wire("settle_tolerance", value) {
-            Ok(parsed) => {
-                assert!(admitted_tolerance(value), "{value} was accepted");
-                assert_eq!(parsed, value);
-            }
-            Err(refusal) => {
-                assert!(!admitted_tolerance(value), "{value} was refused");
-                assert_eq!(refusal, "settle_tolerance must be a positive number");
-            }
-        }
-    }
-
-    #[test]
-    fn non_finite_zero_and_negative_tolerances_are_refused() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1e-9, -1.0] {
-            assert!(
-                tolerance_from_wire("settle_tolerance", bad).is_err(),
-                "tolerance {bad} must be refused"
-            );
-        }
-    }
-
-    // A number of seconds off the wire is exactly a finite value from 0 to the
-    // move ceiling, carried as a duration.
-    #[hegel::test]
-    fn move_seconds_are_accepted_exactly_within_the_ceiling(tc: TestCase) {
-        let value: f64 = tc.draw(gs::floats());
-        let admitted = value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value);
-        match move_seconds_from_wire("settle_timeout_s", value) {
-            Ok(duration) => {
-                assert!(admitted, "{value} s was accepted");
-                assert_eq!(duration, Duration::from_secs_f64(value));
-            }
-            Err(refusal) => {
-                assert!(!admitted, "{value} s was refused");
-                assert_eq!(
-                    refusal,
-                    "settle_timeout_s must be a number of seconds from 0 to 60"
-                );
-            }
-        }
-    }
 
     // A contact gap off the wire is exactly 0, for no contact check, or a
     // positive finite number of meters, carried as that gap.

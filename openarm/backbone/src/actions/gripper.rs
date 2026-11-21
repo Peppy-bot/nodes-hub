@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::robot::{ARMS, gripper_in};
+use control_core::move_slot::MoveSlot;
 use peppygen::exposed_actions::limb_motion::move_gripper::{
     ActionHandle, GoalDecision, GoalRequestData,
 };
@@ -26,7 +27,6 @@ use tracing::error;
 use crate::actions::{GRIPPER_WORDS, admit_limb, move_seconds_from_wire};
 use crate::failure::{Failure, FailureKind};
 use crate::gripper_move::{EffortCap, GripperGoal, GripperReply};
-use crate::move_slot::MoveSlot;
 use crate::streams::LeaderActivity;
 
 /// A `move_gripper` goal parsed off the wire: the arm, a finite opening in

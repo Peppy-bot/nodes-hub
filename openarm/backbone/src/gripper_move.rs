@@ -12,6 +12,7 @@
 
 use std::time::{Duration, Instant};
 
+use control_core::move_slot::{MoveSlot, SlotRelease};
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use robot_description::ArmId;
 use tokio::sync::mpsc;
@@ -19,7 +20,6 @@ use tracing::{error, warn};
 
 use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::liveness::Admission;
-use crate::move_slot::{MoveSlot, SlotRelease};
 use crate::planner::{Outcome, POSTURE_SETTLE, PostureShare};
 use crate::robot::LIMBS;
 

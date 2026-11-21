@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arm_order::ArmOrder;
 use crate::robot::{ARMS, LIMBS};
+use control_core::move_slot::MoveSlot;
 use peppygen::exposed_actions::limb_motion::execute_joint_path::{
     self, ExecuteJointPathResultArmsItem,
 };
@@ -36,7 +37,6 @@ use crate::actions::{
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind, PathFailure};
-use crate::move_slot::MoveSlot;
 use crate::planner::{
     JointPath, Outcome, PathGoal, PathOrder, ShareReply, ShareReport, cancelled_reason,
 };

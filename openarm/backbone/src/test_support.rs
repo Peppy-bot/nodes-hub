@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
+use control_core::move_slot::MoveSlot;
 use control_core::path_timing::RoundedPath;
 use robot_description::{ArmId, Driven, PerArm, RobotDescription};
 use srs_model::{ARM_DOF, Arm, JointVec, Limit};
@@ -22,7 +23,6 @@ use workspace_core::surface_block::ArmBodies;
 
 use crate::arm_order::ArmOrder;
 use crate::governor::{GovState, GuardAt, PathArms};
-use crate::move_slot::MoveSlot;
 use crate::planner::{
     JointPath, Measurement, PathGoal, PathGuard, PlanConfig, Planner, ShareReply, ShareReport,
 };

@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use control_core::geometry::pose_arrays;
+use control_core::move_slot::MoveSlot;
 use peppygen::exposed_actions::postures::{move_to_home, move_to_ready};
 use peppygen::{NodeRunner, Result};
 use robot_description::{ArmId, PerArm};
@@ -50,7 +51,6 @@ use crate::actions::{
 use crate::coordinator::{CoordinatorRequest, GraspMeasurement, MeasuredGrasp, newest_of};
 use crate::failure::{Failure, FailureKind};
 use crate::gripper_move::GripperGoal;
-use crate::move_slot::MoveSlot;
 use crate::planner::{Goal, JointReply, Outcome, PostureShare, Unmeasured};
 use crate::publish::clock_now;
 use crate::robot::{ARMS, LIMBS};

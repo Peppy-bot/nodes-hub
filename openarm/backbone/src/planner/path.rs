@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use control_core::move_slot::SlotRelease;
 use control_core::path_timing::{JointTrajectory, MIN_JOINT_CHANGE_RAD, RoundedPath};
 use control_core::time::ticks_within;
 use control_core::timing::{MotionClock, Pace};
@@ -45,7 +46,6 @@ use crate::actions::MAX_MOVE_DURATION_S;
 use crate::arm_order::ArmOrder;
 use crate::failure::{Failure, FailureKind, PathFailure, stale_failure};
 use crate::governor::{GuardAt, PathArms, PathBlocked};
-use crate::move_slot::SlotRelease;
 use crate::robot::{ARMS, DUAL_DOF, LIMBS};
 use crate::settle::{ContactGap, Settle, farthest_outside, joint_shortfall, verdict};
 use crate::streams::ArmState;
@@ -1161,7 +1161,6 @@ mod tests {
 
     use control_core::positive_finite::PositiveFinite;
 
-    use crate::move_slot::MoveSlot;
     use crate::planner::Goal;
     use crate::planner::Tick;
     use crate::test_support::{
@@ -1169,6 +1168,7 @@ mod tests {
         distance_to_segment, measured_at_setpoints, path_goal_through, plan_config,
         planner_holding, share_reply, standing_at, test_guard, test_settle,
     };
+    use control_core::move_slot::MoveSlot;
 
     /// Where the path tests take the arms from [`BOTH_HELD`], inside v1's
     /// limits: the left shoulder 0.4 rad out, the right elbow 0.1 rad in.

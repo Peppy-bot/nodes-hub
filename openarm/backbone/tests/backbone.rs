@@ -2391,7 +2391,7 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
-    let ceiling = "duration_s must be a number of seconds from 0 to 60";
+    let ceiling = "duration_s must be a number of seconds from 0 to 60, got 61";
     assert_posture_refused!(harness, move_to_ready, 61.0, Rejected, ceiling);
     assert_posture_refused!(harness, move_to_home, 61.0, Rejected, ceiling);
     harness.shutdown().await

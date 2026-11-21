@@ -21,7 +21,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::robot::{ARMS, arm_in};
 use control_core::geometry::{PoseTarget, Stamped};
+use control_core::move_slot::MoveSlot;
 use control_core::positive_finite::PositiveFinite;
+use control_core::robot_tree::{Placer, Unplaced};
 use control_core::serving;
 use control_core::sync::lock_ignoring_poison;
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
@@ -39,9 +41,7 @@ use crate::actions::{
     contact_gap_from_wire, move_seconds_from_wire, tolerance_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
-use crate::failure::{Failure, FailureKind, TargetFailure, Unplaced};
-use crate::move_slot::MoveSlot;
-use crate::placement::Placer;
+use crate::failure::{Failure, FailureKind, TargetFailure};
 use crate::planner::{ArmMoveRequest, Goal, JointReply, PlanCheck};
 use crate::settle::{ContactGap, PoseTolerance, Settle};
 use crate::streams::LeaderActivity;
@@ -279,7 +279,7 @@ pub async fn run_move_arm(
                         move_arm::GoalDecision::accept()
                     }
                     Err(f) => {
-                        let (kind, message) = f.for_member();
+                        let (kind, message) = f.for_member(move_arm::FailureKind::parse);
                         move_arm::GoalDecision::refuse(kind, message)
                     }
                 })
@@ -329,7 +329,7 @@ pub async fn run_check_arm_move(
     serving::serve("check_arm_move", token.cancelled(), || {
         check_arm_move::handle_requests(&runner, |req| {
             check_plan(&placer, &requests, &fresh, &activity, &req.data).map_err(|f| {
-                let (kind, message) = f.for_member();
+                let (kind, message) = f.for_member(check_arm_move::FailureKind::parse);
                 check_arm_move::Failure::new(kind, message)
             })
         })
@@ -521,11 +521,11 @@ mod tests {
     fn a_settle_tolerance_names_the_axis_it_refuses() {
         assert_eq!(
             settle_tolerance_from_wire(0.0, 0.1).unwrap_err(),
-            "settle_position_tolerance_m must be a positive number"
+            "settle_position_tolerance_m must be a positive number, got 0"
         );
         assert_eq!(
             settle_tolerance_from_wire(0.01, -1.0).unwrap_err(),
-            "settle_orientation_tolerance_rad must be a positive number"
+            "settle_orientation_tolerance_rad must be a positive number, got -1"
         );
         assert_eq!(
             settle_tolerance_from_wire(0.005, 0.087),
