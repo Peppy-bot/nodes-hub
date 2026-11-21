@@ -155,8 +155,8 @@ impl BaseAxes {
 /// which a differential base does not move along, 0.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RestBounds {
-    pub velocity: f64,
-    pub rate: f64,
+    velocity: f64,
+    rate: f64,
 }
 
 impl RestBounds {
@@ -167,7 +167,7 @@ impl RestBounds {
     /// separation, so a reading that keeps each wheel within
     /// ±`rest_velocity` gives a velocity within `rest_velocity` and a turn
     /// rate within 2 × `rest_velocity` / separation.
-    pub fn of_wheels(rest_velocity: f64, wheels: &WheelGeometry) -> Self {
+    fn of_wheels(rest_velocity: f64, wheels: &WheelGeometry) -> Self {
         Self {
             velocity: rest_velocity,
             rate: 2.0 * rest_velocity / wheels.wheel_separation_m.get(),
