@@ -183,6 +183,8 @@ def _joining_io(model: str = "openarm_v2"):
     io._handovers = {}
     io._robots = Mock(spec=["release", "stand"])
     io._models = MODELS
+    # What the robot commanded, which a stand that never happens drops.
+    io._io = Mock(spec=["setpoints"])
     io._loop = Mock()
     io._loop.time.return_value = 0.0
     return io

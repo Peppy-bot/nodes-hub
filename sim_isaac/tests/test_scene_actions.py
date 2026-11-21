@@ -29,7 +29,7 @@ from sim_robot_core.object_state import ObjectRecord
 from sim_robot_core.world import UnknownFrame, base_target, in_world
 
 from _scene_actions import scene_actions_module
-from _world import refusal_of
+from _world import known, refusal_of, world_module
 from runtime_fakes import CANCEL_REASONS
 
 
@@ -75,14 +75,6 @@ def _target(position, orientation=None, frame="world", timestamp=None):
 _QUARTER_TURN = [0.0, 0.0, 2 ** -0.5, 2 ** -0.5]
 
 
-class _Robot(SimpleNamespace):
-    """A robot as world.py reports it: the name it stands under, its model,
-    where, and how fast its robot frame moves there."""
-
-    def prim(self):
-        return f"/World/{self.instance}"
-
-
 class _World:
     """The stage's robots, as SceneActionIO reads them, and each move it
     hands the stage, as the robot's name and its target."""
@@ -110,14 +102,15 @@ class _Registry:
 
 
 def _world(*robots):
-    """The stage's robots, each as (instance, model, position, orientation),
-    the pose of its base in world, at rest, or with its linear and angular
-    velocities after them."""
+    """The stage's robots, as world.py holds them, each given as (instance,
+    model, position, orientation), the pose of its base in world, at rest, or
+    with its linear and angular velocities after them."""
     at_rest = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    robot = world_module().Robot
     return _World(
-        _Robot(
+        robot(
             instance=instance,
-            model=model,
+            known=known(model),
             placement=Pose.parse(position, orientation),
             linear_velocity=(moving or [at_rest])[0][0],
             angular_velocity=(moving or [at_rest])[0][1],
