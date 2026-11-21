@@ -270,7 +270,8 @@ pub fn move_request(
     );
     if plan.duration_s > MAX_MOVE_DURATION_S {
         return Err(format!(
-            "the move to the target takes {:.1} s at the base's limits, more than {MAX_MOVE_DURATION_S:.0} s",
+            "the move to the target takes {:.1} s at the base's limits, more than \
+             {MAX_MOVE_DURATION_S:.0} s: split it into moves to nearer targets",
             plan.duration_s
         ));
     }
@@ -570,7 +571,9 @@ mod tests {
         let refused = at([5.0, 0.0, 0.0], 0.0).unwrap_err();
         assert!(
             refused.starts_with("the move to the target takes 100.")
-                && refused.ends_with("s at the base's limits, more than 60 s"),
+                && refused.ends_with(
+                    "s at the base's limits, more than 60 s: split it into moves to nearer targets"
+                ),
             "{refused}"
         );
         // 2.5 m takes about 50 s: taken, its plan at least that long.

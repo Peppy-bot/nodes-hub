@@ -235,16 +235,17 @@ to the target's heading, each turn the shorter way, as the fastest moves
 describe_base's limits allow at the speed of the way each leg goes, and scales
 each leg's speed to take the requested duration. The node takes a base that
 drives ahead and turns both ways: x's max_velocity above 0, and angular's
-min_rate below 0 and max_rate above 0. A move whose plan takes longer than 60
-s, as the fastest move to a far target does on a slow base, is refused, the
-refusal giving its time. Each step steers on the odometry: a turn as Nav2's
-Spin turns, a drive as Nav2's DriveOnHeading drives, each braking at the speed
-from which the limiter's steps stop the base on the end of its leg. The drive
-turns toward the target again once the target's bearing leaves the orientation
-tolerance, or the node's `rotate_to_heading_min_angle_rad`, as Nav2's
-regulated pure pursuit's rotate_to_heading_min_angle, when the tolerance is
-wider. A turn ends once what remains of it falls below one limiter step at the
-angular deadband. A drive past its target backs up to it on a base that drives
+min_rate below 0 and max_rate above 0. A move whose plan takes longer than
+60 s, as the fastest move to a far target does on a slow base, is refused, the
+refusal giving its time and saying to split it into moves to nearer targets.
+Each step steers on the odometry: a turn as Nav2's Spin turns, a drive as
+Nav2's DriveOnHeading drives, each braking at the speed from which the
+limiter's steps stop the base on the end of its leg. The drive turns toward
+the target again once the target's bearing leaves the orientation tolerance,
+or the node's `rotate_to_heading_min_angle_rad`, as Nav2's regulated pure
+pursuit's rotate_to_heading_min_angle, when the tolerance is wider. A turn
+ends once what remains of it falls below one limiter step at the angular
+deadband. A drive past its target backs up to it on a base that drives
 backward, and turns toward it again on a base that cannot. While the base
 stands outside the tolerances, the axis of the leg it is on commands at least
 just above its deadband. The move completes once, at or after its planned end,

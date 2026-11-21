@@ -192,8 +192,9 @@ async fn a_move_the_limits_cannot_run_within_60_s_is_rejected() {
         .expect("a move past 60 s is refused");
     assert_eq!(far.kind, move_base::FailureKind::Rejected);
     assert!(
-        far.message
-            .ends_with("s at the base's limits, more than 60 s"),
+        far.message.ends_with(
+            "s at the base's limits, more than 60 s: split it into moves to nearer targets"
+        ),
         "{}",
         far.message
     );
