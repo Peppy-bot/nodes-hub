@@ -1,6 +1,6 @@
 """The MuJoCo model of each robot this engine stands, held to its description,
 the URDF and SRDF robot_description bundles: the joints and their limits, the
-start posture, and where the cameras hang. The models are the release of
+start posture, where the cameras hang, and the wheels a base rolls on. The models are the release of
 Waldo's catalogue that sim_base_images/waldo_catalogue.py pins, read as baked
 where PEPPY_ROBOT_ASSETS_DIR holds one, and staged here otherwise, which
 needs the network. Either way every file is checked against the pin, so what
@@ -8,14 +8,16 @@ is compared with the description is the model the image carries."""
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 
 import mujoco
 import numpy as np
 import pytest
 import robot_description_py
-from control_core_py.geometry import normalized
-from entries import staged_release
+from control_core_py.geometry import normalized, product, rotate
+from entries import placement_at, staged_release
+from sim_robot_core.cameras import camera_pose
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the bridge imports)
 
@@ -26,7 +28,7 @@ from world import World, compile_spec  # noqa: E402  pylint: disable=C0413
 
 # The name each robot stands under, which every name it answers to carries.
 ROBOT = "charlo"
-MODELS = ("openarm_v1", "openarm_v2", "so101")
+MODELS = ("openarm_v1", "openarm_v2", "so101", "botshare_base")
 # The URDFs round their limits to five decimals and the MJCFs write seven.
 LIMIT_TOLERANCE_RAD = 1e-4
 POSITION_TOLERANCE_M = 1e-4
@@ -57,7 +59,7 @@ def _standing(model: str, renders: bool = False):
     compiled = world.compose().compile()
     data = mujoco.MjData(compiled)
     mujoco.mj_forward(compiled, data)
-    MujocoBridgeExtension(compiled, data, None, [robot], 50, renders=False, time_base_s=0.0).startup(
+    MujocoBridgeExtension(compiled, data, None, world, 50, renders=False, time_base_s=0.0).startup(
         posture_for=[robot]
     )
     mujoco.mj_forward(compiled, data)
@@ -76,6 +78,10 @@ class TestJoints:
         description = _described(model)
         for joint in known.entry.joints():
             limits = description.joint_limits(joint)
+            if math.isinf(limits.lower) and math.isinf(limits.upper):
+                # A continuous joint, such as a wheel, turns without end.
+                assert not compiled.jnt_limited[compiled.joint(f"{ROBOT}/{joint}").id], joint
+                continue
             assert compiled.joint(f"{ROBOT}/{joint}").range == pytest.approx(
                 (limits.lower, limits.upper), abs=LIMIT_TOLERANCE_RAD
             ), joint
@@ -217,3 +223,46 @@ class TestTheOpenArmV2HeadCamera:
 
         assert position == pytest.approx(chest.pos, abs=POSITION_TOLERANCE_M)
         assert rotation == pytest.approx(described.reshape(3, 3), abs=ORIENTATION_TOLERANCE)
+
+
+def _in_root(description, link: str):
+    """Where the fixed joints of `description` place `link` in its root
+    link's frame: a position and an orientation (x, y, z, w)."""
+    placed = {transform.child: transform for transform in description.fixed_transforms()}
+    position, orientation = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
+    while link != description.root_link:
+        joint = placed[link]
+        position = tuple(a + b for a, b in zip(joint.position, rotate(joint.orientation, position)))
+        orientation = product(joint.orientation, orientation)
+        link = joint.parent
+    return position, orientation
+
+
+class TestTheBotshareBase:
+    def test_its_camera_is_the_models_own_where_the_description_puts_its_optical_frame(self):
+        """The model's MJCF carries the base camera on the body that holds its
+        root link and every link fixed joints join to it, and the engine
+        renders that camera at its render's field of view."""
+        known = _known("botshare_base")
+        (described,) = known.entry.cameras
+        description = _described("botshare_base")
+        world = World(renders=True)
+        world.add(ROBOT, known, world.free_spot())
+        compiled = world.compose().compile()
+        camera = compiled.camera(f"{ROBOT}/{described.name}")
+        carrier = compiled.body(f"{ROBOT}/{known.body_of(description.root_link)}")
+        assert compiled.cam_bodyid[camera.id] == carrier.id
+        position, orientation = camera_pose(*_in_root(description, described.frame))
+
+        assert compiled.cam_pos[camera.id] == pytest.approx(position, abs=POSITION_TOLERANCE_M)
+        assert compiled.cam_quat[camera.id] == pytest.approx(
+            normalized(orientation), abs=ORIENTATION_TOLERANCE
+        )
+        assert compiled.cam_fovy[camera.id] == pytest.approx(described.fovy_deg)
+
+    def test_it_stands_beside_an_openarm_on_the_settings_they_share(self):
+        world = World(renders=False)
+        world.add("india", _known("botshare_base"), placement_at(0.0))
+        world.add("alpha", _known("openarm_v2"), placement_at(3.0))
+        compiled = world.compose().compile()
+        assert compiled.joint("india").id >= 0 and compiled.joint("alpha/openarm_left_joint1").id >= 0

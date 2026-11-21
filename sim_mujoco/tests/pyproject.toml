@@ -21,9 +21,9 @@ dependencies = [
     "mujoco==4.0.1",
     "numpy==2.5.4",
     "pyjson5==2.0.1",
-    # What the engine shares with every other one: the registry, the four
-    # slots, the model entries, the camera configuration and world, the one
-    # frame of a simulation.
+    # What the engine shares with every other one: the registry, the five
+    # slots, the model entries, the setpoints it takes on a pair, the camera
+    # configuration and world, the one frame of a simulation.
     "sim_robot_core",
     # The geometry types of the contracts and the rotation arithmetic the
     # engine places poses with.

@@ -2,16 +2,20 @@
 
 Bridges the physics thread (sync, runs the engine step in an executor) to the
 node_runner's asyncio loop, where peppygen pairing pub/sub lives. The engine
-plays the follower role of every limb's joint_link / gripper_link pairing on
-two slots, `arms` and `grippers`, each holding any number of pairs: one
-consume task per slot holds a generated `subscribe()` subscription (gap-free,
-in-order) and keeps the latest governed setpoint per limb of the robot in
-thread-safe slots; the physics thread reads those and publishes the robot's
-stamped measured state back on the pair of the same limb. A pair carries the
-copy its robot attached under and the link it comes from on the robot's
-side, which is what tells one robot's limbs from another's and one limb from
-the next (sim_robot_core.pairs), and a pair of a robot the engine does not
-stand is left alone. The engine also plays the camera role of the
+plays the follower role of every limb's joint_link / gripper_link pairing and
+of every base's joint_link pairing on three slots, `arms`, `grippers` and
+`bases`, each holding any number of pairs: one consume task per slot holds a
+generated `subscribe()` subscription (gap-free, in-order) and keeps the
+latest setpoint per limb or base of the robot in thread-safe slots, each
+joint setpoint parsed by sim_robot_core.setpoints and one it refuses dropped;
+the physics thread reads those and publishes the robot's stamped measured
+state back on the pair of the same limb or base. A base's setpoint belongs to
+the pair it came on, so a reading of the pairs that finds that pair gone
+drops it (`keep_paired_bases`). A pair carries the copy its robot attached
+under and the link it comes from on the robot's side, which is what tells one
+robot's parts from another's and one part from the next
+(sim_robot_core.pairs), and a pair of a robot the engine does not stand is
+left alone. The engine also plays the camera role of the
 sim_rgb_camera_link / sim_rgbd_camera_link pairings on `rgb_cameras` and
 `rgbd_cameras`, one pair per rendered camera named after its relay, handing
 finished frames to the same loop and dropping a frame whose stream's
@@ -42,6 +46,8 @@ from peppygen import clock
 from peppylib.clock import ClockPublisher
 from peppygen.paired_topics.arms import joint_setpoints as arm_setpoints
 from peppygen.paired_topics.arms import joint_states as arm_states
+from peppygen.paired_topics.bases import joint_setpoints as base_setpoints
+from peppygen.paired_topics.bases import joint_states as base_states
 from peppygen.paired_topics.grippers import gripper_setpoints
 from peppygen.paired_topics.grippers import gripper_states
 from peppygen.paired_topics.rgb_cameras import geometry as rgb_geometry
@@ -52,7 +58,17 @@ from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
 from sim_robot_core.cameras import DISTORTION_MODEL
-from sim_robot_core.pairs import ARMS, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held, PairTable
+from sim_robot_core.pairs import (
+    ARMS,
+    BASE_NAME,
+    BASES,
+    GRIPPERS,
+    RGB_CAMERAS,
+    RGBD_CAMERAS,
+    Held,
+    PairTable,
+)
+from sim_robot_core.setpoints import BaseSetpoints, JointSetpoint
 
 logger = logging.getLogger(__name__)
 
@@ -153,11 +169,15 @@ class SimTopicIO:
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        # The four slots, read into robots, limbs and cameras.
+        # The robots in the scene, whose models give each limb and base its
+        # joint count.
+        self._robots = robots
+        # The five slots, read into robots, limbs, bases and cameras.
         self._pairs = PairTable(
             {
                 ARMS: lambda: arm_setpoints.peers(node_runner),
                 GRIPPERS: lambda: gripper_setpoints.peers(node_runner),
+                BASES: lambda: base_setpoints.peers(node_runner),
                 RGB_CAMERAS: lambda: rgb_video.peers(node_runner),
                 RGBD_CAMERAS: lambda: rgbd_video.peers(node_runner),
             },
@@ -165,9 +185,13 @@ class SimTopicIO:
         )
         self._arm_pub: Optional[peppylib.PeerPublisher] = None
         self._gripper_pub: Optional[peppylib.PeerPublisher] = None
+        self._base_pub: Optional[peppylib.PeerPublisher] = None
         # The latest setpoint of one limb of one robot, keyed by (limb, robot).
         self._arm_cmd: dict[tuple[str, str], _LatestSlot] = {}
         self._gripper_cmd: dict[tuple[str, str], _LatestSlot] = {}
+        # The latest setpoint of each robot's base, held for the pair it came
+        # on.
+        self._base_cmd = BaseSetpoints()
         self._cmd_lock = threading.Lock()
         # Camera publishers and their in-flight guards, keyed by (slot, topic)
         # and (robot, camera, surface); a slot's publisher reaches every
@@ -202,6 +226,7 @@ class SimTopicIO:
             logger.info(f"publishing clock domain {self._clock_publisher.domain}")
         self._arm_pub = await arm_states.declare_publisher(self._node_runner)
         self._gripper_pub = await gripper_states.declare_publisher(self._node_runner)
+        self._base_pub = await base_states.declare_publisher(self._node_runner)
         await self._declare_camera_publishers(
             RGB_CAMERAS,
             [(_VIDEO_STREAM, rgb_video), (_STREAM_INFO, rgb_info), (_GEOMETRY, rgb_geometry)],
@@ -218,6 +243,7 @@ class SimTopicIO:
         self._tasks = [
             asyncio.create_task(self._consume_arms()),
             asyncio.create_task(self._consume_grippers()),
+            asyncio.create_task(self._consume_bases()),
         ]
 
     async def stop(self) -> None:
@@ -247,16 +273,13 @@ class SimTopicIO:
             if named is None:
                 continue
             robot, arm = named
-            # Drop a poisoned setpoint rather than writing NaN/Inf into the sim.
-            if not all(math.isfinite(v) for v in msg.positions) or not all(
-                math.isfinite(v) for v in msg.velocities
-            ):
-                logger.warning(f"dropping non-finite setpoint for '{robot}' {arm}")
+            setpoint = self._setpoint(robot, arm, self._arm_joint_count(robot, arm), "joints", msg)
+            if setpoint is None:
                 continue
             slot = self._command_slot(self._arm_cmd, arm, robot)
             if slot.get() is None:
                 logger.info(f"first setpoint for '{robot}' {arm}")
-            slot.set((msg.positions, msg.velocities))
+            slot.set((list(setpoint.positions), list(setpoint.velocities)))
 
     async def _consume_grippers(self) -> None:
         subscription = await gripper_setpoints.subscribe(self._node_runner)
@@ -293,15 +316,79 @@ class SimTopicIO:
                 logger.info(f"first setpoint for '{robot}' {gripper}")
             slot.set((msg.opening, msg.max_effort))
 
+    async def _consume_bases(self) -> None:
+        subscription = await base_setpoints.subscribe(self._node_runner)
+        while True:
+            try:
+                pair = await subscription.next()
+                if pair is None:
+                    return
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                # A corrupt frame is dropped and logged rather than killing
+                # this consume task; the pause keeps a persistent fault from
+                # hot-spinning the loop.
+                logger.warning(f"{BASES} setpoint consume error: {exc}")
+                await asyncio.sleep(0.1)
+                continue
+            peer, msg = pair
+            named = self._pairs.pair_of(BASES, peer)
+            if named is None:
+                continue
+            robot, base = named
+            setpoint = self._setpoint(robot, base, self._wheel_count(robot, base), "wheels", msg)
+            if setpoint is not None and self._base_cmd.put(robot, peer, setpoint):
+                logger.info(f"first setpoint for '{robot}' {base}")
+
+    def _arm_joint_count(self, robot: str, arm: str) -> Optional[int]:
+        """How many joints the arm `arm` of `robot`'s model moves, or None
+        for an arm the model lacks or a robot the scene does not hold."""
+        held = self._robots.of_name(robot)
+        if held is None:
+            return None
+        return next((len(each.joints) for each in held.entry.arms if each.name == arm), None)
+
+    def _wheel_count(self, robot: str, base: str) -> Optional[int]:
+        """How many wheels the base `base` of `robot`'s model drives, or None
+        for a base the model lacks or a robot the scene does not hold."""
+        held = self._robots.of_name(robot)
+        if held is None or held.entry.base is None or held.entry.base.name != base:
+            return None
+        return len(held.entry.base.wheels)
+
+    @staticmethod
+    def _setpoint(
+        robot: str, part: str, count: Optional[int], joints: str, msg
+    ) -> Optional[JointSetpoint]:
+        """The setpoint `msg` gives `robot`'s arm or base `part` of `count`
+        `joints` (joints, wheels), or None: for a part its model lacks, which
+        drives nothing, and for a setpoint the parse refuses, which is dropped
+        saying why rather than written into the simulation."""
+        if count is None:
+            return None
+        try:
+            return JointSetpoint.parse(msg.positions, msg.velocities, count, joints)
+        except ValueError as error:
+            logger.warning(f"dropping a setpoint for '{robot}' {part}: it {error}")
+            return None
+
     def _command_slot(self, slots: dict, limb: str, robot: str) -> "_LatestSlot":
         with self._cmd_lock:
             return slots.setdefault((limb, robot), _LatestSlot())
 
     def held_by(self, robot: str) -> Held:
-        """What `robot` holds on the four slots: the limbs its pairs drive and
-        the cameras they stream. Read on the node loop, which is what keeps a
-        robot in the scene and what its readiness asks."""
+        """What `robot` holds on the five slots: the limbs and the base its
+        pairs drive and the cameras they stream. Read on the node loop, which
+        is what keeps a robot in the scene and what its readiness asks."""
         return self._pairs.held_by(robot)
+
+    def keep_paired_bases(self) -> None:
+        """Drops each base's setpoint whose pair is gone, on the node loop's
+        reading of the pairs: its wheels hold at rate 0 until its pair's
+        leader sends again."""
+        for robot in self._base_cmd.keep_paired(self._pairs):
+            logger.info(f"the base pair of '{robot}' is gone: its wheels hold at rate 0")
 
     # --- called from the physics thread ---
 
@@ -315,6 +402,11 @@ class SimTopicIO:
         slot = self._gripper_cmd.get((gripper, robot))
         return slot.get() if slot is not None else None
 
+    def latest_base_command(self, robot: str) -> Optional[JointSetpoint]:
+        """The setpoint `robot`'s wheels follow, or None while they hold at
+        rate 0."""
+        return self._base_cmd.latest(robot)
+
     def forget(self, robot: str) -> None:
         """Drops what a robot that left the scene had commanded, so a robot
         rejoining under the same name starts from its model's pose."""
@@ -322,6 +414,7 @@ class SimTopicIO:
             for slots in (self._arm_cmd, self._gripper_cmd):
                 for key in [key for key in slots if key[1] == robot]:
                     del slots[key]
+        self._base_cmd.forget(robot)
 
     def record_engine_time(self, engine_time_s: float) -> None:
         """Adopt this step's engine clock for every stamp this engine emits.
@@ -406,6 +499,18 @@ class SimTopicIO:
         # Efforts are empty: the engine measures no joint torques.
         payload = arm_states.build_message(self.timestamp_s(), positions, velocities, [])
         self._schedule_publish(self._arm_pub, ARMS, robot, arm, payload)
+
+    def publish_base_states(
+        self, robot: str, positions: list[float], velocities: list[float]
+    ) -> None:
+        """The measured angles and rates of `robot`'s wheels, left then
+        right, on its base's pair."""
+        if self._base_pub is None:
+            return
+        # Efforts are empty, as an arm's are: the engine measures no joint
+        # torques.
+        payload = base_states.build_message(self.timestamp_s(), positions, velocities, [])
+        self._schedule_publish(self._base_pub, BASES, robot, BASE_NAME, payload)
 
     def publish_gripper_states(
         self, robot: str, gripper: str, opening: float, force: float = 0.0

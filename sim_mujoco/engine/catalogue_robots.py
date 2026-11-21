@@ -1,9 +1,9 @@
 """Each robot's MuJoCo model as the release of Waldo's catalogue gives it,
 which the base image bakes under the assets directory
 (sim_base_images/waldo_catalogue.py): the MJCF a robot is attached from, the
-body of it that carries the whole robot, the body of each URDF link the MJCF
-names otherwise, whether the robot's weight is compensated, and the servo
-gains of its arms and grippers. Waldo stands its robots from the same
+body of it that carries the whole robot, whether that body rolls, the body of
+each URDF link the MJCF names otherwise, whether the robot's weight is
+compensated, and the servo gains of its arms and grippers. Waldo stands its robots from the same
 release, so both engines stand one model of each robot.
 
 The robots this engine stands are read strictly: a field the engine reads
@@ -20,6 +20,10 @@ from pathlib import Path
 from sim_robot_core.errors import ModelEntryError
 
 ROBOTS_FILE = "robots.json"
+# How a robot meets the floor (`mount.stance`): a standing or a mounted robot
+# holds where it is placed, and a rolling robot's wheels carry it.
+STANCES = ("standing", "mounted", "rolling")
+ROLLING = "rolling"
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,8 @@ class CatalogueRobot:
     # The body of the MJCF that carries the whole robot, which is what a
     # scene attaches.
     mount_body: str
+    # Whether that body rolls on the robot's wheels, free on the floor.
+    rolls: bool
     # URDF link to the MJCF body that is that link, where they differ.
     link_bodies: dict
     gravity_compensation: bool
@@ -126,6 +132,9 @@ def _robot(directory: Path, model: str, raw: dict) -> CatalogueRobot:
     mount = _object(model, raw.get("mount"), "mount")
     if not isinstance(mount.get("body"), str) or not mount["body"]:
         raise _fail(model, "names no mount body, the body a scene attaches the robot by")
+    if mount.get("stance") not in STANCES:
+        stance = mount.get("stance")
+        raise _fail(model, f"mount.stance must be one of {list(STANCES)}, got {stance!r}")
     link_bodies = raw.get("linkBodies", {})
     if not isinstance(link_bodies, dict) or not all(
         isinstance(k, str) and isinstance(v, str) and k and v for k, v in link_bodies.items()
@@ -143,6 +152,7 @@ def _robot(directory: Path, model: str, raw: dict) -> CatalogueRobot:
         model=model,
         file=directory / model / _scene(model, raw),
         mount_body=mount["body"],
+        rolls=mount["stance"] == ROLLING,
         link_bodies=dict(link_bodies),
         gravity_compensation=compensated,
         arm_gains={name: joints for name, joints, _ in arms if joints},

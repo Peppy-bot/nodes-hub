@@ -1,11 +1,12 @@
 """The models this engine stands, one entry per model under models/.
 
-What a robot of a model is made of (its limbs, joints, cameras and start
-posture) comes from the description its attach goal carries, through
-sim_robot_core's entry of the same model, shared with every engine. Its
-MuJoCo model (the MJCF it is attached from, the body that carries it, the
-body of each URDF link the file names otherwise, its weight compensation and
-its servo gains) is the release of Waldo's catalogue the base image bakes
+What a robot of a model is made of (its limbs, its base, its joints, cameras
+and start posture) comes from the description its attach goal carries,
+through sim_robot_core's entry of the same model, shared with every engine.
+Its MuJoCo model (the MJCF it is attached from, the body that carries it,
+whether that body rolls, the body of each URDF link the file names otherwise,
+its weight compensation and its servo gains) is the release of Waldo's
+catalogue the base image bakes
 (catalogue_robots), which Waldo stands its robots from too. What is here is
 what this engine alone decides about a model: the light rig and the floor.
 The engine reads every entry here when it starts, and holds one to a robot's
@@ -64,6 +65,12 @@ class MujocoModel:
     @property
     def model(self) -> str:
         return self.entry.model
+
+    @property
+    def rolls(self) -> bool:
+        """Whether the robot rolls on the wheels of its base, free on the
+        floor, its placement where it starts."""
+        return self.entry.base is not None
 
     def scene_path(self) -> Path:
         """The MJCF on disk."""
@@ -142,7 +149,26 @@ def robot_fail(robot: CatalogueRobot, reason: str) -> ModelEntryError:
 def stood(entry: ModelEntry, robot: CatalogueRobot, fields: dict) -> MujocoModel:
     """The model `robot` and `fields` of this engine's entry describe, as the
     robot that `entry` describes stands: the release's gains name the arms of
-    the description, with one gain per joint."""
+    the description, with one gain per joint, and the release stands the
+    robot rolling exactly when its description gives it a base, which then
+    carries its whole weight on its wheels."""
+    if robot.rolls and entry.base is None:
+        raise robot_fail(
+            robot,
+            "its mount.stance is rolling, and the description gives no differential base to "
+            "roll on: give the robot a mount.stance of standing or mounted",
+        )
+    if entry.base is not None and not robot.rolls:
+        raise robot_fail(
+            robot,
+            f"the description gives a base on the wheels {list(entry.base.wheels)}, and its "
+            "mount.stance is not rolling: give the robot the mount.stance rolling",
+        )
+    if robot.rolls and robot.gravity_compensation:
+        raise robot_fail(
+            robot,
+            "a rolling robot rests its weight on its wheels: leave gravityCompensation out",
+        )
     arms = {arm.name: arm for arm in entry.arms}
     for name in sorted(set(robot.arm_gains) | set(robot.gripper_gains)):
         if name not in arms:

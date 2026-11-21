@@ -1,11 +1,11 @@
-"""Which robot, limb and camera a pair names, and what that decides.
+"""Which robot, limb, base and camera a pair names, and what that decides.
 
-Every robot's limbs reach the engine on two slots and its cameras on two more,
-each holding any number of pairs. The copy a pair carries is the robot that
-attached under that name, the link it comes from on the robot's side is its
-limb, and its relay's name in the copy is its camera. These cover the ways
-that is read: a setpoint arriving on a pair, a state or a frame published
-back on one, and what a robot holds.
+Every robot's limbs reach the engine on two slots, its base on a third and its
+cameras on two more, each holding any number of pairs. The copy a pair
+carries is the robot that attached under that name, the link it comes from on
+the robot's side is its limb or its base, and its relay's name in the copy is
+its camera. These cover the ways that is read: a setpoint arriving on a pair,
+a state or a frame published back on one, and what a robot holds.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from sim_robot_core.cameras import DEPTH_TO_COLOR, pinhole
 from sim_robot_core.models import shipped_entry
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
+from sim_robot_core.setpoints import MAX_VALUE, JointSetpoint
 
 import runtime_fakes
 from runtime_fakes import MessageDepthToColor, member, pair, topic
@@ -43,6 +44,10 @@ ALPHA_WRIST_LEFT = member("alpha_wrist_left", "simulation", "alpha")
 ALPHA_WRIST_RIGHT = member("alpha_wrist_right", "simulation", "alpha")
 ALPHA_CHEST = member("alpha_chest", "simulation", "alpha")
 CHARLO_WRIST = member("charlo_wrist", "simulation", "charlo")
+# A base node leads its robot's wheels from the link named after the base.
+INDIA_BASE = member("india_base_inst", "base", "india")
+# An OpenArm's arm moves seven joints.
+OPENARM_ARM = 7
 
 
 @pytest.fixture(name="scene")
@@ -75,11 +80,13 @@ async def _drain(loop_turns: int = 10) -> None:
         await asyncio.sleep(0)
 
 
-def _serve(scene, arms=(), grippers=()) -> None:
+def _serve(scene, arms=(), grippers=(), bases=()) -> None:
     """Starts the transport with these setpoints queued on the two limb
-    slots, and runs each consume task to the end of its subscription."""
+    slots and the base slot, and runs each consume task to the end of its
+    subscription."""
     topic("arms", "joint_setpoints").arrivals = list(arms)
     topic("grippers", "gripper_setpoints").arrivals = list(grippers)
+    topic("bases", "joint_setpoints").arrivals = list(bases)
 
     async def serve() -> None:
         await scene.io.start()
@@ -103,10 +110,16 @@ class TestWhichRobotAPairBelongsTo:
         _admit(scene, "bravo", "openarm_v2")
         pair("arms", ALPHA_LEFT_ARM, BRAVO_LEFT_ARM)
 
-        _serve(scene, arms=[_arm_setpoint(BRAVO_LEFT_ARM, [0.9]), _arm_setpoint(ALPHA_LEFT_ARM, [0.5])])
+        _serve(
+            scene,
+            arms=[
+                _arm_setpoint(BRAVO_LEFT_ARM, [0.9] * OPENARM_ARM),
+                _arm_setpoint(ALPHA_LEFT_ARM, [0.5] * OPENARM_ARM),
+            ],
+        )
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.5], [])
-        assert scene.io.latest_arm_command("bravo", "left_arm") == ([0.9], [])
+        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.5] * OPENARM_ARM, [])
+        assert scene.io.latest_arm_command("bravo", "left_arm") == ([0.9] * OPENARM_ARM, [])
 
     def test_a_pair_with_no_copy_belongs_to_the_only_robot_in_the_scene(self, scene):
         _admit(scene, "solo", "so101")
@@ -124,7 +137,7 @@ class TestWhichRobotAPairBelongsTo:
         backbone = member("backbone_inst", "left_arm", None)
         pair("arms", backbone)
 
-        _serve(scene, arms=[_arm_setpoint(backbone, [0.5])])
+        _serve(scene, arms=[_arm_setpoint(backbone, [0.5] * OPENARM_ARM)])
 
         for robot in ("alpha", "bravo"):
             assert scene.io.latest_arm_command(robot, "left_arm") is None
@@ -133,7 +146,7 @@ class TestWhichRobotAPairBelongsTo:
     def test_a_peer_the_slot_does_not_hold_belongs_to_no_robot(self, scene):
         _admit(scene, "alpha", "openarm_v2")
 
-        _serve(scene, arms=[_arm_setpoint(ALPHA_LEFT_ARM, [0.5])])
+        _serve(scene, arms=[_arm_setpoint(ALPHA_LEFT_ARM, [0.5] * OPENARM_ARM)])
 
         assert scene.io.latest_arm_command("alpha", "left_arm") is None
 
@@ -391,15 +404,32 @@ class TestSetpoints:
         _admit(scene, "alpha", "openarm_v2")
         pair("arms", ALPHA_LEFT_ARM)
 
-        _serve(scene, arms=[_arm_setpoint(ALPHA_LEFT_ARM, [0.1]), _arm_setpoint(ALPHA_LEFT_ARM, [0.4])])
+        _serve(
+            scene,
+            arms=[
+                _arm_setpoint(ALPHA_LEFT_ARM, [0.1] * OPENARM_ARM),
+                _arm_setpoint(ALPHA_LEFT_ARM, [0.4] * OPENARM_ARM),
+            ],
+        )
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.4], [])
+        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.4] * OPENARM_ARM, [])
 
     @pytest.mark.parametrize(
         ("positions", "velocities"),
-        [([float("nan")], [0.0]), ([0.0], [float("inf")])],
+        [
+            ([float("nan")] * OPENARM_ARM, [0.0] * OPENARM_ARM),
+            ([0.0] * OPENARM_ARM, [float("inf")] * OPENARM_ARM),
+            ([10 * MAX_VALUE] * OPENARM_ARM, []),
+            ([0.0] * OPENARM_ARM, [-10 * MAX_VALUE] * OPENARM_ARM),
+            ([0.0] * 5, []),
+            ([0.0] * OPENARM_ARM, [0.0] * 5),
+        ],
     )
-    def test_a_non_finite_arm_setpoint_never_reaches_the_scene(self, scene, positions, velocities):
+    def test_an_arm_setpoint_the_simulation_cannot_hold_never_reaches_the_scene(
+        self, scene, positions, velocities
+    ):
+        """One that is not a number, one past what a simulation holds, and one
+        of another joint count than the arm's are dropped as they arrive."""
         _admit(scene, "alpha", "openarm_v2")
         pair("arms", ALPHA_LEFT_ARM)
 
@@ -426,7 +456,10 @@ class TestSetpoints:
         pair("grippers", ALPHA_LEFT_GRIPPER)
         _serve(
             scene,
-            arms=[_arm_setpoint(ALPHA_LEFT_ARM, [0.5]), _arm_setpoint(BRAVO_LEFT_ARM, [0.9])],
+            arms=[
+                _arm_setpoint(ALPHA_LEFT_ARM, [0.5] * OPENARM_ARM),
+                _arm_setpoint(BRAVO_LEFT_ARM, [0.9] * OPENARM_ARM),
+            ],
             grippers=[_gripper_setpoint(ALPHA_LEFT_GRIPPER, 0.25)],
         )
 
@@ -434,4 +467,94 @@ class TestSetpoints:
 
         assert scene.io.latest_arm_command("alpha", "left_arm") is None
         assert scene.io.latest_gripper_command("alpha", "left_gripper") is None
-        assert scene.io.latest_arm_command("bravo", "left_arm") == ([0.9], [])
+        assert scene.io.latest_arm_command("bravo", "left_arm") == ([0.9] * OPENARM_ARM, [])
+
+
+class TestTheBase:
+    def test_a_base_setpoint_reaches_the_base_of_the_copy_it_carries(self, scene):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+
+        _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
+
+        assert scene.io.latest_base_command("india") == JointSetpoint((0.0, 0.0), (1.0, 1.5))
+        assert scene.io.held_by("india") == Held(bases=frozenset({"base"}))
+
+    @pytest.mark.parametrize(
+        ("positions", "velocities"),
+        [
+            ([0.0], [1.0]),
+            ([0.0, 0.0], [1.0]),
+            ([0.0, 0.0], [float("nan"), 0.0]),
+            ([0.0, 0.0], [0.0, 10 * MAX_VALUE]),
+        ],
+    )
+    def test_a_base_setpoint_the_simulation_cannot_hold_never_reaches_the_wheels(
+        self, scene, positions, velocities
+    ):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+
+        _serve(scene, bases=[_arm_setpoint(INDIA_BASE, positions, velocities)])
+
+        assert scene.io.latest_base_command("india") is None
+
+    def test_a_base_pair_of_a_robot_with_no_base_drives_nothing(self, scene):
+        _admit(scene, "charlo", "so101")
+        stray = member("charlo_base_inst", "base", "charlo")
+        pair("bases", stray)
+
+        _serve(scene, bases=[_arm_setpoint(stray, [0.0, 0.0], [1.0, 1.0])])
+
+        assert scene.io.latest_base_command("charlo") is None
+
+    def test_the_wheels_hold_at_rate_0_once_a_reading_finds_their_pair_gone(self, scene):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+        _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
+
+        scene.io.keep_paired_bases()
+        assert scene.io.latest_base_command("india") is not None
+        pair("bases")
+        scene.io.keep_paired_bases()
+
+        assert scene.io.latest_base_command("india") is None
+
+    def test_a_base_pair_that_comes_back_drives_nothing_until_its_leader_sends(self, scene):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+        _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
+
+        # The base node came back on a pair of its own between two readings.
+        back = runtime_fakes.Member(
+            info=runtime_fakes.Peer(
+                producer=runtime_fakes.Producer("sim17", "india_base_inst"), peer_link_id="base"
+            ),
+            copy="india",
+        )
+        pair("bases", back)
+        scene.io.keep_paired_bases()
+        assert scene.io.latest_base_command("india") is None
+
+        _serve(scene, bases=[_arm_setpoint(back, [0.0, 0.0], [0.5, 0.5])])
+        scene.io.keep_paired_bases()
+        assert scene.io.latest_base_command("india") == JointSetpoint((0.0, 0.0), (0.5, 0.5))
+
+    def test_a_robot_that_left_takes_its_base_setpoint_with_it(self, scene):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+        _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
+
+        scene.io.forget("india")
+
+        assert scene.io.latest_base_command("india") is None
+
+    def test_the_wheel_state_goes_back_on_the_base_pair_of_its_robot(self, scene):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+        _serve(scene)
+
+        scene.io.publish_base_states("india", [0.1, 0.2], [1.0, 1.5])
+        _publishes(scene)
+
+        assert _sent("bases", "joint_states") == [(INDIA_BASE.info, (0.0, [0.1, 0.2], [1.0, 1.5], []))]

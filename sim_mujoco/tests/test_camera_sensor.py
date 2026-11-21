@@ -290,9 +290,15 @@ def test_compile_rejects_a_parent_link_that_is_no_body_of_the_scene(scene, paren
     assert "link_a" in message
 
 
-def test_compile_rejects_a_camera_name_the_scene_already_uses(scene):
-    with pytest.raises(RuntimeError, match="scene_cam"):
-        compile_model_with_cameras(scene, [color_camera(name="scene_cam")])
+def test_a_camera_the_scene_defines_under_its_name_is_that_camera_at_its_renders_view(scene):
+    """A model written from its description carries its cameras where the
+    description puts them, and the render gives each its field of view."""
+    model = compile_model_with_cameras(scene, [color_camera(name="scene_cam", parent="no_such_link")])
+    assert model.ncam == 1
+    camera = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "scene_cam")
+    assert camera_body(model, "scene_cam") == 0
+    assert model.cam_pos[camera] == pytest.approx((0.0, 0.0, 1.0))
+    assert model.cam_fovy[camera] == pytest.approx(60.0)
 
 
 def test_the_offscreen_buffer_grows_to_cover_every_stream_of_the_scene(scene):

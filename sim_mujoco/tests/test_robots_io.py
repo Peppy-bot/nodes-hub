@@ -85,10 +85,13 @@ PAIR_GRACE = "2.0s, the pair grace time this scene gives"
 # What each model's side of a mismatch names.
 OPENARM_V2_HAS = (
     "the model openarm_v2 has arms ['left_arm', 'right_arm'], "
-    "grippers ['left_gripper', 'right_gripper'], rgb_cameras ['wrist_left', 'wrist_right'], "
+    "grippers ['left_gripper', 'right_gripper'], bases [], rgb_cameras ['wrist_left', 'wrist_right'], "
     "rgbd_cameras ['chest']"
 )
-SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], rgb_cameras ['wrist'], rgbd_cameras []"
+SO101_HAS = (
+    "the model so101 has arms ['arm'], grippers ['gripper'], bases [], rgb_cameras ['wrist'], "
+    "rgbd_cameras []"
+)
 
 
 def _robots_io() -> RobotsIO:
@@ -188,7 +191,7 @@ def test_a_model_the_engine_has_no_entry_for_is_rejected_with_the_ones_it_stands
     io = _robots_io()
     decision = io._admit(_request(model="openarm_v9", described_as="openarm_v2"))
     assert _refused(decision, FailureKind.REJECTED) == (
-        "unknown model 'openarm_v9': this engine stands openarm_v1, openarm_v2, so101"
+        "unknown model 'openarm_v9': this engine stands botshare_base, openarm_v1, openarm_v2, so101"
     )
     assert io._robots.robots() == []
 
@@ -387,11 +390,16 @@ def test_a_pair_grace_time_no_robot_can_keep_is_refused_as_the_engine_is_built()
 
 
 class _Pairs:
-    """What each robot holds on the four slots, as the engine reads its
-    pairs."""
+    """What each robot holds on the five slots, as the engine reads its
+    pairs, and how many readings dropped the setpoints of the bases whose
+    pair is gone."""
 
     def __init__(self, held: dict) -> None:
         self.held = dict(held)
+        self.base_readings = 0
+
+    def keep_paired_bases(self) -> None:
+        self.base_readings += 1
 
     def held_by(self, robot: str) -> Held:
         return self.held.get(robot, Held())
@@ -406,7 +414,7 @@ def _io_at(
 ) -> RobotsIO:
     """A RobotsIO whose robot `alpha` of `model` holds `held`, read at `now_s`
     with the pair grace time this scene gives. Its pair grace time runs from
-    `reached_s`, when a limb first reached it, and not at all when that is
+    `reached_s`, when a limb or its base first reached it, and not at all when that is
     None."""
     return _fleet_io_at(now_s, {"alpha": (model, held)}, reached_s)
 
@@ -414,13 +422,13 @@ def _io_at(
 def _fleet_io_at(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) -> RobotsIO:
     """A RobotsIO whose robots, each given as name: (model, what it holds),
     are read at `now_s` with the pair grace time this scene gives. Their pair
-    grace times run from `reached_s`, when a limb first reached each, and not
+    grace times run from `reached_s`, when a limb or a base first reached each, and not
     at all when that is None."""
     io = _robots_io()
     for name, (model, _held) in fleet.items():
         io._robots.admit(name, _known(model).entry, _caller(name))
         if reached_s is not None:
-            io._robots.note_limbs_reached(name, reached_s)
+            io._robots.note_driven_part_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs({name: held for name, (_model, held) in fleet.items()})
     io._pair_grace_s = PAIR_GRACE_S
@@ -631,7 +639,7 @@ class TestPairGrace:
         io = _io_at(now_s=10.0, held=Held())
 
         assert io._lapse(io._robots.of_name("alpha")) == (
-            f"none of this robot's limbs were paired for {PAIR_GRACE}"
+            f"this robot held no pair for {PAIR_GRACE}"
         )
 
     def test_a_robot_whose_limbs_left_keeps_its_place_for_the_pair_grace_time(self):
@@ -680,7 +688,7 @@ class TestPairGrace:
 
         assert io._lapse(io._robots.of_name("alpha")) == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
-            "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], rgb_cameras [], "
+            "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], bases [], rgb_cameras [], "
             f"rgbd_cameras [], and {OPENARM_V2_HAS}"
         )
 
@@ -692,7 +700,7 @@ class TestPairGrace:
 
         assert io._lapse(io._robots.of_name("alpha")) == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
-            "arms ['arm'], grippers ['gripper'], rgb_cameras [], rgbd_cameras ['chest'], "
+            "arms ['arm'], grippers ['gripper'], bases [], rgb_cameras [], rgbd_cameras ['chest'], "
             f"and {SO101_HAS}"
         )
 
@@ -712,7 +720,7 @@ class TestPairGrace:
         assert why == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
             "arms ['left_arm', 'right_arm'], grippers ['left_gripper', 'right_gripper'], "
-            f"rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
+            f"bases [], rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
         )
         assert io._robots.of_name("alpha").last_paired_s == 0.0
 
@@ -724,6 +732,8 @@ class TestPairGrace:
             ("so101", OPENARM_LIMBS, 0.0),
             ("openarm_v2", Held(arms=OPENARM_LIMBS.arms), 0.0),
             ("openarm_v2", Held(), 0.0),
+            ("botshare_base", Held(bases=frozenset({"base"})), 10.0),
+            ("botshare_base", Held(rgbd_cameras=frozenset({"base_camera"})), 0.0),
         ],
     )
     def test_the_watcher_restarts_a_pair_grace_time_only_while_the_pairs_are_the_models(
@@ -742,15 +752,16 @@ class TestPairGrace:
         asyncio.run(one_tick())
 
         assert io._robots.of_name("alpha").last_paired_s == renewed_s
+        assert io._io.base_readings == 1, "each reading drops the setpoints of bases whose pair is gone"
 
 
 class TestAFleetsPairGraceTimes:
-    """Every robot of a fleet holds its own pairs on the four slots this
+    """Every robot of a fleet holds its own pairs on the five slots this
     engine declares, so each one's pair grace time and each one's readiness
     is read off its own."""
 
     def test_each_robot_is_held_to_its_own_model(self):
-        """An SO-101 stands beside an OpenArm on the same four slots. Each
+        """An SO-101 stands beside an OpenArm on the same five slots. Each
         holds its own model's limbs, and neither is asked for the other's."""
         io = _fleet_io_at(
             now_s=10.0,
@@ -1109,7 +1120,7 @@ def test_a_robot_that_lapsed_fails_its_goal_as_gone():
 
 def test_a_robot_whose_pairs_lapsed_on_its_watch_fails_its_goal_naming_its_pairs():
     """A stay whose pair grace time ran out takes its robot out of the scene,
-    and the failed goal says that none of its limbs were paired."""
+    and the failed goal says that it held no pair."""
     io = _io_at(now_s=10.0, held=Held())
     io._robots.stand("alpha")
     io._pair_grace_check_period = lambda: 0.0
@@ -1128,7 +1139,7 @@ def test_a_robot_whose_pairs_lapsed_on_its_watch_fails_its_goal_naming_its_pairs
         (
             "failed",
             FailureKind.RESOURCE_UNAVAILABLE,
-            f"none of this robot's limbs were paired for {PAIR_GRACE}",
+            f"this robot held no pair for {PAIR_GRACE}",
         )
     ]
 
@@ -1169,6 +1180,11 @@ class TestReadiness:
     def test_limbs_of_another_model_make_no_robot_ready(self):
         assert not self._ready(OPENARM_LIMBS, model="so101")
         assert not self._ready(SO101_LIMBS, model="openarm_v2")
+
+    def test_a_base_is_ready_once_its_base_is_paired(self):
+        assert self._ready(Held(bases=frozenset({"base"})), model="botshare_base")
+        assert not self._ready(Held(rgbd_cameras=frozenset({"base_camera"})), model="botshare_base")
+        assert not self._ready(SO101_LIMBS, model="botshare_base")
 
     def test_a_robot_the_scene_has_not_stood_yet_is_not_ready(self):
         assert not self._ready(OPENARM_LIMBS, standing=False)

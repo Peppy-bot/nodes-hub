@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # pylint: disable=C0413
 """MujocoBridgeExtension owns the physics tick of the scene. Each step it
-applies the latest setpoint of every limb of every robot standing, advances
-physics, and (throttled to state_rate_hz) publishes MuJoCo's own clock
-followed by the measured joint and gripper state it stamps.
+applies the latest setpoint of every limb and base of every robot standing,
+clamps the integral of each wheel's rate loop, advances physics, and
+(throttled to state_rate_hz) publishes MuJoCo's own clock followed by the
+measured joint, gripper and wheel state it stamps, and records where each
+robot that rolls stands.
 
-Every robot is driven through its own limb pairs and publishes its state
-back on them. A robot's joints, actuators and cameras carry its own prefix in
-the scene, which is what tells one robot's limbs from another's when two
-robots of the same model stand together. Transport is typed peppygen via
+Every robot is driven through its own limb and base pairs and publishes its
+state back on them. A base's wheels run at the rates of its pair's latest
+setpoint, and at rate 0 while it holds none (sim_robot_core.setpoints). A
+robot's joints, actuators and cameras carry its own prefix in the scene,
+which is what tells one robot's limbs from another's when two robots of the
+same model stand together. Transport is typed peppygen via
 SimTopicIO; there is no JSON and no raw peppylib on the path.
 """
 from __future__ import annotations
@@ -16,7 +20,9 @@ from __future__ import annotations
 import logging
 import time
 
+from control_core_py.geometry import xyzw_of_wxyz
 from sim_robot_core.cameras import FramePacer
+from sim_robot_core.world import rolled_placement
 from robot_description_py import FingerSpan
 
 from exts import (
@@ -24,11 +30,12 @@ from exts import (
     MujocoArticulation,
     MujocoCameraSensor,
     MujocoGripperSensor,
+    MujocoWheelDrive,
     home_inertia,
 )
 from exts.camera_sensor import Rig
 from sim_topics import SimTopicIO
-from world import Robot
+from world import Robot, World
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +43,9 @@ logger = logging.getLogger(__name__)
 class _RobotLimbs:
     """One standing robot's own views of the scene: the actuators its limbs
     are driven through, the sensor each gripper is read from, the span each
-    finger travels, and where its joints sit in the scene's state."""
+    finger travels, the rate loops of its base's wheels, where its joints sit
+    in the scene's state, and where the free joint of a robot that rolls
+    does."""
 
     def __init__(self, robot: Robot, model, data) -> None:
         self.robot = robot
@@ -63,6 +72,12 @@ class _RobotLimbs:
         self.applied_effort: dict[str, float] = {}
         # Where each joint of this robot sits in the scene's joint order.
         self.joint_index: dict[str, int] = {}
+        # The wheels of its base, by their scene names, left then right; none
+        # for a robot without a base.
+        wheels = [self.scene_name(joint) for joint in self.entry.wheel_joints()]
+        self.wheels = MujocoWheelDrive(model, data, wheels) if wheels else None
+        # Where the free joint a robot that rolls hangs on sits in qpos.
+        self.free_qpos: int | None = None
 
     def scene_name(self, joint: str) -> str:
         return self.robot.scene_name(joint)
@@ -117,6 +132,20 @@ class _RobotLimbs:
                 )
             self.gripper_sensors[gripper.name] = sensor
             self.finger_spans[gripper.name] = list(gripper.spans)
+        if self.wheels is not None:
+            self.wheels.setup()
+        if self.robot.known.rolls:
+            import mujoco  # pylint: disable=C0415
+
+            free = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, self.robot.instance)
+            self.free_qpos = int(self._model.jnt_qposadr[free])
+
+    def rolled_placement(self):
+        """Where the wheels of a robot that rolls carried it: the origin of
+        its free joint, facing the heading its body turned to."""
+        at = self.free_qpos
+        qpos = self._data.qpos
+        return rolled_placement(qpos[at : at + 3], xyzw_of_wxyz(qpos[at + 3 : at + 7]))
 
     def start_in_posture(self) -> None:
         """Puts this robot in the posture its model starts in, and holds it
@@ -138,18 +167,21 @@ class _RobotLimbs:
         self.actuator.teardown()
         for sensor in self.gripper_sensors.values():
             sensor.teardown()
+        if self.wheels is not None:
+            self.wheels.teardown()
 
 
 class MujocoBridgeExtension:
-    """Drives every robot standing in the scene from its own command streams
-    and publishes its state on its own pairs."""
+    """Drives every robot standing in the scene from its own command streams,
+    publishes its state on its own pairs, and records in the world where each
+    robot that rolls stands."""
 
     def __init__(
         self,
         model,
         data,
         io: SimTopicIO,
-        robots: "list[Robot]",
+        world: World,
         state_rate_hz: int,
         renders: bool,
         time_base_s: float,
@@ -158,7 +190,8 @@ class MujocoBridgeExtension:
         self._model = model
         self._data = data
         self._io = io
-        self._robots = list(robots)
+        self._world = world
+        self._robots: list[Robot] = world.robots()
         # State publishes ride an absolute grid at state_rate_hz: serializing
         # every reader at the ~500 Hz physics tick saturates the single sim
         # thread. Writers and the physics step still run every tick.
@@ -254,13 +287,17 @@ class MujocoBridgeExtension:
                 if command is None:
                     continue
                 positions, velocities = command
-                if len(positions) != len(arm.joints):
-                    continue
                 joints = [limbs.scene_name(joint) for joint in arm.joints]
                 velocity_values = (
                     dict(zip(joints, velocities)) if len(velocities) == len(joints) else None
                 )
                 limbs.actuator.write_targets(dict(zip(joints, positions)), velocity_values)
+
+            if limbs.wheels is not None:
+                setpoint = self._io.latest_base_command(robot)
+                stopped = (0.0,) * len(limbs.entry.wheel_joints())
+                limbs.wheels.drive(stopped if setpoint is None else setpoint.rates())
+                limbs.wheels.clamp_integrals()
 
             for gripper in limbs.entry.grippers:
                 command = self._io.latest_gripper_command(robot, gripper.name)
@@ -296,6 +333,13 @@ class MujocoBridgeExtension:
                         [positions[index] for index in indices],
                         [velocities[index] for index in indices],
                     )
+                if limbs.wheels is not None:
+                    indices = [limbs.joint_index[joint] for joint in limbs.entry.wheel_joints()]
+                    self._io.publish_base_states(
+                        robot,
+                        [positions[index] for index in indices],
+                        [velocities[index] for index in indices],
+                    )
 
             for name, sensor in limbs.gripper_sensors.items():
                 data = sensor.get_gripper_state()
@@ -308,6 +352,9 @@ class MujocoBridgeExtension:
                         for position, span in zip(data["positions"], spans)
                     ]
                     self._io.publish_gripper_states(robot, name, sum(fractions) / len(fractions))
+
+            if limbs.free_qpos is not None:
+                self._world.follow(robot, limbs.rolled_placement())
 
     def shutdown(self) -> dict:
         """Stops every view this scene reads the model through, and says what

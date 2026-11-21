@@ -3,9 +3,9 @@
 
 A robot joins by attaching with the copy it runs as, the model it is and
 where it stands, and its goal runs for as long as it is in the scene. Its
-limbs reach it through its own pairs, so nothing here carries motion: what
-this serves is who may join, where, how long they stay, and whether the
-robot that joined is ready to be driven.
+limbs and its base reach it through its own pairs, so nothing here carries
+motion: what this serves is who may join, where, how long they stay, and
+whether the robot that joined is ready to be driven.
 
 The scene belongs to the thread that steps it, so standing a robot and
 taking one out are handed to that thread and waited on: both compose and
@@ -35,7 +35,7 @@ from mujoco_models import MujocoModel, MujocoModels
 from world import SPOT_PITCH_M, World, name_in_the_scene, within_one_spot
 
 # How long a robot's stay waits between checks of its own pair grace time, as
-# a share of that time: a robot whose limbs are gone leaves within a quarter
+# a share of that time: a robot whose pairs are gone leaves within a quarter
 # of its pair grace time after that time runs out. The same tick records
 # whether the robot holds the pairs its model asks for, which is what starts
 # its pair grace time again.
@@ -83,8 +83,8 @@ class Ending(enum.Enum):
 
 class RobotsIO:
     """Serves how a robot joins the scene and whether it is ready: who may
-    attach, where they stand, how long they stay, and whether each holds
-    every limb pair its model asks for."""
+    attach, where they stand, how long they stay, and whether each holds a
+    pair for every limb and the base its model has."""
 
     def __init__(
         self,
@@ -99,16 +99,16 @@ class RobotsIO:
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        # The models this engine stands, each with the limbs and cameras a
-        # robot of it pairs.
+        # The models this engine stands, each with the limbs, the base and the
+        # cameras a robot of it pairs.
         self._models = models
         self._robots = robots
         # The robots standing in the scene, and the scene they compose.
         self._world = world
         # The changes waiting for the thread that steps the scene.
         self._edits = edits
-        # The limb pairs, which are what a robot is driven through and what
-        # keeps it in the scene.
+        # The limb and base pairs, which are what a robot is driven through and
+        # what keeps it in the scene.
         self._io = io
         if pair_grace_s <= 0.0:
             raise ValueError(
@@ -211,10 +211,12 @@ class RobotsIO:
 
     async def _watch_pairs(self) -> None:
         """Records which robots hold the pairs their model asks for, on the
-        same tick their stay checks its pair grace time. A robot's pairs
-        dissolve when its nodes stop, so this is how a robot that is gone stops
-        starting its pair grace time again, and a robot paired as another model
-        never starts it again at all."""
+        same tick their stay checks its pair grace time, and drops the
+        setpoint of each base whose pair is gone. A robot's pairs dissolve
+        when its nodes stop, so this is how a robot that is gone stops
+        starting its pair grace time again, a robot paired as another model
+        never starts it again at all, and the wheels of a base whose node is
+        gone hold at rate 0."""
         period = self._pair_grace_check_period()
         while True:
             try:
@@ -222,10 +224,11 @@ class RobotsIO:
                     robot.name for robot in self._robots.robots() if self._mismatch(robot) is None
                 }
                 self._robots.note_paired(matched, self._loop.time())
+                self._io.keep_paired_bases()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pylint: disable=W0718
-                logger.exception("reading the limb pairs failed")
+                logger.exception("reading the pairs failed")
             await asyncio.sleep(period)
 
     async def _serve_attach(self, handle: attach.ActionHandle) -> None:
@@ -370,7 +373,7 @@ class RobotsIO:
 
     async def _stay(self, context: attach.GoalContext) -> None:
         """One robot's stay in the scene: it joins, it is driven through its
-        limb pairs, and it leaves when the goal is cancelled, when its pairs
+        limb and base pairs, and it leaves when the goal is cancelled, when its pairs
         have not been its model's for the pair grace time, or when the engine
         stops.
 
@@ -539,23 +542,23 @@ class RobotsIO:
         pairs are not its model's now, and were not for the pair grace time.
         They are read here as well as on the watcher's tick, so a robot still
         holding them keeps its place however long the node loop went without
-        starting its pair grace time again, and a robot no limb reached yet
-        keeps its place for as long as its goal runs. A robot holding no pair
-        is told its limbs were gone, and any other which of its pairs and its
-        model's limbs and cameras differ."""
+        starting its pair grace time again, and a robot no limb or base
+        reached yet keeps its place for as long as its goal runs. A robot
+        holding no pair is told so, and any other which of its pairs and its
+        model's limbs, base and cameras differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)
         if mismatch is None:
             self._robots.note_paired({robot.name}, now)
             return None
-        if held.holds_a_limb():
-            self._robots.note_limbs_reached(robot.name, now)
+        if held.holds_a_driven_part():
+            self._robots.note_driven_part_reached(robot.name, now)
         if not robot.pair_grace_ran_out(now, self._pair_grace_s):
             return None
         if held.is_empty():
             return (
-                f"none of this robot's limbs were paired for {self._pair_grace_s:.1f}s, "
+                f"this robot held no pair for {self._pair_grace_s:.1f}s, "
                 "the pair grace time this scene gives"
             )
         return (
@@ -586,14 +589,14 @@ class RobotsIO:
 
     def _ready(self, request: is_ready.Request) -> is_ready.Response:
         """Whether the asking instance's robot is ready to be driven: it
-        stands in the scene and holds a pair for every limb of its model, so
-        a setpoint reaches each one and its state comes back. A robot's limbs
-        go ready together, so one answer covers them all."""
+        stands in the scene and holds a pair for every limb and the base of
+        its model, so a setpoint reaches each one and its state comes back. A
+        robot's parts go ready together, so one answer covers them all."""
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
         robot = self._robots.of_caller(caller)
         ready = (
             robot is not None
             and robot.standing()
-            and robot.entry.holds_every_limb(self._io.held_by(robot.name))
+            and robot.entry.holds_every_driven_part(self._io.held_by(robot.name))
         )
         return is_ready.Response(ready=ready)

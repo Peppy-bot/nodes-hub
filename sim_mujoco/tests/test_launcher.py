@@ -1,12 +1,14 @@
 """What a robot joining or leaving does to the scene already running: it is
 composed again, and the robots that stay carry onto it what they were doing,
-while the one that arrived starts in its model's posture. The scenes are
+a wheel's integral and where a robot that rolls stands among it, while the
+one that arrived starts in its model's posture. The scenes are
 real (tiny) MJCF composed and compiled by MuJoCo.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import threading
 import types
@@ -16,7 +18,7 @@ from pathlib import Path
 import mujoco
 import pytest
 import viewer_fakes
-from entries import camera, entry, known as known_model
+from entries import WHEELED, WHEELED_ENTRY, WHEELED_MOUNT, camera, entry, known as known_model
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the launcher imports)
 
@@ -94,12 +96,18 @@ class FakeIO:
     def latest_gripper_command(self, robot, gripper):
         return None
 
+    def latest_base_command(self, robot):
+        return None
+
+    def publish_base_states(self, robot, positions, velocities):
+        return None
+
 
 class _Unwatched(SimLauncher):
     """A launcher whose scene nobody watches, for the tests that hold the
     scene itself and not how it is shown."""
 
-    def _open_view(self, model, data, extension):
+    def _open_view(self, model, data, extension, robots):
         return _NoView(model, extension)
 
 
@@ -125,6 +133,12 @@ def assets_fixture(tmp_path, monkeypatch):
 
 def _known(robot=None, **release):
     return known_model("arm", robot or _ARM_ENTRY, mujoco_models.ASSETS_DIR / _SCENE, "base", **release)
+
+
+def _wheeled():
+    scene = mujoco_models.ASSETS_DIR / "wheeled.xml"
+    scene.write_text(WHEELED)
+    return known_model("wheeled", WHEELED_ENTRY, scene, WHEELED_MOUNT)
 
 
 def _launcher(world: World) -> SimLauncher:
@@ -198,6 +212,31 @@ class TestTheSceneAsRobotsComeAndGo:
         assert _ctrl(launcher, "alpha/flex") == pytest.approx(-0.75)
         # The robot that just joined starts where its model's posture puts it.
         assert _qpos(launcher, "bravo/lift") == pytest.approx(_POSTURE["lift"])
+
+    def test_a_robot_that_rolls_keeps_where_it_rolled_and_its_wheels_integrals(self):
+        """Its free joint is carried as any joint is, and the activation of
+        each wheel's integral actuator, the angle its target rates carried
+        it to, is carried too, so its rate loop does not snap back."""
+        world = World(renders=False)
+        launcher = _launcher(world)
+        launcher.rebind()
+        _stand(launcher, world, "india", _wheeled())
+        model, data = launcher._model, launcher._data  # pylint: disable=W0212
+        free = model.joint("india").qposadr[0]
+        rolled = [0.4, 0.2, 0.0, math.cos(0.2), 0.0, 0.0, math.sin(0.2)]
+        data.qpos[free : free + 7] = rolled
+        integral = model.actuator_actadr[model.actuator("india/left_wheel_integral").id]
+        data.act[integral] = 0.15
+
+        _stand(launcher, world, "juliet", _wheeled())
+
+        moved, moved_data = launcher._model, launcher._data  # pylint: disable=W0212
+        moved_free = moved.joint("india").qposadr[0]
+        assert list(moved_data.qpos[moved_free : moved_free + 7]) == pytest.approx(rolled)
+        moved_integral = moved.actuator_actadr[moved.actuator("india/left_wheel_integral").id]
+        assert moved_data.act[moved_integral] == pytest.approx(0.15)
+        # The base that just joined starts at rest at its own placement.
+        assert moved_data.act[moved.actuator_actadr[moved.actuator("juliet/left_wheel_integral").id]] == 0.0
 
     def test_a_ball_joint_a_robot_carries_keeps_its_pose_across_a_rebuild(self):
         """A ball joint carries four positions and three speeds, which is a
@@ -465,6 +504,18 @@ class TestTheSceneOnTheViewersServer:
         assert len(viser.click_callbacks) == 1
         assert len(viser.connect_callbacks) == 2
 
+    def test_the_free_joint_of_a_robot_that_rolls_is_no_prop_to_reset(self):
+        """The button that restages the scene's props would teleport the
+        robot: a robot's own free joint is left to its wheels."""
+        viewer_server = _viewer_server()
+        world = World(renders=False)
+        launcher = _watched(world, viewer_server)
+        launcher.rebind()
+
+        _stand(launcher, world, "india", _wheeled())
+
+        assert viewer_server.viser.controls == ["Controls"]
+
     def test_a_scene_the_engine_lets_go_of_leaves_nothing_on_the_server(self):
         viewer_server = _viewer_server()
         launcher = _watched(World(renders=False), viewer_server)
@@ -495,7 +546,7 @@ class TestTheSceneOnTheViewersServer:
             # The view fails before the scene is ever stepped through the
             # extension, so it needs none.
             launcher_module._BrowserView(  # pylint: disable=W0212
-                model, mujoco.MjData(model), None, viewer_server
+                model, mujoco.MjData(model), None, viewer_server, {"alpha"}
             )
 
         assert viewer_server.viser.left_on_it() == []
@@ -568,7 +619,7 @@ def _open_view(kind: str, scene: _CountingScene):
     if kind == "none":
         return launcher_module._NoView(model, scene)  # pylint: disable=W0212
     return launcher_module._BrowserView(  # pylint: disable=W0212
-        model, data, scene, _viewer_server()
+        model, data, scene, _viewer_server(), {"alpha"}
     )
 
 

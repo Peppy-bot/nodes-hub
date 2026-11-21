@@ -7,7 +7,11 @@ actuators and cameras, and taking one out is composing the scene again
 without it. What is attached is the body of its model's MJCF that carries
 the whole robot, with its servos and weight compensation as the release of
 Waldo's catalogue gives them and the cameras of its description; where it
-stands is its placement.
+stands is its placement. A robot that rolls hangs from the world on a free
+joint of its own, named as the robot is: its placement is where it starts,
+it settles onto the floor the scene lays for it, its wheels carry it from
+there, and its placement follows it (`World.follow`), so the spacing rule
+and the scene composed next take where it stands.
 
 MuJoCo compiles a scene whole, so a robot joining or leaving makes a new
 model out of the robots standing then. The thread that steps the scene
@@ -23,6 +27,7 @@ it.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import threading
@@ -37,7 +42,8 @@ from mujoco_models import MujocoModel
 logger = logging.getLogger(__name__)
 
 # The empty scene robots join. A model that works against a floor asks for
-# one in its entry, and the scene lays it once for every robot that does.
+# one in its entry, a model that rolls needs one, and the scene lays it once
+# for every robot of either.
 _STAGE_XML = '<mujoco model="stage"><compiler angle="radian"/><worldbody/></mujoco>'
 
 # Side of the square the engine parks robots on when one asks for no
@@ -209,6 +215,14 @@ class World:
         )
         return robot
 
+    def follow(self, instance: str, placement: Pose) -> None:
+        """Records where a robot that rolls stands now: its wheels carried it
+        to `placement`. A robot no longer in the scene is left out."""
+        with self._lock:
+            robot = self._robots.get(instance)
+            if robot is not None:
+                self._robots[instance] = dataclasses.replace(robot, placement=placement)
+
     def remove(self, instance: str) -> None:
         """Takes a robot out of the scene."""
         with self._lock:
@@ -229,15 +243,14 @@ class World:
         settings = _shared_settings(children)
         if settings is not None:
             stage.option, stage.stat = settings
-        if any(robot.known.floor for robot in robots):
+        if any(robot.known.floor or robot.known.rolls for robot in robots):
             _lay_floor(stage)
         if self._renders:
             self._fit_out_rendering(stage, robots)
         for robot, child in children:
-            frame = stage.worldbody.add_frame()
-            frame.pos = list(robot.placement.position.position)
-            frame.quat = list(wxyz_of_xyzw(robot.placement.orientation.quaternion))
-            frame.attach_body(child.body(robot.known.robot.mount_body), robot.prefix, "")
+            _stance(stage, robot).attach_body(
+                child.body(robot.known.robot.mount_body), robot.prefix, ""
+            )
         return stage
 
     def _fit_out_rendering(self, stage, robots: list[Robot]) -> None:
@@ -257,6 +270,22 @@ class World:
         if self._renders and known.entry.cameras:
             add_cameras(spec, known, known.scene_path())
         return spec
+
+
+def _stance(stage, robot: Robot):
+    """The frame a robot is attached on, at its placement: a frame of the
+    world for a robot that holds where it is placed, and, for a robot that
+    rolls, the frame of a body of its own hanging from the world on a free
+    joint, body and joint named as the robot is."""
+    position = list(robot.placement.position.position)
+    orientation = list(wxyz_of_xyzw(robot.placement.orientation.quaternion))
+    if not robot.known.rolls:
+        frame = stage.worldbody.add_frame()
+        frame.pos, frame.quat = position, orientation
+        return frame
+    body = stage.worldbody.add_body(name=robot.instance, pos=position, quat=orientation)
+    body.add_freejoint(name=robot.instance)
+    return body.add_frame()
 
 
 def within_one_spot(one: Pose, other: Pose) -> bool:

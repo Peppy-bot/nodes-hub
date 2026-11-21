@@ -1,6 +1,7 @@
 """The physics tick of the scene: the posture each robot starts in, the limbs
 its setpoints drive under the names its pairs carry, how a gripper's opening
-maps onto its finger joints, and the state it publishes back. Every name a
+maps onto its finger joints, the rate loop each wheel of a base runs, and the
+state it publishes back. Every name a
 robot answers to carries its own prefix in the composed scene, so two robots
 of one model are driven apart. The scenes are real (tiny) MJCF composed and
 compiled by MuJoCo, and the transport is a fake that keeps what the bridge
@@ -10,6 +11,7 @@ read and published.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -17,8 +19,19 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import pytest
-from entries import camera, entry, known as known_model
+from entries import (
+    WHEEL_CAP_NM,
+    WHEEL_INTEGRAL_GAIN,
+    WHEELED,
+    WHEELED_ENTRY,
+    WHEELED_MOUNT,
+    camera,
+    entry,
+    known as known_model,
+    placement_at,
+)
 from sim_robot_core.models import Arm, ModelEntry
+from sim_robot_core.setpoints import JointSetpoint
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the bridge imports)
 
@@ -107,13 +120,21 @@ class FakeIO:
     def __init__(self) -> None:
         self.arm_commands: dict[tuple[str, str], tuple] = {}
         self.gripper_commands: dict[tuple[str, str], tuple] = {}
+        self.base_commands: dict[str, JointSetpoint] = {}
         self.engine_times: list[float] = []
         self.clock_ticks = 0
         self.arm_states: list[tuple] = []
         self.gripper_states: list[tuple] = []
+        self.base_states: list[tuple] = []
 
     def latest_arm_command(self, robot, arm):
         return self.arm_commands.get((robot, arm))
+
+    def latest_base_command(self, robot):
+        return self.base_commands.get(robot)
+
+    def publish_base_states(self, robot, positions, velocities):
+        self.base_states.append((robot, positions, velocities))
 
     def latest_gripper_command(self, robot, gripper):
         return self.gripper_commands.get((robot, gripper))
@@ -157,7 +178,7 @@ def assets_fixture(tmp_path, monkeypatch):
 
 
 # The body of each scene that carries its robot.
-_MOUNTS = {"jaw_arm": "base", "pincher": "palm"}
+_MOUNTS = {"jaw_arm": "base", "pincher": "palm", "wheeled": WHEELED_MOUNT}
 
 
 def _known(model: str, robot: ModelEntry, xml: str, **release):
@@ -166,21 +187,20 @@ def _known(model: str, robot: ModelEntry, xml: str, **release):
     return known_model(model, robot, scene, _MOUNTS[model], **release)
 
 
-def _stand(xml: str, known, io=None, time_base_s: float = 0.0, names=(ROBOT,)):
+def _stand(xml: str, known, io=None, time_base_s: float = 0.0, names=(ROBOT,), world=None):
     """A scene composed and started the way the launcher stands it, with one
-    robot of `known` under each name."""
-    world = World(renders=False)
+    robot of `known` under each name, in `world` or a world of its own."""
+    world = world or World(renders=False)
     for name in names:
         world.add(name, known, world.free_spot())
     model = world.compose().compile()
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     io = io or FakeIO()
-    robots = world.robots()
     bridge = MujocoBridgeExtension(
-        model, data, io, robots, _STATE_RATE_HZ, renders=False, time_base_s=time_base_s
+        model, data, io, world, _STATE_RATE_HZ, renders=False, time_base_s=time_base_s
     )
-    bridge.startup(posture_for=robots)
+    bridge.startup(posture_for=world.robots())
     mujoco.mj_forward(model, data)
     return model, data, io, bridge
 
@@ -370,15 +390,6 @@ class TestLimbs:
 
         assert (_ctrl(model, data, "lift"), _ctrl(model, data, "flex")) == tuple(_POSTURE.values())
 
-    def test_a_setpoint_of_another_joint_count_is_left_alone(self, clock):
-        io = FakeIO()
-        io.arm_commands[(ROBOT, "arm")] = ([0.1] * 7, [])
-        model, data, _, bridge = _jaw_arm(io)
-
-        bridge.step()
-
-        assert (_ctrl(model, data, "lift"), _ctrl(model, data, "flex")) == tuple(_POSTURE.values())
-
     def test_state_goes_back_under_the_limbs_own_names_in_joint_order(self):
         model, data, io, bridge = _jaw_arm()
         data.qvel[model.joint(f"{ROBOT}/flex").dofadr[0]] = 0.25
@@ -410,7 +421,7 @@ class TestStartup:
                 model,
                 mujoco.MjData(model),
                 FakeIO(),
-                [],
+                World(renders=False),
                 0,
                 renders=False,
                 time_base_s=0.0,
@@ -576,7 +587,7 @@ class TestARenderingScene:
             model,
             mujoco.MjData(model),
             FakeIO(),
-            world.robots(),
+            world,
             _STATE_RATE_HZ,
             renders=True,
             time_base_s=0.0,
@@ -609,7 +620,7 @@ class TestARenderingScene:
         world.add(ROBOT, known, world.free_spot())
         model = world.compose().compile()
         first = MujocoBridgeExtension(
-            model, mujoco.MjData(model), FakeIO(), world.robots(), _STATE_RATE_HZ,
+            model, mujoco.MjData(model), FakeIO(), world, _STATE_RATE_HZ,
             renders=True, time_base_s=0.0,
         )
         carried = first.shutdown()
@@ -619,7 +630,7 @@ class TestARenderingScene:
         world.add("delta", known, world.free_spot())
         composed = world.compose().compile()
         second = MujocoBridgeExtension(
-            composed, mujoco.MjData(composed), FakeIO(), world.robots(), _STATE_RATE_HZ,
+            composed, mujoco.MjData(composed), FakeIO(), world, _STATE_RATE_HZ,
             renders=True, time_base_s=0.0, camera_counters=carried,
         )
 
@@ -627,3 +638,118 @@ class TestARenderingScene:
         assert counted[(ROBOT, "wrist")].next() == 3
         # The robot that just joined starts its own count.
         assert counted[("delta", "wrist")].next() == 0
+
+
+def _wheeled(io=None, xml: str = WHEELED, world=None):
+    return _stand(xml, _known("wheeled", WHEELED_ENTRY, xml), io, world=world)
+
+
+def _wheel_ctrls(model, data) -> list[float]:
+    """The controls of the wheels' rate loops: left proportional and
+    integral, then right's."""
+    return [
+        _ctrl(model, data, f"{side}_wheel_{part}")
+        for side in ("left", "right")
+        for part in ("proportional", "integral")
+    ]
+
+
+class TestTheWheelsOfABase:
+    def test_each_wheel_runs_at_its_rate_of_the_latest_setpoint_and_its_position_goes_unread(self):
+        io = FakeIO()
+        io.base_commands[ROBOT] = JointSetpoint((5.0, -5.0), (1.0, -2.0))
+        model, data, _, bridge = _wheeled(io)
+
+        bridge.step()
+
+        assert _wheel_ctrls(model, data) == [1.0, 1.0, -2.0, -2.0]
+
+    @pytest.mark.parametrize("setpoint", [None, JointSetpoint((0.3, 0.3), ())])
+    def test_the_wheels_hold_at_rate_0_without_a_setpoint_or_its_velocities(self, setpoint):
+        io = FakeIO()
+        model, data, _, bridge = _wheeled(io)
+        io.base_commands[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
+        bridge.step()
+        if setpoint is None:
+            del io.base_commands[ROBOT]
+        else:
+            io.base_commands[ROBOT] = setpoint
+
+        bridge.step()
+
+        assert _wheel_ctrls(model, data) == [0.0, 0.0, 0.0, 0.0]
+
+    def test_the_integral_of_each_wheel_is_clamped_at_what_its_torque_cap_holds(self):
+        model, data, _, bridge = _wheeled()
+        integral = model.actuator(f"{ROBOT}/left_wheel_integral")
+        act = int(model.actuator_actadr[integral.id])
+        angle = _qpos(model, data, "left_wheel")
+        data.act[act] = angle + 10.0
+
+        bridge.step()
+
+        # The step integrates a rate of 0 after the clamp, so the activation
+        # stands where the clamp left it.
+        windup = WHEEL_CAP_NM / WHEEL_INTEGRAL_GAIN
+        assert data.act[act] == pytest.approx(angle + windup)
+
+    def test_the_wheel_state_goes_back_left_then_right_on_the_state_rate(self, clock):
+        io = FakeIO()
+        io.base_commands[ROBOT] = JointSetpoint((0.0, 0.0), (2.0, 4.0))
+        model, data, _, bridge = _wheeled(io)
+
+        bridge.step()
+
+        ((robot, positions, velocities),) = io.base_states
+        assert robot == ROBOT
+        assert positions == [_qpos(model, data, "left_wheel"), _qpos(model, data, "right_wheel")]
+        assert velocities == [
+            float(data.qvel[model.joint(f"{ROBOT}/{wheel}").dofadr[0]])
+            for wheel in ("left_wheel", "right_wheel")
+        ]
+
+    def test_where_the_wheels_carried_the_base_becomes_its_placement(self, clock):
+        io = FakeIO()
+        world = World(renders=False)
+        model, data, _, bridge = _wheeled(io, world=world)
+        free = model.joint(ROBOT).qposadr[0]
+        data.qpos[free : free + 7] = [0.75, -0.25, 0.01, math.cos(0.3), 0.0, 0.0, math.sin(0.3)]
+
+        bridge.step()
+
+        (robot,) = world.robots()
+        x, y, z = robot.placement.position.position
+        assert (x, y) == pytest.approx((0.75, -0.25), abs=1e-3)
+        assert z == pytest.approx(0.01, abs=1e-3)
+        assert robot.placement.orientation.quaternion == pytest.approx(
+            placement_at(0.0, yaw=0.6).orientation.quaternion, abs=1e-3
+        )
+
+    @pytest.mark.parametrize(
+        ("change", "refusal"),
+        [
+            (('actuatorfrcrange="-4.0 4.0"', ""), "no range caps its actuator force"),
+            (
+                (f'<intvelocity name="left_wheel_integral" joint="left_wheel" kp="{WHEEL_INTEGRAL_GAIN}"/>', ""),
+                "1 actuators drive it",
+            ),
+            (
+                ('<velocity name="left_wheel_proportional" joint="left_wheel" kv="10"/>',
+                 '<velocity name="left_wheel_proportional" joint="left_wheel" kv="10" gear="2"/>'),
+                "has gear 2",
+            ),
+            (
+                (f'<intvelocity name="left_wheel_integral" joint="left_wheel" kp="{WHEEL_INTEGRAL_GAIN}"/>',
+                 f'<intvelocity name="left_wheel_integral" joint="left_wheel" kp="{WHEEL_INTEGRAL_GAIN}" actrange="-1 1"/>'),
+                "clamps its activation",
+            ),
+            (('<joint name="left_wheel" class="wheel"/>', '<joint name="left_wheel" class="wheel" type="slide"/>'),
+             "is not a hinge"),
+        ],
+    )
+    def test_a_wheel_its_mjcf_does_not_run_as_a_rate_loop_is_refused_saying_what_to_give(self, change, refusal):
+        old, new = change
+        assert WHEELED.count(old) >= 1, old
+        broken = WHEELED.replace(old, new, 1) if "left" in old else WHEELED.replace(old, new)
+        with pytest.raises(RuntimeError, match=rf"wheel '{ROBOT}/left_wheel'.*{refusal}"):
+            _wheeled(xml=broken)
