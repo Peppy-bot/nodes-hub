@@ -165,9 +165,10 @@ mod tests {
     // A drive_base velocity in a frame turned a quarter turn about +z from the
     // robot frame is placed in the robot frame before the base's limits judge
     // it: 0.1 m/s along that frame's -y is 0.1 m/s ahead, and its turn about z
-    // keeps its rate.
-    #[test]
-    fn a_drive_in_a_turned_frame_is_placed_in_the_robot_frame() {
+    // keeps its rate. The placement waits on the runtime as the generated
+    // decider's does, on a multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drive_in_a_turned_frame_is_placed_in_the_robot_frame() {
         let tree =
             RobotTree::new(Duration::from_secs(10), NodeClock::wall()).expect("a window above 0");
         let initializer = Publisher {
