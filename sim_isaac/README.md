@@ -104,12 +104,12 @@ stage is held to its own model.
 
 An arm's or a base's setpoint is taken as `sim_robot_core.setpoints` parses
 it: one position per joint, and no velocities or one per joint, each a
-number no further from 0 than the largest a simulation holds. Any other is
-dropped with a warning naming the robot, the part and why, once until one of
-that part's setpoints fits. A base's wheels follow the velocities of its
-latest setpoint, as the base's driver runs them in profile velocity mode,
-and the positions go unread; a setpoint that carries no velocities runs them
-at rate 0. They follow as `joint_link`'s follower of a velocity-mode device
+number no further from 0 than the largest a simulation holds, a base's with
+one velocity per wheel. Any other is dropped with a warning naming the
+robot, the part and why, once until one of that part's setpoints fits. A
+base's wheels follow the velocities of its latest setpoint, as the base's
+driver runs them in profile velocity mode, and the positions go unread.
+They follow as `joint_link`'s follower of a velocity-mode device
 follows: from each setpoint that arrives until more than 0.5 s pass with no
 setpoint, on the timeline, and then they are held where they stand, the
 integral of each wheel's loop cleared, at rate 0. The setpoint also belongs

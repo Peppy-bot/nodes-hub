@@ -341,7 +341,7 @@ class IsaacBridgeExtension:
         setpoint = self._io.setpoints.base(robot, now_s)
         if self._io.setpoints.take_base_release(robot):
             self._let_go_of_wheels(robot)
-        rates = (0.0,) * len(wheels) if setpoint is None else setpoint.rates()
+        rates = (0.0,) * len(wheels) if setpoint is None else setpoint.velocities
         loops = tuple(
             loop.advanced(positions[limbs.joint_index[wheel]], elapsed_s, gain).driven_at(rate)
             for loop, wheel, rate, gain in zip(

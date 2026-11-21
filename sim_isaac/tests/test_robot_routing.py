@@ -533,22 +533,16 @@ class TestBases:
     def test_a_base_setpoint_reaches_its_robots_wheels_at_its_velocities(self, rolling):
         _serve(rolling, bases=[_base_setpoint(DELTA_BASE, [0.0, 0.0], [1.0, -1.0])])
 
-        setpoint = rolling.io.setpoints.base("delta", 0.0)
-        assert setpoint == _arm([0.0, 0.0], [1.0, -1.0])
-        assert setpoint.rates() == (1.0, -1.0)
+        assert rolling.io.setpoints.base("delta", 0.0) == _arm([0.0, 0.0], [1.0, -1.0])
         assert rolling.io.held_by("delta") == Held(bases=frozenset({"base"}))
-
-    def test_a_setpoint_without_velocities_runs_the_wheels_at_rate_0(self, rolling):
-        _serve(rolling, bases=[_base_setpoint(DELTA_BASE, [0.4, 0.2])])
-
-        assert rolling.io.setpoints.base("delta", 0.0).rates() == (0.0, 0.0)
 
     @pytest.mark.parametrize(
         ("positions", "velocities"),
         [
-            ([0.0, 0.0, 0.0], []),
+            ([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
             ([0.0, 0.0], [1.0]),
-            ([float("nan"), 0.0], []),
+            ([0.0, 0.0], []),
+            ([float("nan"), 0.0], [1.0, 1.0]),
             ([0.0, 0.0], [float("inf"), 0.0]),
             ([0.0, 0.0], [0.0, 10.0 * MAX_VALUE]),
         ],
