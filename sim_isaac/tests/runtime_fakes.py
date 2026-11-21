@@ -6,7 +6,7 @@ the engine imports, once, ahead of the engine's own imports. Every suite that
 needs the runtime imports it, so they all meet the same modules whichever of
 them a session collects first.
 
-The pairing modules follow the node's four slots. A slot's pairs are the
+The pairing modules follow the node's five slots. A slot's pairs are the
 slot's, so every topic module of a slot reads the same members, exactly as the
 generated `peers()` does. A setpoint module hands the engine the arrivals a
 test queued and then ends its subscription, and every publisher records the
@@ -25,6 +25,7 @@ from typing import Optional
 SLOT_TOPICS = {
     "arms": ("joint_setpoints", "joint_states"),
     "grippers": ("gripper_setpoints", "gripper_states"),
+    "bases": ("joint_setpoints", "joint_states"),
     "rgb_cameras": ("video_stream", "stream_info", "geometry"),
     "rgbd_cameras": ("video_stream", "depth_stream", "stream_info", "geometry"),
 }
@@ -85,6 +86,24 @@ class Subscription:
 
     async def next(self):
         return self._arrivals.pop(0) if self._arrivals else None
+
+
+class _Token:
+    """The node's cancellation token, which no test cancels."""
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    async def cancelled(self) -> None:
+        await asyncio.Event().wait()
+
+
+class NodeRunner:
+    """The node runner the engine's transport holds: what it reads of it is
+    the node's cancellation token."""
+
+    def cancellation_token(self) -> _Token:
+        return _Token()
 
 
 class FailureKind(str, enum.Enum):

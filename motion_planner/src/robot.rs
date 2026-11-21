@@ -507,7 +507,7 @@ pub(crate) mod tests {
 
     #[test]
     fn each_bundled_models_arms_are_its_descriptions() {
-        for bundled in robot_description::models() {
+        for bundled in robot_description::models_with_arms() {
             let id = bundled.id();
             let described = Described::bundled(id);
             on_shape(

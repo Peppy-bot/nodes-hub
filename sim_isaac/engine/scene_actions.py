@@ -57,9 +57,10 @@ from peppygen.exposed_services.scene import (
     get_robots_list,
     get_scene,
 )
+from sim_robot_core.object_state import ObjectStateSnapshot
 from sim_robot_core.world import WORLD, UnknownFrame, base_target, failure_kind_of, in_world
 
-from object_state import IsaacObjectReader, ObjectStateSnapshot
+from object_state import IsaacObjectReader
 
 
 logger = logging.getLogger(__name__)
@@ -545,6 +546,7 @@ class SceneActionIO:
         loop: asyncio.AbstractEventLoop,
         io,
         world,
+        robots,
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
@@ -556,6 +558,10 @@ class SceneActionIO:
         # get_robots_list reports, and which move_robot resolves a name
         # against and moves the robot through on the Isaac main thread.
         self._world = world
+        # The robots the engine has stood, which simulation_robot's attach
+        # reports standing: object_state lists a robot of the stage from then
+        # on.
+        self._robots = robots
 
         self._lock = threading.Lock()
 
@@ -939,7 +945,8 @@ class SceneActionIO:
         self._object_reader.invalidate()
 
     def capture_object_states(self) -> ObjectStateSnapshot | None:
-        """Capture every spawned object on the Isaac main thread.
+        """Capture every spawned object, and every robot of the stage the
+        engine has stood, on the Isaac main thread.
 
         The capture becomes the snapshot get_object_states answers and is
         returned for the stream to publish. None when there is no snapshot:
@@ -976,9 +983,13 @@ class SceneActionIO:
 
             return None
 
+        standing = self._robots.standing()
         snapshot = ObjectStateSnapshot(
             timestamp_s=timestamp_s,
             objects=tuple(records),
+            robots=tuple(
+                robot.record() for robot in self._world.robots() if robot.instance in standing
+            ),
         )
 
         with self._lock:
@@ -1005,6 +1016,10 @@ class SceneActionIO:
                     **record.fields()
                 )
                 for record in snapshot.objects
+            ],
+            robots=[
+                get_object_states.ResponseRobotsItem(**record.fields())
+                for record in snapshot.robots
             ],
         )
 

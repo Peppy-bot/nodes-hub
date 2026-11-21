@@ -1,13 +1,14 @@
 """The models this engine stands, one entry per model under models/.
 
-What a robot of a model is made of (its limbs, joints, cameras and start
-posture) comes from the description its attach goal carries, through
+What a robot of a model is made of (its limbs, base, joints, cameras and
+start posture) comes from the description its attach goal carries, through
 sim_robot_core's entry of the same model, shared with every engine, and so
-does the effort ceiling of each of its PhysX drives, the effort limit the
-description gives the drive's joint. What is here is what Isaac Sim alone
+does the effort ceiling of each of its limbs' PhysX drives, the effort limit
+the description gives the drive's joint. What is here is what Isaac Sim alone
 knows about the model: the USD stage it references, where that stage keeps
-its articulation root and its links, the gains of its PhysX drives, and
-whether its weight is compensated. The engine reads every entry here when it
+its articulation root and its links, the gains of its limbs' PhysX drives,
+and whether its weight is compensated. A base's wheels run the drives their
+stage authors. The engine reads every entry here when it
 starts, and holds one to a robot's description when the robot attaches. A
 model with no entry here is refused, and none falls back to another's.
 """
@@ -68,6 +69,9 @@ class IsaacModel:
     the model."""
 
     entry: ModelEntry
+    # The description's root link: the robot frame, where a robot that rolls
+    # is read.
+    root_link: str
     # Joint name to the effort limit the description gives the joint, N*m or
     # N: the ceiling of the joint's drive.
     effort_limits: dict
@@ -93,6 +97,12 @@ class IsaacModel:
     @property
     def model(self) -> str:
         return self.entry.model
+
+    @property
+    def rolls(self) -> bool:
+        """Whether a robot of this model rolls on the wheels of its base: it
+        stands free on the floor, where its wheels carry it."""
+        return self.entry.rolls
 
     def stage_path(self) -> Path:
         """The USD on disk."""
@@ -261,14 +271,20 @@ def _effort_limits_fit(model: str, joints: list[str], gains: Optional[DriveGains
 
 
 def stood(
-    model: str, entry: ModelEntry, fields: dict, effort_limits: dict, position_limits: dict
+    model: str,
+    entry: ModelEntry,
+    fields: dict,
+    effort_limits: dict,
+    position_limits: dict,
+    root_link: str,
 ) -> IsaacModel:
     """The model `fields` of this engine's entry describe, as the robot that
     `entry` describes stands: the entry's gains serve its arms and the
     fingers of its grippers that move of their own, `effort_limits`, the
     effort limit the robot's description gives each of its joints, cap their
-    drives, and `position_limits`, the position limits it gives each, are
-    what the stage's joints hold."""
+    drives, `position_limits`, the position limits it gives each, are what
+    the stage's joints hold, and `root_link`, the description's root link, is
+    its robot frame."""
     _gains_fit(model, "arm_gains", entry.arm_joint_counts(), "arms", "joints", fields["arm_gains"])
     _gains_fit(
         model,
@@ -282,7 +298,11 @@ def stood(
     _effort_limits_fit(model, entry.arm_joints(), fields["arm_gains"], effort_limits)
     _effort_limits_fit(model, driven_fingers, fields["gripper_gains"], effort_limits)
     return IsaacModel(
-        entry=entry, effort_limits=effort_limits, position_limits=position_limits, **fields
+        entry=entry,
+        root_link=root_link,
+        effort_limits=effort_limits,
+        position_limits=position_limits,
+        **fields,
     )
 
 
@@ -313,4 +333,6 @@ class IsaacModels:
         limits = {joint: description.joint_limits(joint) for joint in entry.joints()}
         effort_limits = {joint: limit.effort for joint, limit in limits.items()}
         position_limits = {joint: (limit.lower, limit.upper) for joint, limit in limits.items()}
-        return stood(model, entry, self._parsed[model], effort_limits, position_limits)
+        return stood(
+            model, entry, self._parsed[model], effort_limits, position_limits, description.root_link
+        )

@@ -44,13 +44,9 @@ change with any of them, also when the stage's do not.
 from __future__ import annotations
 
 import argparse
-import gzip
-import hashlib
-import io
 import json
 import math
 import sys
-import tarfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,7 +55,8 @@ import mujoco
 import numpy as np
 import robot_description_py
 from control_core_py.geometry import wxyz_of_xyzw
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, Vt
+from mujoco_usd import define_geom, gf_quat, pack, release_source, set_pose, sha256
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
 # The SO-101 of the release, whose model directory the builder reads.
 ROBOT_ID = "so101"
@@ -104,10 +101,6 @@ class Description:
     joints: dict[str, UrdfJoint]
     root_link: str
     tool: robot_description_py.LinkTransform
-
-
-def sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _urdf_joint(joint: ET.Element) -> UrdfJoint:
@@ -160,105 +153,6 @@ def compile_model(model_dir: Path, fuse: bool) -> mujoco.MjModel:
     return spec.compile()
 
 
-def gf_quat(wxyz, kind=Gf.Quatf):
-    w, x, y, z = (float(v) for v in wxyz)
-    return kind(w, x, y, z)
-
-
-def set_pose(prim, pos, quat_wxyz, scale=None) -> None:
-    xform = UsdGeom.Xformable(prim)
-    xform.AddTranslateOp().Set(Gf.Vec3d(*(float(v) for v in pos)))
-    xform.AddOrientOp().Set(gf_quat(quat_wxyz))
-    xform.AddScaleOp().Set(Gf.Vec3f(*(scale if scale is not None else (1.0, 1.0, 1.0))))
-
-
-def material_for(stage, model, geom_id: int, cache: dict) -> UsdShade.Material:
-    """One preview-surface material per colour the model draws."""
-    mat_id = int(model.geom_matid[geom_id])
-    rgba = model.mat_rgba[mat_id] if mat_id >= 0 else model.geom_rgba[geom_id]
-    name = model.material(mat_id).name if mat_id >= 0 else "geom_colour"
-    key = (name, tuple(round(float(v), 4) for v in rgba))
-    if key in cache:
-        return cache[key]
-    material = UsdShade.Material.Define(stage, f"{LOOKS_PATH}/{name}")
-    shader = UsdShade.Shader.Define(stage, f"{LOOKS_PATH}/{name}/surface")
-    shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-        Gf.Vec3f(*(float(v) for v in rgba[:3]))
-    )
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.6)
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-    material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-    cache[key] = material
-    return material
-
-
-def define_mesh(stage, path: str, model, mesh_id: int) -> UsdGeom.Mesh:
-    """The compiled mesh, in the frame MuJoCo placed its geom in."""
-    vert_adr, vert_num = int(model.mesh_vertadr[mesh_id]), int(model.mesh_vertnum[mesh_id])
-    face_adr, face_num = int(model.mesh_faceadr[mesh_id]), int(model.mesh_facenum[mesh_id])
-    points = model.mesh_vert[vert_adr : vert_adr + vert_num]
-    faces = model.mesh_face[face_adr : face_adr + face_num]
-    mesh = UsdGeom.Mesh.Define(stage, path)
-    mesh.CreatePointsAttr(Vt.Vec3fArray.FromNumpy(points.astype(np.float32)))
-    mesh.CreateFaceVertexCountsAttr(Vt.IntArray([3] * face_num))
-    mesh.CreateFaceVertexIndicesAttr(Vt.IntArray.FromNumpy(faces.astype(np.int32).reshape(-1)))
-    mesh.CreateSubdivisionSchemeAttr(UsdGeom.Tokens.none)
-    low, high = points.min(axis=0), points.max(axis=0)
-    mesh.CreateExtentAttr([Gf.Vec3f(*map(float, low)), Gf.Vec3f(*map(float, high))])
-    return mesh
-
-
-def define_geom(stage, parent: str, name: str, model, geom_id: int, materials: dict):
-    """One geom of a link, drawn or collided with."""
-    visual = int(model.geom_group[geom_id]) == VISUAL_GROUP
-    kind = int(model.geom_type[geom_id])
-    size = model.geom_size[geom_id]
-    path = f"{parent}/{'visuals' if visual else 'collisions'}/{name}"
-    pos, quat = model.geom_pos[geom_id], model.geom_quat[geom_id]
-    if kind == mujoco.mjtGeom.mjGEOM_MESH:
-        prim = define_mesh(stage, path, model, int(model.geom_dataid[geom_id])).GetPrim()
-        set_pose(prim, pos, quat)
-        approximation = UsdPhysics.Tokens.convexHull
-    elif kind == mujoco.mjtGeom.mjGEOM_BOX:
-        cube = UsdGeom.Cube.Define(stage, path)
-        cube.CreateSizeAttr(2.0)
-        cube.CreateExtentAttr([Gf.Vec3f(-1, -1, -1), Gf.Vec3f(1, 1, 1)])
-        prim = cube.GetPrim()
-        set_pose(prim, pos, quat, scale=tuple(float(v) for v in size))
-        approximation = None
-    elif kind == mujoco.mjtGeom.mjGEOM_SPHERE:
-        sphere = UsdGeom.Sphere.Define(stage, path)
-        sphere.CreateRadiusAttr(float(size[0]))
-        prim = sphere.GetPrim()
-        set_pose(prim, pos, quat)
-        approximation = None
-    elif kind == mujoco.mjtGeom.mjGEOM_CAPSULE:
-        capsule = UsdGeom.Capsule.Define(stage, path)
-        capsule.CreateRadiusAttr(float(size[0]))
-        capsule.CreateHeightAttr(2.0 * float(size[1]))
-        capsule.CreateAxisAttr(UsdGeom.Tokens.z)
-        prim = capsule.GetPrim()
-        set_pose(prim, pos, quat)
-        approximation = None
-    elif kind == mujoco.mjtGeom.mjGEOM_CYLINDER:
-        cylinder = UsdGeom.Cylinder.Define(stage, path)
-        cylinder.CreateRadiusAttr(float(size[0]))
-        cylinder.CreateHeightAttr(2.0 * float(size[1]))
-        cylinder.CreateAxisAttr(UsdGeom.Tokens.z)
-        prim = cylinder.GetPrim()
-        set_pose(prim, pos, quat)
-        approximation = None
-    else:
-        raise ValueError(f"geom {geom_id} has a type this builder does not write: {kind}")
-    if visual:
-        UsdShade.MaterialBindingAPI.Apply(prim).Bind(material_for(stage, model, geom_id, materials))
-        return
-    UsdPhysics.CollisionAPI.Apply(prim)
-    if approximation is not None:
-        UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr(approximation)
-
-
 def define_link(stage, model, data, body_id: int, link: str, base_inertial, materials: dict) -> str:
     path = f"{ROBOT_PATH}/{link}"
     prim = UsdGeom.Xform.Define(stage, path).GetPrim()
@@ -287,7 +181,7 @@ def define_link(stage, model, data, body_id: int, link: str, base_inertial, mate
         if int(model.geom_bodyid[geom_id]) != body_id:
             continue
         name = model.geom(geom_id).name or f"geom_{index}"
-        define_geom(stage, path, name, model, geom_id, materials)
+        define_geom(stage, path, name, model, geom_id, VISUAL_GROUP, LOOKS_PATH, materials)
         index += 1
     return path
 
@@ -393,19 +287,11 @@ def build_stage(model_dir: Path, description: Description, output: Path) -> Path
     return path
 
 
-def model_source(release: Path) -> dict:
-    """The release a staged SO-101 model came from and the tree of it."""
-    index = json.loads((release / "index.json").read_text())
-    robots = json.loads((release / "robots.json").read_text())
-    (tree,) = [robot["tree"] for robot in robots if robot["id"] == ROBOT_ID]
-    return {"release": index["prefix"], "tree": tree, "license": "Apache-2.0"}
-
-
 def write_manifest(output: Path, stage_path: Path, release: Path, description: Description) -> None:
     manifest = {
         "version": 1,
         "stage": STAGE_FILENAME,
-        "source": model_source(release),
+        "source": {**release_source(release, ROBOT_ID), "license": "Apache-2.0"},
         "description": {"model": ROBOT_ID, "digest": description.digest},
         "builder": {"script": Path(__file__).name, "sha256": sha256(Path(__file__).read_bytes())},
         "tools": {
@@ -420,26 +306,6 @@ def write_manifest(output: Path, stage_path: Path, release: Path, description: D
         },
     }
     (output / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2) + "\n")
-
-
-def pack(directory: Path, archive: Path) -> str:
-    """Packs `directory` into `archive` reproducibly and returns the archive's
-    SHA-256, the key it is published under."""
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        for path in sorted(directory.iterdir()):
-            info = tar.gettarinfo(str(path), arcname=path.name)
-            info.uid = info.gid = 0
-            info.uname = info.gname = ""
-            info.mtime = 0
-            info.mode = 0o644
-            with path.open("rb") as source:
-                tar.addfile(info, source)
-    with archive.open("wb") as target, gzip.GzipFile(
-        fileobj=target, mode="wb", mtime=0, filename=""
-    ) as compressed:
-        compressed.write(buffer.getvalue())
-    return sha256(archive.read_bytes())
 
 
 def main(argv=None) -> int:

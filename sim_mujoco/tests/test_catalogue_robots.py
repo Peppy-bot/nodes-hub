@@ -42,11 +42,18 @@ def test_a_robot_is_its_wrapper_its_mount_its_bodies_and_its_gains(tmp_path):
     robot = _read(tmp_path, ARM)["so101"]
     assert robot.file == tmp_path / "so101" / "mounted.xml"
     assert robot.mount_body == "arm_mount"
+    assert not robot.rolls
     assert robot.body_of("gripper_link") == "gripper"
     assert robot.body_of("base_link") == "base_link"
     assert robot.gravity_compensation
     assert robot.arm_gains == {"arm": (ServoGains(10.0, 1.0), ServoGains(20.0, 2.0))}
     assert robot.gripper_gains == {"arm": ServoGains(5.0, 0.5)}
+
+
+@pytest.mark.parametrize(("stance", "rolls"), [("standing", False), ("mounted", False), ("rolling", True)])
+def test_a_rolling_robot_rolls_and_any_other_holds_where_it_is_placed(tmp_path, stance, rolls):
+    robot = _read(tmp_path, {**ARM, "mount": {"body": "arm_mount", "stance": stance}})["so101"]
+    assert robot.rolls is rolls
 
 
 def test_a_robot_without_a_wrapper_stands_from_its_source_scene(tmp_path):
@@ -64,6 +71,8 @@ def test_a_robot_without_gains_runs_its_files_actuators(tmp_path):
     [
         ({"mount": None}, "mount must be an object"),
         ({"mount": {"stance": "mounted"}}, "names no mount body"),
+        ({"mount": {"body": "arm_mount"}}, r"mount.stance must be one of \['standing', 'mounted', 'rolling'\], got None"),
+        ({"mount": {"body": "arm_mount", "stance": "seated"}}, "mount.stance must be one of"),
         ({"wrapper": None, "source": {}}, "names neither a wrapper nor a source scene"),
         ({"wrapper": None, "source": "scene.xml"}, "source must be an object"),
         ({"wrapper": 7}, "wrapper must be a name"),

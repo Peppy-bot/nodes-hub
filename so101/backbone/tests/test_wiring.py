@@ -18,6 +18,7 @@ from conftest import (
     MEASURED,
     NEAR,
     START_TOLERANCE_RAD,
+    STOP_ANSWER_TIMEOUT_S,
     TREE_TOLERANCE,
     assert_rectangle_inside_reach,
     joint_path_goal,
@@ -52,7 +53,7 @@ from peppygen.fixtures.exposed_actions.postures import move_to_home as move_to_h
 from peppygen.fixtures.exposed_actions.postures import move_to_ready as move_to_ready_fx
 from peppygen.consumed_services.transform_lookup import lookup_transform
 from peppygen.exposed_services.limb_motion import check_arm_move as check_arm_move_prod
-from peppygen.exposed_services.limb_motion import stop as stop_prod
+from peppygen.exposed_services.robot_stop import stop as robot_stop_prod
 from peppygen.exposed_services.workspace import check_positions as check_positions_prod
 from peppygen.exposed_services.workspace import (
     describe_workspace as describe_workspace_prod,
@@ -60,7 +61,7 @@ from peppygen.exposed_services.workspace import (
 from peppygen.fixtures.exposed_services.limb_motion import (
     check_arm_move as check_arm_move_fx,
 )
-from peppygen.fixtures.exposed_services.limb_motion import stop as stop_fx
+from peppygen.fixtures.exposed_services.robot_stop import stop as robot_stop_fx
 from peppygen.fixtures.exposed_services.limb_state import (
     get_limb_names as get_limb_names_fx,
 )
@@ -119,6 +120,7 @@ def make_parameters(**overrides) -> Parameters:
         "max_gripper_rate_frac_s": 8.0,
         "start_tolerance_rad": START_TOLERANCE_RAD,
         "lookup_timeout_s": 0.1,
+        "stop_answer_timeout_s": STOP_ANSWER_TIMEOUT_S,
     }
     return Parameters(**{**base, **overrides})
 
@@ -1291,7 +1293,9 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
     ) as h:
         feeder = await feeding_measured(h)
         try:
-            idle = await stop_fx.poll(h, stop_prod.RequestData(reason="nothing yet"), TIMEOUT_S)
+            idle = await robot_stop_fx.poll(
+                h, robot_stop_prod.RequestData(reason="nothing yet"), TIMEOUT_S
+            )
             assert idle.stopped == []
 
             slow = await move_arm_joints_fx.send_goal(
@@ -1319,8 +1323,8 @@ async def test_a_stop_ends_the_moves_in_flight_and_a_later_goal_runs():
             await asyncio.wait_for(h.mocks.pairings.arm.joint_setpoints.next(), TIMEOUT_S)
             await asyncio.wait_for(h.mocks.pairings.gripper.gripper_setpoints.next(), TIMEOUT_S)
 
-            answer = await stop_fx.poll(
-                h, stop_prod.RequestData(reason="the operator asked"), TIMEOUT_S
+            answer = await robot_stop_fx.poll(
+                h, robot_stop_prod.RequestData(reason="the operator asked"), TIMEOUT_S
             )
             assert answer.stopped == ["arm", "gripper"]
 

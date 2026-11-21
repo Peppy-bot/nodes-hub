@@ -10,13 +10,13 @@ import sys
 from pathlib import Path
 
 import pytest
+from sim_robot_core.object_state import ObjectRecord, ObjectStateSnapshot, RobotRecord
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime sim_topics imports)
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 
-import object_state  # noqa: E402  (beside sim_topics on the engine path)
 import sim_topics  # noqa: E402  (needs the runtime fakes)
 
 
@@ -195,24 +195,27 @@ class _GatedPublisher:
 def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight(io, loop, monkeypatch):
     topic = sim_topics.object_states
     monkeypatch.setattr(topic, "MessageObjectsItem", lambda **fields: fields, raising=False)
+    monkeypatch.setattr(topic, "MessageRobotsItem", lambda **fields: fields, raising=False)
     monkeypatch.setattr(
-        topic, "build_message", lambda frame, timestamp, objects: (frame, timestamp, objects), raising=False
+        topic, "build_message", lambda frame, timestamp, objects, robots: (frame, timestamp, objects, robots), raising=False
     )
     publisher = _GatedPublisher()
     io._object_states_pub = publisher
 
-    def snapshot(timestamp_s, *object_ids):
-        return object_state.ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
-            object_state.ObjectRecord(
+    robot = RobotRecord.fixed("alpha", "openarm_v2", (0.0, -1.5, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def snapshot(timestamp_s, *object_ids, robots=()):
+        return ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
+            ObjectRecord(
                 object_id=object_id, name=object_id, asset_id="props/blocks/red_block", physics="dynamic", mass=0.1,
                 scale=1.0,
                 position=(0.5, 0.0, 0.8), orientation=(0.0, 0.0, 0.0, 1.0),
                 linear_velocity=(0.0, 0.0, -0.2), angular_velocity=(0.0, 0.0, 0.0),
             )
             for object_id in object_ids
-        ))
+        ), robots=robots)
 
-    first, second, third = snapshot(1.5, "obj_a", "obj_b"), snapshot(1.6, "obj_a"), snapshot(1.7)
+    first, second, third = snapshot(1.5, "obj_a", "obj_b", robots=(robot,)), snapshot(1.6, "obj_a"), snapshot(1.7)
 
     async def scenario():
         publisher.gate = asyncio.Event()
@@ -226,6 +229,6 @@ def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight
 
     loop.run_until_complete(scenario())
     assert publisher.payloads == [
-        ("world", 1.5, [record.fields() for record in first.objects]),
-        ("world", 1.7, []),
+        ("world", 1.5, [record.fields() for record in first.objects], [robot.fields()]),
+        ("world", 1.7, [], []),
     ]

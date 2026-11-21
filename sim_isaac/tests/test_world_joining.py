@@ -58,7 +58,7 @@ def _model_starting_in(posture: dict, joints=("slide", "hinge")):
     """A model whose one arm moves `joints` and starts in `posture`."""
     rig = entry("rig", arms={"arm": list(joints)}, start_posture=posture)
     return isaac_models.stood(
-        "rig", rig, isaac_models.parse("rig", {"stage": "rig/rig.usd", "articulation_root": "."}), {}, {}
+        "rig", rig, isaac_models.parse("rig", {"stage": "rig/rig.usd", "articulation_root": "."}), {}, {}, "base_link"
     )
 
 
@@ -198,9 +198,10 @@ def _rig_of_followers(*pairs):
         ),
         cameras=(),
         start_posture={joint: 0.0 for joint in joints},
+        base=None,
     )
     raw = {"stage": "rig/rig.usd", "articulation_root": "."}
-    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {})
+    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {}, "base_link")
 
 
 class TestFollowers:
@@ -395,3 +396,159 @@ class TestStageHeldToTheDescription:
 
         with pytest.raises(RuntimeError, match=r"'wrist_roll' is no revolute or prismatic joint of it"):
             world.World._hold_to_description(root, model_known)
+
+
+_WHEELS = {"left_wheel_joint": "left_wheel_link", "right_wheel_joint": "right_wheel_link"}
+
+
+# Each wheel's rate loop as a stage authors it: a velocity drive of its
+# proportional gain, per degree, capped at its torque, and its integral gain:
+# 128 and 64, and 96 and 32 N m/rad.
+_LOOPS = {
+    "left_wheel_joint": (math.radians(128.0), 16.0, 64.0),
+    "right_wheel_joint": (math.radians(96.0), 12.0, 32.0),
+}
+_INTEGRAL_GAIN = "peppy:rateLoop:integralGain"
+
+
+def _rolling_stage():
+    """A botshare base as its entry expects it on the stage: its robot frame,
+    base_footprint, a rigid body no joint moves, and each wheel a rigid body
+    on a revolute joint without limits that carries its rate loop, kept
+    under a scope."""
+    stage = Usd.Stage.CreateInMemory()
+    root = stage.DefinePrim("/World/delta", "Xform")
+    for link in ("base_footprint", *_WHEELS.values()):
+        UsdPhysics.RigidBodyAPI.Apply(UsdGeom.Xform.Define(stage, f"/World/delta/{link}").GetPrim())
+    for joint, wheel in _WHEELS.items():
+        revolute = UsdPhysics.RevoluteJoint.Define(stage, f"/World/delta/joints/{joint}")
+        revolute.CreateBody0Rel().SetTargets(["/World/delta/base_footprint"])
+        revolute.CreateBody1Rel().SetTargets([f"/World/delta/{wheel}"])
+        drive = UsdPhysics.DriveAPI.Apply(revolute.GetPrim(), "angular")
+        damping, cap, integral = _LOOPS[joint]
+        drive.CreateStiffnessAttr(0.0)
+        drive.CreateDampingAttr(damping)
+        drive.CreateMaxForceAttr(cap)
+        revolute.GetPrim().CreateAttribute(_INTEGRAL_GAIN, Sdf.ValueTypeNames.Float, True).Set(integral)
+    return stage, root, known("botshare_base")
+
+
+class TestARollingStage:
+    def test_a_base_standing_free_on_wheels_that_turn_without_end_is_held(self):
+        world = world_module()
+        _, root, model_known = _rolling_stage()
+
+        world.World._hold_to_description(root, model_known)
+
+    def test_a_wheel_with_limits_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        wheel = UsdPhysics.RevoluteJoint(stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint"))
+        wheel.CreateLowerLimitAttr(-180.0)
+        wheel.CreateUpperLimitAttr(180.0)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"'left_wheel_joint' moves over \[-3\.14159, 3\.14159\] where the description gives \[-inf, inf\]",
+        ):
+            world.World._hold_to_description(root, model_known)
+
+    def test_a_base_held_to_the_world_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/delta/root_joint")
+        fixed.CreateBody1Rel().SetTargets(["/World/delta/base_footprint"])
+
+        with pytest.raises(RuntimeError, match=r"'root_joint' holds it to the world, and a robot that rolls stands free"):
+            world.World._hold_to_description(root, model_known)
+
+    def test_a_robot_frame_that_is_no_rigid_body_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/base_footprint").RemoveAPI(UsdPhysics.RigidBodyAPI)
+
+        with pytest.raises(RuntimeError, match=r"its robot frame 'base_footprint' is no rigid body of it"):
+            world.World._hold_to_description(root, model_known)
+
+    def test_a_robot_frame_hung_from_another_body_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        hung = UsdPhysics.FixedJoint.Define(stage, "/World/delta/joints/hang")
+        hung.CreateBody0Rel().SetTargets(["/World/delta/left_wheel_link"])
+        hung.CreateBody1Rel().SetTargets(["/World/delta/base_footprint"])
+
+        with pytest.raises(RuntimeError, match=r"'hang' hangs its robot frame 'base_footprint' from another body"):
+            world.World._hold_to_description(root, model_known)
+
+
+class TestAWheelsLoop:
+    def test_each_wheel_runs_the_loop_its_stage_carries_left_then_right(self):
+        world = world_module()
+        _, root, model_known = _rolling_stage()
+
+        loops = world.World._wheel_loops(root, model_known)
+
+        assert world.INTEGRAL_GAIN_ATTRIBUTE == _INTEGRAL_GAIN
+        assert [(loop.proportional_gain, loop.integral_gain, loop.max_torque) for loop in loops] == [
+            (pytest.approx(128.0), pytest.approx(64.0), pytest.approx(16.0)),
+            (pytest.approx(96.0), pytest.approx(32.0), pytest.approx(12.0)),
+        ]
+
+    def test_a_robot_with_no_base_runs_no_loop(self):
+        world = world_module()
+        _, root, model_known = _described_stage("so101")
+
+        assert world.World._wheel_loops(root, model_known) == ()
+
+    def test_a_wheel_whose_drive_has_a_stiffness_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        prim = stage.GetPrimAtPath("/World/delta/joints/right_wheel_joint")
+        UsdPhysics.DriveAPI(prim, "angular").GetStiffnessAttr().Set(1.0)
+
+        with pytest.raises(RuntimeError, match=r"drives the wheel 'right_wheel_joint' with no velocity drive"):
+            world.World._wheel_loops(root, model_known)
+
+    def test_a_wheel_with_no_drive_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").RemoveAPI(UsdPhysics.DriveAPI, "angular")
+
+        with pytest.raises(RuntimeError, match=r"drives the wheel 'left_wheel_joint' with no velocity drive"):
+            world.World._wheel_loops(root, model_known)
+
+    @pytest.mark.parametrize(
+        ("attribute", "named"),
+        [
+            ("drive:angular:physics:damping", "damping"),
+            ("drive:angular:physics:maxForce", "maximum force"),
+            (_INTEGRAL_GAIN, _INTEGRAL_GAIN),
+        ],
+    )
+    @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+    def test_a_wheel_whose_loop_takes_no_positive_number_is_refused(self, attribute, named, value):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/right_wheel_joint").GetAttribute(attribute).Set(value)
+
+        with pytest.raises(RuntimeError, match=rf"gives the wheel 'right_wheel_joint' \{{'{named}'"):
+            world.World._wheel_loops(root, model_known)
+
+    def test_a_wheel_with_no_integral_gain_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").RemoveProperty(_INTEGRAL_GAIN)
+
+        with pytest.raises(RuntimeError, match=rf"gives the wheel 'left_wheel_joint' \{{'{_INTEGRAL_GAIN}': None\}}"):
+            world.World._wheel_loops(root, model_known)
+
+    def test_a_wheels_drive_capped_at_nothing_is_refused(self):
+        """A drive left at USD's default force has no cap."""
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").GetAttribute(
+            "drive:angular:physics:maxForce"
+        ).Clear()
+
+        with pytest.raises(RuntimeError, match=r"gives the wheel 'left_wheel_joint' \{'maximum force': inf\}"):
+            world.World._wheel_loops(root, model_known)

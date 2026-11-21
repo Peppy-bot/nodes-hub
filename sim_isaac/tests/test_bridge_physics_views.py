@@ -35,7 +35,7 @@ def _limbs_of(module, instance):
     limbs.exts.return_value = views
     limbs.setup.return_value = True
     limbs.ready = True
-    limbs.robot = Mock(instance=instance)
+    limbs.robot = Mock(instance=instance, known=Mock(rolls=False))
     return limbs
 
 
@@ -58,6 +58,7 @@ def bridge(monkeypatch):
     extension = bridge_extension.IsaacBridgeExtension(
         Mock(), Mock(), Mock(), Mock(), state_rate_hz=60, renders=True
     )
+    extension._world.take_set_down.return_value = set()
     # Two robots on the stage, each with views of its own.
     extension._limbs = {
         "alpha": _limbs_of(bridge_extension, "alpha"),

@@ -102,7 +102,7 @@ def known_model(cameras, link_bodies=None, camera_lights=True):
     maps its links to (the welded pedestal to the world body, unless
     `link_bodies` says otherwise) and how the scene is lit."""
     entry = ModelEntry(
-        model="test", arms=(), grippers=(), cameras=tuple(cameras), start_posture={}
+        model="test", arms=(), grippers=(), cameras=tuple(cameras), start_posture={}, base=None
     )
     return known(
         "test",
@@ -290,8 +290,25 @@ def test_compile_rejects_a_parent_link_that_is_no_body_of_the_scene(scene, paren
     assert "link_a" in message
 
 
-def test_compile_rejects_a_camera_name_the_scene_already_uses(scene):
-    with pytest.raises(RuntimeError, match="scene_cam"):
+def test_a_camera_the_scene_defines_under_its_name_is_that_camera_at_its_renders_view(scene):
+    """A model written from its description carries its cameras where the
+    description puts them, and the render gives each its field of view."""
+    model = compile_model_with_cameras(scene, [color_camera(name="scene_cam", parent="no_such_link")])
+    assert model.ncam == 1
+    camera = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, "scene_cam")
+    assert camera_body(model, "scene_cam") == 0
+    assert model.cam_pos[camera] == pytest.approx((0.0, 0.0, 1.0))
+    assert model.cam_fovy[camera] == pytest.approx(60.0)
+
+
+def test_a_camera_the_scene_defines_projecting_through_its_sensor_size_is_refused(scene):
+    projected = scene.read_text().replace(
+        '<camera name="scene_cam" pos="0 0 1"/>',
+        '<camera name="scene_cam" pos="0 0 1" sensorsize="0.004 0.003" focal="0.002 0.002" '
+        'resolution="8 6"/>',
+    )
+    scene.write_text(projected)
+    with pytest.raises(RuntimeError, match="camera 'scene_cam' of scene.xml projects through its sensorsize"):
         compile_model_with_cameras(scene, [color_camera(name="scene_cam")])
 
 

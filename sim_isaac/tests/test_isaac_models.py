@@ -60,7 +60,7 @@ def _parse(model: str, **engine):
         joint: (description.joint_limits(joint).lower, description.joint_limits(joint).upper)
         for joint in entry.joints()
     }
-    return stood(model, entry, parse(model, raw), effort_limits, position_limits)
+    return stood(model, entry, parse(model, raw), effort_limits, position_limits, description.root_link)
 
 
 def _gains(joints: int, **replaced) -> dict:
@@ -68,8 +68,8 @@ def _gains(joints: int, **replaced) -> dict:
 
 
 class TestTheShippedEntries:
-    def test_the_engine_stands_the_three_models_it_has_an_entry_for(self):
-        assert IsaacModels.read().names() == ["openarm_v1", "openarm_v2", "so101"]
+    def test_the_engine_stands_the_four_models_it_has_an_entry_for(self):
+        assert IsaacModels.read().names() == ["botshare_base", "openarm_v1", "openarm_v2", "so101"]
 
     def test_an_openarm_v1_is_servoed_and_compensated_and_draws_no_head_camera(self):
         known = _world.known("openarm_v1")
@@ -95,6 +95,18 @@ class TestTheShippedEntries:
         assert known.arm_gains == DriveGains(kp=(998.22,) * 5, kd=(2.731,) * 5)
         assert known.gripper_gains == DriveGains(kp=(998.22,), kd=(2.731,))
         assert (known.gravity_compensation, known.head_camera) == (False, False)
+        assert not known.rolls
+
+    def test_a_botshare_base_rolls_on_the_wheels_its_stage_drives(self):
+        """Its entry names no gain: each wheel runs the rate loop its stage
+        authors (test_world_joining.py)."""
+        known = _world.known("botshare_base")
+        assert known.stage == "botshare_base/botshare_base.usd"
+        assert (known.articulation_root, known.link_prims) == (".", {})
+        assert known.rolls and known.root_link == "base_footprint"
+        assert known.entry.base.wheels == ("left_wheel_joint", "right_wheel_joint")
+        assert (known.arm_gains, known.gripper_gains) == (None, None)
+        assert (known.gravity_compensation, known.head_camera) == (False, False)
 
     def test_every_entry_is_the_shared_entry_of_the_same_model(self):
         models = IsaacModels.read()
@@ -104,7 +116,7 @@ class TestTheShippedEntries:
     def test_an_unknown_model_says_what_the_engine_stands(self):
         with pytest.raises(
             ValueError,
-            match="unknown model 'openarm_v3': this engine stands openarm_v1, openarm_v2, so101",
+            match="unknown model 'openarm_v3': this engine stands botshare_base, openarm_v1, openarm_v2, so101",
         ):
             IsaacModels.read().of("openarm_v3", bundled("so101").description())
 
@@ -279,7 +291,7 @@ class TestGains:
         lopsided = entry("lopsided", arms={"long": ["a", "b"], "short": ["c"]})
         engine = {"stage": "lopsided.usd", "articulation_root": ".", "arm_gains": _gains(2)}
         with pytest.raises(ModelEntryError, match=r"arms of 2 joints, and the description's arms have \[1, 2\]"):
-            stood("lopsided", lopsided, parse("lopsided", engine), {}, {})
+            stood("lopsided", lopsided, parse("lopsided", engine), {}, {}, "base_link")
 
     def test_a_model_with_no_gripper_carries_no_gripper_gains(self):
         bare = entry("bare", arms={"arm": ["a", "b"]})
@@ -288,7 +300,7 @@ class TestGains:
             ModelEntryError,
             match=r"grippers of 1 fingers that move of their own, and the description's grippers have \[\]",
         ):
-            stood("bare", bare, parse("bare", engine), {}, {})
+            stood("bare", bare, parse("bare", engine), {}, {}, "base_link")
 
 
 class TestDriveParams:

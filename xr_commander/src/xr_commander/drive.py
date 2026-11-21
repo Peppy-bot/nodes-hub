@@ -186,8 +186,8 @@ class Stops(Protocol):
     async def stop(self, robot: str) -> str | None: ...
 
 
-class LimbStops:
-    """`stop` of limb_motion on the robot's own backbone, with the reason
+class RobotStops:
+    """`stop` of robot_stop on the robot's own backbone, with the reason
     that names the headset."""
 
     def __init__(
@@ -205,7 +205,7 @@ class LimbStops:
     async def stop(self, robot: str) -> str | None:
         producer = self._robots.producer_of(self._stop, robot)
         if producer is None:
-            return f"{robot} has no limb_motion: the launcher links none to the headset"
+            return f"{robot} has no robot_stop: the launcher links none to the headset"
         request = self._stop.Request(reason=LEASE_NAME)
         call = self._stop.poll(self._node_runner, producer, request, self._timeout_s)
         stopped = await outcome_of(call, self._stop.Failure, f"stop of {robot}")

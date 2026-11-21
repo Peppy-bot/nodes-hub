@@ -15,12 +15,12 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 sys.path.insert(0, str(_ENGINE_DIR / "exts"))
 
-import _world
-import camera_sensor
-import isaac_models
-from camera_sensor import _MAX_CAPTURE_FAILURES, IsaacCameraSensor
-from entries import entry
-from sim_robot_core.cameras import DEPTH_TO_COLOR, CameraConfig, DepthSpec, pinhole
+import _world  # noqa: E402
+import camera_sensor  # noqa: E402
+import isaac_models  # noqa: E402
+from camera_sensor import _MAX_CAPTURE_FAILURES, IsaacCameraSensor  # noqa: E402
+from entries import entry  # noqa: E402
+from sim_robot_core.cameras import DEPTH_TO_COLOR, CameraConfig, DepthSpec, pinhole  # noqa: E402
 
 _WIDTH, _HEIGHT = 4, 2
 _FPS = 10
@@ -88,7 +88,7 @@ def _known(*cameras, **engine):
     """A model carrying `cameras`, as this engine knows it."""
     rig = entry("rig", arms={"arm": ["joint"]}, cameras=tuple(cameras))
     raw = {"stage": "rig/rig.usd", "articulation_root": ".", **engine}
-    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {})
+    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {}, "base_link")
 
 
 @pytest.fixture

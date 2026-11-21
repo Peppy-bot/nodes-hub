@@ -29,6 +29,9 @@
       // trajectory path as move_arm_joints. move_to_home first closes the
       // gripper, a gripper plan as move_gripper installs one.
       { name: "postures", tag: "v1", link_id: "postures" },
+      // The robot stop the robot's MCP endpoint calls as robot.stop: it
+      // ends every limb and posture move this backbone runs.
+      { name: "robot_stop", tag: "v1", link_id: "robot_stop" },
       // Where the robot can work, from its design alone: where its arm
       // reaches, in the robot frame (the URDF's base_link frame), on a flat,
       // level surface at a given height or at given points. The robot has no
@@ -176,7 +179,7 @@
         // The stop of every planned move in flight, whoever started it, and
         // the plan check of a Cartesian move that moves nothing: the same
         // solve a move_arm goal runs, from the same anchor.
-        { link_id: "limb_motion", name: "stop" },
+        { link_id: "robot_stop", name: "stop" },
         { link_id: "limb_motion", name: "check_arm_move" },
         // Where the robot can work on a surface and whether it can work
         // given points, answered from bringup: they read the design, never
@@ -256,6 +259,10 @@
       // goal or a request whose wait runs out is refused with the failure of
       // the lookup, and a pose setpoint is dropped.
       lookup_timeout_s: "f64",
+      // How long (s) robot_stop's stop waits for the control loop to take
+      // and answer it before it answers attempt_failed: below the deadline of
+      // the stop's callers. Above 0.
+      stop_answer_timeout_s: "f64",
     },
   },
 }

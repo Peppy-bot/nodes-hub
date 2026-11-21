@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import TYPE_CHECKING, Optional, Protocol
 
 from control_core_py.geometry import PoseTarget, quaternion_of_yaw
 from sim_robot_core.cameras import FramePacer
@@ -18,6 +18,10 @@ from sim_robot_core.cameras import FramePacer
 from bridge_extension import IsaacBridgeExtension
 from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
 from runtime_commander_server import RuntimeCommanderServer
+from world import GROUND_PRIM, World
+
+if TYPE_CHECKING:  # the stage's edit queue, which the launch builds
+    from edits import Edits
 
 logger = logging.getLogger(__name__)
 
@@ -284,9 +288,11 @@ class SimLauncher:
     def unbind(self) -> None:
         """Lets go of the stage so it can be changed: every view on an
         articulation stops reading, and the timeline stops so the prims can
-        move under it."""
+        move under it, each robot that rolls held where its wheels carried
+        it."""
         self._extension.unbind()
         if self._timeline is not None:
+            self._extension.hold_through_stop()
             self._timeline.stop()
 
     def rebind(self) -> None:
@@ -638,6 +644,17 @@ class SimLauncher:
             )
         )
 
+        self._lay_floor(stage)
+
+    def _lay_floor(self, stage) -> None:
+        """Lays the stage's floor while its runtime scene brings none of its
+        own, and takes it up while one does (World.needs_floor)."""
+        if self._world.needs_floor(stage.GetPrimAtPath(_RUNTIME_SCENE_PATH)):
+            self._world.lay_floor(stage)
+            return
+        if self._remove_prim(stage, GROUND_PRIM):
+            logger.info("The runtime scene brings its own floor; the stage's floor is taken up")
+
     def _runtime_clear_scene(self) -> None:
         """Remove the currently loaded runtime scene."""
 
@@ -654,6 +671,8 @@ class SimLauncher:
             logger.info(
                 "No runtime scene to remove"
             )
+
+        self._lay_floor(stage)
 
     def _runtime_load_usd_scene(
         self,

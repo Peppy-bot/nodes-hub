@@ -211,3 +211,18 @@ async fn a_gripper_rate_too_slow_to_make_progress_is_refused_by_name() {
 async fn a_non_positive_start_tolerance_is_refused_by_name() {
     refusal_names("start_tolerance_rad", |p| p.start_tolerance_rad = 0.0).await;
 }
+
+/// 0, a value that rounds to no time and one longer than a timer holds are
+/// each refused naming the parameter, then the text that says what to give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_answer_timeout_no_timer_holds_is_refused_saying_what_to_give() {
+    for (seconds, why) in [
+        (0.0, "must be a positive finite number of seconds, got 0"),
+        (1e-10, "1e-10 s rounds to no time at all"),
+        (1e300, "1e300 s is longer than a Duration holds"),
+    ] {
+        let text = refusal(|p| p.stop_answer_timeout_s = seconds).await;
+        let expected = format!("parameter stop_answer_timeout_s: {why}");
+        assert!(text.contains(&expected), "got: {text}");
+    }
+}

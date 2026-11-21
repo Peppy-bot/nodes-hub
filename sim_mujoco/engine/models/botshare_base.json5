@@ -1,0 +1,7 @@
+// What this engine alone decides about the botshare base: nothing beyond
+// what it decides for every robot. Its wheels and its camera come from the
+// robot's description, through sim_robot_core's entry of the same name, and
+// its MuJoCo model, the rate loop of each wheel among it, from the release
+// of Waldo's catalogue the base image bakes. It rolls on the floor the scene
+// lays for every robot that rolls.
+{}

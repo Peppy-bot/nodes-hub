@@ -19,7 +19,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use control_core::geometry::{Pose, Stamped};
 use control_core::receiving::{Tagged, receive, tagged};
-use control_core::throttle::Throttle;
+use control_core::robot_tree::Placer;
+use control_core::stream_window::StreamWindow;
+use control_core::throttle::{LOG_WINDOW, Throttle};
 use peppygen::NodeRunner;
 use peppygen::consumed_topics::collision_ctrl::governor_control as collision_ctrl_governor_control;
 use peppygen::paired_topics::{
@@ -32,14 +34,8 @@ use srs_model::JointVec;
 use tokio::sync::watch;
 use tracing::{error, warn};
 
-use crate::placement::Placer;
 use crate::robot::{ARMS, LIMBS};
 use crate::upstream::Upstream;
-
-/// At most one dropped-message warning per stream (and one build/timestamp error
-/// per publisher) in this window, so a misrouted producer or a stalled clock
-/// is visible in the log without flooding it at the stream rate.
-pub(crate) const THROTTLED_WARN_PERIOD: Duration = Duration::from_secs(1);
 
 /// The latest commanded opening for one gripper, fed by the upstream
 /// pairing's `gripper_setpoints`: the raw wire opening fraction, clamped into
@@ -218,6 +214,10 @@ async fn subscribe_pair<L, R>(
 /// 4 Hz or faster.
 pub const LEADER_STREAMING_WINDOW: Duration = Duration::from_millis(250);
 
+/// A leader's stream of one limb, on the monotonic clock: live within
+/// [`LEADER_STREAMING_WINDOW`] of its newest command.
+const LEADER_STREAM: StreamWindow<Duration> = StreamWindow::new(LEADER_STREAMING_WINDOW);
+
 /// When a leader last streamed a well-formed command for one limb. Written by
 /// the limb's listener, read by the goal handlers, which refuse a goal on a
 /// limb a leader is streaming, and by the coordinator, which follows a command
@@ -246,10 +246,8 @@ impl LeaderActivity {
 
     /// Whether a leader command arrived within [`LEADER_STREAMING_WINDOW`].
     pub fn streaming(&self) -> bool {
-        self.last
-            .lock()
-            .expect("stamp lock poisoned")
-            .is_some_and(|last| last.elapsed() <= LEADER_STREAMING_WINDOW)
+        let last = *self.last.lock().expect("stamp lock poisoned");
+        LEADER_STREAM.streams(last, Instant::now())
     }
 }
 
@@ -276,7 +274,7 @@ async fn follow_pair<Raw, Parsed, Reason: Display, Parsing>(
 ) where
     Parsing: Future<Output = Result<Parsed, Reason>>,
 {
-    let mut reject_warn = Throttle::new(THROTTLED_WARN_PERIOD);
+    let mut reject_warn = Throttle::new(LOG_WINDOW);
     let stream = what.to_owned();
     let named_errors = async move || {
         next_message()

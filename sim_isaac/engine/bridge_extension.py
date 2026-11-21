@@ -2,28 +2,37 @@
 # pylint: disable=R0902,C0413
 """IsaacBridgeExtension owns the per-step bridge for the Isaac stage. Isaac's
 sim_app.update() advances physics on the main thread; each step this
-extension applies the latest setpoint of every robot's limbs, reads the
-measured joint and gripper state, and (throttled to state_rate_hz) publishes
-Isaac's own timeline clock followed by the state it stamps: each robot's
-joint and gripper states and a snapshot of every spawned object.
+extension applies the latest setpoint of every robot's limbs and base, runs
+the rate loop of each wheel (wheel_loop), records where the wheels carried
+each robot that rolls, reads the measured joint and gripper state, and
+(throttled to state_rate_hz) publishes Isaac's own timeline clock followed
+by the state it stamps: each robot's joint, wheel and gripper states and a
+snapshot of every spawned object and standing robot.
 
-Every robot is commanded through its own limb pairs and publishes its state
-back on them; the copy a pair carries is the robot it belongs to, and the
-limbs it is driven by are its own model's. Transport is typed peppygen via
-SimTopicIO; there is no JSON and no raw peppylib on the path.
+Every robot is commanded through its own limb and base pairs and publishes
+its state back on them; the copy a pair carries is the robot it belongs to,
+and the parts it is driven by are its own model's. A base's wheels run at the
+rates of its pair's latest setpoint, and at rate 0 while it holds none; once
+a reading of the pairs finds that pair gone, or the setpoint outlives its
+leader's window on the engine's clock, they are held where they stand, the
+integral of each wheel's loop cleared (sim_robot_core.setpoints). Transport is
+typed peppygen via SimTopicIO; there is no JSON and no raw peppylib on the
+path.
 """
 from __future__ import annotations
 
 import gc
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
+from control_core_py.geometry import Pose
 from robot_description_py import FingerSpan
 from sim_robot_core.cameras import FramePacer
 from sim_robot_core.registry import Registry
+from sim_robot_core.setpoints import GripperSetpoint, JointSetpoint
 
+from wheel_loop import WheelLoop
 from world import Robot, World
 from exts import IsaacActuatorCtrl, IsaacArticulation, IsaacCameraSensor, IsaacGripperSensor
 
@@ -31,24 +40,6 @@ if TYPE_CHECKING:  # the transport, which carries the node runtime with it
     from sim_topics import SimTopicIO
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class ArmSetpoint:
-    """One arm's commanded joint positions, and the velocities to reach them
-    with when the command carries any."""
-
-    positions: tuple[float, ...]
-    velocities: tuple[float, ...]
-
-
-@dataclass(frozen=True)
-class GripperSetpoint:
-    """One gripper's commanded opening fraction and the force it may apply;
-    0 leaves the model's own limit as the only one."""
-
-    opening: float
-    max_effort: float
 
 
 class RobotLimbs:
@@ -97,6 +88,20 @@ class RobotLimbs:
             gripper.name: IsaacGripperSensor(prim, finger_joints=list(gripper.joints))
             for gripper in self.entry.grippers
         }
+        # The controller of the base's wheels, each on the velocity drive its
+        # stage authors, which it keeps; none for a robot that stands where
+        # it is placed.
+        base = self.entry.base
+        self.base_actuator: Optional[IsaacActuatorCtrl] = (
+            None
+            if base is None
+            else IsaacActuatorCtrl(
+                prim,
+                joint_names=list(base.wheels),
+                params={"joint_names": list(base.wheels), "kp": [], "kd": [], "max_efforts": []},
+                name=f"{base.name}_{view}",
+            )
+        )
         self.joint_index: dict[str, int] = {}
         # Where the gripper's closed and open states put each finger joint,
         # as the robot's description gives them; measured positions read
@@ -112,6 +117,7 @@ class RobotLimbs:
             *self.arm_actuators.values(),
             *self.gripper_actuators.values(),
             *self.gripper_sensors.values(),
+            *([] if self.base_actuator is None else [self.base_actuator]),
         ]
 
     def setup(self) -> bool:
@@ -186,6 +192,13 @@ class IsaacBridgeExtension:
         self._renders = renders
         self._camera_sensors: dict[str, IsaacCameraSensor] = {}
         self._limbs: dict[str, RobotLimbs] = {}
+        # The rate loop of each wheel of each robot that rolls, left then
+        # right, kept while the stage is edited so the angle a wheel reports
+        # runs on.
+        self._wheels: dict[str, tuple[WheelLoop, ...]] = {}
+        # The engine time of the last step (s), which a wheel's loop sums its
+        # rate over.
+        self._last_step_s: Optional[float] = None
         self._standing_reported = False
 
     def bind(self) -> None:
@@ -196,6 +209,9 @@ class IsaacBridgeExtension:
         assert not self._limbs, "bind takes the stage up after unbind let it go"
         self._limbs = {
             robot.instance: RobotLimbs(robot) for robot in self._world.robots()
+        }
+        self._wheels = {
+            name: loops for name, loops in self._wheels.items() if name in self._limbs
         }
         self._reconcile_rigs()
 
@@ -231,6 +247,16 @@ class IsaacBridgeExtension:
                 robot.instance, robot.prim(), robot.known, self._io
             )
 
+    def hold_through_stop(self) -> None:
+        """Readies the robots that roll for a timeline that stops, which sets
+        every body and joint back on its stage: each is stood where its
+        wheels carried it, so the stage holds it there, and its wheels' loops
+        read the stage afresh once it plays again."""
+        self._world.stand_where_rolled()
+        self._wheels = {
+            name: tuple(loop.let_go() for loop in loops) for name, loops in self._wheels.items()
+        }
+
     def unbind(self) -> None:
         """Drops every view. A view of a prim that is edited under it stops
         reading, so this runs before the stage changes, and the bind after
@@ -255,20 +281,29 @@ class IsaacBridgeExtension:
         # stamp of this step, the camera captures included, and ahead of the
         # setup gate: an object-state capture after a scene edit stamps from
         # it while the articulation views are being created again.
-        self._io.record_engine_time(self._engine_time_s())
+        now_s = self._engine_time_s()
+        self._io.record_engine_time(now_s)
+        elapsed_s = 0.0 if self._last_step_s is None else now_s - self._last_step_s
+        self._last_step_s = now_s
         ready = [limbs for limbs in self._limbs.values() if limbs.setup()]
         if not ready:
             return
 
-        self._apply_commands(ready)
+        self._set_down_moved()
+        self._apply_commands(ready, now_s, elapsed_s)
+        # Every step, so each capture and listing is of the instant it is
+        # stamped with.
+        self._roll(ready)
         for sensor in self._camera_sensors.values():
             if sensor.setup():
                 sensor.step()
 
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
-        # The camera pairs are read once per state tick: a rig follows its
-        # pair within a tick of it forming or dissolving.
+        # The camera and base pairs are read once per state tick: a rig
+        # follows its pair within a tick of it forming or dissolving, and a
+        # base whose pair is gone holds its wheels where they stand.
+        self._io.setpoints.keep_paired_bases()
         self._reconcile_rigs()
         # Published before the state it stamps; a stopped timeline stops the
         # domain's clock with it.
@@ -281,40 +316,96 @@ class IsaacBridgeExtension:
 
         return float(omni.timeline.get_timeline_interface().get_current_time())
 
-    def _apply_commands(self, ready: list[RobotLimbs]) -> None:
+    def _apply_commands(self, ready: list[RobotLimbs], now_s: float, elapsed_s: float) -> None:
         standing = self._robots.standing()
         for limbs in ready:
-            if limbs.robot.instance in standing:
-                self._apply(limbs, *self._setpoints(limbs))
+            if limbs.robot.instance not in standing:
+                continue
+            self._apply(limbs, *self._setpoints(limbs))
+            if limbs.base_actuator is not None:
+                self._drive_base(limbs, now_s, elapsed_s)
+
+    def _drive_base(self, limbs: RobotLimbs, now_s: float, elapsed_s: float) -> None:
+        """Runs each wheel's rate loop over the `elapsed_s` since the last
+        step and writes its drive's target velocity: the rate of the setpoint
+        the robot's base follows at `now_s`, or rate 0 while it has none.
+        Wheels released since the last step are held where they stand: each
+        loop's integral cleared, anchored at its read of this step."""
+        robot = limbs.robot.instance
+        wheels = limbs.entry.base.wheels
+        gains = limbs.robot.wheel_loops
+        states = limbs.articulation.get_joint_states()
+        if states is None:
+            return
+        positions, _ = states
+        setpoint = self._io.setpoints.base(robot, now_s)
+        if self._io.setpoints.take_base_release(robot):
+            self._let_go_of_wheels(robot)
+        rates = (0.0,) * len(wheels) if setpoint is None else setpoint.velocities
+        loops = tuple(
+            loop.advanced(positions[limbs.joint_index[wheel]], elapsed_s, gain).driven_at(rate)
+            for loop, wheel, rate, gain in zip(
+                self._wheels.get(robot, (WheelLoop(),) * len(wheels)), wheels, rates, gains, strict=True
+            )
+        )
+        self._wheels[robot] = loops
+        limbs.base_actuator.write_velocity_targets(
+            {
+                wheel: loop.velocity_target(gain)
+                for wheel, loop, gain in zip(wheels, loops, gains, strict=True)
+            }
+        )
+
+    def _roll(self, ready: list[RobotLimbs]) -> None:
+        """Records where the wheels carried each robot that rolls, its robot
+        frame as the articulation's root reads it, and how fast it moves."""
+        for limbs in ready:
+            if not limbs.robot.known.rolls:
+                continue
+            state = limbs.articulation.get_root_state()
+            if state is None:
+                continue
+            position, orientation, linear, angular = state
+            frame = Pose.parse(position, orientation)
+            self._world.roll(limbs.robot.instance, frame, linear, angular)
+
+    def _set_down_moved(self) -> None:
+        """Sets each robot that rolls and was moved since the last step down
+        at rest where the move stood it: its root and its joints still, the
+        integral of each wheel's loop cleared, and its base's setpoint
+        dropped, so its wheels hold at rate 0 until its leader sends again."""
+        for name in self._world.take_set_down():
+            limbs = self._limbs.get(name)
+            robot = next((one for one in self._world.robots() if one.instance == name), None)
+            if limbs is None or robot is None:
+                continue
+            limbs.articulation.set_down_at(
+                robot.placement.position.position, robot.placement.orientation.quaternion
+            )
+            self._let_go_of_wheels(name)
+            self._io.setpoints.drop_base(name)
+            logger.info("robot '%s' is set down at rest where it was moved", name)
+
+    def _let_go_of_wheels(self, robot: str) -> None:
+        """Clears the integral of each wheel's loop of `robot`, the loop
+        anchored afresh at its next read. A robot whose wheels no step read
+        yet has no loop to clear."""
+        loops = self._wheels.get(robot)
+        if loops is not None:
+            self._wheels[robot] = tuple(loop.let_go() for loop in loops)
 
     def _setpoints(self, limbs: RobotLimbs):
         """One robot's latest setpoints, from the pairs its backbone leads,
         limb by limb of its model. A limb nothing has commanded holds where
         it stands."""
         robot = limbs.robot.instance
-        arms = []
-        for arm in limbs.entry.arms:
-            command = self._io.latest_arm_command(robot, arm.name)
-            if command is None or len(command[0]) != len(arm.joints):
-                arms.append(None)
-                continue
-            positions, velocities = command
-            arms.append(
-                ArmSetpoint(
-                    positions=tuple(positions),
-                    velocities=(
-                        tuple(velocities) if len(velocities) == len(arm.joints) else ()
-                    ),
-                )
-            )
-        grippers = []
-        for gripper in limbs.entry.grippers:
-            command = self._io.latest_gripper_command(robot, gripper.name)
-            grippers.append(
-                None
-                if command is None
-                else GripperSetpoint(opening=command[0], max_effort=command[1])
-            )
+        setpoints = self._io.setpoints
+        arms: list[Optional[JointSetpoint]] = [
+            setpoints.arm(robot, arm.name) for arm in limbs.entry.arms
+        ]
+        grippers: list[Optional[GripperSetpoint]] = [
+            setpoints.gripper(robot, gripper.name) for gripper in limbs.entry.grippers
+        ]
         return arms, grippers
 
     def _apply(self, limbs: RobotLimbs, arms, grippers) -> None:
@@ -368,6 +459,7 @@ class IsaacBridgeExtension:
                 for gripper in limbs.entry.grippers
             ]
             self._publish_pairs(limbs, arms, grippers)
+            self._publish_base(limbs, velocities)
 
         # A full snapshot of the spawned objects rides the same tick; it is
         # the one get_object_states answers until the next capture.
@@ -382,6 +474,20 @@ class IsaacBridgeExtension:
         for gripper, (reading, _cap) in zip(limbs.entry.grippers, grippers):
             if reading is not None:
                 self._io.publish_gripper_states(robot, gripper.name, reading[0])
+
+    def _publish_base(self, limbs: RobotLimbs, velocities: list[float]) -> None:
+        """The wheels' angles, as their loops count them, and their measured
+        rates, back on the base's pair. A wheel whose loop has not read the
+        stage yet reports nothing."""
+        base = limbs.entry.base
+        loops = self._wheels.get(limbs.robot.instance)
+        if base is None or loops is None or any(loop.read is None for loop in loops):
+            return
+        self._io.publish_base_states(
+            limbs.robot.instance,
+            [loop.angle for loop in loops],
+            [velocities[limbs.joint_index[wheel]] for wheel in base.wheels],
+        )
 
     @staticmethod
     def _gripper_state(limbs: RobotLimbs, name: str):

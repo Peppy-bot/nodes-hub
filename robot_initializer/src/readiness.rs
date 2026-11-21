@@ -6,7 +6,7 @@
 //! it is told, then asks it whether it is ready; a driver whose polls fail is
 //! logged once for each run of one reply. On a
 //! simulated one it is the simulation standing it, bound on `simulation`,
-//! which answers for every limb at once.
+//! which answers for every part at once.
 
 use std::collections::HashMap;
 use std::sync::Arc;

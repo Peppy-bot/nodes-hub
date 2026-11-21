@@ -166,37 +166,49 @@ class MujocoActuatorCtrl:
                 self._model.actuator_forcerange[ctrl_id] = self._default_forcerange[ctrl_id]
         return True
 
-    def write_targets(self, actuator_values: dict, velocity_values: dict | None = None) -> int:
-        """Write each {name: value} pair into data.ctrl[ctrl_id[name]]. When a
-        velocity setpoint is supplied for a gain-configured joint, it is folded
-        into ctrl as q_des + (kd/kp)*dq_des. Returns the count of values
-        applied. Unknown actuator names are logged and dropped so a single bad
-        entry does not stop the rest of the batch."""
-        if not self._ready:
-            return 0
+    def controls(
+        self, actuator_values: dict, velocity_values: dict | None = None
+    ) -> dict[int, float]:
+        """The control of each actuator of the {name: value} pairs, by ctrl
+        index. When a velocity setpoint is supplied for a gain-configured
+        joint, it is folded into the control as q_des + (kd/kp)*dq_des.
+        Unknown actuator names are logged and dropped so a single bad entry
+        does not stop the rest of the batch."""
         if not isinstance(actuator_values, dict):
             logger.warning(
                 f"actuator_values must be a dict, got {type(actuator_values).__name__}"
             )
-            return 0
+            return {}
         velocities = velocity_values if isinstance(velocity_values, dict) else {}
-        applied = 0
+        controls: dict[int, float] = {}
         for name, value in actuator_values.items():
             ctrl_id = self._name_to_id.get(name)
             if ctrl_id is None:
                 logger.warning(f"unknown actuator '{name}', dropped")
                 continue
-            try:
-                ctrl = float(value)
-                ratio = self._kd_over_kp.get(name)
-                dq_des = velocities.get(name)
-                if ratio is not None and dq_des is not None:
-                    ctrl += ratio * float(dq_des)
-                self._data.ctrl[ctrl_id] = ctrl
-                applied += 1
-            except Exception as exc:
-                logger.warning(f"failed to write ctrl[{ctrl_id}] for '{name}': {exc}")
-        return applied
+            ctrl = float(value)
+            ratio = self._kd_over_kp.get(name)
+            dq_des = velocities.get(name)
+            if ratio is not None and dq_des is not None:
+                ctrl += ratio * float(dq_des)
+            controls[ctrl_id] = ctrl
+        return controls
+
+    def write_controls(self, controls: dict[int, float]) -> int:
+        """Writes each control into data.ctrl at its index, and returns how
+        many were written: none before setup."""
+        if not self._ready:
+            return 0
+        for ctrl_id, ctrl in controls.items():
+            self._data.ctrl[ctrl_id] = ctrl
+        return len(controls)
+
+    def write_targets(self, actuator_values: dict, velocity_values: dict | None = None) -> int:
+        """Writes the control of each {name: value} pair (`controls`) into
+        data.ctrl, and returns how many were written: none before setup."""
+        if not self._ready:
+            return 0
+        return self.write_controls(self.controls(actuator_values, velocity_values))
 
     @property
     def is_ready(self) -> bool:

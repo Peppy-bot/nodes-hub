@@ -71,14 +71,7 @@ fn driven_by(answer: Answer) -> Result<Driven<ARM_DOF, ARMS>, NodeError> {
     let driven = LIMBS
         .model(&answer.model)
         .map_err(|undriven| NodeError::Model(undriven.into()))?;
-    let built = driven.model().digest();
-    if answer.digest != built {
-        return Err(NodeError::OtherDescription {
-            model: driven.model().id(),
-            served: answer.digest,
-            built: built.to_owned(),
-        });
-    }
+    driven.model().hold_digest(&answer.digest)?;
     Ok(driven)
 }
 

@@ -7,18 +7,19 @@ staged here otherwise, which needs the network."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pyjson5
 import pytest
-from entries import entry, known, staged_release
+from entries import WHEELED_ENTRY, entry, known, staged_release
 from robot_description_py import model as bundled
 from sim_robot_core.errors import ModelEntryError
 from sim_robot_core.models import shipped_entry
 
 import mujoco_models
 from catalogue_robots import ServoGains
-from mujoco_models import MujocoModels, Servo, parse
+from mujoco_models import MujocoModels, Servo, parse, stood
 
 # The node whose defaults are the real OpenArm arm's MIT gains.
 _ARM_NODE = Path(__file__).resolve().parents[2] / "openarm" / "arm" / "peppy.json5"
@@ -53,8 +54,8 @@ def _driver_gains() -> tuple[ServoGains, ...]:
 
 
 class TestTheShippedModels:
-    def test_the_engine_stands_the_three_models_it_has_an_entry_for(self):
-        assert MujocoModels.read().names() == ["openarm_v1", "openarm_v2", "so101"]
+    def test_the_engine_stands_the_models_it_has_an_entry_for(self):
+        assert MujocoModels.read().names() == ["botshare_base", "openarm_v1", "openarm_v2", "so101"]
 
     @pytest.mark.parametrize("model", ["openarm_v1", "openarm_v2"])
     def test_an_openarm_runs_the_real_arms_gains_on_every_arm(self, model):
@@ -74,6 +75,13 @@ class TestTheShippedModels:
         assert not known.robot.gravity_compensation
         assert (known.camera_lights, known.floor) == (False, True)
 
+    def test_the_botshare_base_rolls_on_its_wheels_against_the_floor_the_scene_lays(self):
+        known = _read("botshare_base")
+        assert known.rolls and known.robot.rolls
+        assert known.entry.wheel_joints() == ["left_wheel_joint", "right_wheel_joint"]
+        assert (known.robot.arm_gains, known.robot.gravity_compensation) == ({}, False)
+        assert (known.camera_lights, known.floor) == (False, False)
+
     def test_every_model_stands_from_its_wrapper_by_the_body_that_carries_it(self, release):
         for name in MujocoModels.read().names():
             known = _read(name)
@@ -88,7 +96,7 @@ class TestTheShippedModels:
     def test_an_unknown_model_says_what_the_engine_stands(self):
         with pytest.raises(
             ValueError,
-            match="unknown model 'openarm_v3': this engine stands openarm_v1, openarm_v2, so101",
+            match="unknown model 'openarm_v3': this engine stands botshare_base, openarm_v1, openarm_v2, so101",
         ):
             MujocoModels.read().of("openarm_v3", bundled("so101").description())
 
@@ -174,3 +182,33 @@ class TestBodies:
 
     def test_any_other_link_is_the_body_of_its_own_name(self):
         assert _known(link_bodies={"base_link": "base"}).body_of("gripper_link") == "gripper_link"
+
+
+class TestTheStance:
+    """The release stands a robot rolling exactly when its description gives
+    it a base, which carries its whole weight on its wheels."""
+
+    def test_a_robot_with_a_base_rolls_and_one_without_holds_where_it_is_placed(self):
+        assert known("wheeled", WHEELED_ENTRY, Path("wheeled.xml"), "chassis").rolls
+        assert not _known().rolls
+
+    def test_a_release_rolling_a_robot_with_no_base_is_refused(self):
+        release = replace(_known().robot, rolls=True)
+        with pytest.raises(
+            ModelEntryError,
+            match="robot 'arm': its mount.stance is rolling, and the description gives no differential base",
+        ):
+            stood(_ARM, release, parse("arm", {}))
+
+    def test_a_release_standing_a_base_still_is_refused_saying_to_roll_it(self):
+        release = replace(known("wheeled", WHEELED_ENTRY, Path("wheeled.xml"), "chassis").robot, rolls=False)
+        with pytest.raises(
+            ModelEntryError,
+            match=r"the description gives a base on the wheels \['left_wheel', 'right_wheel'\], and its "
+            "mount.stance is not rolling: give the robot the mount.stance rolling",
+        ):
+            stood(WHEELED_ENTRY, release, parse("wheeled", {}))
+
+    def test_a_rolling_robot_whose_weight_the_release_compensates_is_refused(self):
+        with pytest.raises(ModelEntryError, match="a rolling robot rests its weight on its wheels"):
+            known("wheeled", WHEELED_ENTRY, Path("wheeled.xml"), "chassis", gravity_compensation=True)

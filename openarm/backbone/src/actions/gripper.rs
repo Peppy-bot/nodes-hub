@@ -10,11 +10,14 @@
 //! planned end of the commanded travel or at the goal's settle timeout, and
 //! releases the move slot at the terminal.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::robot::{ARMS, gripper_in};
+use control_core::move_seconds::MoveSeconds;
+use control_core::move_slot::MoveSlot;
+use control_core::sync::lock_ignoring_poison;
 use peppygen::exposed_actions::limb_motion::move_gripper::{
     ActionHandle, GoalDecision, GoalRequestData,
 };
@@ -23,10 +26,9 @@ use robot_description::{ArmId, PerArm};
 use tokio::sync::mpsc;
 use tracing::error;
 
-use crate::actions::{GRIPPER_WORDS, admit_limb, move_seconds_from_wire};
+use crate::actions::{GRIPPER_WORDS, admit_limb};
 use crate::failure::{Failure, FailureKind};
 use crate::gripper_move::{EffortCap, GripperGoal, GripperReply};
-use crate::move_slot::MoveSlot;
 use crate::streams::LeaderActivity;
 
 /// A `move_gripper` goal parsed off the wire: the arm, a finite opening in
@@ -54,7 +56,7 @@ fn gripper_goal_request(d: &GoalRequestData) -> std::result::Result<GripperGoalR
             d.max_effort
         ));
     }
-    let settle_timeout = move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?;
+    let settle_timeout = MoveSeconds::from_wire("settle_timeout_s", d.settle_timeout_s)?.duration();
     Ok(GripperGoalRequest {
         arm,
         opening: d.opening,
@@ -64,7 +66,8 @@ fn gripper_goal_request(d: &GoalRequestData) -> std::result::Result<GripperGoalR
 }
 
 /// Expose `move_gripper`: validate + claim, then hand the goal to the
-/// coordinator. The coordinator releases the move slot when the move ends.
+/// coordinator with the release of its claim. The coordinator releases the
+/// move slot when the move ends.
 pub async fn run_move_gripper(
     runner: Arc<NodeRunner>,
     goal_txs: PerArm<mpsc::Sender<GripperGoal>, ARMS>,
@@ -74,44 +77,51 @@ pub async fn run_move_gripper(
 ) -> Result<()> {
     let mut handle = ActionHandle::expose(&runner).await?;
     loop {
+        let accepted_goal = Mutex::new(None);
         let accepted = handle
             .handle_goal_next_request(|req| {
                 let admitted = gripper_goal_request(&req.data)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|request| {
                         let arm = request.arm;
-                        admit_limb(
+                        let move_slot = admit_limb(
                             &fresh[arm],
                             &activity[arm],
                             &move_slots[arm],
                             &GRIPPER_WORDS,
-                        )
+                        )?;
+                        Ok((request, move_slot))
                     });
                 Ok(match admitted {
-                    Ok(()) => GoalDecision::accept(),
+                    Ok(goal) => {
+                        *lock_ignoring_poison(&accepted_goal) = Some(goal);
+                        GoalDecision::accept()
+                    }
                     Err(f) => GoalDecision::refuse(f.kind.into(), f.message),
                 })
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let GripperGoalRequest {
-            arm,
-            opening,
-            max_effort,
-            settle_timeout,
-        } = gripper_goal_request(&ctx.request().data).expect("validated on accept");
-        if goal_txs[arm]
-            .send(GripperGoal {
+        let (
+            GripperGoalRequest {
+                arm,
                 opening,
-                effort: EffortCap::Named(max_effort),
+                max_effort,
                 settle_timeout,
-                travel_timeout: None,
-                reply: GripperReply::MoveGripper(Box::new(ctx)),
-            })
-            .await
-            .is_err()
-        {
-            move_slots[arm].release();
+            },
+            move_slot,
+        ) = lock_ignoring_poison(&accepted_goal)
+            .take()
+            .expect("the decider keeps the goal it accepts");
+        let goal = GripperGoal {
+            opening,
+            effort: EffortCap::Named(max_effort),
+            settle_timeout,
+            travel_timeout: None,
+            reply: GripperReply::MoveGripper(Box::new(ctx)),
+            move_slot,
+        };
+        if goal_txs[arm].send(goal).await.is_err() {
             error!("move_gripper: coordinator channel closed");
             return Ok(());
         }

@@ -662,8 +662,8 @@ def _turn(yaw):
 _IDENTITY = [0.0, 0.0, 0.0, 1.0]
 
 
-def _snapshot(*records):
-    return SimpleNamespace(frame=_WORLD, timestamp=_CAPTURED, objects=list(records))
+def _snapshot(*records, robots=()):
+    return SimpleNamespace(frame=_WORLD, timestamp=_CAPTURED, objects=list(records), robots=list(robots))
 
 
 def _no_object_state(kind=FailureKind.PRECONDITION_FAILED, message=_NOT_READY):
@@ -865,7 +865,8 @@ def test_an_empty_scene_is_a_snapshot_with_no_objects_and_its_capture_time(comma
     caplog.set_level(logging.INFO)
 
     assert _call(commander, lambda client: _get(client, "/api/objects")) == (
-        200, {"success": True, "objects": [], "count": 0, "frame": _WORLD, "timestamp": _CAPTURED},
+        200,
+        {"success": True, "objects": [], "count": 0, "robots": [], "frame": _WORLD, "timestamp": _CAPTURED},
     )
     assert _node_log(commander, caplog) == [
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
@@ -889,7 +890,10 @@ def test_objects_answer_503_with_the_provider_reason_while_it_has_no_object_stat
     # the page reads its kind with its reason.
     assert first == (503, {"success": False, "message": f"{kind.value}: {reason}"})
     assert second == first
-    assert third == (200, {"success": True, "objects": [], "count": 0, "frame": _WORLD, "timestamp": _CAPTURED})
+    assert third == (
+        200,
+        {"success": True, "objects": [], "count": 0, "robots": [], "frame": _WORLD, "timestamp": _CAPTURED},
+    )
     assert _node_log(commander, caplog) == [
         (logging.INFO, f"Scene provider has no object state: {kind.value}: {reason}", None),
         (logging.INFO, "Scene provider object state ready: 0 runtime objects", None),
@@ -928,6 +932,7 @@ def test_object_records_reach_the_page_with_every_field_as_spawned(commander):
     assert body == {
         "success": True,
         "count": 3,
+        "robots": [],
         "frame": _WORLD,
         "timestamp": _CAPTURED,
         "objects": [
@@ -948,6 +953,30 @@ def test_object_records_reach_the_page_with_every_field_as_spawned(commander):
             },
         ],
     }
+
+
+def test_robot_records_reach_the_page_beside_the_objects_with_every_field(commander):
+    """object_state gives one record per standing robot: the name it stands
+    under, its model, and its robot frame's pose and velocities in world."""
+    commander.objects.get_object_states.answers = [_snapshot(robots=[
+        SimpleNamespace(
+            robot="india", model="botshare_base", position=[1.0, 0.5, 0.0],
+            orientation=[0.0, 0.0, 0.7071, 0.7071], linear_velocity=[0.0, 0.2, 0.0],
+            angular_velocity=[0.0, 0.0, 0.3],
+        ),
+    ])]
+
+    status, body = _call(commander, lambda client: _get(client, "/api/objects"))
+
+    assert status == 200
+    assert (body["objects"], body["count"]) == ([], 0)
+    assert body["robots"] == [
+        {
+            "robot": "india", "model": "botshare_base", "position": [1.0, 0.5, 0.0],
+            "orientation": [0.0, 0.0, 0.7071, 0.7071], "linear_velocity": [0.0, 0.2, 0.0],
+            "angular_velocity": [0.0, 0.0, 0.3],
+        },
+    ]
 
 
 @pytest.mark.parametrize(("path", "service"), [

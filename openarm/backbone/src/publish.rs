@@ -16,12 +16,12 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use control_core::geometry::pose_arrays;
 use control_core::robot_tree::RobotTree;
-use control_core::throttle::Throttle;
-use frame_tree::{MovingMessage, Publisher as TreePublisher};
+use control_core::throttle::{LOG_WINDOW, Throttle};
+use frame_tree::{MovingMessage, Publisher as TreePublisher, Stamp};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
@@ -37,7 +37,7 @@ use srs_model::nalgebra::Isometry3;
 use tracing::{error, warn};
 
 use crate::robot::ARMS;
-use crate::streams::{GripperState, THROTTLED_WARN_PERIOD};
+use crate::streams::GripperState;
 use crate::transforms::JointTransforms;
 use crate::types::limb_names;
 
@@ -46,7 +46,7 @@ use crate::types::limb_names;
 /// Errors until the clock delivers its first tick.
 pub(crate) fn clock_now() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
-    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+    Ok(Stamp::from_nanos(ns).time())
 }
 
 /// A joint vector slot: `joint_setpoints` downstream and `joint_states`
@@ -105,11 +105,10 @@ pub struct Publisher<Build> {
     what: String,
     /// Throttles this slot's failure logs: a stalled clock or a persistently
     /// failing wire hits every cycle, and the log must say so once per
-    /// [`crate::streams::THROTTLED_WARN_PERIOD`] per slot, not at the control
-    /// rate. One state for both failure kinds (a message either fails to build
-    /// or fails to publish, never both). A mutex only because the coordinator
-    /// future must be `Send`; it is touched exclusively on error paths, by one
-    /// task.
+    /// [`LOG_WINDOW`] per slot, not at the control rate. One state for both
+    /// failure kinds (a message either fails to build or fails to publish,
+    /// never both). A mutex only because the coordinator future must be
+    /// `Send`; it is touched exclusively on error paths, by one task.
     error_log: Mutex<Throttle>,
 }
 
@@ -123,7 +122,7 @@ impl<Build> Publisher<Build> {
             publisher: declare(&what, declaring).await?,
             build,
             what,
-            error_log: Mutex::new(Throttle::new(THROTTLED_WARN_PERIOD)),
+            error_log: Mutex::new(Throttle::new(LOG_WINDOW)),
         })
     }
 }

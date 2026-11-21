@@ -2126,14 +2126,15 @@ async fn goals_for_unknown_limb_names_are_refused() -> peppygen::Result<()> {
     Ok(())
 }
 
-/// The stop service ends the moves in flight, whoever started them: an arm
-/// move and a gripper move both end cancelled, for a reason that names the
-/// stop and the reason of its request, the answer names both limbs, a stop
-/// with nothing moving names none, and a goal that arrives after the stop
-/// runs to its end.
+/// robot_stop's stop, the robot stop the robot's MCP endpoint calls,
+/// ends the moves in flight, whoever started them: an arm move and a gripper
+/// move both end cancelled, for a reason that names the stop and the reason
+/// of its request, the answer names both limbs in ascending byte order, a
+/// stop with nothing moving names none, and a goal that arrives after the
+/// stop runs to its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_services::limb_motion::stop;
+    use peppygen::fixtures::exposed_services::robot_stop::stop;
 
     let (harness, LeftFollowers { arm, gripper }) = start_with_left_followers(0.0).await?;
 
@@ -2234,7 +2235,7 @@ async fn a_stop_ends_every_move_in_flight_and_a_later_goal_runs() -> peppygen::R
 /// that the gripper got is still 0.1, where its jaws stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_leaves_a_settled_gripper_closed() -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_services::limb_motion::stop;
+    use peppygen::fixtures::exposed_services::robot_stop::stop;
 
     let (harness, LeftFollowers { gripper, .. }) = start_with_left_followers(0.0).await?;
 
@@ -2390,7 +2391,7 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
     pump_right_arm_and_grippers!(mocks);
     await_streaming(mocks.pairings.right_arm.joint_setpoints).await?;
 
-    let ceiling = "duration_s must be a number of seconds from 0 to 60";
+    let ceiling = "duration_s must be a number of seconds from 0 to 60, got 61";
     assert_posture_refused!(harness, move_to_ready, 61.0, Rejected, ceiling);
     assert_posture_refused!(harness, move_to_home, 61.0, Rejected, ceiling);
     harness.shutdown().await
@@ -2408,7 +2409,7 @@ async fn a_posture_goal_above_the_duration_ceiling_is_refused() -> peppygen::Res
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_posture_reports_where_the_arms_stopped() -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::postures::move_to_ready;
-    use peppygen::fixtures::exposed_services::limb_motion::stop;
+    use peppygen::fixtures::exposed_services::robot_stop::stop;
 
     let (mut harness, mocks) = start_ready_vacant(params(), MODEL).await?;
     pump_is_ready(
@@ -2739,14 +2740,15 @@ async fn move_to_home_parks_the_arms_of_a_robot_whose_gripper_stopped_reporting(
 /// gripper opening at 0.01 of the jaw travel per second, so each close
 /// travels for 50 s from the half open jaws:
 /// - the stop comes once both grippers got a setpoint that closes them, and
-///   names both grippers and no arm;
+///   names both grippers, whose close it ended, and both arms, whose move it
+///   ended before it started;
 /// - the goal ends cancelled for the stop's reason;
 /// - neither arm got a setpoint other than Ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_during_the_close_of_move_to_home_ends_it_before_the_arms_move()
 -> peppygen::Result<()> {
     use peppygen::fixtures::exposed_actions::postures::move_to_home;
-    use peppygen::fixtures::exposed_services::limb_motion::stop;
+    use peppygen::fixtures::exposed_services::robot_stop::stop;
 
     let slow_grippers = peppygen::Parameters {
         max_gripper_rate_frac_s: 0.01,
@@ -2770,7 +2772,10 @@ async fn a_stop_during_the_close_of_move_to_home_ends_it_before_the_arms_move()
         DEADLINE,
     )
     .await?;
-    assert_eq!(answer.stopped, ["left_gripper", "right_gripper"]);
+    assert_eq!(
+        answer.stopped,
+        ["left_arm", "left_gripper", "right_arm", "right_gripper"]
+    );
 
     match goal.get_result(DEADLINE).await?.outcome {
         move_to_home::ResultOutcome::Cancelled { reason, data } => {
@@ -4272,7 +4277,7 @@ async fn a_joint_path_stops_where_it_turns_back_and_at_a_repeated_waypoint() -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_joint_path_ends_on_a_cancel_or_a_stop_and_takes_the_duration_asked()
 -> peppygen::Result<()> {
-    use peppygen::fixtures::exposed_services::limb_motion::stop;
+    use peppygen::fixtures::exposed_services::robot_stop::stop;
 
     let (harness, LeftFollowers { arm, .. }) = start_with_left_followers(0.0).await?;
     let mut moving = arm.clone();

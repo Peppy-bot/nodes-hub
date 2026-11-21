@@ -69,11 +69,11 @@ shutdown grace, and cancels a goal that the engine accepts in that time.
 Then the node's process ends, so a goal that the engine accepts later gets
 no cancel from this node.
 
-The robot's limbs reach the engine through the backbone's pairings, one pair
-per limb on the engine's slots, and the engine tells one robot's limbs from
-another's by the copy each pair belongs to, which is the name this node
-attached under. Every simulation stands as many robots as its machine
-can run.
+The robot's parts reach the engine through the backbone's pairings, one pair
+per limb and one for both wheels of a mobile base, on the engine's slots, and
+the engine tells one robot's parts from another's by the copy each pair
+belongs to, which is the name this node attached under. Every simulation
+stands as many robots as its machine can run.
 
 A robot that drives its own hardware leaves the `simulation` slot vacant: it
 joins no simulation and starts at once, and its `model` names the
@@ -93,9 +93,10 @@ fails, with an error reply or no reply, is
 logged naming the driver and the reply, once for each run of one reply. On a
 simulated one the simulation bound on `simulation` answers for
 the whole robot: standing, and holding a pair for every limb its description
-names. One initializer serves the real robot and every simulation. An answer
-that dies or becomes unreachable flips the robot back to not-ready on the
-next poll, and a launcher that binds neither slot is refused at start.
+names and, on a mobile base, for its wheels. One initializer serves the real
+robot and every simulation. An answer that dies or becomes unreachable flips
+the robot back to not-ready on the next poll, and a launcher that binds
+neither slot is refused at start.
 
 Readiness comes after the robot stands: a robot that the simulation refused
 or did not stand never serves `is_ready` at all, so the backbone never gates

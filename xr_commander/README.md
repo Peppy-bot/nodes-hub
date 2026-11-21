@@ -25,7 +25,7 @@ side and bind them in a launcher. No code here changes.
 | `rgb_camera/v1` | contract | implementer | `color_cameras` (any number) |
 | `rgbd_camera/v1` | contract | implementer | `rgbd_cameras` (any number, colour half only) |
 | `postures/v1` | contract | implementer | `postures` (any number; the chosen robot's takes the face buttons) |
-| `limb_motion/v1` | contract | implementer | `limb_motion` (any number; a squeeze stops the moves in flight on the robot it takes) |
+| `robot_stop/v1` | contract | implementer | `robot_stop` (any number; a squeeze stops the moves in flight on the robot it takes) |
 | `episode_recording/v1` | contract | implementer | `recorder` (any number; the chosen robot's takes the left face buttons) |
 
 Both pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
@@ -63,10 +63,10 @@ The robot declares the pairs from its own side, naming this node's slots:
 }
 ```
 
-and the launcher adds the robot's postures, limb_motion, recorder and cameras
+and the launcher adds the robot's postures, robot_stop, recorder and cameras
 to the headset under the option that selects the robot, so a robot that
 joins later brings them with it: `add_links: { postures: ["backbone_inst"],
-limb_motion: ["backbone_inst"], rgbd_cameras: ["chest"] }` on
+robot_stop: ["backbone_inst"], rgbd_cameras: ["chest"] }` on
 `headset_inst`. The page's **Robot** card
 lists the paired robots in name order and picks the one to drive; it works from a laptop's
 browser as well as the headset's. Until a robot is chosen, or while the
@@ -102,7 +102,7 @@ outside any copy:
 - **The lease follows the grip.** A squeeze on a robot that the headset does
   not drive yet takes the robot's lease under the name `driven from the
   headset`, stops the planned moves in flight on the robot (`stop` of
-  `limb_motion`, with that name as the reason), and only then streams. The
+  `robot_stop`, with that name as the reason), and only then streams. The
   headset releases the lease once no hand drives the robot, after the
   release burst of the last hand, and no posture move of its own runs.
 - **A held robot.** While another client holds the lease, a squeeze does
