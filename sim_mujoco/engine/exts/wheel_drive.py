@@ -9,15 +9,18 @@ pushes against the wheel's angle from it. The joint's `actuatorfrcrange`
 caps the two together at the motor's torque, and the integral is clamped at
 what that cap holds, as a drive clamps its integral at its current limit: a
 stalled wheel stores no more than the cap, and once let go runs on by no
-more than the cap over the integral gain.
+more than the cap over the integral gain. The two actuators are held to
+sim_robot_core.rate_loop's rule, which the Isaac node's stage builder holds
+the same MJCF to.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
+
+from sim_robot_core.rate_loop import wheel_rate_loop
 
 logger = logging.getLogger(__name__)
 
@@ -34,32 +37,6 @@ class _RateLoop:
     integral: int
     integral_act: int
     windup: tuple[float, float]
-
-
-def _part(model, actuator: int) -> str | None:
-    """The part `actuator` plays in a wheel's rate loop: "proportional" for
-    a velocity servo, whose force is its gain times its control less the
-    joint's rate, "integral" for an integrated-velocity servo, whose force is
-    its gain times its activation less the joint's angle, and None for any
-    other."""
-    import mujoco  # pylint: disable=E0401,C0415
-
-    gain = float(model.actuator_gainprm[actuator][0])
-    fixed_affine = (
-        int(model.actuator_gaintype[actuator]) == int(mujoco.mjtGain.mjGAIN_FIXED)
-        and int(model.actuator_biastype[actuator]) == int(mujoco.mjtBias.mjBIAS_AFFINE)
-        and math.isfinite(gain)
-        and gain > 0.0
-    )
-    if not fixed_affine:
-        return None
-    bias = [float(value) for value in model.actuator_biasprm[actuator][:3]]
-    dynamics = int(model.actuator_dyntype[actuator])
-    if dynamics == int(mujoco.mjtDyn.mjDYN_NONE) and bias == [0.0, 0.0, -gain]:
-        return "proportional"
-    if dynamics == int(mujoco.mjtDyn.mjDYN_INTEGRATOR) and bias == [0.0, -gain, 0.0]:
-        return "integral"
-    return None
 
 
 class MujocoWheelDrive:
@@ -97,42 +74,17 @@ class MujocoWheelDrive:
                 f"{where}: no range caps its actuator force; give the joint an actuatorfrcrange "
                 "of the wheel motor's peak torque either way"
             )
-        drivers = [
-            actuator
-            for actuator in range(model.nu)
-            if int(model.actuator_trntype[actuator]) == int(mujoco.mjtTrn.mjTRN_JOINT)
-            and int(model.actuator_trnid[actuator, 0]) == joint
-        ]
-        parts = {_part(model, actuator): actuator for actuator in drivers}
-        if len(drivers) != 2 or set(parts) != {"proportional", "integral"}:
-            raise RuntimeError(
-                f"{where}: {len(drivers)} actuators drive it; drive the wheel with one <velocity> "
-                "actuator, its kv the loop's proportional gain, and one <intvelocity> actuator, "
-                "its kp the loop's integral gain"
-            )
-        for actuator in drivers:
-            gear = float(model.actuator_gear[actuator][0])
-            if gear != 1.0:
-                name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator)
-                raise RuntimeError(
-                    f"{where}: its actuator '{name}' has gear {gear:g}; a wheel's setpoints are its "
-                    "rates, so give the actuator gear 1"
-                )
-        integral = parts["integral"]
-        if model.actuator_actlimited[integral]:
-            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, integral)
-            raise RuntimeError(
-                f"{where}: its actuator '{name}' clamps its activation; a wheel turns without end, "
-                "so give the <intvelocity> no actrange"
-            )
-        integral_gain = float(model.actuator_gainprm[integral][0])
+        try:
+            loop = wheel_rate_loop(model, wheel, joint)
+        except ValueError as refusal:
+            raise RuntimeError(str(refusal)) from refusal
         return _RateLoop(
             joint=wheel,
             qpos=int(model.jnt_qposadr[joint]),
-            proportional=parts["proportional"],
-            integral=integral,
-            integral_act=int(model.actuator_actadr[integral]),
-            windup=(lowest / integral_gain, highest / integral_gain),
+            proportional=loop.proportional,
+            integral=loop.integral,
+            integral_act=int(model.actuator_actadr[loop.integral]),
+            windup=(lowest / loop.integral_gain, highest / loop.integral_gain),
         )
 
     def drive(self, rates: Sequence[float]) -> None:

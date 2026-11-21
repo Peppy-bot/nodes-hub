@@ -25,7 +25,7 @@ from sim_robot_core.registry import Caller, Registry
 from sim_robot_core.setpoints import MAX_VALUE, GripperSetpoint, JointSetpoint
 
 import runtime_fakes
-from runtime_fakes import MessageDepthToColor, member, pair, topic
+from runtime_fakes import MessageDepthToColor, member, pair, queue, topic
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
@@ -56,7 +56,7 @@ def scene_fixture():
     runtime_fakes.reset()
     loop = asyncio.new_event_loop()
     robots = Registry()
-    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=robots)
+    io = sim_topics.SimTopicIO(node_runner=runtime_fakes.NodeRunner(), loop=loop, robots=robots)
     yield SimpleNamespace(io=io, robots=robots, loop=loop)
     loop.close()
 
@@ -88,16 +88,18 @@ async def _drain(loop_turns: int = 10) -> None:
 
 def _serve(scene, arms=(), grippers=(), bases=()) -> None:
     """Starts the transport with these setpoints queued on the two limb
-    slots and the base slot, lets each consume task run to the end of its
-    subscription, which hands every arrival over at once, and stops the
-    service that runs for the node's life."""
-    topic("arms", "joint_setpoints").arrivals = list(arms)
-    topic("grippers", "gripper_setpoints").arrivals = list(grippers)
-    topic("bases", "joint_setpoints").arrivals = list(bases)
+    slots and the base slot, waits until each consume task took every
+    arrival of its subscription, and stops the service that runs for the
+    node's life."""
+    ended = [
+        queue("arms", "joint_setpoints", arms),
+        queue("grippers", "gripper_setpoints", grippers),
+        queue("bases", "joint_setpoints", bases),
+    ]
 
     async def serve() -> None:
         await scene.io.start()
-        await _drain()
+        await asyncio.gather(*(event.wait() for event in ended))
         await scene.io.stop()
 
     scene.loop.run_until_complete(serve())

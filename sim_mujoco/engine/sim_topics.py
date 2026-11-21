@@ -41,6 +41,7 @@ import logging
 import math
 import threading
 import time
+from functools import partial
 from typing import Optional
 
 import peppylib
@@ -78,6 +79,13 @@ from sim_robot_core.setpoints import Setpoints
 from sim_robot_core.world import WORLD
 
 logger = logging.getLogger(__name__)
+
+# The topic each driven slot's setpoints arrive on.
+_SETPOINT_TOPICS = (
+    (ARMS, arm_setpoints),
+    (GRIPPERS, gripper_setpoints),
+    (BASES, base_setpoints),
+)
 
 # The clock topic reserves zero for "no tick observed yet", so the smallest
 # instant an engine can carry is one nanosecond. A timeline still sitting at
@@ -245,18 +253,16 @@ class SimTopicIO:
                 (_GEOMETRY, rgbd_geometry),
             ],
         )
-        # The consume tasks end with their subscriptions; the service runs
-        # for the life of the node.
+        # The consume tasks end with their subscriptions or the node's
+        # cancellation; the service runs for the life of the node.
         runner = self._node_runner
+        token = runner.cancellation_token()
         self._tasks = [
-            asyncio.create_task(
-                self.setpoints.consume(ARMS, lambda: arm_setpoints.subscribe(runner))
-            ),
-            asyncio.create_task(
-                self.setpoints.consume(GRIPPERS, lambda: gripper_setpoints.subscribe(runner))
-            ),
-            asyncio.create_task(
-                self.setpoints.consume(BASES, lambda: base_setpoints.subscribe(runner))
+            *(
+                asyncio.create_task(
+                    self.setpoints.consume(slot, partial(topic.subscribe, runner), token)
+                )
+                for slot, topic in _SETPOINT_TOPICS
             ),
             asyncio.create_task(self._serve_object_states()),
         ]

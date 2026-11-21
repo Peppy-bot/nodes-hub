@@ -30,6 +30,7 @@ from entries import (
     known as known_model,
     placement_at,
 )
+from sim_robot_core import rate_loop
 from sim_robot_core.models import Arm, ModelEntry
 from sim_robot_core.setpoints import MAX_VALUE, GripperSetpoint, JointSetpoint
 
@@ -723,6 +724,24 @@ def _wheel_ctrls(model, data) -> list[float]:
         for side in ("left", "right")
         for part in ("proportional", "integral")
     ]
+
+
+def test_the_wheel_rule_reads_mujocos_numbers():
+    """sim_robot_core's rule names MuJoCo's enumerations by their numbers,
+    which this MuJoCo gives them."""
+    assert (
+        rate_loop.TRN_JOINT,
+        rate_loop.DYN_NONE,
+        rate_loop.DYN_INTEGRATOR,
+        rate_loop.GAIN_FIXED,
+        rate_loop.BIAS_AFFINE,
+    ) == (
+        int(mujoco.mjtTrn.mjTRN_JOINT),
+        int(mujoco.mjtDyn.mjDYN_NONE),
+        int(mujoco.mjtDyn.mjDYN_INTEGRATOR),
+        int(mujoco.mjtGain.mjGAIN_FIXED),
+        int(mujoco.mjtBias.mjBIAS_AFFINE),
+    )
 
 
 class TestTheWheelsOfABase:

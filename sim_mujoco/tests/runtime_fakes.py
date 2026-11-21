@@ -9,7 +9,7 @@ them a session collects first.
 The pairing modules follow the node's five slots. A slot's pairs are the
 slot's, so every topic module of a slot reads the same members, exactly as the
 generated `peers()` does. A setpoint module hands the engine the arrivals a
-test queued and then ends its subscription, and every publisher records the
+test queued and then ends its subscription, saying so, and every publisher records the
 peer each payload was addressed to, so nothing here waits on a clock.
 """
 
@@ -88,13 +88,36 @@ class ServiceFailure(Exception):
 
 class Subscription:
     """A slot's setpoint subscription: hands over what the test queued, in
-    order, then ends."""
+    order, then ends, setting `ended` once its consumer took every
+    arrival."""
 
-    def __init__(self, arrivals: list) -> None:
+    def __init__(self, arrivals: list, ended: asyncio.Event) -> None:
         self._arrivals = arrivals
+        self._ended = ended
 
     async def next(self):
-        return self._arrivals.pop(0) if self._arrivals else None
+        if self._arrivals:
+            return self._arrivals.pop(0)
+        self._ended.set()
+        return None
+
+
+class _Token:
+    """The node's cancellation token, which no test cancels."""
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    async def cancelled(self) -> None:
+        await asyncio.Event().wait()
+
+
+class NodeRunner:
+    """The node runner the engine's transport holds: what it reads of it is
+    the node's cancellation token."""
+
+    def cancellation_token(self) -> _Token:
+        return _Token()
 
 
 class FailureKind(str, enum.Enum):
@@ -208,13 +231,14 @@ def _topic_module(slot_module: types.ModuleType, slot: str, topic: str) -> types
     module = types.ModuleType(f"peppygen.paired_topics.{slot}.{topic}")
     module.LINK_ID = slot
     module.arrivals = []
+    module.ended = asyncio.Event()
     module.publisher = Publisher()
     module.peers = lambda _runner: list(slot_module.members)
     module.build_message = _payload
     module.MessageHeader = lambda **fields: types.SimpleNamespace(**fields)
 
     async def subscribe(_runner) -> Subscription:
-        return Subscription(module.arrivals)
+        return Subscription(module.arrivals, module.ended)
 
     async def declare_publisher(_runner) -> Publisher:
         return module.publisher
@@ -323,6 +347,15 @@ def topic(slot: str, name: str) -> types.ModuleType:
 def pair(slot: str, *members: Member) -> None:
     """Gives one slot the pairs it holds."""
     _slot(slot).members = list(members)
+
+
+def queue(slot: str, name: str, arrivals) -> asyncio.Event:
+    """Queues `arrivals` on the setpoint topic `name` of `slot`, and gives
+    the event its next subscription sets once it handed them all over."""
+    module = topic(slot, name)
+    module.arrivals = list(arrivals)
+    module.ended = asyncio.Event()
+    return module.ended
 
 
 def reset() -> None:
