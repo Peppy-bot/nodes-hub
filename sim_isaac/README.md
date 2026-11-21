@@ -674,6 +674,41 @@ uv run --project sim_isaac/tests --locked --group dev pytest sim_isaac/tests/tes
 `PEPPY_ROBOT_ASSETS_DIR` holds a baked stage, as in the image, the suite reads
 that stage.
 
+### The botshare base's stage
+
+The botshare base's stage is built from its description alone:
+`scripts/build_botshare_base.py` compiles the URDF that `robot_description_py`
+bundles with MuJoCo, with the visual meshes it names, and writes the stage from
+the compiled model, as the SO-101's builder does. Every link that fixed joints
+join is one body, the first link of the group, with the sum of their masses:
+the chassis is `base_footprint`, the robot frame, and each wheel is a body of
+its own, as Waldo's MJCF of the base fuses them. Each link stands under its
+body as a prim of its name, so the depth camera stands under
+`base_camera_link`. Each wheel turns on a revolute joint without limits with a
+velocity drive, whose gains the engine sets from its entry, and the robot's
+prim roots the articulation with no joint to the world. What the URDF does
+not hold is the builder's: each wheel's armature, the tires' friction and the
+casters' spheres, which take none, as in Waldo's MJCF. The visual meshes
+come from botshare's openamr-platform-sw at the commit the URDF was written
+from, each held to its SHA-256 in the builder, with that repository's
+licenses. From the repository root, CPU only:
+
+```bash
+uv run --project sim_isaac/tests --locked --group dev \
+  python sim_isaac/scripts/build_botshare_base.py \
+  --fetch --meshes /tmp/botshare-meshes \
+  --output /tmp/botshare-base-isaac-assets \
+  --archive /tmp/botshare-base-isaac-assets.tar.gz
+```
+
+The archive holds the stage, the licenses and `bundle_manifest.json`, and is
+published as the SO-101's is, at `botshare_base/<version>/<sha256>.tar.gz`,
+for the image to bake under `/opt/robot_assets/botshare_base/`.
+`tests/test_botshare_base_stage.py` holds the stage to the description: its
+bodies and their masses, the place of every link, the wheels' joints and the
+contact of the tires and the casters. `BOTSHARE_MESHES` names a directory the
+meshes are staged in; without it the suite stages them over the network.
+
 ## Tests
 
 Run the GPU-free regression suites from the repository root:
