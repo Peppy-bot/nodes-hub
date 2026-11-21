@@ -22,7 +22,7 @@ from sim_robot_core.models import shipped_entry
 from sim_robot_core.object_state import RobotRecord
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
-from sim_robot_core.setpoints import MAX_VALUE, JointSetpoint
+from sim_robot_core.setpoints import MAX_VALUE, GripperSetpoint, JointSetpoint
 
 import runtime_fakes
 from runtime_fakes import MessageDepthToColor, member, pair, topic
@@ -70,6 +70,11 @@ def _arm_setpoint(sender, positions, velocities=()):
     return sender.info, SimpleNamespace(positions=list(positions), velocities=list(velocities))
 
 
+def _arm(positions, velocities=()) -> JointSetpoint:
+    """The setpoint the engine takes from these positions and velocities."""
+    return JointSetpoint(positions=tuple(positions), velocities=tuple(velocities))
+
+
 def _gripper_setpoint(sender, opening, max_effort=0.0):
     return sender.info, SimpleNamespace(opening=opening, max_effort=max_effort)
 
@@ -83,15 +88,16 @@ async def _drain(loop_turns: int = 10) -> None:
 
 def _serve(scene, arms=(), grippers=(), bases=()) -> None:
     """Starts the transport with these setpoints queued on the two limb
-    slots and the base slot, runs each consume task to the end of its
-    subscription, and stops the service that runs for the node's life."""
+    slots and the base slot, lets each consume task run to the end of its
+    subscription, which hands every arrival over at once, and stops the
+    service that runs for the node's life."""
     topic("arms", "joint_setpoints").arrivals = list(arms)
     topic("grippers", "gripper_setpoints").arrivals = list(grippers)
     topic("bases", "joint_setpoints").arrivals = list(bases)
 
     async def serve() -> None:
         await scene.io.start()
-        await asyncio.gather(*scene.io._consumers)  # pylint: disable=W0212
+        await _drain()
         await scene.io.stop()
 
     scene.loop.run_until_complete(serve())
@@ -120,8 +126,8 @@ class TestWhichRobotAPairBelongsTo:
             ],
         )
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.5] * OPENARM_ARM, [])
-        assert scene.io.latest_arm_command("bravo", "left_arm") == ([0.9] * OPENARM_ARM, [])
+        assert scene.io.setpoints.arm("alpha", "left_arm") == _arm([0.5] * OPENARM_ARM)
+        assert scene.io.setpoints.arm("bravo", "left_arm") == _arm([0.9] * OPENARM_ARM)
 
     def test_a_pair_with_no_copy_belongs_to_the_only_robot_in_the_scene(self, scene):
         _admit(scene, "solo", "so101")
@@ -130,7 +136,7 @@ class TestWhichRobotAPairBelongsTo:
 
         _serve(scene, arms=[_arm_setpoint(backbone, [0.1] * 5)])
 
-        assert scene.io.latest_arm_command("solo", "arm") == ([0.1] * 5, [])
+        assert scene.io.setpoints.arm("solo", "arm") == _arm([0.1] * 5)
         assert scene.io.held_by("solo") == Held(arms=frozenset({"arm"}))
 
     def test_a_pair_with_no_copy_names_no_robot_in_a_fleet(self, scene):
@@ -142,7 +148,7 @@ class TestWhichRobotAPairBelongsTo:
         _serve(scene, arms=[_arm_setpoint(backbone, [0.5] * OPENARM_ARM)])
 
         for robot in ("alpha", "bravo"):
-            assert scene.io.latest_arm_command(robot, "left_arm") is None
+            assert scene.io.setpoints.arm(robot, "left_arm") is None
             assert scene.io.held_by(robot).is_empty()
 
     def test_a_peer_the_slot_does_not_hold_belongs_to_no_robot(self, scene):
@@ -150,7 +156,7 @@ class TestWhichRobotAPairBelongsTo:
 
         _serve(scene, arms=[_arm_setpoint(ALPHA_LEFT_ARM, [0.5] * OPENARM_ARM)])
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") is None
+        assert scene.io.setpoints.arm("alpha", "left_arm") is None
 
 
 class TestLimbsOfOneSlot:
@@ -166,8 +172,8 @@ class TestLimbsOfOneSlot:
             ],
         )
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.1] * 7, [1.0] * 7)
-        assert scene.io.latest_arm_command("alpha", "right_arm") == ([0.2] * 7, [2.0] * 7)
+        assert scene.io.setpoints.arm("alpha", "left_arm") == _arm([0.1] * 7, [1.0] * 7)
+        assert scene.io.setpoints.arm("alpha", "right_arm") == _arm([0.2] * 7, [2.0] * 7)
 
     def test_each_arms_state_goes_back_to_the_peer_of_the_same_limb_only(self, scene):
         _admit(scene, "alpha", "openarm_v2")
@@ -198,8 +204,8 @@ class TestLimbsOfOneSlot:
         scene.io.publish_gripper_states("alpha", "right_gripper", 0.7)
         _publishes(scene)
 
-        assert scene.io.latest_gripper_command("alpha", "left_gripper") == (0.25, 0.0)
-        assert scene.io.latest_gripper_command("alpha", "right_gripper") == (0.75, 4.0)
+        assert scene.io.setpoints.gripper("alpha", "left_gripper") == GripperSetpoint(0.25, 0.0)
+        assert scene.io.setpoints.gripper("alpha", "right_gripper") == GripperSetpoint(0.75, 4.0)
         assert _sent("grippers", "gripper_states") == [
             (ALPHA_RIGHT_GRIPPER.info, (0.0, 0.7, 0.0, 0.0))
         ]
@@ -246,14 +252,14 @@ class TestRobotsOfDifferentModels:
             grippers=[_gripper_setpoint(CHARLO_GRIPPER, 1.0)],
         )
 
-        assert fleet.io.latest_arm_command("charlo", "arm") == ([0.3] * 5, [])
-        assert fleet.io.latest_gripper_command("charlo", "gripper") == (1.0, 0.0)
-        assert fleet.io.latest_arm_command("alpha", "left_arm") == ([0.1] * 7, [])
+        assert fleet.io.setpoints.arm("charlo", "arm") == _arm([0.3] * 5)
+        assert fleet.io.setpoints.gripper("charlo", "gripper") == GripperSetpoint(1.0, 0.0)
+        assert fleet.io.setpoints.arm("alpha", "left_arm") == _arm([0.1] * 7)
         # A limb belongs to the robot that names it: neither answers to the
         # other's.
-        assert fleet.io.latest_arm_command("alpha", "arm") is None
-        assert fleet.io.latest_arm_command("charlo", "left_arm") is None
-        assert fleet.io.latest_gripper_command("alpha", "gripper") is None
+        assert fleet.io.setpoints.arm("alpha", "arm") is None
+        assert fleet.io.setpoints.arm("charlo", "left_arm") is None
+        assert fleet.io.setpoints.gripper("alpha", "gripper") is None
 
     def test_each_robots_state_goes_back_on_its_own_pairs(self, fleet):
         _serve(fleet)
@@ -414,7 +420,7 @@ class TestSetpoints:
             ],
         )
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") == ([0.4] * OPENARM_ARM, [])
+        assert scene.io.setpoints.arm("alpha", "left_arm") == _arm([0.4] * OPENARM_ARM)
 
     @pytest.mark.parametrize(
         ("positions", "velocities"),
@@ -437,7 +443,7 @@ class TestSetpoints:
 
         _serve(scene, arms=[_arm_setpoint(ALPHA_LEFT_ARM, positions, velocities)])
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") is None
+        assert scene.io.setpoints.arm("alpha", "left_arm") is None
 
     @pytest.mark.parametrize(
         ("opening", "max_effort"),
@@ -449,7 +455,7 @@ class TestSetpoints:
 
         _serve(scene, grippers=[_gripper_setpoint(CHARLO_GRIPPER, opening, max_effort)])
 
-        assert scene.io.latest_gripper_command("charlo", "gripper") is None
+        assert scene.io.setpoints.gripper("charlo", "gripper") is None
 
     def test_a_robot_that_left_takes_its_setpoints_with_it(self, scene):
         _admit(scene, "alpha", "openarm_v2")
@@ -465,11 +471,11 @@ class TestSetpoints:
             grippers=[_gripper_setpoint(ALPHA_LEFT_GRIPPER, 0.25)],
         )
 
-        scene.io.forget("alpha")
+        scene.io.setpoints.forget("alpha")
 
-        assert scene.io.latest_arm_command("alpha", "left_arm") is None
-        assert scene.io.latest_gripper_command("alpha", "left_gripper") is None
-        assert scene.io.latest_arm_command("bravo", "left_arm") == ([0.9] * OPENARM_ARM, [])
+        assert scene.io.setpoints.arm("alpha", "left_arm") is None
+        assert scene.io.setpoints.gripper("alpha", "left_gripper") is None
+        assert scene.io.setpoints.arm("bravo", "left_arm") == _arm([0.9] * OPENARM_ARM)
 
 
 class TestTheBase:
@@ -479,7 +485,7 @@ class TestTheBase:
 
         _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
 
-        assert scene.io.latest_base_command("india") == JointSetpoint((0.0, 0.0), (1.0, 1.5))
+        assert scene.io.setpoints.base("india", 0.0) == JointSetpoint((0.0, 0.0), (1.0, 1.5))
         assert scene.io.held_by("india") == Held(bases=frozenset({"base"}))
 
     @pytest.mark.parametrize(
@@ -499,21 +505,7 @@ class TestTheBase:
 
         _serve(scene, bases=[_arm_setpoint(INDIA_BASE, positions, velocities)])
 
-        assert scene.io.latest_base_command("india") is None
-
-    def test_a_part_whose_setpoints_do_not_fit_is_warned_of_once_until_one_fits(self, scene, caplog):
-        _admit(scene, "india", "botshare_base")
-        pair("bases", INDIA_BASE)
-        unfit = _arm_setpoint(INDIA_BASE, [0.0], [1.0])
-
-        with caplog.at_level("WARNING"):
-            _serve(scene, bases=[unfit, unfit, _arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.0]), unfit])
-
-        dropped = [record.getMessage() for record in caplog.records if "dropping" in record.getMessage()]
-        assert dropped == [
-            "dropping the setpoints for 'india' base until one fits: it has 2 wheels, and the command "
-            "carries 1 positions"
-        ] * 2
+        assert scene.io.setpoints.base("india", 0.0) is None
 
     def test_a_base_pair_of_a_robot_with_no_base_drives_nothing(self, scene):
         _admit(scene, "charlo", "so101")
@@ -522,20 +514,20 @@ class TestTheBase:
 
         _serve(scene, bases=[_arm_setpoint(stray, [0.0, 0.0], [1.0, 1.0])])
 
-        assert scene.io.latest_base_command("charlo") is None
+        assert scene.io.setpoints.base("charlo", 0.0) is None
 
     def test_the_wheels_hold_at_rate_0_once_a_reading_finds_their_pair_gone(self, scene):
         _admit(scene, "india", "botshare_base")
         pair("bases", INDIA_BASE)
         _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
 
-        scene.io.keep_paired_bases()
-        assert scene.io.latest_base_command("india") is not None
+        scene.io.setpoints.keep_paired_bases()
+        assert scene.io.setpoints.base("india", 0.0) is not None
         pair("bases")
-        scene.io.keep_paired_bases()
+        scene.io.setpoints.keep_paired_bases()
 
-        assert scene.io.latest_base_command("india") is None
-        assert scene.io.take_base_release("india")
+        assert scene.io.setpoints.base("india", 0.0) is None
+        assert scene.io.setpoints.take_base_release("india")
 
     def test_a_base_pair_that_comes_back_drives_nothing_until_its_leader_sends(self, scene):
         _admit(scene, "india", "botshare_base")
@@ -545,22 +537,22 @@ class TestTheBase:
         # The base node came back on a pair of its own between two readings.
         back = member("india_base_inst", "base", "india", core_node="sim17")
         pair("bases", back)
-        scene.io.keep_paired_bases()
-        assert scene.io.latest_base_command("india") is None
-        assert scene.io.take_base_release("india"), "its wheels are held where they stand"
+        scene.io.setpoints.keep_paired_bases()
+        assert scene.io.setpoints.base("india", 0.0) is None
+        assert scene.io.setpoints.take_base_release("india"), "its wheels are held where they stand"
 
         _serve(scene, bases=[_arm_setpoint(back, [0.0, 0.0], [0.5, 0.5])])
-        scene.io.keep_paired_bases()
-        assert scene.io.latest_base_command("india") == JointSetpoint((0.0, 0.0), (0.5, 0.5))
+        scene.io.setpoints.keep_paired_bases()
+        assert scene.io.setpoints.base("india", 0.0) == JointSetpoint((0.0, 0.0), (0.5, 0.5))
 
     def test_a_robot_that_left_takes_its_base_setpoint_with_it(self, scene):
         _admit(scene, "india", "botshare_base")
         pair("bases", INDIA_BASE)
         _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
 
-        scene.io.forget("india")
+        scene.io.setpoints.forget("india")
 
-        assert scene.io.latest_base_command("india") is None
+        assert scene.io.setpoints.base("india", 0.0) is None
 
     def test_the_wheel_state_goes_back_on_the_base_pair_of_its_robot(self, scene):
         _admit(scene, "india", "botshare_base")
@@ -580,7 +572,15 @@ class TestObjectState:
 
     RECORD = RobotRecord.fixed("alpha", "openarm_v2", (0.0, -1.5, 0.0), (0.0, 0.0, 0.0, 1.0))
 
-    def test_a_capture_is_published_in_world_under_its_stamp_with_no_object(self, scene):
+    @pytest.fixture(name="standing")
+    def standing_fixture(self, scene):
+        """alpha, stood: its attach goal reports it standing."""
+        _admit(scene, "alpha", "openarm_v2")
+        scene.robots.stand("alpha")
+        return scene
+
+    def test_a_capture_is_published_in_world_under_its_stamp_with_no_object(self, standing):
+        scene = standing
         _serve(scene)
 
         scene.io.publish_object_states([self.RECORD])
@@ -589,7 +589,8 @@ class TestObjectState:
         stream = sys.modules["peppygen.emitted_topics.objects.object_states"]
         assert stream.publisher.sent == [(None, ("world", 0.0, [], [self.RECORD.fields()]))]
 
-    def test_get_object_states_answers_the_latest_capture(self, scene):
+    def test_get_object_states_answers_the_latest_capture(self, standing):
+        scene = standing
         _serve(scene)
         scene.io.publish_object_states([])
         scene.io.publish_object_states([self.RECORD])
@@ -598,6 +599,18 @@ class TestObjectState:
 
         assert (answer.frame, answer.timestamp, answer.objects) == ("world", 0.0, [])
         assert answer.robots == [self.RECORD.fields()]
+
+    def test_a_robot_lists_from_the_feedback_that_reports_it_standing(self, scene):
+        """The scene composes a joining robot in before its attach goal
+        reports it standing."""
+        _admit(scene, "alpha", "openarm_v2")
+        _serve(scene)
+
+        scene.io.publish_object_states([self.RECORD])
+        assert scene.io._answer_object_states(None).robots == []  # pylint: disable=W0212
+        scene.robots.stand("alpha")
+        scene.io.publish_object_states([self.RECORD])
+        assert scene.io._answer_object_states(None).robots == [self.RECORD.fields()]  # pylint: disable=W0212
 
     def test_no_capture_yet_is_an_error_reply_and_not_an_empty_scene(self, scene):
         with pytest.raises(runtime_fakes.ServiceFailure) as refusal:

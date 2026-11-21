@@ -31,7 +31,7 @@ from entries import (
     placement_at,
 )
 from sim_robot_core.models import Arm, ModelEntry
-from sim_robot_core.setpoints import MAX_VALUE, JointSetpoint
+from sim_robot_core.setpoints import MAX_VALUE, GripperSetpoint, JointSetpoint
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the bridge imports)
 
@@ -113,16 +113,40 @@ _PINCHER_ENTRY = entry(
 )
 
 
-class FakeIO:
-    """The transport as the bridge meets it: the latest setpoint of each limb
-    of each robot, and everything the bridge recorded and published."""
+class FakeSetpoints:
+    """The setpoints as the bridge reads them: the latest of each limb and
+    base of each robot, the robots whose wheels a dropped setpoint
+    released, and the engine time of each read of a base."""
 
     def __init__(self) -> None:
-        self.arm_commands: dict[tuple[str, str], tuple] = {}
-        self.gripper_commands: dict[tuple[str, str], tuple] = {}
-        self.base_commands: dict[str, JointSetpoint] = {}
-        # The robots whose wheels a dropped setpoint released.
+        self.arms: dict[tuple[str, str], JointSetpoint] = {}
+        self.grippers: dict[tuple[str, str], GripperSetpoint] = {}
+        self.bases: dict[str, JointSetpoint] = {}
         self.released: set[str] = set()
+        self.base_reads: list[float] = []
+
+    def arm(self, robot, arm):
+        return self.arms.get((robot, arm))
+
+    def gripper(self, robot, gripper):
+        return self.grippers.get((robot, gripper))
+
+    def base(self, robot, now_s):
+        self.base_reads.append(now_s)
+        return self.bases.get(robot)
+
+    def take_base_release(self, robot):
+        released = robot in self.released
+        self.released.discard(robot)
+        return released
+
+
+class FakeIO:
+    """The transport as the bridge meets it: the setpoints it took, and
+    everything the bridge recorded and published."""
+
+    def __init__(self) -> None:
+        self.setpoints = FakeSetpoints()
         self.engine_times: list[float] = []
         self.clock_ticks = 0
         self.arm_states: list[tuple] = []
@@ -131,25 +155,11 @@ class FakeIO:
         # Each capture of object_state: the robots' records.
         self.object_states: list[list] = []
 
-    def latest_arm_command(self, robot, arm):
-        return self.arm_commands.get((robot, arm))
-
-    def latest_base_command(self, robot):
-        return self.base_commands.get(robot)
-
-    def take_base_release(self, robot):
-        released = robot in self.released
-        self.released.discard(robot)
-        return released
-
     def publish_base_states(self, robot, positions, velocities):
         self.base_states.append((robot, positions, velocities))
 
     def publish_object_states(self, robots):
         self.object_states.append(robots)
-
-    def latest_gripper_command(self, robot, gripper):
-        return self.gripper_commands.get((robot, gripper))
 
     def record_engine_time(self, engine_time_s):
         self.engine_times.append(engine_time_s)
@@ -266,7 +276,7 @@ class TestStartPosture:
         for joint, position in _POSTURE.items():
             assert _qpos(model, data, joint) == pytest.approx(position, abs=1e-9)
 
-        io.arm_commands[(ROBOT, "arm")] = ([0.0, 0.0], [])
+        io.setpoints.arms[(ROBOT, "arm")] = JointSetpoint((0.0, 0.0), ())
         for _ in range(200):
             bridge.step()
         assert abs(_qpos(model, data, "lift")) < _POSTURE["lift"] / 2
@@ -279,7 +289,7 @@ class TestAJawClosedAtItsLowerLimit:
     )
     def test_an_opening_maps_onto_the_whole_range_of_the_jaw(self, clock, opening, position):
         io = FakeIO()
-        io.gripper_commands[(ROBOT, "gripper")] = (opening, 0.0)
+        io.setpoints.grippers[(ROBOT, "gripper")] = GripperSetpoint(opening, 0.0)
         model, data, _, bridge = _jaw_arm(io)
 
         bridge.step()
@@ -303,11 +313,11 @@ class TestAJawClosedAtItsLowerLimit:
         model, _, _, bridge = _jaw_arm(io)
         jaw = model.actuator(f"{ROBOT}/jaw").id
 
-        io.gripper_commands[(ROBOT, "gripper")] = (0.5, 1.5)
+        io.setpoints.grippers[(ROBOT, "gripper")] = GripperSetpoint(0.5, 1.5)
         bridge.step()
         assert model.actuator_forcerange[jaw].tolist() == [-1.5, 1.5]
 
-        io.gripper_commands[(ROBOT, "gripper")] = (0.5, 0.0)
+        io.setpoints.grippers[(ROBOT, "gripper")] = GripperSetpoint(0.5, 0.0)
         bridge.step()
         assert model.actuator_forcerange[jaw].tolist() == [-3.0, 3.0]
 
@@ -327,7 +337,7 @@ _COUPLED_PINCHER = _PINCHER.replace(
 class TestAFingerAnEqualityCouples:
     def test_the_opening_drives_the_actuated_finger_and_reads_back_from_both(self, clock):
         io = FakeIO()
-        io.gripper_commands[(ROBOT, "hand")] = (1.0, 2.0)
+        io.setpoints.grippers[(ROBOT, "hand")] = GripperSetpoint(1.0, 2.0)
         model, data, _, bridge = _stand(
             _COUPLED_PINCHER, _known("pincher", _PINCHER_ENTRY, _COUPLED_PINCHER), io
         )
@@ -364,7 +374,7 @@ class TestAFingerAnEqualityCouples:
 class TestFingersClosedAtZero:
     def test_an_opening_drives_each_finger_toward_its_own_far_end(self, clock):
         io = FakeIO()
-        io.gripper_commands[(ROBOT, "hand")] = (1.0, 0.0)
+        io.setpoints.grippers[(ROBOT, "hand")] = GripperSetpoint(1.0, 0.0)
         model, data, _, bridge = _stand(_PINCHER, _known("pincher", _PINCHER_ENTRY, _PINCHER), io)
 
         bridge.step()
@@ -385,7 +395,7 @@ class TestFingersClosedAtZero:
 class TestLimbs:
     def test_a_setpoint_drives_the_joints_of_the_limb_it_names(self, clock):
         io = FakeIO()
-        io.arm_commands[(ROBOT, "arm")] = ([0.1, -0.2], [])
+        io.setpoints.arms[(ROBOT, "arm")] = JointSetpoint((0.1, -0.2), ())
         model, data, _, bridge = _jaw_arm(io)
 
         bridge.step()
@@ -394,8 +404,8 @@ class TestLimbs:
 
     def test_another_robots_setpoint_and_another_models_limb_drive_nothing(self, clock):
         io = FakeIO()
-        io.arm_commands[("alpha", "arm")] = ([0.1, -0.2], [])
-        io.arm_commands[(ROBOT, "left_arm")] = ([0.3, 0.3], [])
+        io.setpoints.arms[("alpha", "arm")] = JointSetpoint((0.1, -0.2), ())
+        io.setpoints.arms[(ROBOT, "left_arm")] = JointSetpoint((0.3, 0.3), ())
         model, data, _, bridge = _jaw_arm(io)
 
         bridge.step()
@@ -538,12 +548,12 @@ class TestAControlMuJoCoCannotHold:
     def test_the_setpoint_is_dropped_and_the_arm_holds_the_one_before_it(self, caplog):
         io = FakeIO()
         model, data, _, bridge = self._gained(io)
-        io.arm_commands[(ROBOT, "arm")] = ([0.3, -0.3], [])
+        io.setpoints.arms[(ROBOT, "arm")] = JointSetpoint((0.3, -0.3), ())
         bridge.step()
         held = (_ctrl(model, data, "lift"), _ctrl(model, data, "flex"))
         # Each value lies at the bound, so the setpoint parses, and the
         # feedforward carries the control past it.
-        io.arm_commands[(ROBOT, "arm")] = ([MAX_VALUE, 0.0], [MAX_VALUE, 0.0])
+        io.setpoints.arms[(ROBOT, "arm")] = JointSetpoint((MAX_VALUE, 0.0), (MAX_VALUE, 0.0))
 
         with caplog.at_level(logging.WARNING, logger="bridge_extension"):
             bridge.step()
@@ -561,10 +571,10 @@ class TestAControlMuJoCoCannotHold:
     def test_a_setpoint_that_fits_again_drives_the_arm_and_is_warned_of_anew(self, caplog):
         io = FakeIO()
         model, data, _, bridge = self._gained(io)
-        beyond = ([MAX_VALUE, 0.0], [MAX_VALUE, 0.0])
+        beyond = JointSetpoint((MAX_VALUE, 0.0), (MAX_VALUE, 0.0))
         with caplog.at_level(logging.WARNING, logger="bridge_extension"):
-            for command in (beyond, ([0.2, 0.1], []), beyond):
-                io.arm_commands[(ROBOT, "arm")] = command
+            for setpoint in (beyond, JointSetpoint((0.2, 0.1), ()), beyond):
+                io.setpoints.arms[(ROBOT, "arm")] = setpoint
                 bridge.step()
 
         assert (_ctrl(model, data, "lift"), _ctrl(model, data, "flex")) == (0.2, 0.1)
@@ -594,7 +604,7 @@ class TestAFleetOfOneModel:
 
     def test_a_setpoint_drives_the_robot_it_names_and_no_other(self, clock):
         io = FakeIO()
-        io.arm_commands[(ROBOT, "arm")] = ([0.9, -0.9], [])
+        io.setpoints.arms[(ROBOT, "arm")] = JointSetpoint((0.9, -0.9), ())
         model, data, _, bridge = _jaw_arm(io, names=(ROBOT, self.OTHER))
 
         bridge.step()
@@ -618,7 +628,7 @@ class TestAFleetOfOneModel:
 
     def test_a_gripper_command_closes_the_jaw_of_the_robot_it_names(self, clock):
         io = FakeIO()
-        io.gripper_commands[(self.OTHER, "gripper")] = (1.0, 0.0)
+        io.setpoints.grippers[(self.OTHER, "gripper")] = GripperSetpoint(1.0, 0.0)
         model, data, _, bridge = _jaw_arm(io, names=(ROBOT, self.OTHER))
 
         bridge.step()
@@ -718,7 +728,7 @@ def _wheel_ctrls(model, data) -> list[float]:
 class TestTheWheelsOfABase:
     def test_each_wheel_runs_at_its_rate_of_the_latest_setpoint_and_its_position_goes_unread(self):
         io = FakeIO()
-        io.base_commands[ROBOT] = JointSetpoint((5.0, -5.0), (1.0, -2.0))
+        io.setpoints.bases[ROBOT] = JointSetpoint((5.0, -5.0), (1.0, -2.0))
         model, data, _, bridge = _wheeled(io)
 
         bridge.step()
@@ -729,12 +739,12 @@ class TestTheWheelsOfABase:
     def test_the_wheels_hold_at_rate_0_without_a_setpoint_or_its_velocities(self, setpoint):
         io = FakeIO()
         model, data, _, bridge = _wheeled(io)
-        io.base_commands[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
+        io.setpoints.bases[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
         bridge.step()
         if setpoint is None:
-            del io.base_commands[ROBOT]
+            del io.setpoints.bases[ROBOT]
         else:
-            io.base_commands[ROBOT] = setpoint
+            io.setpoints.bases[ROBOT] = setpoint
 
         bridge.step()
 
@@ -745,7 +755,7 @@ class TestTheWheelsOfABase:
         stored the integral its cap holds. Released, its wheels push nothing
         and hold where they stand."""
         io = FakeIO()
-        io.base_commands[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
+        io.setpoints.bases[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
         model, data, _, bridge = _wheeled(io)
         bridge.step()
         integrals = [
@@ -754,15 +764,26 @@ class TestTheWheelsOfABase:
         ]
         for act in integrals:
             data.act[act] += WHEEL_CAP_NM / WHEEL_INTEGRAL_GAIN
-        del io.base_commands[ROBOT]
-        io.released.add(ROBOT)
+        del io.setpoints.bases[ROBOT]
+        io.setpoints.released.add(ROBOT)
 
         angles = [_qpos(model, data, "left_wheel"), _qpos(model, data, "right_wheel")]
         bridge.step()
 
         assert _wheel_ctrls(model, data) == [0.0, 0.0, 0.0, 0.0]
         assert [float(data.act[act]) for act in integrals] == pytest.approx(angles)
-        assert not io.released, "a release is held once"
+        assert not io.setpoints.released, "a release is held once"
+
+    def test_each_step_reads_the_bases_setpoint_at_the_engine_time_it_steps_from(self):
+        """The leader's window runs on the engine's clock, the simulation
+        clock, which carries on from the scenes before this one."""
+        io = FakeIO()
+        model, _, _, bridge = _stand(WHEELED, _known("wheeled", WHEELED_ENTRY, WHEELED), io, 12.0)
+
+        bridge.step()
+        bridge.step()
+
+        assert io.setpoints.base_reads == pytest.approx([12.0, 12.0 + float(model.opt.timestep)])
 
     def test_the_integral_of_each_wheel_is_clamped_at_what_its_torque_cap_holds(self):
         model, data, _, bridge = _wheeled()
@@ -780,7 +801,7 @@ class TestTheWheelsOfABase:
 
     def test_the_wheel_state_goes_back_left_then_right_on_the_state_rate(self, clock):
         io = FakeIO()
-        io.base_commands[ROBOT] = JointSetpoint((0.0, 0.0), (2.0, 4.0))
+        io.setpoints.bases[ROBOT] = JointSetpoint((0.0, 0.0), (2.0, 4.0))
         model, data, _, bridge = _wheeled(io)
 
         bridge.step()

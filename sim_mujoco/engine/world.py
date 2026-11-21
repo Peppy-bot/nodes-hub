@@ -257,9 +257,10 @@ class World:
         if self._renders:
             self._fit_out_rendering(stage, robots)
         for robot, child in children:
-            _stance(stage, robot).attach_body(
-                child.body(robot.known.robot.mount_body), robot.prefix, ""
-            )
+            mount = child.body(robot.known.robot.mount_body)
+            if robot.known.rolls:
+                _hold_mount_to_robot_frame(robot, mount)
+            _stance(stage, robot).attach_body(mount, robot.prefix, "")
         return stage
 
     def _fit_out_rendering(self, stage, robots: list[Robot]) -> None:
@@ -279,6 +280,22 @@ class World:
         if self._renders and known.entry.cameras:
             add_cameras(spec, known, known.scene_path())
         return spec
+
+
+def _hold_mount_to_robot_frame(robot: Robot, mount) -> None:
+    """Refuses a robot that rolls whose mount body its MJCF places off its
+    own origin or turns: the free joint it hangs on is its robot frame,
+    which the engine reports and places it by, and stands where the mount
+    body does only when the body sits at the MJCF's origin unturned."""
+    position = [float(value) for value in mount.pos]
+    turn = [float(value) for value in mount.quat]
+    if position == [0.0, 0.0, 0.0] and turn == [1.0, 0.0, 0.0, 0.0]:
+        return
+    raise RuntimeError(
+        f"the MJCF of {robot.model} places its mount body '{robot.known.robot.mount_body}' at "
+        f"{position}, turned by {turn} (w, x, y, z): a robot that rolls stands on its robot frame, "
+        "so give the mount body no pos and no quat"
+    )
 
 
 def _stance(stage, robot: Robot):

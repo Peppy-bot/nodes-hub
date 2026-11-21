@@ -71,11 +71,28 @@ _CAMERA_ARM_ENTRY = replace(
 )
 
 
+class _NoSetpoints:
+    """The setpoints of a scene no leader drives."""
+
+    def arm(self, robot, arm):
+        return None
+
+    def gripper(self, robot, gripper):
+        return None
+
+    def base(self, robot, now_s):
+        return None
+
+    def take_base_release(self, robot):
+        return False
+
+
 class FakeIO:
     """The transport the bridge publishes on, which these tests only need to
     swallow."""
 
     def __init__(self) -> None:
+        self.setpoints = _NoSetpoints()
         self.engine_times = []
 
     def record_engine_time(self, seconds):
@@ -89,18 +106,6 @@ class FakeIO:
 
     def publish_gripper_states(self, robot, gripper, opening):
         return None
-
-    def latest_arm_command(self, robot, arm):
-        return None
-
-    def latest_gripper_command(self, robot, gripper):
-        return None
-
-    def latest_base_command(self, robot):
-        return None
-
-    def take_base_release(self, robot):
-        return False
 
     def publish_object_states(self, robots):
         return None

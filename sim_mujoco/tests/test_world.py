@@ -9,13 +9,14 @@ scenes are real (tiny) MJCF compiled by MuJoCo.
 from __future__ import annotations
 
 import math
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
 
 import mujoco
 import pytest
-from entries import camera, entry, known as known_model, placement_at, wheeled
+from entries import WHEELED, camera, entry, known as known_model, placement_at, wheeled
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the world imports)
 
@@ -498,6 +499,25 @@ class TestARobotThatRolls:
         start = data.qpos[free.qposadr[0] : free.qposadr[0] + 7]
         assert start[:3] == pytest.approx([1.5, -3.0, 0.0])
         assert start[3:] == pytest.approx([math.cos(0.25), 0.0, 0.0, math.sin(0.25)])
+
+    @pytest.mark.parametrize(
+        ("mount", "placed"),
+        [
+            ('pos="0.1 0 0"', "at [0.1, 0.0, 0.0], turned by [1.0, 0.0, 0.0, 0.0]"),
+            ('quat="0 0 0 1"', "at [0.0, 0.0, 0.0], turned by [0.0, 0.0, 0.0, 1.0]"),
+        ],
+    )
+    def test_a_rolling_robot_whose_mount_body_stands_off_its_origin_is_refused(self, mount, placed):
+        """Its free joint is its robot frame, which the engine reports and
+        places it by: it stands where the mount body does only while that body
+        sits at the MJCF's origin unturned."""
+        xml = WHEELED.replace('<body name="chassis">', f'<body name="chassis" {mount}>')
+        offset = wheeled(mujoco_models.ASSETS_DIR, xml)
+        world = World(renders=False)
+        world.add("india", offset, placement_at(0.0))
+
+        with pytest.raises(RuntimeError, match=f"places its mount body 'chassis' {re.escape(placed)}"):
+            world.compose()
 
     def test_a_robot_that_holds_where_it_is_placed_hangs_on_no_free_joint(self):
         world = World(renders=False)

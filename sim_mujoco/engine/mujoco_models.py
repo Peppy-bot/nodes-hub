@@ -70,7 +70,7 @@ class MujocoModel:
     def rolls(self) -> bool:
         """Whether the robot rolls on the wheels of its base, free on the
         floor, its placement where it starts."""
-        return self.entry.base is not None
+        return self.entry.rolls
 
     def scene_path(self) -> Path:
         """The MJCF on disk."""

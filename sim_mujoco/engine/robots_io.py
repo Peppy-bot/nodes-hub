@@ -174,7 +174,7 @@ class RobotsIO:
         try:
             self._unbind()
             self._world.remove(name)
-            self._io.forget(name)
+            self._io.setpoints.forget(name)
         finally:
             self._rebind()
         self._robots.renew(self._loop.time())
@@ -224,7 +224,7 @@ class RobotsIO:
                     robot.name for robot in self._robots.robots() if self._mismatch(robot) is None
                 }
                 self._robots.note_paired(matched, self._loop.time())
-                self._io.keep_paired_bases()
+                self._io.setpoints.keep_paired_bases()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pylint: disable=W0718
@@ -572,7 +572,7 @@ class RobotsIO:
         drives nothing until its own leaders send."""
         self._handovers.pop(name, None)
         self._promises.pop(name, None)
-        self._io.forget(name)
+        self._io.setpoints.forget(name)
 
     async def _serve_ready(self) -> None:
         """Answers is_ready for the life of the node. When the service stops,

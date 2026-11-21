@@ -107,7 +107,7 @@ def _robots_io() -> RobotsIO:
     io._admitted = None
     # The pairs, of which admitting a robot and giving its name back touch
     # what it commanded alone.
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     return io
 
 
@@ -369,7 +369,7 @@ def _built(pair_grace_s: float = PAIR_GRACE_S) -> RobotsIO:
         Registry(),
         World(renders=False),
         Edits(),
-        Mock(spec=["forget", "held_by"]),
+        Mock(spec=["setpoints", "held_by"]),
         pair_grace_s,
     )
 
@@ -394,15 +394,12 @@ def test_a_pair_grace_time_no_robot_can_keep_is_refused_as_the_engine_is_built()
 
 class _Pairs:
     """What each robot holds on the five slots, as the engine reads its
-    pairs, and how many readings dropped the setpoints of the bases whose
-    pair is gone."""
+    pairs, and the setpoints each reading drops of the bases whose pair is
+    gone."""
 
     def __init__(self, held: dict) -> None:
         self.held = dict(held)
-        self.base_readings = 0
-
-    def keep_paired_bases(self) -> None:
-        self.base_readings += 1
+        self.setpoints = Mock(spec=["keep_paired_bases", "forget"])
 
     def held_by(self, robot: str) -> Held:
         return self.held.get(robot, Held())
@@ -473,7 +470,7 @@ def _ending_io() -> RobotsIO:
     io = _robots_io()
     io._edits = Mock(spec=["submit"])
     io._edits.submit.return_value = _done()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._promises["alpha"] = _promised()
     return io
 
@@ -498,7 +495,7 @@ def test_a_scene_that_cannot_stand_the_robot_answers_its_own_goal(model):
     cannot take the robot says so on that robot's goal, and its name goes
     back."""
     io = _robots_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots.admit("alpha", _known(model).entry, CALLER)
     io._promises["alpha"] = _promised(model)
     refused: concurrent.futures.Future = concurrent.futures.Future()
@@ -521,7 +518,7 @@ def test_standing_a_robot_composes_the_scene_around_it_and_takes_it_back_out_on_
     """The scene is let go of, changed and taken up again, and a scene that
     will not compile leaves the robots that were standing where they were."""
     io = _robots_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["renew", "release", "stand"])
     composed = []
     io.binds_with(lambda: composed.append("rebind"), lambda: composed.append("unbind"))
@@ -544,7 +541,7 @@ def test_standing_a_robot_composes_the_scene_around_it_and_takes_it_back_out_on_
 
 def test_taking_a_robot_out_composes_the_scene_around_the_ones_that_remain():
     io = _robots_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["renew", "release", "stand"])
     composed = []
     io.binds_with(lambda: composed.append("rebind"), lambda: composed.append("unbind"))
@@ -555,7 +552,7 @@ def test_taking_a_robot_out_composes_the_scene_around_the_ones_that_remain():
 
     assert composed == ["unbind", "rebind"]
     assert io._world.robots() == []
-    io._io.forget.assert_called_once_with("alpha")
+    io._io.setpoints.forget.assert_called_once_with("alpha")
 
 
 class _Unreachable(_Answers):
@@ -755,7 +752,9 @@ class TestPairGrace:
         asyncio.run(one_tick())
 
         assert io._robots.of_name("alpha").last_paired_s == renewed_s
-        assert io._io.base_readings == 1, "each reading drops the setpoints of bases whose pair is gone"
+        assert io._io.setpoints.keep_paired_bases.call_count == 1, (
+            "each reading drops the setpoints of bases whose pair is gone"
+        )
 
 
 class TestAFleetsPairGraceTimes:
@@ -892,7 +891,7 @@ def _standing_io() -> RobotsIO:
     """A RobotsIO with a robot admitted and its stand still waiting."""
     io = _robots_io()
     io._edits = Edits()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots.admit("alpha", _known("openarm_v2").entry, CALLER)
     io._promises["alpha"] = _promised()
     io._admitted = None
@@ -1013,7 +1012,7 @@ def test_forgetting_a_robot_drops_its_spot_its_signal_and_its_setpoints():
 
     assert io._promises == {}
     assert io._handovers == {}
-    io._io.forget.assert_called_once_with("alpha")
+    io._io.setpoints.forget.assert_called_once_with("alpha")
 
 
 class TestHowAStayEnds:
@@ -1133,7 +1132,7 @@ def test_a_robot_whose_pairs_lapsed_on_its_watch_fails_its_goal_naming_its_pairs
     io._stopping = asyncio.Event()
     io._edits = Mock(spec=["submit"])
     io._edits.submit.return_value = _done()
-    io._io = Mock(spec=["forget", "held_by"])
+    io._io = Mock(spec=["setpoints", "held_by"])
     io._io.held_by.return_value = Held()
     goal = _Hosting()
 
@@ -1217,7 +1216,7 @@ def test_a_scene_that_will_not_let_go_is_taken_up_again(change):
     """Letting go of the scene is part of the change that asked for it, so a
     scene that will not let go leaves the engine holding one it can step."""
     io = _robots_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     composed = []
 
     def refuse_to_let_go():
@@ -1242,7 +1241,7 @@ def test_a_stand_that_cannot_compose_the_scene_puts_the_previous_one_back():
     """The scene is let go of before it is changed, so a robot the scene will
     not take leaves the robots that were standing stepping as they were."""
     io = _robots_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["renew", "release", "stand"])
     composed = []
     refusals = iter([RuntimeError("this scene compiles nothing")])
@@ -1493,7 +1492,7 @@ def test_a_spot_the_robot_coming_back_stands_on_is_its_own():
 
 def test_a_goal_whose_spot_was_taken_back_gives_its_name_back():
     io = _robots_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots.admit("alpha", _known("openarm_v2").entry, CALLER)
     goal = _Goal(_request())
 

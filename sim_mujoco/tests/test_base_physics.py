@@ -5,8 +5,9 @@ wheel setpoint at each step of the node's limiter held until the next. Its
 wheels drive it straight as the differential mix of their measured turns
 predicts, and through a turn as the mix predicts on a track within its
 tires' width of its own; standing at rate 0, its wheel states give the base
-node a velocity at rest. Every outcome is read after a step count, so none
-depends on the host's speed. The bounds are Waldo's (private-nodes-hub
+node a velocity at rest; lifted off the floor, its wheels spin while its
+body stays. Every outcome is read after a step count, so none depends on the
+host's speed. The bounds are Waldo's (private-nodes-hub
 waldo/crates/sim_mujoco/src/testing/base_physics.rs), both engines standing
 one model of the base."""
 
@@ -18,6 +19,7 @@ from dataclasses import dataclass
 import mujoco
 import pytest
 import robot_description_py
+from control_core_py import geometry
 from control_core_py.geometry import xyzw_of_wxyz, yaw_of_quaternion
 from entries import staged_release
 from sim_robot_core.setpoints import JointSetpoint
@@ -36,14 +38,23 @@ ROBOT = "india"
 # one wheel setpoint each step of it.
 LIMITER_RATE_HZ = 20
 # The base's rest velocity and rest rate in the same launchers (x.rest_velocity
-# in m/s, angular.rest_rate in rad/s), and its odometry window: each velocity
-# the node reports is the mean over that many of its 100 Hz wheel states.
-REST_VELOCITY_M_S = 0.005
+# in m/s, angular.rest_rate in rad/s), and its odometry window there
+# (odometry_velocity_window): each velocity the node reports is the mean over
+# that many of its wheel states.
+REST_VELOCITY_M_S = 0.02
 REST_RATE_RAD_S = 0.01
-WHEEL_STATE_RATE_HZ = 100
 ODOMETRY_WINDOW = 10
+# This engine's state rate in the simulation launchers (launchers-hub
+# simulation/fragments/mujoco.json5, state_rate_hz): the rate its wheel states
+# go out at.
+WHEEL_STATE_RATE_HZ = 100
 # How long the base settles at rate 0 before a drive, as Waldo's tests settle it.
 SETTLE_S = 0.5
+# Half the side of the block a lifted base rests its belly on (m): Waldo's
+# lifted-base block (base_physics.rs BLOCK_HALF_M), the fixture cube scaled
+# to 0.24 m wide, which fits under the belly clear of the wheels and the
+# casters.
+BLOCK_HALF_M = 0.12
 
 
 @pytest.fixture(name="release", scope="module", autouse=True)
@@ -112,26 +123,35 @@ class Odometry:
         return Odometry(pose=pose, path_m=self.path_m + abs(ahead))
 
 
-class _Driver:
-    """The transport as the bridge meets it while a base node drives the
-    wheels: the latest setpoint of the base, and nothing published."""
+class _BaseSetpoint:
+    """The setpoints as the bridge reads them while a base node drives the
+    wheels: the latest setpoint of the base, which a step of its limiter
+    sends before its window ends."""
 
     def __init__(self) -> None:
-        self.base: JointSetpoint | None = None
+        self.latest: JointSetpoint | None = None
 
-    def latest_base_command(self, _robot):
-        return self.base
+    def base(self, _robot, _now_s):
+        return self.latest
 
     def take_base_release(self, _robot) -> bool:
         return False
 
+    def arm(self, _robot, _arm):
+        return None
+
+    def gripper(self, _robot, _gripper):
+        return None
+
+
+class _Driver:
+    """The transport as the bridge meets it while a base node drives the
+    wheels: the base's setpoint, and nothing published."""
+
+    def __init__(self) -> None:
+        self.setpoints = _BaseSetpoint()
+
     def publish_object_states(self, _robots) -> None:
-        return None
-
-    def latest_arm_command(self, _robot, _arm):
-        return None
-
-    def latest_gripper_command(self, _robot, _gripper):
         return None
 
     def record_engine_time(self, _engine_time_s) -> None:
@@ -161,15 +181,43 @@ class Drive:
         return odometry
 
 
+def _belly_height_m(known) -> float:
+    """The lowest face of the base link's collision box above the robot
+    frame (m), as the base's MJCF places it standing level: the belly Waldo's
+    lifted base rests on (base_physics.rs Chassis::belly_height_m)."""
+    world = World(renders=False)
+    world.add(ROBOT, known, world.free_spot())
+    model = world.compose().compile()
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    box = model.geom(f"{ROBOT}/base_link")
+    assert int(box.type[0]) == int(mujoco.mjtGeom.mjGEOM_BOX), "the base link collides as a box"
+    assert list(data.geom_xmat[box.id]) == pytest.approx([1, 0, 0, 0, 1, 0, 0, 0, 1]), "standing level"
+    return float(data.geom_xpos[box.id][2] - box.size[2])
+
+
+def _lay_block(stage) -> None:
+    """A static block at the origin, BLOCK_HALF_M each way of its centre, its
+    top BLOCK_HALF_M above the floor."""
+    block = stage.worldbody.add_geom()
+    block.type = mujoco.mjtGeom.mjGEOM_BOX
+    block.size = [BLOCK_HALF_M] * 3
+
+
 class DrivenBase:
     """The base standing alone as `india` at the origin, its wheels driven as
-    its base node drives them."""
+    its base node drives them: on the floor, or, `lifted`, with its belly on
+    a block under it, its wheels and its casters clear of the floor."""
 
-    def __init__(self) -> None:
+    def __init__(self, lifted: bool = False) -> None:
         known = MujocoModels.read().of(MODEL, robot_description_py.model(MODEL).description())
+        height_m = BLOCK_HALF_M - _belly_height_m(known) if lifted else 0.0
         self.world = World(renders=False)
-        self.world.add(ROBOT, known, self.world.free_spot())
-        self.model = self.world.compose().compile()
+        self.world.add(ROBOT, known, geometry.Pose.parse((0.0, 0.0, height_m), geometry.IDENTITY))
+        stage = self.world.compose()
+        if lifted:
+            _lay_block(stage)
+        self.model = stage.compile()
         self.data = mujoco.MjData(self.model)
         mujoco.mj_forward(self.model, self.data)
         self.driver = _Driver()
@@ -198,6 +246,10 @@ class DrivenBase:
         heading = yaw_of_quaternion(xyzw_of_wxyz(self.data.qpos[at + 3 : at + 7]))
         return Pose(x=float(self.data.qpos[at]), y=float(self.data.qpos[at + 1]), yaw=heading)
 
+    def height_m(self) -> float:
+        """How high the robot frame stands above the floor (m)."""
+        return float(self.data.qpos[self.free + 2])
+
     def drive(self, seconds: float, rates) -> Drive:
         """Steps for `seconds`, each step of the node's limiter sending the
         wheel rates `rates` gives for the time since the drive began, with
@@ -208,7 +260,9 @@ class DrivenBase:
         for step in range(self._steps(seconds)):
             before = self.angles()
             if step % per_setpoint == 0:
-                self.driver.base = JointSetpoint.parse(before, rates(step * self.timestep_s), 2, "wheels")
+                self.driver.setpoints.latest = JointSetpoint.parse(
+                    before, rates(step * self.timestep_s), 2, "wheels"
+                )
             self.bridge.step()
             after = self.angles()
             drive.turns.append((after[0] - before[0], after[1] - before[1]))
@@ -283,3 +337,20 @@ def test_a_standing_base_reports_a_velocity_at_rest():
         if abs(linear) > REST_VELOCITY_M_S or abs(angular) > REST_RATE_RAD_S:
             moving.append((state / WHEEL_STATE_RATE_HZ, linear, angular))
     assert moving == [], "the time (s), linear (m/s) and angular (rad/s) velocity of each state past rest"
+
+
+def test_a_base_lifted_off_the_floor_spins_its_wheels_while_its_body_stays():
+    """On a block narrower than its track, under its belly, the base's
+    wheels clear the floor: driven 2 s up to 5 rad/s they turn far enough to
+    roll it over half a metre, and its body moves less than a millimetre and
+    turns less than a milliradian, Waldo's bounds of the same drive."""
+    india = DrivenBase(lifted=True)
+    start, start_height_m = india.pose(), india.height_m()
+
+    odometry = india.drive(2.0, ramped(5.0, 5.0)).odometry_on(WHEELS.separation_m)
+
+    assert odometry.path_m > 0.5, f"the wheels rolled {odometry.path_m} m"
+    reached = india.pose()
+    moved = math.hypot(plan_distance(start, reached), india.height_m() - start_height_m)
+    assert moved < 1e-3, f"the body moved {moved} m: {start}, then {reached}"
+    assert abs(math.remainder(reached.yaw - start.yaw, math.tau)) < 1e-3, reached

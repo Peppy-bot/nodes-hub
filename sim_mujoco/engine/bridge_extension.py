@@ -11,12 +11,13 @@ stands.
 Every robot is driven through its own limb and base pairs and publishes its
 state back on them. A base's wheels run at the rates of its pair's latest
 setpoint, and at rate 0 while it holds none; once a reading of the pairs
-finds that pair gone, they are held where they stand, the integral of each
-wheel's rate loop cleared (sim_robot_core.setpoints). A
-robot's joints, actuators and cameras carry its own prefix in the scene,
-which is what tells one robot's limbs from another's when two robots of the
-same model stand together. Transport is typed peppygen via
-SimTopicIO; there is no JSON and no raw peppylib on the path.
+finds that pair gone, or the setpoint outlives its leader's window on the
+engine's clock, they are held where they stand, the integral of each wheel's
+rate loop cleared (sim_robot_core.setpoints). A robot's joints, actuators and
+cameras carry its own prefix in the scene, which is what tells one robot's
+limbs from another's when two robots of the same model stand together.
+Transport is typed peppygen via SimTopicIO; there is no JSON and no raw
+peppylib on the path.
 """
 from __future__ import annotations
 
@@ -148,6 +149,11 @@ class _RobotLimbs:
             import mujoco  # pylint: disable=C0415
 
             free = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, self.robot.instance)
+            if free < 0:
+                raise RuntimeError(
+                    f"the scene standing '{self.robot.instance}' has no free joint of that name, "
+                    "which a robot that rolls hangs from the world on"
+                )
             self.free_qpos = int(self._model.jnt_qposadr[free])
             self.free_dof = int(self._model.jnt_dofadr[free])
 
@@ -350,47 +356,46 @@ class MujocoBridgeExtension:
         self._publish_state()
 
     def _apply_commands(self) -> None:
+        setpoints = self._io.setpoints
+        now_s = self.engine_time_s()
         for limbs in self._limbs.values():
             robot = limbs.robot.instance
             for arm in limbs.entry.arms:
-                command = self._io.latest_arm_command(robot, arm.name)
-                if command is None:
+                setpoint = setpoints.arm(robot, arm.name)
+                if setpoint is None:
                     continue
-                positions, velocities = command
                 joints = [limbs.scene_name(joint) for joint in arm.joints]
-                velocity_values = (
-                    dict(zip(joints, velocities)) if len(velocities) == len(joints) else None
-                )
-                controls = limbs.actuator.controls(dict(zip(joints, positions)), velocity_values)
+                velocities = dict(zip(joints, setpoint.velocities)) if setpoint.velocities else None
+                positions = dict(zip(joints, setpoint.positions))
+                controls = limbs.actuator.controls(positions, velocities)
                 if limbs.fits(arm.name, controls):
                     limbs.actuator.write_controls(controls)
 
             if limbs.wheels is not None:
-                if self._io.take_base_release(robot):
+                setpoint = setpoints.base(robot, now_s)
+                if setpoints.take_base_release(robot):
                     limbs.wheels.hold()
-                setpoint = self._io.latest_base_command(robot)
                 stopped = (0.0,) * len(limbs.entry.wheel_joints())
                 limbs.wheels.drive(stopped if setpoint is None else setpoint.rates())
                 limbs.wheels.clamp_integrals()
 
             for gripper in limbs.entry.grippers:
-                command = self._io.latest_gripper_command(robot, gripper.name)
-                if command is None:
+                setpoint = setpoints.gripper(robot, gripper.name)
+                if setpoint is None:
                     continue
-                opening, max_effort = command
                 driven = limbs.driven_fingers[gripper.name]
                 joints = [name for name, _ in driven]
                 # Re-applied only on change: the cap is a model write, not a
                 # per-tick target.
-                if limbs.applied_effort.get(gripper.name) != max_effort:
+                if limbs.applied_effort.get(gripper.name) != setpoint.max_effort:
                     # Recorded only once written, so a not-ready tick retries.
-                    if limbs.actuator.set_force_limit(joints, max_effort):
-                        limbs.applied_effort[gripper.name] = max_effort
+                    if limbs.actuator.set_force_limit(joints, setpoint.max_effort):
+                        limbs.applied_effort[gripper.name] = setpoint.max_effort
                 # Map the opening fraction onto each driven finger's own span,
                 # so the same command drives prismatic fingers, revolute ones
                 # and a single jaw.
                 limbs.actuator.write_targets(
-                    {name: span.position_at(opening) for name, span in driven}
+                    {name: span.position_at(setpoint.opening) for name, span in driven}
                 )
 
     def _publish_state(self) -> None:
