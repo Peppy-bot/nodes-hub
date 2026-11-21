@@ -1934,8 +1934,8 @@ async fn a_drive_base_whose_base_does_not_rest_by_its_settle_timeout_fails_with_
     assert_eq!(failure.kind, drive_base::FailureKind::Timeout);
     assert_eq!(
         failure.message,
-        "the base still moves at x 0.040 m/s and yaw 0.000 rad/s 0.100 s after \
-         the command reached 0"
+        "the base still moves at 0.040 m/s along x and turns at 0.000 rad/s 0.100 s \
+         after the command reached 0"
     );
     rig.shutdown().await;
 }

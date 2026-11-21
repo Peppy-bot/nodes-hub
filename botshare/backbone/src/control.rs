@@ -472,7 +472,7 @@ impl RunningGoal {
                 && now_ns >= stopped_ns + settle_timeout_ns =>
             {
                 format!(
-                    "the base still moves at x {:.3} m/s and yaw {:.3} rad/s \
+                    "the base still moves at {:.3} m/s along x and turns at {:.3} rad/s \
                      {:.3} s after the command reached 0",
                     measured.linear_x(),
                     measured.angular_z(),
@@ -1099,7 +1099,7 @@ impl Base {
         }
         if let Some(ending) = goal.unsettled_cancel(now_ns) {
             warn!(
-                "the base still moves at x {:.3} m/s and yaw {:.3} rad/s \
+                "the base still moves at {:.3} m/s along x and turns at {:.3} rad/s \
                  {:.3} s after its goal was cancelled: the goal ends",
                 measured.linear_x(),
                 measured.angular_z(),
