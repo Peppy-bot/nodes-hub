@@ -44,7 +44,7 @@ drive_link setpoint in the robot frame, by the place of their frame there at
 their own time, so a velocity in the robot frame stands in it at any time.
 
 ```text
-   drive (drive_link, follower, one leader)               base_motion: drive_base, move_base
+   leader_base (drive_link, follower, one leader)         base_motion: drive_base, move_base
    drive_setpoints in, drive_states out                   robot_stop: stop
                  |                                                  |
                  v                                                  v
@@ -304,8 +304,8 @@ limiter's rate, the odometry window, the rotate-to-heading angle of
 move_base's drive, how long a robot stop waits for the control loop, and how
 long a placement waits for the robot's tree. `cache_window_s` keeps tf2's 10 s
 by default. The `base` slot is required and names the wheels' follower; the
-`drive` slot holds one leader or none. `robot_init`, `robot_identity` and
-`other_transforms` bind to the robot's initializer.
+`leader_base` slot holds one leader or none. `robot_init`, `robot_identity`
+and `other_transforms` bind to the robot's initializer.
 
 ## Build, run, test
 

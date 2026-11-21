@@ -1,10 +1,10 @@
 //! The streams the base receives: the wheels' measured angles on the `base`
 //! pair, with the instance that sent them, and the leader's velocity
-//! setpoints on the `drive` pair, each handed to the control loop in arrival
-//! order. A measurement with a value that is not finite is dropped. A setpoint
-//! is placed in the robot frame by the robot's tree, at its timestamp or at the
-//! latest time for none, and is dropped, as drive_link counts it as no
-//! setpoint, when a value is not finite, when the tree cannot place it, and
+//! setpoints on the `leader_base` pair, each handed to the control loop in
+//! arrival order. A measurement with a value that is not finite is dropped. A
+//! setpoint is placed in the robot frame by the robot's tree, at its timestamp
+//! or at the latest time for none, and is dropped, as drive_link counts it as
+//! no setpoint, when a value is not finite, when the tree cannot place it, and
 //! when, placed, its linear_velocity's z or its angular_velocity's x or y lies
 //! farther than 1e-9 from 0. A setpoint's y reaches the limiter, whose range
 //! along y on a differential base is 0 alone. Each stream logs at most one
@@ -20,7 +20,7 @@ use control_core::throttle::{LOG_WINDOW, Throttle};
 use control_core::twist::PlanarTwist;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::base::joint_states;
-use peppygen::paired_topics::drive::drive_setpoints;
+use peppygen::paired_topics::leader_base::drive_setpoints;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 

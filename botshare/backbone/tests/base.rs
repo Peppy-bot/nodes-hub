@@ -1837,11 +1837,12 @@ async fn base_states_repeat_the_newest_measurement_every_tenth_of_a_second_until
         .count();
     let mut stamps = Vec::new();
     for _ in 0..repeats + 2 {
-        let drive = tokio::time::timeout(ANSWER_BUDGET, rig.pairings.drive.drive_states.next())
-            .await
-            .expect("the node publishes drive_states")
-            .expect("drive_states receive")
-            .expect("drive_states open");
+        let drive =
+            tokio::time::timeout(ANSWER_BUDGET, rig.pairings.leader_base.drive_states.next())
+                .await
+                .expect("the node publishes drive_states")
+                .expect("drive_states receive")
+                .expect("drive_states open");
         stamps.push(ns(drive.timestamp));
     }
     let expected: Vec<i64> = std::iter::repeat_n(START_NS, repeats + 1)

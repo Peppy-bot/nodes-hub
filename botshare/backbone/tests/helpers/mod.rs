@@ -1,16 +1,15 @@
 //! The rig the base's harness tests drive: the node booted on a simulated
 //! clock the test ticks and told the robot's model, robot_description's
 //! botshare_base, and that the robot is ready, as the robot's initializer
-//! tells it, the wheels' follower
-//! played by the `base` pair's mock and the leader by the `drive` pair's
-//! mock. Each step publishes the wheels' measurement stamped with the step's
-//! time, waits until the node took it (its transforms of the wheel joints
-//! carry the stamp), ticks the clock to that time and waits for the node's
-//! base_states of that measurement, which the node publishes once its clock
-//! reads the stamp, after the steps up to it. The node so runs each step after
-//! the measurement of its time, and the test's time is the node's, whatever
-//! the host's speed. A silent step ticks the clock alone and waits for
-//! nothing.
+//! tells it, the wheels' follower played by the `base` pair's mock and the
+//! leader by the `leader_base` pair's mock. Each step publishes the wheels'
+//! measurement stamped with the step's time, waits until the node took it
+//! (its transforms of the wheel joints carry the stamp), ticks the clock to
+//! that time and waits for the node's base_states of that measurement, which
+//! the node publishes once its clock reads the stamp, after the steps up to
+//! it. The node so runs each step after the measurement of its time, and the
+//! test's time is the node's, whatever the host's speed. A silent step ticks
+//! the clock alone and waits for nothing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +26,7 @@ mod parameters;
 pub use parameters::*;
 use peppygen::fixtures::harness::{Config, Harness, Mocks, PairingMocks};
 use peppygen::mock::deps::{other_transforms, robot_identity};
-use peppygen::mock::pairings::{base, drive};
+use peppygen::mock::pairings::{base, leader_base};
 
 /// One step of the velocity limiter (ns): 20 Hz.
 pub const STEP_NS: i64 = 50_000_000;
@@ -380,8 +379,8 @@ impl Rig {
     }
 
     /// The node's first drive_states of time `t_ns` or later.
-    pub async fn drive_state_at(&mut self, t_ns: i64) -> drive::drive_states::Message {
-        let states = &mut self.pairings.drive.drive_states;
+    pub async fn drive_state_at(&mut self, t_ns: i64) -> leader_base::drive_states::Message {
+        let states = &mut self.pairings.leader_base.drive_states;
         tokio::time::timeout(ANSWER_BUDGET, async {
             loop {
                 let state = states
@@ -490,9 +489,9 @@ impl Rig {
     /// Publish the leader's setpoint on drive_link.
     pub async fn lead(&self, linear_velocity: [f64; 3], yaw_rate: f64) {
         self.pairings
-            .drive
+            .leader_base
             .drive_setpoints
-            .publish(&drive::drive_setpoints::Message {
+            .publish(&leader_base::drive_setpoints::Message {
                 frame: None,
                 timestamp: Some(wire(self.now_ns)),
                 linear_velocity,

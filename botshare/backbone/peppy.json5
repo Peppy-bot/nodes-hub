@@ -44,7 +44,7 @@
       pairings: [
         // The velocity stream of the base's one leader of drive_link, which
         // gets the base's state back with whether the base follows it.
-        { name: "drive_link", tag: "v1", role: "follower", link_id: "drive", cardinality: "zero_or_one" },
+        { name: "drive_link", tag: "v1", role: "follower", link_id: "leader_base", cardinality: "zero_or_one" },
         // The exclusive command loop with the wheels' follower: the base
         // plays the leader role, streams the wheel angle setpoints down
         // joint_setpoints and reads the measured wheel angles back on
@@ -82,7 +82,7 @@
         { link_id: "transforms", name: "static_transforms" },
         // The follower role's state back-channel to the leader: the same
         // measurement as base_states, with whether the base follows it.
-        { link_id: "drive", name: "drive_states" },
+        { link_id: "leader_base", name: "drive_states" },
         // The wheel setpoint of each step, [left, right]: angles (rad) and
         // the wheel rates (rad/s) as feedforward velocities.
         {
@@ -93,7 +93,7 @@
       ],
       consumes: [
         // The leader's body velocity setpoints.
-        { link_id: "drive", name: "drive_setpoints" },
+        { link_id: "leader_base", name: "drive_setpoints" },
         // The measured wheel angles (rad), [left, right].
         {
           link_id: "base",
