@@ -1,13 +1,17 @@
-"""The botshare base's stage scripts/build_botshare_base.py writes, held to its
-description, the URDF robot_description bundles: the bodies its fixed joints
-fuse with the sum of their masses, every link at its place, the wheels'
-continuous joints, and the contact of its tires and casters.
+"""The botshare base's stage scripts/build_botshare_base.py writes from its
+MuJoCo model, held to its description, the URDF robot_description bundles
+(the bodies its fixed joints fuse with the sum of their masses, every link
+at its place, the wheels' continuous joints), and to the model (each wheel's
+rate loop as its drive, the contact of its tires and casters, and the
+colour of each mesh).
 
 The stage is read as baked where PEPPY_ROBOT_ASSETS_DIR holds one (the base
-image's suite), and built here otherwise, from the visual meshes
-BOTSHARE_MESHES names, or that the suite stages in a directory of its own
-over the network, each held to its pin. The suite needs mujoco, which the
-builder runs on, and USD.
+image's suite), and built here otherwise, from the base's model in the
+release of Waldo's catalogue that sim_base_images/waldo_catalogue.py pins.
+BOTSHARE_RELEASE names a directory a release holding the base is staged in;
+without it the suite stages the pinned release in a directory of its own,
+which needs the network. The suite needs mujoco, which the builder runs on,
+and USD.
 """
 
 from __future__ import annotations
@@ -24,13 +28,17 @@ import pytest
 import robot_description_py
 from control_core_py.geometry import rotation_of
 
+from _base_images import IMAGES_DIR
+
 pytest.importorskip("mujoco")
 pytest.importorskip("pxr")
 from pxr import Usd, UsdGeom, UsdPhysics, UsdShade  # noqa: E402  pylint: disable=C0413
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(IMAGES_DIR))
 
 import build_botshare_base as builder  # noqa: E402  pylint: disable=C0413
+import waldo_catalogue  # noqa: E402  pylint: disable=C0413
 
 ROBOT = builder.ROBOT_PATH
 BODIES = ("base_footprint", "left_wheel_link", "right_wheel_link")
@@ -52,14 +60,27 @@ def description() -> builder.Description:
 
 
 @pytest.fixture(scope="module")
-def stage(tmp_path_factory, description) -> Usd.Stage:
+def release(tmp_path_factory) -> Path:
+    staged = os.environ.get("BOTSHARE_RELEASE")
+    if staged:
+        return Path(staged)
+    release = tmp_path_factory.mktemp("botshare_release") / "release"
+    waldo_catalogue.fetch(release, robots=[builder.ROBOT_ID])
+    return release
+
+
+@pytest.fixture(scope="module")
+def model(release):
+    """The base's MuJoCo model, as the builder compiles it."""
+    return builder.compile_model(release)
+
+
+@pytest.fixture(scope="module")
+def stage(tmp_path_factory, description, release) -> Usd.Stage:
     baked = _baked_stage()
     if baked is not None:
         return Usd.Stage.Open(str(baked))
-    staged = os.environ.get("BOTSHARE_MESHES")
-    meshes = Path(staged) if staged else tmp_path_factory.mktemp("botshare_meshes")
-    builder.fetch_meshes(meshes)
-    path = builder.build_stage(meshes, description, tmp_path_factory.mktemp("botshare_stage"))
+    path = builder.build_stage(release, description, tmp_path_factory.mktemp("botshare_stage"))
     return Usd.Stage.Open(str(path))
 
 
@@ -114,11 +135,10 @@ def test_the_bodies_are_the_root_link_and_the_wheels(stage, description):
 
 def test_each_body_weighs_the_links_its_fixed_joints_join(stage, description, urdf):
     """The chassis carries every link fixed to the root; a wheel its own."""
-    parents = builder.link_parents(description)
     links = [link.get("name") for link in urdf.findall("link")]
     expected = {
         "base_footprint": sum(
-            _mass_of(urdf, link) for link in links if builder.body_of(link, parents) == "base_footprint"
+            _mass_of(urdf, link) for link in links if builder.body_of(link, description) == "base_footprint"
         ),
         "left_wheel_link": _mass_of(urdf, "left_wheel_link"),
         "right_wheel_link": _mass_of(urdf, "right_wheel_link"),
@@ -141,7 +161,7 @@ def test_every_link_of_the_urdf_stands_where_its_fixed_joints_place_it(stage, de
         assert ours[:3, :3] == pytest.approx(theirs[:3, :3], abs=1e-6), link
 
 
-def test_the_wheels_turn_without_limits_on_velocity_drives_about_their_axle(stage, description):
+def test_the_wheels_turn_without_limits_about_their_axle(stage, description):
     for joint, link in zip(description.wheels, ("left_wheel_link", "right_wheel_link"), strict=True):
         prim = stage.GetPrimAtPath(f"{builder.JOINTS_PATH}/{joint}")
         revolute = UsdPhysics.RevoluteJoint(prim)
@@ -150,10 +170,6 @@ def test_the_wheels_turn_without_limits_on_velocity_drives_about_their_axle(stag
         assert revolute.GetUpperLimitAttr().Get() == math.inf
         assert [t.name for t in revolute.GetBody0Rel().GetTargets()] == ["base_footprint"]
         assert [t.name for t in revolute.GetBody1Rel().GetTargets()] == [link]
-        drive = UsdPhysics.DriveAPI(prim, "angular")
-        assert drive.GetTypeAttr().Get() == "force"
-        assert drive.GetStiffnessAttr().Get() == 0.0
-        assert prim.GetAttribute("physxJoint:armature").Get() == pytest.approx(builder.WHEEL_ARMATURE)
         # The joint's frame on the chassis is the wheel's place in the URDF.
         wheel = _world(stage.GetPrimAtPath(f"{ROBOT}/{link}"))
         assert tuple(revolute.GetLocalPos0Attr().Get()) == pytest.approx(tuple(wheel[:3, 3]), abs=1e-6)
@@ -167,12 +183,30 @@ def test_the_robot_roots_its_articulation_and_stands_free(stage):
     assert sorted(prim.GetName() for prim in joints) == list(WHEELS)
 
 
+def test_each_wheels_drive_is_the_rate_loop_its_model_runs_it_with(stage, model, description):
+    """The PD on the wheel's angle the loop is: the integral gain as its
+    stiffness and the proportional gain as its damping, per degree as USD
+    writes an angular drive's, the cap as its maximum force, with the
+    armature of the model's wheel."""
+    for joint in description.wheels:
+        loop = builder.rate_loop_of(model, joint)
+        assert loop.kv > 0.0 and loop.kp > 0.0 and loop.cap > 0.0
+        prim = stage.GetPrimAtPath(f"{builder.JOINTS_PATH}/{joint}")
+        drive = UsdPhysics.DriveAPI(prim, "angular")
+        assert drive.GetTypeAttr().Get() == "force"
+        assert drive.GetStiffnessAttr().Get() == pytest.approx(math.radians(loop.kp))
+        assert drive.GetDampingAttr().Get() == pytest.approx(math.radians(loop.kv))
+        assert drive.GetMaxForceAttr().Get() == pytest.approx(loop.cap)
+        armature = model.dof_armature[int(model.jnt_dofadr[model.joint(joint).id])]
+        assert prim.GetAttribute("physxJoint:armature").Get() == pytest.approx(armature)
+
+
 def _bound_physics(prim):
     material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial("physics")
     return material.GetPrim().GetName() if material else None
 
 
-def test_the_tires_grip_and_the_casters_slide(stage):
+def test_the_tires_grip_as_the_model_gives_and_the_casters_slide(stage, model):
     for body in ("left_wheel_link", "right_wheel_link"):
         (tire,) = stage.GetPrimAtPath(f"{ROBOT}/{body}/collisions").GetChildren()
         assert tire.IsA(UsdGeom.Cylinder)
@@ -185,16 +219,20 @@ def test_the_tires_grip_and_the_casters_slide(stage):
     caster = stage.GetPrimAtPath(f"{builder.MATERIALS_PATH}/caster")
     assert UsdPhysics.MaterialAPI(caster).GetDynamicFrictionAttr().Get() == 0.0
     assert caster.GetAttribute("physxMaterial:frictionCombineMode").Get() == "min"
+    wheel = model.body("left_wheel_link").id
+    (tire_geom,) = [
+        geom for geom in range(model.ngeom)
+        if model.geom_bodyid[geom] == wheel and model.geom_group[geom] != builder.VISUAL_GROUP
+    ]
     tire_material = stage.GetPrimAtPath(f"{builder.MATERIALS_PATH}/tire")
-    assert UsdPhysics.MaterialAPI(tire_material).GetDynamicFrictionAttr().Get() == builder.WHEEL_FRICTION
+    assert UsdPhysics.MaterialAPI(tire_material).GetDynamicFrictionAttr().Get() == pytest.approx(
+        model.geom_friction[tire_geom][0]
+    )
     assert tire_material.GetAttribute("physxMaterial:frictionCombineMode").Get() == "max"
 
 
-def test_every_body_draws_its_meshes_in_the_urdfs_materials_and_hides_its_collisions(stage, urdf):
-    colors = {
-        material.get("name"): tuple(float(v) for v in material.find("color").get("rgba").split()[:3])
-        for material in urdf.findall("material")
-    }
+def test_every_body_draws_its_meshes_in_their_model_colors_and_hides_its_collisions(stage, model):
+    colors = {model.material(i).name: tuple(float(v) for v in model.mat_rgba[i][:3]) for i in range(model.nmat)}
     for body in BODIES:
         drawn = stage.GetPrimAtPath(f"{ROBOT}/{body}/visuals").GetChildren()
         assert drawn, body

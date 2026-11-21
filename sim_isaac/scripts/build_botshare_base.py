@@ -1,68 +1,73 @@
 #!/usr/bin/env python3
-"""Build the botshare base's Isaac Sim stage from its description.
+"""Build the botshare base's Isaac Sim stage from its MuJoCo model.
 
 The botshare base is botshare.ai's OpenAMRobot 2.0 base, robot_description's
-model botshare_base: a chassis on two driven hub-motor wheels and four
-casters. Its URDF, as robot_description_py bundles it, is the one source of
-the stage: MuJoCo compiles it, with the visual meshes it names, and the stage
-is written from the compiled model, as build_so101.py writes the SO-101's.
-MuJoCo fuses every link that fixed joints join into one body, the first link
-of the group, with the sum of their inertials: the root link base_footprint
-and every link fixed to it is the chassis, and each wheel, on a continuous
-joint, is a body of its own. Waldo's MJCF of the base fuses the URDF the same
-way, so both engines roll the same masses.
+model botshare_base. Its model is the one in the release of Waldo's catalogue:
+the MJCF Waldo's tools/botshare_base writes from the base's URDF, with the
+meshes its tree stages from botshare's openamr-platform-sw. The MuJoCo node
+bakes the same model and Waldo loads it, so the three engines stand the same
+robot, and the URDF is the one source of its geometry.
 
-Each body is a link prim at its pose with every joint at zero, with its
-mass, its visual meshes and its collision shapes; each link fixed to it is a
-prim under it, nested as the URDF nests them and placed by the URDF's fixed
-joints, so a camera stands under the link it hangs from. Each wheel joint is
-a revolute joint without limits, as its continuous joint turns, with a
-velocity drive: no stiffness, its damping and its torque cap set by the
-engine from its entry of the model. The articulation's root carries no joint
-to the world: the base rolls on its wheels.
+MuJoCo compiles the MJCF with its mount body hanging from the world on a free
+joint, as Waldo hangs a rolling robot, and the stage is written from the
+compiled model:
 
-What the URDF does not hold:
+- the mount body is the URDF's root link, base_footprint, with the sum of the
+  inertials of every link fixed to it, as the MJCF gives it; each body a hinge
+  moves is the link the URDF joint of the same name places, a wheel;
+- each link the URDF fixes to a body is a prim under the prim of the link it
+  hangs from, placed by the URDF's fixed joint, so a camera stands under the
+  link it hangs from;
+- each drawn geom is a mesh in a material named after the mesh, of its colour,
+  and each collision geom a hidden collider: a geom that takes no friction
+  (condim 1, a caster's sphere) in a frictionless material that wins over any
+  other, and a wheel's collider in the friction the MJCF gives it, the larger
+  of two winning, as MuJoCo combines two geoms' friction;
+- each hinge is a revolute joint without limits about its axis, with the
+  wheel's armature and its rate loop as its drive. The MJCF runs the loop as a
+  velocity actuator, its kv the loop's proportional gain, and an
+  integrated-velocity actuator, its kp the loop's integral gain, the two
+  capped together by the joint's actuatorfrcrange. The drive is the PD on the
+  wheel's angle that the loop is: its stiffness the integral gain, its
+  damping the proportional gain and its maximum force the cap, which the
+  engine reads back as the loop it runs (engine/wheel_loop.py);
+- the robot's prim roots the articulation with no joint to the world: the
+  base rolls on its wheels.
 
-- each wheel's armature, WHEEL_ARMATURE, the provisional rotor inertia Waldo's
-  MJCF gives the same wheel;
-- the wheels' grip, WHEEL_FRICTION, the sliding friction MuJoCo gives a
-  contact by default, which Waldo's wheels run on;
-- the casters' spheres take no friction, the least of any two materials in
-  contact, so the wheels alone grip the floor.
+The hinges are the wheels of the description's differential base, and the
+stage refuses any other.
 
-The visual meshes are botshare's, from openAMRobot/openamr-platform-sw at the
-commit the URDF was written from (MESH_SOURCE), each held to its SHA-256
-(MESHES). `fetch_meshes` stages them, with the repository's licenses.
+CPU only: it needs the `mujoco`, `usd-core`, `numpy`, `robot_description_py`
+and `control_core_py` packages, no Isaac Sim.
 
-CPU only: it needs the `mujoco`, `usd-core`, `numpy` and
-`robot_description_py` packages, no Isaac Sim.
-
-    python3 build_botshare_base.py --meshes <directory> --output <directory> \\
+    python3 build_botshare_base.py --release <staged release> --output <directory> \\
         [--archive <bundle.tar.gz>]
 
-`--meshes` is a directory `fetch_meshes` staged, or that `--fetch` stages
-first. `--archive` packs the output directory into the bundle the Isaac base
-image downloads, as build_so101.py packs the SO-101's: the stage, the
-licenses of the meshes and a manifest of what built it (the meshes' source,
-the digest of this script, the digest robot_description_py gives the base's
-model, and the versions of the tools).
+`--release` is a directory `waldo_catalogue.py fetch <directory> --robot
+botshare_base` staged, which holds the base's model under botshare_base/.
+
+`--archive` packs the output directory into the bundle the Isaac base image
+downloads, as build_so101.py packs the SO-101's: the stage, the licenses of
+the meshes and a manifest of what built it (the release and the tree the
+model came from, the digest of this script, the digest robot_description_py
+gives the base's model, and the versions of the tools).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.request import urlopen
 
 import mujoco
 import numpy as np
 import robot_description_py
 from control_core_py.geometry import wxyz_of_xyzw
-from mujoco_usd import define_geom, pack, set_pose, sha256
+from mujoco_usd import define_geom, pack, release_source, set_pose, sha256
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
 ROBOT_ID = "botshare_base"
@@ -72,41 +77,16 @@ ROBOT_PATH = f"/{ROBOT_ID}"
 JOINTS_PATH = f"{ROBOT_PATH}/joints"
 LOOKS_PATH = f"{ROBOT_PATH}/Looks"
 MATERIALS_PATH = f"{ROBOT_PATH}/PhysicsMaterials"
+# The licenses of botshare's repository, which cover its meshes
+# (CERN-OHL-P-2.0 for those derived from the hardware's CAD, MIT for the
+# rest, as LICENSING.md maps them), where the model's tree stages them.
+LICENSES = ("LICENSE", "LICENSING.md", "NOTICE.md")
+LICENSE_DIRECTORY = "license"
 
-# What MuJoCo makes of a URDF's visual elements: drawn geoms of group 1.
-VISUAL_GROUP = 1
-
-# Where the URDF's visual meshes live, and where they are staged from: the
-# directory of openamrobot_description's visual meshes, and its repository,
-# at the commit the URDF was written from (its header names it).
-MESH_PACKAGE = "package://openamrobot_description/meshes/visual/"
-MESH_SOURCE = "https://raw.githubusercontent.com/openAMRobot/openamr-platform-sw/69847ab7c9c6cd49b3022dc1a62f86c044ba10ff/"
-MESH_DIRECTORY = "ros2/src/openamrobot_description/meshes/visual/"
-MESHES = {
-    "base_camera.stl": "26dd5d0899140ef7db660a41544e2d21b763d03f0dddf07e07524d06e43c6391",
-    "base_chassis.stl": "693c71f0e6aac3af27e024fdb8bcf32287240d5177195ad002135002c38c8089",
-    "base_covers.stl": "26250674f5a6492cbd66a97aaf44593c840484366ceb5eda9352b278e04c6232",
-    "base_equipment.stl": "2cfe6d6b973e68cda68e36901a607703153335a653ab66e58d4cd5d7e80c267d",
-    "caster.stl": "83739568c39cf68bc4dd2fe0c06680352ae69dab145a5463fcffaa6f7bdf9deb",
-    "hub_motor_wheel.stl": "638b308b212dd992b3bbd5331f49032119bea12ddd2656c8881680a5dd3af820",
-    "imu.stl": "8a8d2b79d03fee0a5a71624ae77c34304ba84e76dcd8776fa1d642f218779a65",
-    "lidar.stl": "421b2dfa45a743527c53c61b0fb5cf206a4b7f7a259f5457a483f4489f18611b",
-    "tof.stl": "2a64dcb271f41c4f7aeaa510c0b5762b78d498a3eca0e327dbc0014d9e473fb6",
-    "ultrasonic.stl": "bf7b746729a7fbe30a56ae172ac09ee9fba2a1f6a93c349150e4ae5fa12de09f",
-}
-# The repository's licenses, which cover the meshes (CERN-OHL-P-2.0 for those
-# derived from the hardware's CAD, MIT for the rest, as LICENSING.md maps them).
-LICENSES = {
-    "LICENSE": "3b255148b447030828e24e478cd1ee2cc711155abc1c50cf6985fbe3611e7737",
-    "LICENSING.md": "19d39bdbd398243fccfe2a80148ca067ce5fc3bcfd783c11c79c0a4dedaef6f1",
-    "NOTICE.md": "4903cce2ebdde634ac790fc1c6fc778ba56dac6cdc743072733b815008748475",
-}
-
-# The wheels' rotor inertia (kg m^2): provisional, as Waldo's MJCF gives it,
-# since no ZLTech document gives the hub motor's.
-WHEEL_ARMATURE = 0.05
-# The tires' sliding friction: MuJoCo's default, which Waldo's wheels grip with.
-WHEEL_FRICTION = 1.0
+# The MJCF's geom groups: what is drawn.
+VISUAL_GROUP = 2
+# The contact dimension of a geom that takes no friction.
+FRICTIONLESS_CONDIM = 1
 
 ARTICULATION_POSITION_ITERATIONS = 32
 ARTICULATION_VELOCITY_ITERATIONS = 1
@@ -114,119 +94,138 @@ ARTICULATION_VELOCITY_ITERATIONS = 1
 
 @dataclass(frozen=True)
 class Description:
-    """What the builder takes of the base's description: its URDF, the
-    digest of its model, its root link, its wheel joints, left then right,
-    and every fixed joint of the URDF by the link it places."""
+    """What the builder takes of the base's description: the digest of its
+    model, its root link, its wheel joints, left then right, the link each
+    joint of the URDF places, and every fixed joint by the link it places."""
 
-    urdf: str
     digest: str
     root_link: str
     wheels: tuple[str, str]
+    child_links: dict[str, str]
     fixed: dict[str, robot_description_py.LinkTransform]
 
 
+@dataclass(frozen=True)
+class RateLoop:
+    """A wheel's rate loop as the MJCF runs it: the proportional gain of its
+    velocity actuator (N*m*s/rad), the integral gain of its
+    integrated-velocity actuator (N*m/rad) and the cap of the two (N*m)."""
+
+    kv: float
+    kp: float
+    cap: float
+
+
 def read_description() -> Description:
-    """The base's description as robot_description_py bundles it."""
+    """The base's description as robot_description_py bundles it. The
+    bindings give the root link, the wheels and the fixed joints;
+    ElementTree reads the link each joint places."""
     model = robot_description_py.model(ROBOT_ID)
     described = model.description()
     base = described.differential_base()
+    joints = ET.fromstring(model.urdf).findall("joint")
     return Description(
-        urdf=model.urdf,
         digest=model.digest,
         root_link=described.root_link,
         wheels=(base.left.joint, base.right.joint),
+        child_links={joint.get("name"): joint.find("child").get("link") for joint in joints},
         fixed={fixed.child: fixed for fixed in described.fixed_transforms()},
     )
 
 
-def fetch_meshes(directory: Path) -> None:
-    """Stages the visual meshes under `directory` and the licenses under
-    `directory`/license, each from MESH_SOURCE and held to its SHA-256. A
-    file staged before and still held to it is kept."""
-    wanted = [
-        *((directory / name, MESH_DIRECTORY + name, digest) for name, digest in MESHES.items()),
-        *((directory / "license" / name, name, digest) for name, digest in LICENSES.items()),
-    ]
-    for path, source, digest in wanted:
-        if path.is_file() and sha256(path.read_bytes()) == digest:
+def catalogue_entry(release: Path) -> dict:
+    """The base's entry in the release's robots.json."""
+    robots = json.loads((release / "robots.json").read_text())
+    (entry,) = [robot for robot in robots if robot["id"] == ROBOT_ID]
+    return entry
+
+
+def compile_model(release: Path) -> mujoco.MjModel:
+    """The base's MJCF, compiled with its mount body free, as Waldo hangs a
+    rolling robot from the world, and each drawn geom in a material named
+    after its mesh. A mesh drawn in two colours is refused."""
+    entry = catalogue_entry(release)
+    spec = mujoco.MjSpec.from_file(str(release / ROBOT_ID / entry["wrapper"]))
+    colours: dict[str, tuple[float, ...]] = {}
+    for geom in spec.geoms:
+        if geom.group != VISUAL_GROUP:
             continue
-        with urlopen(MESH_SOURCE + source, timeout=60) as response:
-            data = response.read()
-        if sha256(data) != digest:
-            raise ValueError(f"{MESH_SOURCE + source} has SHA-256 {sha256(data)}, and the pin is {digest}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-
-def check_meshes(directory: Path) -> None:
-    """Refuses a mesh directory whose files are not the pinned ones."""
-    for name, digest in {**MESHES, **{f"license/{n}": d for n, d in LICENSES.items()}}.items():
-        path = directory / name
-        if not path.is_file() or sha256(path.read_bytes()) != digest:
-            raise ValueError(
-                f"{path} is not the pinned file: stage the meshes with `--fetch` or fetch_meshes"
-            )
-
-
-def compiled_urdf(urdf: str, meshes: Path, root_link: str) -> mujoco.MjModel:
-    """The URDF as MuJoCo compiles it, each visual mesh read from `meshes`
-    and drawn in the URDF's material of its name, every group of links that
-    fixed joints join fused into one body, and the root link free, so its
-    body carries its own inertial."""
-    robot = ET.fromstring(urdf)
-    drawn_in: dict[str, str] = {}
-    for link in robot.findall("link"):
-        for index, visual in enumerate(link.findall("visual")):
-            mesh = visual.find("geometry/mesh")
-            filename = mesh.get("filename")
-            if not filename.startswith(MESH_PACKAGE):
-                raise ValueError(f"link '{link.get('name')}' draws {filename}, which is not under {MESH_PACKAGE}")
-            mesh.set("filename", filename[len(MESH_PACKAGE) :])
-            name = f"{link.get('name')}_visual_{index}"
-            visual.set("name", name)
-            drawn_in[name] = visual.find("material").get("name")
-    for gazebo in robot.findall("gazebo"):
-        robot.remove(gazebo)
-    extension = ET.SubElement(robot, "mujoco")
-    ET.SubElement(extension, "compiler", meshdir=str(meshes), discardvisual="false", fusestatic="true")
-    spec = mujoco.MjSpec.from_string(ET.tostring(robot, encoding="unicode"))
-    for material in robot.findall("material"):
-        rgba = [float(value) for value in material.find("color").get("rgba").split()]
-        spec.add_material(name=material.get("name"), rgba=rgba)
-    for geom, material in drawn_in.items():
-        spec.geom(geom).material = material
-    spec.body(root_link).add_freejoint()
+        colour = tuple(float(value) for value in geom.rgba)
+        if colours.setdefault(geom.meshname, colour) != colour:
+            raise ValueError(f"the MJCF draws the mesh '{geom.meshname}' in two colours")
+        geom.material = geom.meshname
+    for mesh, colour in colours.items():
+        spec.add_material(name=mesh, rgba=list(colour))
+    spec.body(entry["mount"]["body"]).add_freejoint()
     return spec.compile()
 
 
-def link_parents(description: Description) -> dict[str, str]:
-    """The link each fixed link hangs from, by the fixed link."""
-    return {child: fixed.parent for child, fixed in description.fixed.items()}
+def links_of_bodies(model: mujoco.MjModel, mount: str, description: Description) -> dict[str, str]:
+    """The URDF link each body of the compiled model is, by the body's name:
+    the mount body is the root link, and the body a hinge moves is the link
+    the URDF's joint of the same name places."""
+    links = {mount: description.root_link}
+    for joint_id in range(model.njnt):
+        if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_HINGE:
+            body = model.body(int(model.jnt_bodyid[joint_id])).name
+            links[body] = description.child_links[model.joint(joint_id).name]
+    return links
 
 
-def body_of(link: str, parents: dict[str, str]) -> str:
+def rate_loop_of(model: mujoco.MjModel, joint: str) -> RateLoop:
+    """The rate loop the MJCF runs the wheel `joint` with: one velocity
+    actuator and one integrated-velocity actuator on it, both of gear 1,
+    capped together by its actuatorfrcrange, the same either way. Anything
+    else is refused naming what the wheel needs."""
+    joint_id = model.joint(joint).id
+    where = f"the MJCF's wheel '{joint}'"
+    drivers = [
+        actuator
+        for actuator in range(model.nu)
+        if model.actuator_trntype[actuator] == mujoco.mjtTrn.mjTRN_JOINT
+        and int(model.actuator_trnid[actuator][0]) == joint_id
+    ]
+    proportional = [a for a in drivers if model.actuator_dyntype[a] == mujoco.mjtDyn.mjDYN_NONE]
+    integral = [a for a in drivers if model.actuator_dyntype[a] == mujoco.mjtDyn.mjDYN_INTEGRATOR]
+    if len(drivers) != 2 or len(proportional) != 1 or len(integral) != 1:
+        raise ValueError(
+            f"{where} is driven by {len(drivers)} actuators: drive it with one <velocity> actuator, its kv "
+            "the loop's proportional gain, and one <intvelocity> actuator, its kp the loop's integral gain"
+        )
+    if any(not np.allclose(model.actuator_gear[a], (1, 0, 0, 0, 0, 0)) for a in drivers):
+        raise ValueError(f"{where} has an actuator of a gear other than 1: a wheel's setpoints are its rates")
+    low, high = (float(value) for value in model.jnt_actfrcrange[joint_id])
+    if not model.jnt_actfrclimited[joint_id] or low != -high or high <= 0.0:
+        raise ValueError(f"{where} caps its actuators at [{low:g}, {high:g}]: give it an actuatorfrcrange of -cap cap")
+    return RateLoop(
+        kv=float(model.actuator_gainprm[proportional[0]][0]),
+        kp=float(model.actuator_gainprm[integral[0]][0]),
+        cap=high,
+    )
+
+
+def body_of(link: str, description: Description) -> str:
     """The body a link is fused into: the first link up its fixed joints."""
-    while link in parents:
-        link = parents[link]
+    while link in description.fixed:
+        link = description.fixed[link].parent
     return link
 
 
 def define_fixed_links(stage, body_path: str, body: str, description: Description) -> None:
     """Each link fixed to `body`, a prim under the prim of the link it hangs
     from, placed by its fixed joint."""
-    parents = link_parents(description)
     paths = {body: body_path}
 
     def path_of(link: str) -> str:
         if link not in paths:
-            paths[link] = f"{path_of(parents[link])}/{link}"
             fixed = description.fixed[link]
+            paths[link] = f"{path_of(fixed.parent)}/{link}"
             prim = UsdGeom.Xform.Define(stage, paths[link]).GetPrim()
             set_pose(prim, fixed.position, wxyz_of_xyzw(fixed.orientation))
         return paths[link]
 
-    for link in sorted(parents):
-        if body_of(link, parents) == body:
+    for link in sorted(description.fixed):
+        if body_of(link, description) == body:
             path_of(link)
 
 
@@ -244,19 +243,27 @@ def physics_material(stage, name: str, friction: float, combine: str) -> UsdShad
     return material
 
 
-def bind_physics(prim, material: UsdShade.Material) -> None:
-    UsdShade.MaterialBindingAPI.Apply(prim).Bind(
-        material, UsdShade.Tokens.weakerThanDescendants, "physics"
-    )
+def contact_of(stage, model, geom_id: int, wheel: bool, contacts: dict):
+    """The physics material of a collision geom, each defined once: a
+    frictionless one for a geom that takes no friction, one of its MJCF
+    friction for a wheel's collider, and none for any other."""
+    if int(model.geom_condim[geom_id]) == FRICTIONLESS_CONDIM:
+        key = ("caster", 0.0, "min")
+    elif wheel:
+        key = ("tire", float(model.geom_friction[geom_id][0]), "max")
+    else:
+        return None
+    if key not in contacts:
+        contacts[key] = physics_material(stage, *key)
+    return contacts[key]
 
 
 def define_body(
-    stage, model, data, body_id: int, description: Description, looks: dict, physics: dict
+    stage, model, data, body_id: int, link: str, description: Description, looks: dict, contacts: dict
 ) -> str:
-    """One body: its prim at its pose with every joint at zero, its inertial,
-    its geoms and the links fixed to it. `looks` holds the drawn materials
-    written so far, `physics` the tire's and the casters' contact."""
-    link = model.body(body_id).name
+    """One body: its prim at its pose with every joint at zero, its
+    inertial, its geoms and the links fixed to it. `looks` and `contacts`
+    hold the drawn and the physics materials written so far."""
     path = f"{ROBOT_PATH}/{link}"
     prim = UsdGeom.Xform.Define(stage, path).GetPrim()
     set_pose(prim, data.xpos[body_id], data.xquat[body_id])
@@ -269,37 +276,33 @@ def define_body(
     UsdGeom.Xform.Define(stage, f"{path}/visuals")
     collisions = UsdGeom.Xform.Define(stage, f"{path}/collisions")
     UsdGeom.Imageable(collisions).CreatePurposeAttr(UsdGeom.Tokens.guide)
-    is_wheel = link in {wheel_link(model, joint) for joint in description.wheels}
+    wheel = link in {description.child_links[joint] for joint in description.wheels}
     geoms = [geom_id for geom_id in range(model.ngeom) if int(model.geom_bodyid[geom_id]) == body_id]
     for index, geom_id in enumerate(geoms):
         geom = define_geom(stage, path, f"geom_{index}", model, geom_id, VISUAL_GROUP, LOOKS_PATH, looks)
         if int(model.geom_group[geom_id]) == VISUAL_GROUP:
             continue
-        if is_wheel:
-            bind_physics(geom, physics["tire"])
-        elif int(model.geom_type[geom_id]) == mujoco.mjtGeom.mjGEOM_SPHERE:
-            bind_physics(geom, physics["caster"])
+        contact = contact_of(stage, model, geom_id, wheel, contacts)
+        if contact is not None:
+            UsdShade.MaterialBindingAPI.Apply(geom).Bind(contact, UsdShade.Tokens.weakerThanDescendants, "physics")
     define_fixed_links(stage, path, link, description)
     return path
 
 
-def wheel_link(model, joint: str) -> str:
-    return model.body(int(model.joint(joint).bodyid[0])).name
-
-
-def define_wheel_joint(stage, model, joint: str) -> None:
-    """A wheel's continuous joint: a revolute joint without limits between
-    the chassis and the wheel, turning about the joint's axis, with a
-    velocity drive and the wheel's armature."""
+def define_wheel_joint(stage, model, joint: str, links: dict[str, str]) -> None:
+    """A wheel's hinge: a revolute joint without limits between its parent
+    body and the wheel, with the wheel's armature and its rate loop as a PD
+    drive on its angle."""
     joint_id = model.joint(joint).id
     child = int(model.jnt_bodyid[joint_id])
     parent = int(model.body_parentid[child])
     axis = model.jnt_axis[joint_id]
     if not np.allclose(axis, (0.0, 1.0, 0.0), atol=1e-9):
         raise ValueError(f"wheel joint '{joint}' turns about {axis}, not its body's y")
+    loop = rate_loop_of(model, joint)
     prim = UsdPhysics.RevoluteJoint.Define(stage, f"{JOINTS_PATH}/{joint}")
-    prim.CreateBody0Rel().SetTargets([f"{ROBOT_PATH}/{model.body(parent).name}"])
-    prim.CreateBody1Rel().SetTargets([f"{ROBOT_PATH}/{model.body(child).name}"])
+    prim.CreateBody0Rel().SetTargets([f"{ROBOT_PATH}/{links[model.body(parent).name]}"])
+    prim.CreateBody1Rel().SetTargets([f"{ROBOT_PATH}/{links[model.body(child).name]}"])
     prim.CreateAxisAttr(UsdPhysics.Tokens.y)
     anchor = model.jnt_pos[joint_id]
     rotated = np.zeros(3)
@@ -310,14 +313,18 @@ def define_wheel_joint(stage, model, joint: str) -> None:
     prim.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
     drive = UsdPhysics.DriveAPI.Apply(prim.GetPrim(), UsdPhysics.Tokens.angular)
     drive.CreateTypeAttr(UsdPhysics.Tokens.force)
-    drive.CreateStiffnessAttr(0.0)
-    drive.CreateTargetVelocityAttr(0.0)
+    # USD writes an angular drive's gains per degree.
+    drive.CreateStiffnessAttr(math.radians(loop.kp))
+    drive.CreateDampingAttr(math.radians(loop.kv))
+    drive.CreateMaxForceAttr(loop.cap)
     joint_prim = prim.GetPrim()
     joint_prim.AddAppliedSchema("PhysxJointAPI")
-    joint_prim.CreateAttribute("physxJoint:armature", Sdf.ValueTypeNames.Float, False).Set(WHEEL_ARMATURE)
+    joint_prim.CreateAttribute("physxJoint:armature", Sdf.ValueTypeNames.Float, False).Set(
+        float(model.dof_armature[int(model.jnt_dofadr[joint_id])])
+    )
 
 
-def define_articulation_root(stage, robot) -> None:
+def define_articulation_root(robot) -> None:
     """Roots the articulation at the robot's prim, with no joint to the
     world: the base stands free on its wheels."""
     prim = robot.GetPrim()
@@ -332,14 +339,19 @@ def define_articulation_root(stage, robot) -> None:
     )
 
 
-def build_stage(meshes: Path, description: Description, output: Path) -> Path:
-    check_meshes(meshes)
-    model = compiled_urdf(description.urdf, meshes, description.root_link)
+def build_stage(release: Path, description: Description, output: Path) -> Path:
+    model = compile_model(release)
     hinges = sorted(
         model.joint(j).name for j in range(model.njnt) if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE
     )
     if hinges != sorted(description.wheels):
-        raise ValueError(f"the URDF turns {hinges}, and its differential base's wheels are {description.wheels}")
+        raise ValueError(f"the MJCF turns {hinges}, and the description's differential base {description.wheels}")
+    links = links_of_bodies(model, catalogue_entry(release)["mount"]["body"], description)
+    bodies = [model.body(i).name for i in range(1, model.nbody)]
+    if sorted(bodies) != sorted(links):
+        raise ValueError(
+            f"the MJCF's bodies are {bodies}, and the ones its mount and its hinges make links of are {sorted(links)}"
+        )
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
 
@@ -354,29 +366,23 @@ def build_stage(meshes: Path, description: Description, output: Path) -> Path:
     UsdGeom.Scope.Define(stage, LOOKS_PATH)
     UsdGeom.Scope.Define(stage, MATERIALS_PATH)
     UsdGeom.Scope.Define(stage, JOINTS_PATH)
-    # A contact takes the larger friction of a tire's and the smaller of a
-    # caster's, as MuJoCo takes the larger of two geoms' and the caster's
-    # alone at the higher priority Waldo gives it.
-    physics = {
-        "tire": physics_material(stage, "tire", WHEEL_FRICTION, "max"),
-        "caster": physics_material(stage, "caster", 0.0, "min"),
-    }
     looks: dict = {}
+    contacts: dict = {}
     # Body 0 is MuJoCo's world, which holds nothing of the base.
     for body_id in range(1, model.nbody):
-        define_body(stage, model, data, body_id, description, looks, physics)
+        define_body(stage, model, data, body_id, links[model.body(body_id).name], description, looks, contacts)
     for joint in description.wheels:
-        define_wheel_joint(stage, model, joint)
-    define_articulation_root(stage, robot)
+        define_wheel_joint(stage, model, joint, links)
+    define_articulation_root(robot)
     stage.GetRootLayer().Save()
     return path
 
 
-def write_manifest(output: Path, stage_path: Path, description: Description) -> None:
+def write_manifest(output: Path, stage_path: Path, release: Path, description: Description) -> None:
     manifest = {
         "version": 1,
         "stage": STAGE_FILENAME,
-        "source": {"meshes": MESH_SOURCE + MESH_DIRECTORY, "license": "CERN-OHL-P-2.0 and MIT"},
+        "source": {**release_source(release, ROBOT_ID), "license": "CERN-OHL-P-2.0 and MIT"},
         "description": {"model": ROBOT_ID, "digest": description.digest},
         "builder": {"script": Path(__file__).name, "sha256": sha256(Path(__file__).read_bytes())},
         "tools": {
@@ -395,18 +401,15 @@ def write_manifest(output: Path, stage_path: Path, description: Description) -> 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--meshes", type=Path, required=True, help="the staged visual meshes and licenses")
-    parser.add_argument("--fetch", action="store_true", help="stage the meshes at --meshes first")
+    parser.add_argument("--release", type=Path, required=True, help="the staged release of Waldo's catalogue")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--archive", type=Path, help="pack the output into this .tar.gz")
     args = parser.parse_args(argv)
-    if args.fetch:
-        fetch_meshes(args.meshes)
     description = read_description()
-    stage_path = build_stage(args.meshes, description, args.output)
+    stage_path = build_stage(args.release, description, args.output)
     for name in LICENSES:
-        (args.output / name).write_bytes((args.meshes / "license" / name).read_bytes())
-    write_manifest(args.output, stage_path, description)
+        (args.output / name).write_bytes((args.release / ROBOT_ID / LICENSE_DIRECTORY / name).read_bytes())
+    write_manifest(args.output, stage_path, args.release, description)
     print(f"{stage_path}: {stage_path.stat().st_size} bytes")
     if args.archive is not None:
         print(f"{args.archive}: sha256 {pack(args.output, args.archive)}")

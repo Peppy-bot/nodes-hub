@@ -1,6 +1,7 @@
-"""Writing an Isaac Sim stage from a compiled MuJoCo model: the poses, the
-materials, the meshes and the geoms of its bodies, and the reproducible
-archive a bundle is published as. The builders of the robots' stages
+"""Writing an Isaac Sim stage from a compiled MuJoCo model of Waldo's
+catalogue: the poses, the materials, the meshes and the geoms of its bodies,
+the release the model came from, and the reproducible archive a bundle is
+published as. The builders of the robots' stages
 (build_so101.py, build_botshare_base.py) share it.
 
 CPU only: it needs the `mujoco`, `usd-core` and `numpy` packages.
@@ -11,6 +12,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import json
 import tarfile
 from pathlib import Path
 
@@ -21,6 +23,15 @@ from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade, Vt
 
 def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def release_source(release: Path, robot_id: str) -> dict:
+    """The release of Waldo's catalogue a staged model of `robot_id` came
+    from, and the tree of it."""
+    index = json.loads((release / "index.json").read_text())
+    robots = json.loads((release / "robots.json").read_text())
+    (tree,) = [robot["tree"] for robot in robots if robot["id"] == robot_id]
+    return {"release": index["prefix"], "tree": tree}
 
 
 def gf_quat(wxyz, kind=Gf.Quatf):

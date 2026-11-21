@@ -55,7 +55,7 @@ import mujoco
 import numpy as np
 import robot_description_py
 from control_core_py.geometry import wxyz_of_xyzw
-from mujoco_usd import define_geom, gf_quat, pack, set_pose, sha256
+from mujoco_usd import define_geom, gf_quat, pack, release_source, set_pose, sha256
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
 # The SO-101 of the release, whose model directory the builder reads.
@@ -287,19 +287,11 @@ def build_stage(model_dir: Path, description: Description, output: Path) -> Path
     return path
 
 
-def model_source(release: Path) -> dict:
-    """The release a staged SO-101 model came from and the tree of it."""
-    index = json.loads((release / "index.json").read_text())
-    robots = json.loads((release / "robots.json").read_text())
-    (tree,) = [robot["tree"] for robot in robots if robot["id"] == ROBOT_ID]
-    return {"release": index["prefix"], "tree": tree, "license": "Apache-2.0"}
-
-
 def write_manifest(output: Path, stage_path: Path, release: Path, description: Description) -> None:
     manifest = {
         "version": 1,
         "stage": STAGE_FILENAME,
-        "source": model_source(release),
+        "source": {**release_source(release, ROBOT_ID), "license": "Apache-2.0"},
         "description": {"model": ROBOT_ID, "digest": description.digest},
         "builder": {"script": Path(__file__).name, "sha256": sha256(Path(__file__).read_bytes())},
         "tools": {
