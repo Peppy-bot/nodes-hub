@@ -16,12 +16,12 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use control_core::geometry::pose_arrays;
 use control_core::robot_tree::RobotTree;
 use control_core::throttle::{LOG_WINDOW, Throttle};
-use frame_tree::{MovingMessage, Publisher as TreePublisher};
+use frame_tree::{MovingMessage, Publisher as TreePublisher, Stamp};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::collision_status::collision_status;
 use peppygen::emitted_topics::limb_state::limb_states;
@@ -46,7 +46,7 @@ use crate::types::limb_names;
 /// Errors until the clock delivers its first tick.
 pub(crate) fn clock_now() -> Result<SystemTime, String> {
     let ns = peppygen::clock::now_ns().map_err(|e| format!("clock not ready: {e}"))?;
-    Ok(UNIX_EPOCH + Duration::from_nanos(ns))
+    Ok(Stamp::from_nanos(ns).time())
 }
 
 /// A joint vector slot: `joint_setpoints` downstream and `joint_states`
