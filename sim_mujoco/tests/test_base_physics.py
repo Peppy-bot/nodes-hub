@@ -37,12 +37,11 @@ ROBOT = "india"
 # botshare_base/fragments/botshare_base_sim.json5, smoothing_frequency_hz):
 # one wheel setpoint each step of it.
 LIMITER_RATE_HZ = 20
-# The base's rest velocity and rest rate in the same launchers (x.rest_velocity
-# in m/s, angular.rest_rate in rad/s), and its odometry window there
-# (odometry_velocity_window): each velocity the node reports is the mean over
-# that many of its wheel states.
+# The base's rest velocity in the same launchers (x.rest_velocity, m/s), the
+# speed each wheel measures at most while the base stands, and its odometry
+# window there (odometry_velocity_window): each velocity the node reports is
+# the mean over that many of its wheel states.
 REST_VELOCITY_M_S = 0.02
-REST_RATE_RAD_S = 0.01
 ODOMETRY_WINDOW = 10
 # This engine's state rate in the simulation launchers (launchers-hub
 # simulation/fragments/mujoco.json5, state_rate_hz): the rate its wheel states
@@ -89,6 +88,11 @@ class Wheels:
 
 
 WHEELS = Wheels.described()
+# The base's rest rate (rad/s), as its node derives it from the rest velocity:
+# the turn the odometry reads with each wheel at the rest velocity the other
+# way, twice it over the separation (control_core's
+# WheelGeometry::turn_rate_at_opposite_wheel_speeds).
+REST_RATE_RAD_S = 2.0 * REST_VELOCITY_M_S / WHEELS.separation_m
 
 
 @dataclass(frozen=True)
