@@ -397,7 +397,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "camera_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "control_core",
  "frame_tree",
@@ -469,7 +469,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -572,7 +572,7 @@ dependencies = [
 [[package]]
 name = "collision_geometry"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
@@ -634,7 +634,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "frame_tree",
  "nalgebra",
@@ -1229,7 +1229,7 @@ dependencies = [
 [[package]]
 name = "frame_tree"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2335,7 +2335,7 @@ dependencies = [
 [[package]]
 name = "motion_planning_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "camera_core",
  "chain_kinematics",
@@ -2548,7 +2548,7 @@ dependencies = [
 [[package]]
 name = "occupancy_map"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "camera_core",
  "collision_geometry",
@@ -2570,7 +2570,7 @@ dependencies = [
 [[package]]
 name = "ompl_bridge"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "cc",
  "cxx",
@@ -3340,7 +3340,7 @@ dependencies = [
 [[package]]
 name = "robot_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "chain_kinematics",
  "frame_tree",
@@ -3640,7 +3640,7 @@ dependencies = [
 [[package]]
 name = "self_collision_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "chain_kinematics",
  "collision_geometry",
@@ -3987,7 +3987,7 @@ dependencies = [
 [[package]]
 name = "srs_model"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#753a0930ec6ae626583890e4d994aabf7df97bb7"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#33feede993ddeda173b8ce643657ca008df11c5e"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
