@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use control_core::move_slot::SlotRelease;
 use control_core::path_timing::{JointTrajectory, MIN_JOINT_CHANGE_RAD, RoundedPath};
 use control_core::time::ticks_within;
 use control_core::timing::{MotionClock, Pace};
@@ -41,15 +42,14 @@ use super::{
     ANOTHER_MOVE_IN_FLIGHT, Advance, Measurement, Mode, Origin, Outcome, Planner, Unmeasured,
     planned_end,
 };
-use crate::actions::MAX_MOVE_DURATION_S;
 use crate::arm_order::ArmOrder;
 use crate::failure::{Failure, FailureKind, PathFailure, stale_failure};
 use crate::governor::{GuardAt, PathArms, PathBlocked};
-use crate::move_slot::SlotRelease;
 use crate::robot::{ARMS, DUAL_DOF, LIMBS};
 use crate::settle::{ContactGap, Settle, farthest_outside, joint_shortfall, verdict};
 use crate::streams::ArmState;
 use crate::types::{DualJointVec, arm_joints, dual_joints};
+use control_core::move_seconds::MAX_MOVE_DURATION_S;
 
 /// The outcome of a share whose goal was cancelled: the action ends its goal
 /// with the reason of its own cancel.
@@ -1161,7 +1161,6 @@ mod tests {
 
     use control_core::positive_finite::PositiveFinite;
 
-    use crate::move_slot::MoveSlot;
     use crate::planner::Goal;
     use crate::planner::Tick;
     use crate::test_support::{
@@ -1169,6 +1168,7 @@ mod tests {
         distance_to_segment, measured_at_setpoints, path_goal_through, plan_config,
         planner_holding, share_reply, standing_at, test_guard, test_settle,
     };
+    use control_core::move_slot::{MoveSlot, SlotRelease};
 
     /// Where the path tests take the arms from [`BOTH_HELD`], inside v1's
     /// limits: the left shoulder 0.4 rad out, the right elbow 0.1 rad in.
@@ -1196,17 +1196,15 @@ mod tests {
 
     /// A goal of a path of `arms` to `to` over `duration` at least, with
     /// no expected start and [`test_settle`], reporting on `reply`, holding
-    /// the slots of its arms in `move_slots`.
+    /// `claims`, the releases of the claims on its arms in their order.
     fn path_goal(
         arms: &ArmOrder,
         to: &PerArm<JointVec, ARMS>,
         duration: Duration,
         reply: ShareReply,
-        move_slots: &PerArm<MoveSlot, ARMS>,
+        claims: Vec<SlotRelease>,
     ) -> PathGoal {
-        path_goal_through(arms, &[*to], duration, test_settle(arms), reply, |arm| {
-            &move_slots[arm]
-        })
+        path_goal_through(arms, &[*to], duration, test_settle(arms), reply, claims)
     }
 
     /// Start `goal` on `planners` at `now`, each arm measured where it is
@@ -1314,15 +1312,13 @@ mod tests {
     ) {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let settle = Settle {
             timeout: settle,
             ..test_settle(&arms)
         };
-        let goal = path_goal_through(&arms, waypoints, Duration::ZERO, settle, reply, |arm| {
-            &move_slots[arm]
-        });
+        let goal = path_goal_through(&arms, waypoints, Duration::ZERO, settle, reply, claims);
         let measured = PerArm::new([Ok(standing_at(left)), Ok(standing_at(BOTH_HELD[RIGHT]))]);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
         let verdict = judge_path(
@@ -1355,9 +1351,9 @@ mod tests {
         for expected in [None, Some(near)] {
             let mut planners = planners_holding(BOTH_HELD);
             let arms = order(&["left_arm"]);
-            let move_slots = claimed(&arms);
+            let (_, claims) = claimed(&arms);
             let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-            let mut goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+            let mut goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
             goal.expected_starts = vec![expected];
             let measured = left_measuring(lagging);
             let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
@@ -1482,9 +1478,9 @@ mod tests {
     ) -> (PerArm<Planner, ARMS>, PathJudgment, Result<(), PathFailure>) {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm", "right_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let judgment = start_path(
             &mut planners,
             goal,
@@ -1583,13 +1579,13 @@ mod tests {
     async fn a_run_start_off_the_expected_start_fails_the_path_in_its_words() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let mut expected = BOTH_HELD[LEFT];
         expected[1] += 0.006;
         let goal = PathGoal {
             expected_starts: vec![Some(expected)],
-            ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots)
+            ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims)
         };
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
@@ -1817,7 +1813,7 @@ mod tests {
             .map(|k| swung(if k % 2 == 0 { 1.0 } else { -3.0 }))
             .collect();
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal_through(
             &arms,
@@ -1825,7 +1821,7 @@ mod tests {
             Duration::ZERO,
             test_settle(&arms),
             reply,
-            |arm| &move_slots[arm],
+            claims,
         );
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
@@ -1945,9 +1941,9 @@ mod tests {
         }
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let mut guard = Recording(Vec::new());
         start(&mut planners, goal, &mut guard, Instant::now()).expect("the path starts");
         let [(checked, from, to)] = &guard.0[..] else {
@@ -1974,12 +1970,12 @@ mod tests {
     async fn a_share_the_guard_holds_short_of_its_path_fails_its_settle_naming_the_path() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let mut to = BOTH_HELD;
         to[LEFT][0] += 0.005;
         let second = Duration::from_secs(1);
-        let goal = path_goal(&arms, &to, second, reply, &move_slots);
+        let goal = path_goal(&arms, &to, second, reply, claims);
         let start_at = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, start_at).expect("the path starts");
         // The guard holds every step: each tick commits where the arm is held.
@@ -2013,15 +2009,13 @@ mod tests {
         for timeout in [Duration::ZERO, Duration::from_millis(5)] {
             let mut planners = planners_holding(BOTH_HELD);
             let arms = order(&["left_arm"]);
-            let move_slots = claimed(&arms);
+            let (_, claims) = claimed(&arms);
             let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
             let settle = Settle {
                 tolerance: vec![0.01; ARM_DOF],
                 timeout,
             };
-            let goal = path_goal_through(&arms, &[BOTH_TO], second, settle, reply, |arm| {
-                &move_slots[arm]
-            });
+            let goal = path_goal_through(&arms, &[BOTH_TO], second, settle, reply, claims);
             let t0 = Instant::now();
             start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
             let mut ended = None;
@@ -2058,11 +2052,11 @@ mod tests {
         let try_start = |expected_starts: Vec<Option<JointVec>>,
                          measured: PerArm<Measurement, ARMS>| {
             let mut planners = planners_holding(BOTH_HELD);
-            let move_slots = claimed(&arms);
+            let (move_slots, claims) = claimed(&arms);
             let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
             let goal = PathGoal {
                 expected_starts,
-                ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots)
+                ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims)
             };
             let started = start_path(&mut planners, goal, &measured).map(|_| ());
             let moving = PerArm::from_fn(|arm| planners[arm].moving());
@@ -2107,15 +2101,17 @@ mod tests {
     async fn a_path_on_a_busy_or_stale_arm_fails_before_any_arm_moves() {
         let mut planners = planners_holding(BOTH_HELD);
         let left = order(&["left_arm"]);
-        let running_slots = claimed(&left);
+        let (running_slots, running_claims) = claimed(&left);
         let (reply, mut running) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&left, &BOTH_TO, Duration::ZERO, reply, &running_slots);
+        let goal = path_goal(&left, &BOTH_TO, Duration::ZERO, reply, running_claims);
         start(&mut planners, goal, &mut OpenGuard, Instant::now()).expect("the path starts");
 
         let both = order(&["left_arm", "right_arm"]);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let second_slots = PerArm::from_fn(|_| MoveSlot::default());
-        let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, &second_slots);
+        // An admission claims one goal per slot, so the second goal holds
+        // claims of its own.
+        let (_second_slots, second_claims) = claimed(&both);
+        let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, second_claims);
         let failed = start(&mut planners, goal, &mut OpenGuard, Instant::now());
         assert_eq!(
             failed,
@@ -2130,9 +2126,9 @@ mod tests {
         assert!(running_slots[LEFT].is_claimed(), "and holds its slot");
 
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&both);
+        let (move_slots, claims) = claimed(&both);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&both, &BOTH_TO, Duration::ZERO, reply, claims);
         let measured = PerArm::new([Ok(standing_at(BOTH_HELD[LEFT])), Err(Unmeasured::Stale)]);
         let failed = start_path(&mut planners, goal, &measured).map(|_| ());
         assert_eq!(failed, Err(stale_failure().labelled(LIMBS.arm_name(RIGHT))));
@@ -2140,9 +2136,9 @@ mod tests {
         assert!(move_slots.iter().all(|slot| !slot.is_claimed()));
 
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&left);
+        let (move_slots, claims) = claimed(&left);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&left, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&left, &BOTH_TO, Duration::ZERO, reply, claims);
         let measured = PerArm::new([Err(Unmeasured::Stale), Ok(standing_at(BOTH_HELD[RIGHT]))]);
         let failed = start_path(&mut planners, goal, &measured).map(|_| ());
         assert_eq!(
@@ -2160,9 +2156,9 @@ mod tests {
     async fn a_path_the_guard_would_hold_short_fails_each_share_and_frees_its_arms() {
         let arms = order(&["left_arm", "right_arm"]);
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let unreachable = PathFailure::Unreachable(ARMS_WOULD_MEET.to_string());
         let started = start(&mut planners, goal, &mut Refusing, Instant::now());
         assert_eq!(started, Err(unreachable.clone()));
@@ -2250,10 +2246,10 @@ mod tests {
     async fn failing_a_path_share_leaves_a_joint_move_running() {
         let mut planner = planner_holding(LEFT, BOTH_HELD[LEFT]);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (done_tx, mut done_rx) = mpsc::channel(1);
         goal_tx
-            .send(Goal::posture_share(BOTH_TO[LEFT], done_tx))
+            .send(Goal::posture_share(BOTH_TO[LEFT], done_tx, claim))
             .await
             .expect("queue the goal");
         planner
@@ -2279,10 +2275,10 @@ mod tests {
     async fn the_shares_of_a_judged_path_hold_until_the_judgment_and_start_on_it() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm", "right_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let second = Duration::from_secs(1);
-        let goal = path_goal(&arms, &BOTH_TO, second, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, second, reply, claims);
         let t0 = Instant::now();
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
@@ -2321,9 +2317,9 @@ mod tests {
         );
 
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, second, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, second, reply, claims);
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, goal, &measured).expect("the path starts");
         for arm in PerArm::<(), ARMS>::ids() {
@@ -2380,7 +2376,7 @@ mod tests {
         // the path's trajectory nearest `second`.
         let speeds_at_second = async |second: PerArm<JointVec, ARMS>| {
             let mut planners = planners_holding(BOTH_HELD);
-            let move_slots = claimed(&arms);
+            let (_, claims) = claimed(&arms);
             let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
             let goal = path_goal_through(
                 &arms,
@@ -2388,7 +2384,7 @@ mod tests {
                 Duration::ZERO,
                 test_settle(&arms),
                 reply,
-                |arm| &move_slots[arm],
+                claims,
             );
             let t0 = Instant::now();
             start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
@@ -2452,10 +2448,10 @@ mod tests {
     async fn the_governed_share_of_each_step_paces_the_path_clock() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let second = Duration::from_secs(1);
-        let goal = path_goal(&arms, &BOTH_TO, second, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, second, reply, claims);
         let t0 = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
         let held = BOTH_HELD[LEFT];
@@ -2534,9 +2530,9 @@ mod tests {
     async fn both_shares_play_their_clocks_at_one_pace_and_end_together() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["right_arm", "left_arm"]);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let start_at = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, start_at).expect("the move starts");
         assert!(on_one_path(&planners));
@@ -2598,9 +2594,9 @@ mod tests {
         let arms = order(&["left_arm", "right_arm"]);
         let mut to = BOTH_TO;
         to[LEFT][1] = BOTH_HELD[LEFT][1] - 1.0;
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, _done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &to, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &to, Duration::ZERO, reply, claims);
         let start_at = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, start_at).expect("the move starts");
         let ticks = tick_both(&mut planners, start_at + Duration::from_millis(400)).await;
@@ -2631,9 +2627,9 @@ mod tests {
         let start_at = Instant::now();
         let started = async |cancelled: &Arc<AtomicBool>| {
             let mut planners = planners_holding(BOTH_HELD);
-            let move_slots = claimed(&arms);
+            let (move_slots, claims) = claimed(&arms);
             let (reply, done_rx) = share_reply(cancelled);
-            let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+            let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
             start(&mut planners, goal, &mut OpenGuard, start_at).expect("the move starts");
             (planners, done_rx, move_slots)
         };
@@ -2734,9 +2730,9 @@ mod tests {
     async fn a_share_that_times_out_holds_its_arm_where_it_stands() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let t0 = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
 
@@ -2775,9 +2771,9 @@ mod tests {
     async fn a_hold_stands_while_a_path_waits_and_goes_on_when_the_path_never_runs() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (move_slots, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let t0 = Instant::now();
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
         let (report, commands) =
@@ -2791,12 +2787,13 @@ mod tests {
             "the command is on its way back"
         );
 
-        assert!(
-            move_slots[LEFT].claim(),
-            "the next goal's admission claims the arm"
-        );
+        let claims = vec![
+            move_slots[LEFT]
+                .claim()
+                .expect("the next goal's admission claims the arm"),
+        ];
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
-        let second = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let second = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let measured = measured_at_setpoints(&planners);
         let judgment = start_path(&mut planners, second, &measured).expect("the path is taken");
         let waiting = tick_both_measuring(&mut planners, &BOTH_HELD, ended_at + period).await;
@@ -2835,11 +2832,11 @@ mod tests {
 
     /// The goal of a path of both arms to [`BOTH_TO`], as fast as the limits
     /// run it, with the contact gap [`GAP_M`].
-    fn path_goal_with_a_gap(reply: ShareReply, move_slots: &PerArm<MoveSlot, ARMS>) -> PathGoal {
+    fn path_goal_with_a_gap(reply: ShareReply, claims: Vec<SlotRelease>) -> PathGoal {
         let arms = order(&["left_arm", "right_arm"]);
         PathGoal {
             contact: ContactGap::of(PositiveFinite::parse(GAP_M).expect("a positive gap")),
-            ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, move_slots)
+            ..path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims)
         }
     }
 
@@ -2854,10 +2851,10 @@ mod tests {
     #[tokio::test]
     async fn a_path_ends_on_the_contact_of_one_arm_and_each_arm_holds_where_it_stands() {
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&order(&["left_arm", "right_arm"]));
+        let (move_slots, claims) = claimed(&order(&["left_arm", "right_arm"]));
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let t0 = Instant::now();
-        let goal = path_goal_with_a_gap(reply, &move_slots);
+        let goal = path_goal_with_a_gap(reply, claims);
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
         let planned_end = planned_end(path_of(&planners[LEFT]).clock());
         let measured = |commanded: &PerArm<JointVec, ARMS>| {
@@ -2903,10 +2900,10 @@ mod tests {
     #[tokio::test]
     async fn the_contact_of_one_arm_ends_the_other_share_before_its_timeout() {
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&order(&["left_arm", "right_arm"]));
+        let (_, claims) = claimed(&order(&["left_arm", "right_arm"]));
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let t0 = Instant::now();
-        let goal = path_goal_with_a_gap(reply, &move_slots);
+        let goal = path_goal_with_a_gap(reply, claims);
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
         let timed_out = planned_end(path_of(&planners[LEFT]).clock())
             + test_settle(&order(&["left_arm"])).timeout;
@@ -2953,10 +2950,10 @@ mod tests {
     #[tokio::test]
     async fn a_path_with_a_contact_gap_that_nothing_blocks_settles() {
         let mut planners = planners_holding(BOTH_HELD);
-        let move_slots = claimed(&order(&["left_arm", "right_arm"]));
+        let (_, claims) = claimed(&order(&["left_arm", "right_arm"]));
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let t0 = Instant::now();
-        let goal = path_goal_with_a_gap(reply, &move_slots);
+        let goal = path_goal_with_a_gap(reply, claims);
         start(&mut planners, goal, &mut OpenGuard, t0).expect("the path starts");
         let grasp_point = |q: &JointVec| planners[LEFT].root_ee_pose(q).translation.vector;
         let travel_m = (grasp_point(&BOTH_TO[LEFT]) - grasp_point(&BOTH_HELD[LEFT])).norm();
@@ -3002,9 +2999,9 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm"]);
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&cancelled);
-        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, &move_slots);
+        let goal = path_goal(&arms, &BOTH_TO, Duration::ZERO, reply, claims);
         let at_setpoints = measured_at_setpoints(&planners);
         start_path(&mut planners, goal, &at_setpoints).expect("the path starts");
         cancelled.store(true, Ordering::Release);

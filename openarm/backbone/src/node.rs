@@ -11,17 +11,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use control_core::fault::Fault;
+use control_core::move_slot::MoveSlot;
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
-use control_core::robot_tree::RobotTree;
+use control_core::robot_tree::{Placer, RobotTree};
 use control_core::serving;
 use control_core::time::{
-    DurationError, RateOutOfRange, duration_from_secs, period_from_hz, wait_from_secs,
+    RateOutOfRange, SecondsParameterError, duration_parameter, period_from_hz, wait_parameter,
 };
 use frame_tree::{FrameName, FrameNameError};
 use peppygen::consumed_topics::collision_ctrl::governor_control;
 use peppygen::exposed_services::limb_state::get_limb_names;
 use peppygen::{NodeRunner, Parameters, Result};
-use robot_description::{Driven, PerArm, states};
+use robot_description::{Driven, OtherDescription, PerArm, states};
 use srs_model::{ARM_DOF, JointVec};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -36,9 +37,7 @@ use crate::follow::follow_tree;
 use crate::governor;
 use crate::identity;
 use crate::liveness;
-use crate::move_slot::MoveSlot;
 use crate::path_checks::PathChecks;
-use crate::placement::Placer;
 use crate::planner::{PathGuard, PlanConfig, Planner};
 use crate::robot::{self, ARMS, LIMBS};
 use crate::startup;
@@ -77,14 +76,8 @@ pub enum NodeError {
     #[error("parameter start_tolerance_rad")]
     StartTolerance(#[source] NotPositiveFinite),
 
-    #[error("parameter cache_window_s")]
-    CacheWindow(#[source] DurationError),
-
-    #[error("parameter lookup_timeout_s")]
-    LookupTimeout(#[source] DurationError),
-
-    #[error("parameter stop_answer_timeout_s must be a number of seconds a timer holds, got {0}")]
-    StopAnswerTimeout(f64),
+    #[error(transparent)]
+    Seconds(#[from] SecondsParameterError),
 
     #[error("parameter max_joint_velocity_rad_s_{joint}")]
     JointVelocityCap {
@@ -112,16 +105,8 @@ pub enum NodeError {
     #[error("the root link of the robot's description, the robot frame")]
     RobotFrame(#[source] FrameNameError),
 
-    #[error(
-        "the robot's initializer serves the description {served} of {model}, and this \
-         backbone was built with {built}: build the backbone and the initializer from one \
-         public-peppy-libs commit"
-    )]
-    OtherDescription {
-        model: &'static str,
-        served: String,
-        built: String,
-    },
+    #[error(transparent)]
+    OtherDescription(#[from] OtherDescription),
 
     #[error(transparent)]
     UpstreamMode(#[from] crate::upstream::UnknownUpstreamMode),
@@ -266,12 +251,10 @@ impl Launch {
             .map_err(NodeError::EeVelocity)?;
         let start_tolerance =
             PositiveFinite::parse(params.start_tolerance_rad).map_err(NodeError::StartTolerance)?;
-        let cache_window =
-            duration_from_secs(params.cache_window_s).map_err(NodeError::CacheWindow)?;
-        let lookup_timeout =
-            wait_from_secs(params.lookup_timeout_s).map_err(NodeError::LookupTimeout)?;
-        let stop_answer_timeout = duration_from_secs(params.stop_answer_timeout_s)
-            .map_err(|_| NodeError::StopAnswerTimeout(params.stop_answer_timeout_s))?;
+        let cache_window = duration_parameter("cache_window_s", params.cache_window_s)?;
+        let lookup_timeout = wait_parameter("lookup_timeout_s", params.lookup_timeout_s)?;
+        let stop_answer_timeout =
+            duration_parameter("stop_answer_timeout_s", params.stop_answer_timeout_s)?;
         // Enforce the documented contract: the cutoff must sit below the control loop's
         // Nyquist frequency, or the low-pass does not attenuate (and above it is
         // meaningless). A hard bound at Nyquist; the node default sits well under it.
@@ -590,7 +573,9 @@ fn run(
     let runner = node_runner.clone();
     let token = node_runner.cancellation_token().clone();
     tokio::spawn(async move {
-        startup::wait_until_ready(&runner, &token).await;
+        if !startup::wait_until_ready(&runner).await {
+            return;
+        }
 
         // The coordination loop (owns the governor, both planners, the channels;
         // streams governed setpoints once both arms report) and the action

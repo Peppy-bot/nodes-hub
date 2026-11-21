@@ -35,7 +35,9 @@ use srs_model::nalgebra::Isometry3;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{error, info, warn};
 
+use control_core::chase::rate_limited;
 use control_core::filters::LowPassFilter;
+use control_core::move_slot::MoveSlot;
 use control_core::pacer::Pacer;
 use control_core::robot_tree::RobotTree;
 use control_core::stop_reason::stop_reason;
@@ -49,7 +51,6 @@ use crate::gripper_move::{
     service_gripper_move,
 };
 use crate::liveness::{Admission, Cadence, CadenceChange, Liveness};
-use crate::move_slot::MoveSlot;
 use crate::path_checks::PathChecks;
 use crate::planner::{
     self, ArmMoveRequest, Goal, Measurement, PathGoal, PathJudgment, PlanCheck, Planner,
@@ -60,7 +61,6 @@ use crate::robot::{ARMS, LIMBS};
 use crate::streams::{ArmState, GovernorConfig, GripperCommand, GripperState, LeaderActivity};
 use crate::transforms::JointTransforms;
 use crate::upstream::{Upstream, UpstreamMode};
-use control_core::chase::rate_limited;
 
 /// How long [`seed_all`] waits for an arm's first measured state before warning that
 /// the backbone is still blocked, so a silent arm is visible in the log instead of an
@@ -573,7 +573,7 @@ async fn serve_queued(
 ///   but not started. The planner ends an arm's move; the gripper's
 ///   terminal ends a gripper's move. A goal that holds a limb and that the
 ///   loop has not taken yet is marked on its move slot
-///   ([`MoveSlot::stop_unstarted`](crate::move_slot::MoveSlot::stop_unstarted)),
+///   ([`MoveSlot::stop_unstarted`](control_core::move_slot::MoveSlot::stop_unstarted)),
 ///   and ends when the loop takes it.
 /// - Each goal the stop ends is cancelled, for a reason that names the
 ///   stop. The answer names each limb whose move in flight, queued goal or
@@ -613,7 +613,6 @@ async fn serve_request(
                     stopped.push(LIMBS.arm_name(arm).to_string());
                 }
                 while let Ok(goal) = channel.goals.try_recv() {
-                    let _release = channel.move_slot.release_on_drop();
                     goal.stop(&reason, measured, planner).await;
                     stopped.push(LIMBS.arm_name(arm).to_string());
                 }
@@ -629,7 +628,6 @@ async fn serve_request(
                     stopped.push(LIMBS.gripper_name(arm).to_string());
                 }
                 while let Ok(goal) = channel.gripper_goals.try_recv() {
-                    let _release = channel.gripper_move_slot.release_on_drop();
                     goal.stop(&reason, measured_frac).await;
                     stopped.push(LIMBS.gripper_name(arm).to_string());
                 }
@@ -1114,19 +1112,15 @@ async fn seed_all(
                 break;
             }
             Some(goal) = first.goals.recv() => {
-                let _release = first.move_slot.release_on_drop();
                 goal.fail(seed_failure(), &planners[first_arm]).await;
             }
             Some(goal) = second.goals.recv() => {
-                let _release = second.move_slot.release_on_drop();
                 goal.fail(seed_failure(), &planners[second_arm]).await;
             }
             Some(goal) = first.gripper_goals.recv() => {
-                let _release = first.gripper_move_slot.release_on_drop();
                 goal.fail(seed_failure()).await;
             }
             Some(goal) = second.gripper_goals.recv() => {
-                let _release = second.gripper_move_slot.release_on_drop();
                 goal.fail(seed_failure()).await;
             }
             // Nothing moves before the seed, so a stop stops nothing, and a
@@ -1209,7 +1203,6 @@ async fn tick_arm(
     if admission == Admission::Stale {
         planner.fail_active(stale_failure()).await;
         while let Ok(goal) = channels.goals.try_recv() {
-            let _release = channels.move_slot.release_on_drop();
             goal.fail(stale_failure(), planner).await;
         }
         return planner::Tick {
@@ -1324,14 +1317,15 @@ mod tests {
     use super::*;
     use crate::planner::Outcome;
     use crate::test_support::{
-        ARMS_WOULD_MEET, BOTH_HELD, OpenGuard, Refusing, claimed_move_slot, distance_to_segment,
-        measured_at, measured_at_setpoints, path_goal_through, planner_holding, share_reply,
-        standing_at, test_guard, test_settle,
+        ARMS_WOULD_MEET, BOTH_HELD, OpenGuard, Refusing, distance_to_segment, measured_at,
+        measured_at_setpoints, path_goal_through, planner_holding, share_reply, standing_at,
+        test_guard, test_settle,
     };
     use crate::test_support::{LEFT, RIGHT};
 
     use std::sync::Mutex;
 
+    use control_core::move_slot::SlotRelease;
     use control_core::path_timing::RoundedPath;
 
     use crate::arm_order::ArmOrder;
@@ -1476,10 +1470,10 @@ mod tests {
         );
     }
 
-    /// One arm's channels, with its move slot claimed as at a goal's
-    /// accept. The test drives them through the two senders it also gets:
-    /// the measured state and the goal queue.
-    fn claimed_arm_channels() -> (
+    /// One arm's channels, with its move slot free. The test drives them
+    /// through the two senders it also gets: the measured state and the goal
+    /// queue.
+    fn arm_channels() -> (
         ArmChannels,
         watch::Sender<Option<ArmState>>,
         mpsc::Sender<Goal>,
@@ -1498,7 +1492,7 @@ mod tests {
             measured,
             gripper,
             goals,
-            move_slot: claimed_move_slot(),
+            move_slot: MoveSlot::default(),
             gripper_goals,
             gripper_move_slot: MoveSlot::default(),
             fresh: Arc::new(AtomicBool::new(false)),
@@ -1507,14 +1501,28 @@ mod tests {
         (channels, measured_tx, goal_tx)
     }
 
+    /// One arm's channels as [`arm_channels`] gives them, with its move slot
+    /// claimed as at a goal's accept, and the release of the claim, which the
+    /// goal carries.
+    fn claimed_arm_channels() -> (
+        ArmChannels,
+        watch::Sender<Option<ArmState>>,
+        mpsc::Sender<Goal>,
+        SlotRelease,
+    ) {
+        let (channels, measured_tx, goal_tx) = arm_channels();
+        let claim = channels.move_slot.claim().expect("a new slot is free");
+        (channels, measured_tx, goal_tx, claim)
+    }
+
     #[tokio::test]
     async fn a_stale_tick_fails_queued_goals_instead_of_parking_them() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
-        let (mut channels, _measured_tx, goal_tx) = claimed_arm_channels();
+        let (mut channels, _measured_tx, goal_tx, claim) = claimed_arm_channels();
         let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(1);
         goal_tx
-            .send(Goal::posture_share(held, done_tx))
+            .send(Goal::posture_share(held, done_tx, claim))
             .await
             .expect("queue the goal");
 
@@ -1545,7 +1553,7 @@ mod tests {
     async fn a_command_from_a_leader_that_stopped_streaming_is_held_not_followed() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
-        let (mut channels, measured_tx, _goal_tx) = claimed_arm_channels();
+        let (mut channels, measured_tx, _goal_tx, _claim) = claimed_arm_channels();
         measured_tx.send_replace(Some(standing_at(held)));
         let target = [0.3, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         channels
@@ -1572,7 +1580,7 @@ mod tests {
     async fn a_state_that_arrives_after_its_arm_was_judged_counts_on_the_next_tick() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
-        let (mut channels, measured_tx, _goal_tx) = claimed_arm_channels();
+        let (mut channels, measured_tx, _goal_tx, _claim) = claimed_arm_channels();
         measured_tx.send_replace(Some(standing_at(held)));
         assert!(take_arm_delivery(&mut channels.measured), "the first state");
         measured_tx.send_replace(Some(standing_at(held)));
@@ -1590,11 +1598,11 @@ mod tests {
     async fn a_stale_tick_ends_the_posture_share_in_flight() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         let mut planner = planner_holding(LEFT, held);
-        let (mut channels, measured_tx, goal_tx) = claimed_arm_channels();
+        let (mut channels, measured_tx, goal_tx, claim) = claimed_arm_channels();
         measured_tx.send_replace(Some(standing_at(held)));
         let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(1);
         goal_tx
-            .send(Goal::posture_share([0.3; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.3; ARM_DOF], done_tx, claim))
             .await
             .expect("queue the goal");
 
@@ -1630,18 +1638,18 @@ mod tests {
     #[tokio::test]
     async fn a_grasp_request_measures_each_arm_when_it_is_served() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        let (left, left_measured, left_goals) = claimed_arm_channels();
-        let (right, right_measured, right_goals) = claimed_arm_channels();
+        let (left, left_measured, left_goals, left_claim) = claimed_arm_channels();
+        let (right, right_measured, right_goals, right_claim) = claimed_arm_channels();
         let mut channels = PerArm::new([left, right]);
         let mut planners = PerArm::new([planner_holding(LEFT, held), planner_holding(RIGHT, held)]);
         let (done_tx, mut done_rx) = mpsc::channel::<Outcome>(2);
-        for (measured, goals) in [
-            (&left_measured, &left_goals),
-            (&right_measured, &right_goals),
+        for (measured, goals, claim) in [
+            (&left_measured, &left_goals, left_claim),
+            (&right_measured, &right_goals, right_claim),
         ] {
             measured.send_replace(Some(standing_at(held)));
             goals
-                .send(Goal::posture_share([0.3; ARM_DOF], done_tx.clone()))
+                .send(Goal::posture_share([0.3; ARM_DOF], done_tx.clone(), claim))
                 .await
                 .expect("queue the share");
         }
@@ -1709,15 +1717,15 @@ mod tests {
     #[tokio::test]
     async fn a_stop_ends_each_move_cancelled_for_the_stops_reason() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        let (left, left_measured, left_goals) = claimed_arm_channels();
-        let (right, right_measured, right_goals) = claimed_arm_channels();
+        let (left, left_measured, left_goals, left_claim) = claimed_arm_channels();
+        let (right, right_measured, right_goals, right_claim) = claimed_arm_channels();
         let mut channels = PerArm::new([left, right]);
         let mut planners = PerArm::new([planner_holding(LEFT, held), planner_holding(RIGHT, held)]);
         left_measured.send_replace(Some(standing_at(held)));
         right_measured.send_replace(Some(standing_at(held)));
         let (running_tx, mut running) = mpsc::channel::<Outcome>(1);
         left_goals
-            .send(Goal::posture_share([0.3; ARM_DOF], running_tx))
+            .send(Goal::posture_share([0.3; ARM_DOF], running_tx, left_claim))
             .await
             .expect("queue the left share");
         let start = Instant::now();
@@ -1731,7 +1739,7 @@ mod tests {
         assert!(running.try_recv().is_err(), "the left share is in flight");
         let (queued_tx, mut queued) = mpsc::channel::<Outcome>(1);
         right_goals
-            .send(Goal::posture_share([0.3; ARM_DOF], queued_tx))
+            .send(Goal::posture_share([0.3; ARM_DOF], queued_tx, right_claim))
             .await
             .expect("queue the right share");
 
@@ -1769,8 +1777,8 @@ mod tests {
     #[tokio::test]
     async fn a_grasp_request_during_the_seed_wait_gets_no_pose() {
         let held = [0.0, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
-        let (mut left, left_measured, _left_goals) = claimed_arm_channels();
-        let (mut right, right_measured, _right_goals) = claimed_arm_channels();
+        let (mut left, left_measured, _left_goals, _left_claim) = claimed_arm_channels();
+        let (mut right, right_measured, _right_goals, _right_claim) = claimed_arm_channels();
         let (_left_gripper, silent) = watch::channel(None);
         left.gripper = silent;
         let (_right_gripper, silent) = watch::channel(None);
@@ -1803,7 +1811,7 @@ mod tests {
     /// measured.
     #[test]
     fn a_stale_arm_reports_no_measurement_and_a_live_arm_its_latest() {
-        let (channels, measured_tx, _goal_tx) = claimed_arm_channels();
+        let (channels, measured_tx, _goal_tx, _claim) = claimed_arm_channels();
         let latest = [0.1, -0.8, 0.0, 1.2, 0.0, 0.0, 0.0];
         measured_tx.send_replace(Some(standing_at(latest)));
         assert_eq!(
@@ -1837,8 +1845,7 @@ mod tests {
         PerArm<Planner, ARMS>,
     ) {
         let (channels, followers) = PerArm::from_fn(|arm| {
-            let (channels, measured_tx, _goals) = claimed_arm_channels();
-            channels.move_slot.release();
+            let (channels, measured_tx, _goals) = arm_channels();
             measured_tx.send_replace(Some(standing_at(BOTH_HELD[arm])));
             (channels, measured_tx)
         })
@@ -1881,9 +1888,11 @@ mod tests {
             q[0] += 0.3;
             q
         });
-        for &arm in arms.ids() {
-            assert!(channels[arm].move_slot.claim(), "the arm is free");
-        }
+        let claims = arms
+            .ids()
+            .iter()
+            .map(|&arm| channels[arm].move_slot.claim().expect("the arm is free"))
+            .collect();
         let (reply, done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let goal = path_goal_through(
             &arms,
@@ -1891,7 +1900,7 @@ mod tests {
             Duration::from_secs(1),
             test_settle(&arms),
             reply,
-            |arm| &channels[arm].move_slot,
+            claims,
         );
         (goal, done_rx)
     }
@@ -1960,11 +1969,11 @@ mod tests {
     #[tokio::test]
     async fn a_stop_marks_the_goals_that_the_loop_has_not_taken() {
         let (mut channels, mut planners) = both_arms();
-        assert!(channels[LEFT].move_slot.claim(), "the arm is free");
-        assert!(
-            channels[RIGHT].gripper_move_slot.claim(),
-            "the gripper is free"
-        );
+        let _arm_goal = channels[LEFT].move_slot.claim().expect("the arm is free");
+        let _gripper_goal = channels[RIGHT]
+            .gripper_move_slot
+            .claim()
+            .expect("the gripper is free");
         let stopped = stop_alone(&mut channels, &mut planners, Instant::now()).await;
         assert_eq!(stopped, ["left_arm", "right_gripper"]);
 
@@ -1985,7 +1994,7 @@ mod tests {
     #[tokio::test]
     async fn a_stop_before_the_tick_that_takes_an_arm_goal_ends_the_goal() {
         let (mut channels, mut planners) = both_arms();
-        assert!(channels[LEFT].move_slot.claim(), "the arm is free");
+        let claim = channels[LEFT].move_slot.claim().expect("the arm is free");
         let now = Instant::now();
         stop_alone(&mut channels, &mut planners, now).await;
 
@@ -1993,7 +2002,7 @@ mod tests {
         channels[LEFT].goals = goals;
         let (done_tx, mut done_rx) = mpsc::channel(1);
         goal_tx
-            .try_send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .try_send(Goal::posture_share([0.5; ARM_DOF], done_tx, claim))
             .expect("queue the goal");
         let tick = tick_arm(
             &mut channels[LEFT],

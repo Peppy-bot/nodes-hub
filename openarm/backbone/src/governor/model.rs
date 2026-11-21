@@ -12,13 +12,12 @@
 //! queries are sequential by construction; what this boundary adds is that
 //! their *order* no longer matters.
 
-use control_core::throttle::Throttle;
+use control_core::throttle::{LOG_WINDOW, Throttle};
 use self_collision_model::{CollisionError, DistanceGradient, SelfCollisionModel};
 use srs_model::ARM_DOF;
 use tracing::warn;
 
 use crate::robot::ARMS;
-use crate::streams::THROTTLED_WARN_PERIOD;
 
 use super::{GOV_DOF, GovState, NearestPair, split};
 
@@ -35,7 +34,7 @@ impl ConfiguredModel {
     pub fn new(inner: SelfCollisionModel<ARM_DOF, ARMS>) -> Self {
         Self {
             inner,
-            query_error_log: Throttle::new(THROTTLED_WARN_PERIOD),
+            query_error_log: Throttle::new(LOG_WINDOW),
         }
     }
 

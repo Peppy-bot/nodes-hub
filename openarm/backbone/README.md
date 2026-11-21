@@ -185,10 +185,11 @@ gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `+z` out of the gripper), not the wrist flange they mount on: the description
 names it as each arm's grasp link, and each arm's model mounts its tool there,
 so the pose solved for, the pose reported, and the point the EE speed cap
-applies to are one frame. One move per arm at a time (a
-single-flight move slot whose release rides a drop guard, held by the move,
-or by the coordinator for a goal it ends before the move starts, so every
-terminal frees it). `move_arm` plans a straight line (`srs_model::plan_line`): a
+applies to are one frame. One move per arm at a time (a single-flight
+move slot, control_core's `MoveSlot`, whose claim gives the release, a
+drop guard that the goal carries from its admission and the move that
+runs it then, so every terminal frees it, an end before the move starts
+included). `move_arm` plans a straight line (`srs_model::plan_line`): a
 walk along it in MoveIt's steps and within its Cartesian precision of 1 mm and 0.01 rad,
 each step one descent of the KDL search from the state before. The walk plays as a joint
 trajectory, timed from rest to rest within the joint velocity and acceleration
@@ -667,7 +668,6 @@ The robot's own body is not checked for hiding a point from the camera.
 | `coordinator.rs` | the tick, each gripper's target and chase, the upstream relay | IO orchestration; its seam with the safety core is exactly one `govern_along` call, which is why the governor is not folded into it |
 | `gripper_move.rs` | gripper move execution: a `move_gripper` goal, or the close of a gripper for a `move_to_home` goal, admitted into a free arm, the effort cap it relays, the terminal it gets once the jaws stand still, its settle timeout passes or its travel timeout runs out, and the end of its goal or the report to its posture goal | the gripper analog of `planner.rs` + `settle.rs`; the coordinator drives it each tick |
 | `liveness.rs` | follower admission (`Live` / `Reanchor` / `Stale`) | delivery-cadence policy for the coordinator, independent of any message type |
-| `move_slot.rs` | `MoveSlot`, each limb's single-flight move slot (claim, release, the `SlotRelease` a move holds, and the mark a stop leaves on a slot whose goal the coordinator has not taken), and the refusals of a busy limb | one owner for the slot the action handlers claim, and release when a goal never reaches the coordinator, and the planners and the coordinator release when they end a goal or its move |
 | `planner.rs` | per-arm mode machine (Follow / joint move / Cartesian move / share of an `execute_joint_path` path) -> one rate-limited candidate + the stream-tick Jacobian | knows one arm only, but for the path its share follows; never the collision model |
 | `planner/path.rs` | the shares of an `execute_joint_path` path: its start on the arms it names (`start_path`), its judgment (`judge_path`, `resume_judged_path`), the pace a committed step plays its clock at, one pace for the two clocks of a path of both arms (`commit_both`) | reaches the collision model only through the `PathGuard` `judge_path` is handed |
 | `planner/stream_smoothing.rs` | the smoothing of a streamed pose's steps: one Butterworth per joint at MoveIt Servo's default cutoff for the control period | a smoother can overshoot its input, so the planner holds its output to the velocity limit |
@@ -679,13 +679,12 @@ The robot's own body is not checked for hiding a point from the camera.
 | `governor/limiters/` | the `Limiter` trait, one module per limiter, and `allowance.rs` (the `Allowance`/`Limits` currency they speak) | everything expressible as a per-DOF fraction lives together |
 | `governor/path_check.rs` | `PathChecker`, a joint path walked against the step floor before the move starts on a copy of the governor's collision model, and `GuardAt`, the guard it is walked against | the floor scan's resolution and floor, over a whole path |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
-| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
-| `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, the kinds of a placement in the robot's tree, given to the members that place a frame (`TargetFailure`), and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal; a placement's kind reaches no member that places nothing |
+| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names by control_core's `MoveSeconds` and `PositiveFinite::parse_field` | execution belongs to the planner/coordinator that owns the state |
+| `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, control_core's failure of a command the robot's tree cannot place in those kinds (`TargetFailure`), whose kind of a placement reaches the members that place a frame, the refusals of a busy limb, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal; a placement's kind reaches no member that places nothing |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: its arms as `workspace_core`'s reach rule asks them, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `transforms.rs` | `JointTransforms`: the transform of every arm and finger joint at a snapshot's joints and openings, from the description, and the start of every transform | the publisher of a measured joint is the node that measures it; the fixed joints are the initializer's |
 | `workspace_service.rs` | the two workspace services and the read of the linked camera's geometry | the thin edge between the generated handlers and `workspace.rs` |
 | `types.rs` | the limb tables, every arm's joints in one vector | shared primitives; `ArmId` and `PerArm` come from `robot_description`, `ARM_DOF` and `JointVec` from `srs_model` |
-| `placement.rs` | `Placer`: the robot's tree, the robot frame and the wait of a placement; a command's pose or point placed in the robot frame | one placement for every command that gives a pose |
 | `follow.rs` | the followers of the `other_transforms` link, which take each message of `transforms` and `static_transforms` of the other publishers into the robot's tree | the tree is `control_core::robot_tree`'s; each topic's message converts to frame_tree's field for field |
 | `clock.rs` | the node's clock, the wall clock or the simulation clock it is bound to, which every wait of a placement reads | a simulation clock that closes ends the node |
 | `robot.rs` | the robot this node is built for (`ARMS` arms of `ARM_DOF` joints, each arm's and gripper's name, `LIMBS`), a request's arm or gripper by name, the postures of a named state | a model of another shape ends the node, naming the models of this shape |
