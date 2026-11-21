@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use control_core::planar_pose::PlanarPose;
+use frame_tree::arithmetic::quaternion_of_yaw;
 use frame_tree::{FrameName, FrameTransform, MessageError, MovingMessage};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::transforms::transforms;
@@ -91,11 +92,11 @@ impl JointTransforms {
 }
 
 /// `pose` in space, as the messages of the base carry a pose: its position
-/// on the floor at height 0 and its heading's unit quaternion, [x, y, z, w]
-/// ([`PlanarPose::to_transform`]).
+/// on the floor at height 0 and its heading's unit quaternion, [x, y, z, w],
+/// as tf2's `setRPY(0, 0, yaw)` makes it, the quaternion diff_drive_controller
+/// publishes.
 pub fn position_and_orientation(pose: PlanarPose) -> ([f64; 3], [f64; 4]) {
-    let transform = pose.to_transform();
-    (transform.origin(), transform.orientation())
+    ([pose.x(), pose.y(), 0.0], quaternion_of_yaw(pose.yaw()))
 }
 
 /// The message of the transform odom to base_footprint at `pose`, measured at
@@ -192,6 +193,19 @@ mod tests {
             (message.timestamp, message.start_timestamp),
             (MEASURED, started())
         );
+    }
+
+    // A pose's orientation is setRPY's quaternion of its heading, its sign
+    // included: at -2.5 rad, [0, 0, -0.949, 0.315].
+    #[test]
+    fn a_pose_carries_the_setrpy_quaternion_of_its_heading() {
+        let pose = PlanarPose::new(1.0, -2.0, -2.5).expect("a pose");
+        let (position, orientation) = position_and_orientation(pose);
+        assert_eq!(position, [1.0, -2.0, 0.0]);
+        assert_eq!(orientation, quaternion_of_yaw(-2.5));
+        for (actual, expected) in orientation.iter().zip([0.0, 0.0, -0.949, 0.315]) {
+            assert!((actual - expected).abs() < 5e-4, "{orientation:?}");
+        }
     }
 
     // The wheel joints' transforms, left then right as the URDF orders them,
