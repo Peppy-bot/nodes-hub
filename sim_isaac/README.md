@@ -14,8 +14,8 @@ each robot's own cameras, and serves runtime scene and object editing.
 - One entry per model under `engine/models/`, beside the entry
   `sim_robot_core` shares with every engine
 - Peppy runtime integration over five pairing slots that name no robot
-- A rolling robot, the botshare base, on the floor of the stage, each wheel
-  run as its driver runs it in profile velocity mode
+- A rolling robot, the botshare base, each wheel run as its driver runs it
+  in profile velocity mode
 - Headless WebRTC streaming
 - Runtime TCP commander on port `5556`
 - Whole-robot root repositioning
@@ -165,7 +165,6 @@ parsed strictly at node setup by `engine/isaac_models.py`:
 | `link_prims` | URDF link name to the prim that is that link, where they differ |
 | `arm_gains` | `kp` and `kd`, one per joint of an arm, applied to every arm. An OpenArm's `kp` and `kd` are the real arm's, the defaults of `openarm/arm/peppy.json5`, which the MuJoCo node and Waldo run too, and `tests/test_isaac_models.py` holds them equal. Each drive is capped at the effort limit the description gives its joint |
 | `gripper_gains` | `kp` and `kd`, one per finger of a gripper that moves of its own, applied to every gripper, each drive capped as an arm's is. A finger the description gives a mimic has no drive: it follows the finger it mimics |
-| `wheel_rate_loop` | `kp` (N m s/rad) and `ki` (N m/rad), the proportional and integral gains of the loop on each wheel's rate, and `max_torque` (N m), the motor's torque, which caps the two together; each a positive number. A model whose description gives a base has one, and a model without one has none |
 | `gravity_compensation` | Whether gravity is taken off the robot's own links |
 | `head_camera` | Whether the robot draws the OpenArm v2 head camera pack |
 
@@ -177,8 +176,7 @@ What depends on the robot's description is checked at `attach`, which refuses
 with `rejected` gains whose length is not the number of joints of each arm or
 of fingers that move of their own of each gripper of the description, an
 effort limit of the description that is not positive on a joint whose drive it
-caps, a `wheel_rate_loop` for a description that gives no base or none for one
-that does, and a camera the description has and no render names, or the
+caps, and a camera the description has and no render names, or the
 reverse. A model with no entry is refused at `attach`
 naming the models the engine stands, and none falls back to another's entry.
 
@@ -213,8 +211,11 @@ Everything downstream of `attach` takes the robot's own model:
   camera's frame with no timestamp, since it holds at every time;
 - the head camera pack, which is the business of the models whose entry says
   `head_camera: true`. The node reads no pack when no model draws it;
-- for a robot that rolls, its stance: it stands free on the stage's floor, a
-  plane collider at z 0 of `world`, its wheels carrying it. Each step the
+- for a robot that rolls, its stance: it stands free on the floor, its
+  wheels carrying it. The stage's floor is a plane collider at z 0 of
+  `world`, laid while no runtime scene stands on the stage or the one that
+  does carries no collider, and taken up while a scene that carries
+  colliders, an environment with a floor of its own, stands there. Each step the
   engine reads its robot frame, the description's root link and the root of
   its articulation, into its placement, the position and the heading its
   wheels turned it to, with its velocities there, which `get_robots_list`,
@@ -224,15 +225,19 @@ Everything downstream of `attach` takes the robot's own model:
   down at rest where it names: its root and its joints still, the integral of
   each wheel's loop cleared and its base's setpoint dropped;
 - for a robot that rolls, the rate loop of each wheel (`engine/wheel_loop.py`),
-  as its driver runs the wheel in profile velocity mode. PhysX drives a joint
-  as a PD controller, implicit over the step, capped at its maximum force:
-  each wheel's drive has no stiffness, `kp` as its damping and `max_torque`
-  as its maximum force, and each step the engine sets its target velocity to
-  the rate plus `ki` / `kp` times the integral of the rate's error, so the
-  drive's torque is `kp` times the rate's error plus `ki` times that
-  integral, capped together. The integral is the angle the target rates carry
+  as its driver runs the wheel in profile velocity mode. Its stage authors
+  the loop as the PD on the wheel's angle that the loop is: the integral
+  gain `ki` as the drive's stiffness, the proportional gain `kp` as its
+  damping and the motor's torque as its maximum force, which the engine
+  reads as the robot stands, refusing a wheel whose drive gives no positive
+  value of the three. PhysX drives a joint as a PD controller, implicit over
+  the step, capped at its maximum force: the engine runs each wheel's drive
+  with no stiffness, `kp` as its damping and the torque as its maximum force,
+  and each step sets its target velocity to the rate plus `ki` / `kp` times
+  the integral of the rate's error, so the drive's torque is `kp` times the
+  rate's error plus `ki` times that integral, capped together. The integral is the angle the target rates carry
   the wheel to less the angle it turned, summed each step from the angles the
-  articulation reads and clamped at `max_torque` / `ki` either way. PhysX
+  articulation reads and clamped at the torque over `ki` either way. PhysX
   wraps the angle of a joint without limits at a full turn, so the loop
   counts each step's turn less whole turns: the angle a wheel reports on its
   pair runs on without a jump, a stand or a leave of another robot included.
@@ -254,7 +259,8 @@ it through PhysX articulation views, so the USD:
   names a dof after its joint prim. Each is a `PhysicsRevoluteJoint` or a
   `PhysicsPrismaticJoint` with finite limits, which a gripper's span is read
   from, or a wheel's `PhysicsRevoluteJoint` without limits, and a
-  `PhysicsDriveAPI`, which the gains and the start posture are written to;
+  `PhysicsDriveAPI`, which the gains and the start posture are written to,
+  and which a wheel's rate loop is read from;
 - keeps links and joints out of instanceable prims; visual and collision
   geometry below a link may be instanceable;
 - carries no physics scene of its own: the stage's one scene runs the CPU
@@ -725,38 +731,45 @@ that stage.
 
 ### The botshare base's stage
 
-The botshare base's stage is built from its description alone:
-`scripts/build_botshare_base.py` compiles the URDF that `robot_description_py`
-bundles with MuJoCo, with the visual meshes it names, and writes the stage from
-the compiled model, as the SO-101's builder does. Every link that fixed joints
-join is one body, the first link of the group, with the sum of their masses:
-the chassis is `base_footprint`, the robot frame, and each wheel is a body of
-its own, as Waldo's MJCF of the base fuses them. Each link stands under its
-body as a prim of its name, so the depth camera stands under
-`base_camera_link`. Each wheel turns on a revolute joint without limits with a
-velocity drive, whose gains the engine sets from its entry, and the robot's
-prim roots the articulation with no joint to the world. What the URDF does
-not hold is the builder's: each wheel's armature, the tires' friction and the
-casters' spheres, which take none, as in Waldo's MJCF. The visual meshes
-come from botshare's openamr-platform-sw at the commit the URDF was written
-from, each held to its SHA-256 in the builder, with that repository's
-licenses. From the repository root, CPU only:
+The botshare base's stage is built from its MuJoCo model, as the SO-101's is:
+the one in the release of Waldo's catalogue, which Waldo's
+`tools/botshare_base` writes from the base's URDF, `robot_description`'s, so
+the URDF is the one source of its geometry, and which the MuJoCo node bakes
+and Waldo loads. `scripts/build_botshare_base.py` compiles that MJCF with its
+mount body free and writes the stage from the compiled model: the mount body
+is the robot frame, `base_footprint`, with the sum of the inertials of every
+link fixed to it, and each wheel a body of its own. Each link the URDF fixes
+to a body stands under it as a prim of its name, so the depth camera stands
+under `base_camera_link`. Each wheel turns on a revolute joint without limits
+whose drive is the rate loop the MJCF runs it with, as the PD on its angle
+that loop is: the `<intvelocity>` actuator's `kp` as its stiffness, the
+`<velocity>` actuator's `kv` as its damping, the joint's `actuatorfrcrange`
+as its maximum force, with the joint's armature. The engine reads them back
+as the loop it runs. A collider that takes no friction in the MJCF, a
+caster's sphere, takes none on the stage, and each tire grips with the
+friction the MJCF gives it. Each mesh is drawn in a material named after
+it, of its MJCF colour. The robot's prim roots the articulation with no
+joint to the world. From the repository root, CPU only, with the release
+staged by `python3 sim_base_images/waldo_catalogue.py fetch
+/tmp/botshare-release --robot botshare_base`:
 
 ```bash
 uv run --project sim_isaac/tests --locked --group dev \
   python sim_isaac/scripts/build_botshare_base.py \
-  --fetch --meshes /tmp/botshare-meshes \
+  --release /tmp/botshare-release \
   --output /tmp/botshare-base-isaac-assets \
   --archive /tmp/botshare-base-isaac-assets.tar.gz
 ```
 
-The archive holds the stage, the licenses and `bundle_manifest.json`, and is
-published as the SO-101's is, at `botshare_base/<version>/<sha256>.tar.gz`,
-for the image to bake under `/opt/robot_assets/botshare_base/`.
-`tests/test_botshare_base_stage.py` holds the stage to the description: its
-bodies and their masses, the place of every link, the wheels' joints and the
-contact of the tires and the casters. `BOTSHARE_MESHES` names a directory the
-meshes are staged in; without it the suite stages them over the network.
+The archive holds the stage, the licenses of the meshes and
+`bundle_manifest.json`, and is published as the SO-101's is, at
+`botshare_base/<version>/<sha256>.tar.gz`, for the image to bake under
+`/opt/robot_assets/botshare_base/`. `tests/test_botshare_base_stage.py`
+holds the stage to the description, its bodies and their masses, the place of
+every link and the wheels' joints, and to the model, the rate loop of each
+wheel, the contact of the tires and the casters and the colour of each mesh.
+`BOTSHARE_RELEASE` names a directory a release holding the base is staged
+in; without it the suite stages the pinned release.
 
 ## Tests
 

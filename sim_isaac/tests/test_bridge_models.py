@@ -21,6 +21,9 @@ from sim_robot_core.setpoints import JointSetpoint
 import _world
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
+sys.path.insert(0, str(_ENGINE_DIR))
+
+from wheel_loop import RateLoopGains  # noqa: E402  pylint: disable=C0413
 
 
 def _finger(model: str, joint: str):
@@ -423,10 +426,20 @@ class TestRigs:
         fleet._io.camera_robots.assert_not_called()
 
 
+# Each wheel's rate loop as a stage authors it: other gains on each wheel, so
+# nothing of one wheel's loop reaches the other.
+_LOOPS = (RateLoopGains(kp=128.0, ki=64.0, max_torque=16.0), RateLoopGains(kp=96.0, ki=32.0, max_torque=12.0))
+
+
 @pytest.fixture(name="rolling")
 def _rolling(engine, monkeypatch):
-    """A botshare base on the stage, its engine clock under the test's hand."""
-    robot = _robot(engine, "delta", _world.known("botshare_base"))
+    """A botshare base on the stage, its wheels' loops as its stage authors
+    them, its engine clock under the test's hand."""
+    import dataclasses  # pylint: disable=C0415
+
+    robot = dataclasses.replace(
+        _robot(engine, "delta", _world.known("botshare_base")), wheel_loops=_LOOPS
+    )
     world, io, registry = Mock(), Mock(), Mock()
     world.robots.return_value = [robot]
     world.take_set_down.return_value = set()
@@ -462,14 +475,14 @@ def _step_at(rolling, now_s, left=0.0, right=0.0):
 
 
 class TestDrivingABase:
-    def test_the_wheels_drives_take_the_rate_loops_gains_and_cap(self, engine, rolling):
+    def test_the_wheels_drives_run_with_no_stiffness_on_the_loops_their_stage_authors(self, engine, rolling):
         prim, joints, params, _ = engine.views.actuators["base_delta"]
         assert (prim, joints) == ("/World/delta", list(_WHEELS))
         assert params == {
             "joint_names": list(_WHEELS),
             "kp": [0.0, 0.0],
-            "kd": [128.0, 128.0],
-            "max_efforts": [16.0, 16.0],
+            "kd": [128.0, 96.0],
+            "max_efforts": [16.0, 12.0],
         }
 
     def test_each_wheel_follows_the_rate_of_its_setpoint_through_its_loop(self, engine, rolling):
@@ -480,13 +493,14 @@ class TestDrivingABase:
         _wheel_targets(engine).assert_called_with(dict(zip(_WHEELS, (2.0, -1.0))))
 
         _step_at(rolling, _STEP_S, left=0.02, right=-0.02)
-        # The integral: the angle the rates carried each wheel to less its turn.
+        # The integral: the angle the rates carried each wheel to less its
+        # turn, through each wheel's own gains.
         left = 2.0 * _STEP_S - 0.02
         right = -1.0 * _STEP_S + 0.02
         (targets,) = _wheel_targets(engine).call_args.args
         assert targets == {
-            "left_wheel_joint": pytest.approx(2.0 + left),
-            "right_wheel_joint": pytest.approx(-1.0 + right),
+            "left_wheel_joint": pytest.approx(2.0 + 64.0 / 128.0 * left),
+            "right_wheel_joint": pytest.approx(-1.0 + 32.0 / 96.0 * right),
         }
 
     def test_a_base_with_no_setpoint_holds_its_wheels_at_rate_0(self, engine, rolling):
@@ -532,11 +546,12 @@ class TestDrivingABase:
         assert [loop.integral for loop in rolling._wheels["delta"]] == [0.0, 0.0]
         assert [loop.angle for loop in rolling._wheels["delta"]] == [pytest.approx(0.01)] * 2
 
-    def test_a_stage_edit_stands_the_robot_where_it_rolled_and_its_wheels_count_on(self, engine, rolling):
+    def test_a_stopping_timeline_stands_the_robot_where_it_rolled_and_its_wheels_count_on(self, engine, rolling):
         _step_at(rolling, 0.0, left=0.5)
         _step_at(rolling, _STEP_S, left=0.7)
 
         rolling.unbind()
+        rolling.hold_through_stop()
         rolling._world.stand_where_rolled.assert_called_once_with()
         rolling.bind()
         # The timeline set the wheel back to its stage's angle.
@@ -544,3 +559,21 @@ class TestDrivingABase:
         _step_at(rolling, _STEP_S, left=0.1)
 
         assert rolling._wheels["delta"][0].angle == pytest.approx(0.3)
+
+    def test_views_taken_again_while_the_timeline_plays_keep_each_wheels_count_and_integral(
+        self, engine, rolling
+    ):
+        """A prim removal drops the views and takes them again with the
+        timeline playing: the wheels stand where they turned."""
+        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, 2.0))
+        _step_at(rolling, 0.0, left=0.5)
+        _step_at(rolling, _STEP_S, left=0.51)
+        integral = rolling._wheels["delta"][0].integral
+
+        rolling.unbind()
+        rolling.bind()
+        _step_at(rolling, 2 * _STEP_S, left=0.53)
+
+        rolling._world.stand_where_rolled.assert_not_called()
+        assert rolling._wheels["delta"][0].angle == pytest.approx(0.03)
+        assert rolling._wheels["delta"][0].integral == pytest.approx(integral + 2.0 * _STEP_S - 0.02)

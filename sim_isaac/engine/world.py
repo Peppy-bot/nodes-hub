@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """The stage the engine simulates, and the robots standing in it.
 
-The stage opens empty but for its floor, and each robot is referenced under
+The stage opens empty but for its floor, which it keeps while no scene that
+brings a floor of its own stands on it, and each robot is referenced under
 /World as a prim of its own name, so two robots of the same model keep
 separate articulations, and taking one out is removing that prim. What is
 referenced, and what is authored on it as the robot joins, is its model's
@@ -14,7 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, wxyz_of_xyzw
@@ -22,6 +23,7 @@ from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuat
 import head_camera
 from isaac_models import IsaacModel
 from object_state import AT_REST
+from wheel_loop import RateLoopGains
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +42,8 @@ _MAX_RINGS = 64
 # `/World/alpha` is alpha's.
 PRIM_SEPARATOR = "/"
 
-# The floor every robot stands on: a plane collider at z 0 of world, which
-# a robot that rolls rests its wheels on.
+# The floor of a stage whose scene brings none of its own: a plane collider
+# at z 0 of world, which a robot that rolls rests its wheels on.
 GROUND_PRIM = f"{WORLD_PRIM}/ground"
 
 # How brightly an empty stage is lit, in the units UsdLux reads: enough to
@@ -196,14 +198,17 @@ def within_one_spot(one: Pose, other: Pose) -> bool:
 class Robot:
     """One robot in the stage: the name it stands under, the model it is,
     where: the pose of its base in world, whose orientation turns about +z
-    alone, and how fast its robot frame moves in world at its origin, at rest
-    for a robot fixed to the world."""
+    alone, how fast its robot frame moves in world at its origin, at rest
+    for a robot fixed to the world, and the rate loop of each wheel of its
+    base as its stage authors it, left then right, none for a robot that
+    stands where it is placed."""
 
     instance: str
     known: IsaacModel
     placement: Pose
     linear_velocity: tuple[float, float, float] = AT_REST
     angular_velocity: tuple[float, float, float] = AT_REST
+    wheel_loops: tuple[RateLoopGains, ...] = ()
 
     @property
     def model(self) -> str:
@@ -315,7 +320,7 @@ class World:
         UsdGeom.SetStageMetersPerUnit(stage, 1.0)
         UsdGeom.Xform.Define(stage, WORLD_PRIM)
         World._physics_scene(stage)
-        World._floor(stage)
+        World.lay_floor(stage)
         # An empty stage carries no light of its own, and renders black
         # however many robots join it.
         if not any(prim.IsA(UsdLux.DomeLight) for prim in stage.Traverse()):
@@ -323,7 +328,21 @@ class World:
             dome.CreateIntensityAttr(DOME_LIGHT_INTENSITY)
 
     @staticmethod
-    def _floor(stage):
+    def needs_floor(scene) -> bool:
+        """Whether the stage needs its floor laid: while its runtime scene,
+        the prim `scene`, stands nothing or carries no collider. A scene of
+        the catalogue is an environment whose colliders hold what stands in
+        it, its own floor among them, instanced or not."""
+        from pxr import Usd, UsdPhysics  # pylint: disable=C0415
+
+        if not scene.IsValid():
+            return True
+        return not any(
+            prim.HasAPI(UsdPhysics.CollisionAPI) for prim in Usd.PrimRange(scene, Usd.TraverseInstanceProxies())
+        )
+
+    @staticmethod
+    def lay_floor(stage):
         """The floor of the stage: a plane collider at z 0 of world, facing
         +z, which a robot that rolls rests its wheels on. Hydra draws no
         plane, and it stands as a guide."""
@@ -365,7 +384,7 @@ class World:
                 )
         robot = Robot(instance=instance, known=known, placement=placement)
         try:
-            self._reference(robot, self._head_camera_pack)
+            robot = replace(robot, wheel_loops=self._reference(robot, self._head_camera_pack))
         except Exception:
             # What the reference authored before it failed comes off the
             # stage, so a robot that cannot join leaves the stage as it was.
@@ -391,10 +410,11 @@ class World:
         if robot is None:
             raise KeyError(f"no robot stands as {name!r} in this stage")
         heading = robot.placement.orientation if target.orientation is None else target.orientation
-        moved = Robot(
-            instance=robot.instance,
-            known=robot.known,
+        moved = replace(
+            robot,
             placement=Pose(target.position, heading),
+            linear_velocity=AT_REST,
+            angular_velocity=AT_REST,
         )
 
         import omni.usd  # pylint: disable=C0415
@@ -432,9 +452,8 @@ class World:
             robot = self._robots.get(instance)
             if robot is None:
                 return
-            self._robots[instance] = Robot(
-                instance=instance,
-                known=robot.known,
+            self._robots[instance] = replace(
+                robot,
                 placement=placement,
                 linear_velocity=linear_velocity,
                 angular_velocity=angular_velocity,
@@ -480,11 +499,15 @@ class World:
         omni.usd.get_context().get_stage().RemovePrim(robot.prim())
 
     @staticmethod
-    def _reference(robot: Robot, head_camera_pack: Optional[head_camera.Pack]) -> None:
+    def _reference(
+        robot: Robot, head_camera_pack: Optional[head_camera.Pack]
+    ) -> tuple[RateLoopGains, ...]:
         """Puts a model's stage under this robot's prim, at its placement,
         holds the stage to the robot's description, and authors on it what
         its model's entry asks for: the posture the robot starts in, each finger that mimics another bound to it, its
         links out of gravity's reach, and the head camera on its pedestal.
+        Returns the rate loop of each wheel of its base, as its stage
+        authors it.
 
         The reference brings the model's own transform ops along, and these
         models orient by quaternion, which XformCommonAPI does not carry: it
@@ -523,6 +546,45 @@ class World:
                 body,
                 head_camera_pack.directory,
             )
+        return World._wheel_loops(prim, known)
+
+    @staticmethod
+    def _wheel_loops(root, known: IsaacModel) -> tuple[RateLoopGains, ...]:
+        """The rate loop of each wheel of the robot's base, left then right,
+        as its stage authors it: the PD on the wheel's angle the loop is, its
+        stiffness the integral gain and its damping the proportional gain,
+        per degree as USD writes an angular drive's, and its maximum force
+        the motor's torque. None for a robot with no base. A wheel whose drive
+        gives no positive finite value of the three is refused."""
+        from pxr import UsdPhysics  # pylint: disable=C0415
+
+        base = known.entry.base
+        if base is None:
+            return ()
+        joints = _joints_named(root, set(base.wheels))
+        loops = []
+        for wheel in base.wheels:
+            prim = joints.get(wheel)
+            values = []
+            if prim is not None and prim.HasAPI(UsdPhysics.DriveAPI, ANGULAR):
+                drive = UsdPhysics.DriveAPI(prim, ANGULAR)
+                values = [
+                    attribute.Get()
+                    for attribute in (drive.GetStiffnessAttr(), drive.GetDampingAttr(), drive.GetMaxForceAttr())
+                ]
+            if len(values) != 3 or not all(
+                value is not None and math.isfinite(value) and value > 0.0 for value in values
+            ):
+                raise RuntimeError(
+                    f"{known.stage} drives the wheel '{wheel}' with stiffness, damping and maximum force "
+                    f"{values}: a wheel's drive is its rate loop, each value positive. Pin the asset "
+                    "bundle scripts/build_botshare_base.py builds in sim_base_images/isaac_assets.env"
+                )
+            stiffness, damping, max_force = values
+            loops.append(
+                RateLoopGains(kp=math.degrees(damping), ki=math.degrees(stiffness), max_torque=float(max_force))
+            )
+        return tuple(loops)
 
     @staticmethod
     def _hold_to_description(root, known: IsaacModel) -> None:

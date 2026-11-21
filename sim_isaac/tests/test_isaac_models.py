@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
 import isaac_models  # noqa: E402  pylint: disable=C0413
 from isaac_models import DriveGains, IsaacModels, parse, stood  # noqa: E402  pylint: disable=C0413
-from wheel_loop import RateLoopGains  # noqa: E402  pylint: disable=C0413
 
 # The node whose defaults are the real OpenArm arm's MIT gains, which every
 # OpenArm of this engine runs, as the MuJoCo node and Waldo do.
@@ -96,23 +95,18 @@ class TestTheShippedEntries:
         assert known.arm_gains == DriveGains(kp=(998.22,) * 5, kd=(2.731,) * 5)
         assert known.gripper_gains == DriveGains(kp=(998.22,), kd=(2.731,))
         assert (known.gravity_compensation, known.head_camera) == (False, False)
-        assert known.wheel_rate_loop is None and not known.rolls
+        assert not known.rolls
 
-    def test_a_botshare_base_rolls_on_wheels_run_by_the_rate_loop_waldo_measured(self):
-        """kp 128 N m s/rad, ki 128 N m/rad, capped at the hub motor's 16 N m."""
+    def test_a_botshare_base_rolls_on_the_wheels_its_stage_drives(self):
+        """Its entry names no gain: each wheel runs the rate loop its stage
+        authors (test_world_joining.py)."""
         known = _world.known("botshare_base")
         assert known.stage == "botshare_base/botshare_base.usd"
         assert (known.articulation_root, known.link_prims) == (".", {})
         assert known.rolls and known.root_link == "base_footprint"
-        assert known.wheel_rate_loop == RateLoopGains(kp=128.0, ki=128.0, max_torque=16.0)
+        assert known.entry.base.wheels == ("left_wheel_joint", "right_wheel_joint")
         assert (known.arm_gains, known.gripper_gains) == (None, None)
         assert (known.gravity_compensation, known.head_camera) == (False, False)
-        assert known.wheel_params(known.entry.base) == {
-            "joint_names": ["left_wheel_joint", "right_wheel_joint"],
-            "kp": [0.0, 0.0],
-            "kd": [128.0, 128.0],
-            "max_efforts": [16.0, 16.0],
-        }
 
     def test_every_entry_is_the_shared_entry_of_the_same_model(self):
         models = IsaacModels.read()
@@ -307,47 +301,6 @@ class TestGains:
             match=r"grippers of 1 fingers that move of their own, and the description's grippers have \[\]",
         ):
             stood("bare", bare, parse("bare", engine), {}, {}, "base_link")
-
-
-class TestWheelRateLoop:
-    _ROLLING = entry("rolling", wheels=("left_wheel_joint", "right_wheel_joint"))
-    _LOOP = {"kp": 2.0, "ki": 3.0, "max_torque": 4.0}
-
-    def _stood(self, robot, **engine):
-        raw = {"stage": "rolling.usd", "articulation_root": ".", **engine}
-        return stood(robot.model, robot, parse(robot.model, raw), {}, {}, "base_footprint")
-
-    def test_a_base_runs_the_loop_its_entry_gives(self):
-        known = self._stood(self._ROLLING, wheel_rate_loop=self._LOOP)
-        assert known.rolls
-        assert known.wheel_rate_loop == RateLoopGains(kp=2.0, ki=3.0, max_torque=4.0)
-
-    def test_a_base_without_a_loop_is_refused_naming_what_to_write(self):
-        with pytest.raises(
-            ModelEntryError,
-            match=r"the description's base turns \['left_wheel_joint', 'right_wheel_joint'\]: give its wheels "
-            r"`wheel_rate_loop: \{ kp: \.\.\., ki: \.\.\., max_torque: \.\.\. \}`",
-        ):
-            self._stood(self._ROLLING)
-
-    def test_a_model_with_no_base_carries_no_loop(self):
-        with pytest.raises(ModelEntryError, match="the description gives no base: remove it"):
-            self._stood(entry("standing", arms={"arm": ["a"]}), wheel_rate_loop=self._LOOP)
-
-    @pytest.mark.parametrize("key", ["kp", "ki", "max_torque"])
-    @pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan"), True, "1"])
-    def test_each_value_is_a_positive_finite_number(self, key, value):
-        with pytest.raises(ModelEntryError, match=f"wheel_rate_loop.{key} must be a positive finite number"):
-            parse("rolling", {"stage": "r.usd", "articulation_root": ".", "wheel_rate_loop": {**self._LOOP, key: value}})
-
-    def test_a_loop_spells_out_its_three_values(self):
-        loop = {key: value for key, value in self._LOOP.items() if key != "ki"}
-        with pytest.raises(ModelEntryError, match="wheel_rate_loop.ki must be a positive finite number, got None"):
-            parse("rolling", {"stage": "r.usd", "articulation_root": ".", "wheel_rate_loop": loop})
-        with pytest.raises(ModelEntryError, match=r"wheel_rate_loop has unknown key\(s\) \['kd'\]"):
-            parse("rolling", {"stage": "r.usd", "articulation_root": ".", "wheel_rate_loop": {**self._LOOP, "kd": 1.0}})
-        with pytest.raises(ModelEntryError, match="wheel_rate_loop must be an object"):
-            parse("rolling", {"stage": "r.usd", "articulation_root": ".", "wheel_rate_loop": [1.0]})
 
 
 class TestDriveParams:

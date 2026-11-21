@@ -6,10 +6,13 @@ with the integral clamped at what the cap holds.
 
 PhysX drives a joint as a PD controller, implicit over the step: a torque of
 stiffness * (target position - position) + damping * (target velocity -
-velocity), capped at the drive's maximum force. A wheel's drive has no
-stiffness and the loop's proportional gain as its damping, and each step the
-engine sets its target velocity to the rate plus the integral term over that
-gain:
+velocity), capped at the drive's maximum force. A wheel's stage authors its
+loop as the PD on its angle the loop is: the integral gain as the drive's
+stiffness, the proportional gain as its damping and the motor's torque as its
+maximum force (scripts/build_botshare_base.py), which the engine reads as the
+wheel's RateLoopGains when the robot stands. The engine runs the drive with no
+stiffness, the proportional gain as its damping, and each step sets its
+target velocity to the rate plus the integral term over that gain:
 
     damping * (rate + ki / kp * integral - velocity)
         = kp * (rate - velocity) + ki * integral

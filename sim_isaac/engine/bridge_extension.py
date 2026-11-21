@@ -93,9 +93,10 @@ class RobotLimbs:
             gripper.name: IsaacGripperSensor(prim, finger_joints=list(gripper.joints))
             for gripper in self.entry.grippers
         }
-        # The controller of the base's wheels, each on a velocity drive whose
-        # damping is its rate loop's proportional gain; none for a robot that
-        # stands where it is placed.
+        # The controller of the base's wheels, each on a velocity drive: no
+        # stiffness, its rate loop's proportional gain as its damping and its
+        # motor's torque as its maximum force, as its stage authors the loop;
+        # none for a robot that stands where it is placed.
         base = self.entry.base
         self.base_actuator: Optional[IsaacActuatorCtrl] = (
             None
@@ -103,7 +104,12 @@ class RobotLimbs:
             else IsaacActuatorCtrl(
                 prim,
                 joint_names=list(base.wheels),
-                params=known.wheel_params(base),
+                params={
+                    "joint_names": list(base.wheels),
+                    "kp": [0.0] * len(base.wheels),
+                    "kd": [loop.kp for loop in robot.wheel_loops],
+                    "max_efforts": [loop.max_torque for loop in robot.wheel_loops],
+                },
                 name=f"{base.name}_{view}",
             )
         )
@@ -252,18 +258,22 @@ class IsaacBridgeExtension:
                 robot.instance, robot.prim(), robot.known, self._io
             )
 
+    def hold_through_stop(self) -> None:
+        """Readies the robots that roll for a timeline that stops, which sets
+        every body and joint back on its stage: each is stood where its
+        wheels carried it, so the stage holds it there, and its wheels' loops
+        read the stage afresh once it plays again."""
+        self._world.stand_where_rolled()
+        self._wheels = {
+            name: tuple(loop.let_go() for loop in loops) for name, loops in self._wheels.items()
+        }
+
     def unbind(self) -> None:
         """Drops every view. A view of a prim that is edited under it stops
         reading, so this runs before the stage changes, and the bind after
         the change takes the views again. The camera rigs stay: their render
         products ride the robots' prims, and the next bind drops the rigs of
-        robots that left. Each robot that rolls is stood where its wheels
-        carried it first, so the stage the timeline sets back holds it there,
-        and its wheels' loops read the stage afresh once it plays again."""
-        self._world.stand_where_rolled()
-        self._wheels = {
-            name: tuple(loop.let_go() for loop in loops) for name, loops in self._wheels.items()
-        }
+        robots that left."""
         for limbs in self._limbs.values():
             limbs.teardown()
         self._limbs = {}
@@ -332,7 +342,7 @@ class IsaacBridgeExtension:
         setpoint of the robot's base, or rate 0 while it has none."""
         robot = limbs.robot.instance
         wheels = limbs.entry.base.wheels
-        gains = limbs.robot.known.wheel_rate_loop
+        gains = limbs.robot.wheel_loops
         states = limbs.articulation.get_joint_states()
         if states is None:
             return
@@ -340,14 +350,17 @@ class IsaacBridgeExtension:
         setpoint = self._io.latest_base_command(robot)
         rates = (0.0,) * len(wheels) if setpoint is None else setpoint.rates()
         loops = tuple(
-            loop.advanced(positions[limbs.joint_index[wheel]], elapsed_s, gains).driven_at(rate)
-            for loop, wheel, rate in zip(
-                self._wheels.get(robot, (WheelLoop(),) * len(wheels)), wheels, rates, strict=True
+            loop.advanced(positions[limbs.joint_index[wheel]], elapsed_s, gain).driven_at(rate)
+            for loop, wheel, rate, gain in zip(
+                self._wheels.get(robot, (WheelLoop(),) * len(wheels)), wheels, rates, gains, strict=True
             )
         )
         self._wheels[robot] = loops
         limbs.base_actuator.write_velocity_targets(
-            {wheel: loop.velocity_target(gains) for wheel, loop in zip(wheels, loops, strict=True)}
+            {
+                wheel: loop.velocity_target(gain)
+                for wheel, loop, gain in zip(wheels, loops, gains, strict=True)
+            }
         )
 
     def _roll(self, ready: list[RobotLimbs]) -> None:

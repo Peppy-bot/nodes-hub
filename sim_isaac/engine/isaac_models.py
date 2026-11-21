@@ -6,8 +6,9 @@ sim_robot_core's entry of the same model, shared with every engine, and so
 does the effort ceiling of each of its limbs' PhysX drives, the effort limit
 the description gives the drive's joint. What is here is what Isaac Sim alone
 knows about the model: the USD stage it references, where that stage keeps
-its articulation root and its links, the gains of its PhysX drives, the rate
-loop of its wheels, and whether its weight is compensated. The engine reads every entry here when it
+its articulation root and its links, the gains of its limbs' PhysX drives,
+and whether its weight is compensated. A base's wheels run the drives their
+stage authors. The engine reads every entry here when it
 starts, and holds one to a robot's description when the robot attaches. A
 model with no entry here is refused, and none falls back to another's.
 """
@@ -22,9 +23,7 @@ from typing import Optional
 
 from robot_description_py import RobotDescription
 from sim_robot_core.errors import ModelEntryError
-from sim_robot_core.models import Arm, Base, Gripper, ModelEntry, Models
-
-from wheel_loop import RateLoopGains
+from sim_robot_core.models import Arm, Gripper, ModelEntry, Models
 
 ENTRIES_DIR = Path(__file__).parent / "models"
 
@@ -44,13 +43,11 @@ _ENTRY_KEYS = frozenset(
         "link_prims",
         "arm_gains",
         "gripper_gains",
-        "wheel_rate_loop",
         "gravity_compensation",
         "head_camera",
     }
 )
 _GAIN_KEYS = frozenset({"kp", "kd"})
-_RATE_LOOP_KEYS = frozenset({"kp", "ki", "max_torque"})
 
 
 @dataclass(frozen=True)
@@ -93,9 +90,6 @@ class IsaacModel:
     # None for a limb driven by the gains its stage authors.
     arm_gains: Optional[DriveGains]
     gripper_gains: Optional[DriveGains]
-    # The rate loop each wheel of its base runs, None for a model with no
-    # base.
-    wheel_rate_loop: Optional[RateLoopGains]
     gravity_compensation: bool
     # Whether the robot draws the OpenArm v2 head camera pack.
     head_camera: bool
@@ -139,19 +133,6 @@ class IsaacModel:
         its fingers that move of their own; every other finger follows one of
         them and has no drive."""
         return _drive_params(gripper.driven_joints(), self.gripper_gains, self.effort_limits)
-
-    def wheel_params(self, base: Base) -> dict:
-        """What the base's actuator controller applies to the drives of its
-        wheels: no stiffness, the rate loop's proportional gain as their
-        damping, each capped at the loop's torque."""
-        loop = self.wheel_rate_loop
-        count = len(base.wheels)
-        return {
-            "joint_names": list(base.wheels),
-            "kp": [0.0] * count,
-            "kd": [loop.kp] * count,
-            "max_efforts": [loop.max_torque] * count,
-        }
 
 
 def _drive_params(joints: tuple[str, ...], gains: Optional[DriveGains], effort_limits: dict) -> dict:
@@ -244,35 +225,6 @@ def _gains(model: str, key: str, raw) -> Optional[DriveGains]:
     return gains
 
 
-def _rate_loop(model: str, raw) -> Optional[RateLoopGains]:
-    """A wheel's rate loop: each value a positive finite number, since the
-    integral term reaches the drive through kp and is clamped through ki."""
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise _fail(model, f"wheel_rate_loop must be an object, got {raw!r}")
-    _reject_unknown_keys(model, raw, _RATE_LOOP_KEYS, "wheel_rate_loop")
-    values = {}
-    for key in sorted(_RATE_LOOP_KEYS):
-        value = raw.get(key)
-        if not (_is_number(value) and value > 0.0):
-            raise _fail(model, f"wheel_rate_loop.{key} must be a positive finite number, got {value!r}")
-        values[key] = float(value)
-    return RateLoopGains(**values)
-
-
-def _rate_loop_fits(model: str, entry: ModelEntry, loop: Optional[RateLoopGains]) -> None:
-    """Refuses a rate loop for a model with no base, and a base with none."""
-    if entry.base is None and loop is not None:
-        raise _fail(model, "wheel_rate_loop drives a base's wheels, and the description gives no base: remove it")
-    if entry.base is not None and loop is None:
-        raise _fail(
-            model,
-            f"the description's base turns {list(entry.base.wheels)}: give its wheels "
-            "`wheel_rate_loop: { kp: ..., ki: ..., max_torque: ... }`",
-        )
-
-
 def _gains_fit(
     model: str, key: str, joint_counts: list[int], limbs: str, unit: str, gains: Optional[DriveGains]
 ) -> None:
@@ -298,7 +250,6 @@ def parse(model: str, raw: dict) -> dict:
         "link_prims": _link_prims(model, raw.get("link_prims", {})),
         "arm_gains": _gains(model, "arm_gains", raw.get("arm_gains")),
         "gripper_gains": _gains(model, "gripper_gains", raw.get("gripper_gains")),
-        "wheel_rate_loop": _rate_loop(model, raw.get("wheel_rate_loop")),
         "gravity_compensation": _flag(model, raw, "gravity_compensation"),
         "head_camera": _flag(model, raw, "head_camera"),
     }
@@ -332,9 +283,8 @@ def stood(
     fingers of its grippers that move of their own, `effort_limits`, the
     effort limit the robot's description gives each of its joints, cap their
     drives, `position_limits`, the position limits it gives each, are what
-    the stage's joints hold, the entry's rate loop drives the wheels of its
-    base, which a robot with no base has none of, and `root_link`, the
-    description's root link, is its robot frame."""
+    the stage's joints hold, and `root_link`, the description's root link, is
+    its robot frame."""
     _gains_fit(model, "arm_gains", entry.arm_joint_counts(), "arms", "joints", fields["arm_gains"])
     _gains_fit(
         model,
@@ -347,7 +297,6 @@ def stood(
     driven_fingers = [joint for gripper in entry.grippers for joint in gripper.driven_joints()]
     _effort_limits_fit(model, entry.arm_joints(), fields["arm_gains"], effort_limits)
     _effort_limits_fit(model, driven_fingers, fields["gripper_gains"], effort_limits)
-    _rate_loop_fits(model, entry, fields["wheel_rate_loop"])
     return IsaacModel(
         entry=entry,
         root_link=root_link,

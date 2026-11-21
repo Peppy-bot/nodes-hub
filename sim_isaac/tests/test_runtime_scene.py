@@ -19,6 +19,7 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _RUNTIME_COMMAND = Path(__file__).resolve().parents[1] / "scripts" / "runtime_command.py"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
+_FLOOR = "/World/ground"
 _ASSET_ROOT = "https://assets.example/Isaac/6.2"
 _PROPS = {
     "props/blocks/red_block": {
@@ -174,6 +175,34 @@ def test_loading_another_scene_replaces_the_current_one_and_invalidates_the_view
     scene.bridge.unbind.assert_called_once_with()
     scene.bridge.bind.assert_called_once_with()
     assert f"Replacing runtime scene {_SCENE}" in caplog.text
+
+
+def test_a_scene_that_brings_no_floor_keeps_the_stages_floor(scene):
+    scene.world.needs_floor.return_value = True
+
+    _load(scene, "Isaac/Environments/Grid/default_environment.usd")
+
+    scene.world.needs_floor.assert_called_once_with(scene.stage.prims[_SCENE])
+    scene.world.lay_floor.assert_called_once_with(scene.stage)
+    assert scene.stage.removed == []
+
+
+def test_a_scene_that_brings_its_own_floor_takes_the_stages_up_and_a_clear_lays_it_again(scene):
+    scene.stage.DefinePrim(_FLOOR, "Xform")
+    scene.world.needs_floor.return_value = False
+
+    _load(scene, "Isaac/Environments/Simple_Warehouse/warehouse.usd")
+
+    assert _FLOOR not in scene.stage.prims
+    assert scene.stage.removed == [_FLOOR]
+    scene.bridge.unbind.assert_called_once_with()
+    scene.bridge.bind.assert_called_once_with()
+    scene.world.lay_floor.assert_not_called()
+
+    scene.world.needs_floor.return_value = True
+    scene.launcher._runtime_clear_scene()
+
+    scene.world.lay_floor.assert_called_once_with(scene.stage)
 
 
 def test_scene_scale_needs_three_values(scene):

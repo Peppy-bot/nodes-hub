@@ -400,10 +400,19 @@ class TestStageHeldToTheDescription:
 _WHEELS = {"left_wheel_joint": "left_wheel_link", "right_wheel_joint": "right_wheel_link"}
 
 
+# Each wheel's drive as a stage authors it, per degree: stiffness and damping
+# of 64 and 128 N m/rad, and of 32 and 96, and the cap.
+_DRIVES = {
+    "left_wheel_joint": (math.radians(64.0), math.radians(128.0), 16.0),
+    "right_wheel_joint": (math.radians(32.0), math.radians(96.0), 12.0),
+}
+
+
 def _rolling_stage():
     """A botshare base as its entry expects it on the stage: its robot frame,
     base_footprint, a rigid body no joint moves, and each wheel a rigid body
-    on a revolute joint without limits, kept under a scope."""
+    on a revolute joint without limits whose drive is its rate loop, kept
+    under a scope."""
     stage = Usd.Stage.CreateInMemory()
     root = stage.DefinePrim("/World/delta", "Xform")
     for link in ("base_footprint", *_WHEELS.values()):
@@ -412,6 +421,11 @@ def _rolling_stage():
         revolute = UsdPhysics.RevoluteJoint.Define(stage, f"/World/delta/joints/{joint}")
         revolute.CreateBody0Rel().SetTargets(["/World/delta/base_footprint"])
         revolute.CreateBody1Rel().SetTargets([f"/World/delta/{wheel}"])
+        drive = UsdPhysics.DriveAPI.Apply(revolute.GetPrim(), "angular")
+        stiffness, damping, cap = _DRIVES[joint]
+        drive.CreateStiffnessAttr(stiffness)
+        drive.CreateDampingAttr(damping)
+        drive.CreateMaxForceAttr(cap)
     return stage, root, known("botshare_base")
 
 
@@ -461,3 +475,50 @@ class TestARollingStage:
 
         with pytest.raises(RuntimeError, match=r"'hang' hangs its robot frame 'base_footprint' from another body"):
             world.World._hold_to_description(root, model_known)
+
+
+class TestAWheelsLoop:
+    def test_each_wheel_runs_the_loop_its_stage_authors_left_then_right(self):
+        world = world_module()
+        _, root, model_known = _rolling_stage()
+
+        loops = world.World._wheel_loops(root, model_known)
+
+        assert [(loop.kp, loop.ki, loop.max_torque) for loop in loops] == [
+            (pytest.approx(128.0), pytest.approx(64.0), pytest.approx(16.0)),
+            (pytest.approx(96.0), pytest.approx(32.0), pytest.approx(12.0)),
+        ]
+
+    def test_a_robot_with_no_base_runs_no_loop(self):
+        world = world_module()
+        _, root, model_known = _described_stage("so101")
+
+        assert world.World._wheel_loops(root, model_known) == ()
+
+    @pytest.mark.parametrize("attribute", ["stiffness", "damping", "maxForce"])
+    def test_a_wheel_whose_drive_gives_no_positive_value_is_refused(self, attribute):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        prim = stage.GetPrimAtPath("/World/delta/joints/right_wheel_joint")
+        prim.GetAttribute(f"drive:angular:physics:{attribute}").Set(0.0)
+
+        with pytest.raises(RuntimeError, match=r"drives the wheel 'right_wheel_joint' with stiffness, damping and maximum force"):
+            world.World._wheel_loops(root, model_known)
+
+    def test_a_wheel_with_no_drive_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint").RemoveAPI(UsdPhysics.DriveAPI, "angular")
+
+        with pytest.raises(RuntimeError, match=r"drives the wheel 'left_wheel_joint' with stiffness, damping and maximum force \[\]"):
+            world.World._wheel_loops(root, model_known)
+
+    def test_a_wheels_drive_capped_at_nothing_is_refused(self):
+        """A drive left at USD's default force has no cap."""
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        prim = stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint")
+        prim.GetAttribute("drive:angular:physics:maxForce").Clear()
+
+        with pytest.raises(RuntimeError, match=r"'left_wheel_joint' with stiffness, damping and maximum force \[.*inf\]"):
+            world.World._wheel_loops(root, model_known)
