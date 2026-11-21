@@ -750,7 +750,7 @@ impl Base {
     fn at_rest(&self, now_ns: i64) -> bool {
         self.wheels_report_at(now_ns)
             && self.limits.last_velocity() == PlanarTwist::ZERO
-            && self.rest.rests(self.config.axes.rest_bounds())
+            && self.rest.rests(self.config.rest.bounds())
     }
 
     /// Whether the wheels report, as of `now_ns`: base_state's motion sensing
@@ -1222,7 +1222,7 @@ impl Base {
         }
         let (position, orientation) = transforms::position_and_orientation(pose);
         let (linear_velocity, angular_velocity) = ([linear, 0.0, 0.0], [0.0, 0.0, angular]);
-        let mode = match self.rest.rests(self.config.axes.rest_bounds()) {
+        let mode = match self.rest.rests(self.config.rest.bounds()) {
             true => "standing",
             false => "moving",
         };

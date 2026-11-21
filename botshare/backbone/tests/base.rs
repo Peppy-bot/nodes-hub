@@ -19,9 +19,9 @@ use helpers::{
     ANCHOR_BOUND_RAD, ANGULAR_ACCELERATION_RAD_S2, ANGULAR_DEADBAND_RAD_S,
     ANGULAR_DECELERATION_RAD_S2, ANSWER_BUDGET, BaseState, DT, LEADER_STREAMING_WINDOW_NS,
     LINEAR_ACCELERATION_M_S2, LINEAR_DEADBAND_M_S, LINEAR_DECELERATION_M_S2,
-    MAX_ANGULAR_SPEED_RAD_S, MAX_LINEAR_SPEED_M_S, MODEL, REPORTING_SILENT_STEPS,
-    REST_ANGULAR_RAD_S, REST_LINEAR_M_S, Rig, START_NS, STEP_NS, WHEEL_LINKS, WHEEL_RADIUS_M,
-    WHEEL_SEPARATION_M, drive_goal, forward_speed, move_goal, ns, target, turn_rate, velocity,
+    MAX_ANGULAR_SPEED_RAD_S, MAX_LINEAR_SPEED_M_S, MODEL, REPORTING_SILENT_STEPS, REST_LINEAR_M_S,
+    Rig, START_NS, STEP_NS, WHEEL_LINKS, WHEEL_RADIUS_M, WHEEL_SEPARATION_M, drive_goal,
+    forward_speed, move_goal, ns, target, turn_rate, velocity,
 };
 use peppygen::fixtures::exposed_actions::base_motion::{drive_base, move_base};
 use peppygen::fixtures::exposed_services::base_state::describe_base;
@@ -1653,6 +1653,30 @@ async fn a_goal_after_one_that_failed_is_refused_until_the_base_rests() {
     rig.shutdown().await;
 }
 
+// base_state's rest bounds the turn rate by the turn of the two wheels each at
+// the rest velocity, 2 x rest_velocity / separation: wheels creeping opposite
+// ways, each at 0.8 of the rest velocity, keep the base standing, and at 1.2
+// of it the base moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_of_wheels_each_within_the_rest_velocity_rests_and_one_past_it_moves() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    let rest_rate = 2.0 * REST_LINEAR_M_S / WHEEL_SEPARATION_M;
+    for (share, mode) in [(0.8, "standing"), (1.2, "moving")] {
+        let creep = share * REST_LINEAR_M_S / WHEEL_RADIUS_M * DT;
+        // More steps than the 0.2 s of base_states the rest judges.
+        let mut last = None;
+        for _ in 0..6 {
+            rig.wheels = [rig.wheels[0] - creep, rig.wheels[1] + creep];
+            last = Some(rig.step().await);
+        }
+        let state = last.expect("the wheels crept");
+        let turn = state.twist.angular_velocity[2];
+        assert_close(turn, share * rest_rate, "the turn rate");
+        assert_eq!(state.mode, mode, "turning at {turn} rad/s");
+    }
+    rig.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn describe_base_answers_the_limits_and_rest_bounds_of_its_parameters_and_its_models_outline()
 {
@@ -1684,6 +1708,8 @@ async fn describe_base_answers_the_limits_and_rest_bounds_of_its_parameters_and_
             [REST_LINEAR_M_S, 0.0],
         ]
     );
+    // The turn's rest bound is the turn of the two wheels each at the rest
+    // velocity, as the odometry reads it.
     let yaw = &base.angular_limits;
     assert_eq!(
         [
@@ -1700,7 +1726,7 @@ async fn describe_base_answers_the_limits_and_rest_bounds_of_its_parameters_and_
             ANGULAR_ACCELERATION_RAD_S2,
             ANGULAR_DECELERATION_RAD_S2,
             ANGULAR_DEADBAND_RAD_S,
-            REST_ANGULAR_RAD_S,
+            2.0 * REST_LINEAR_M_S / WHEEL_SEPARATION_M,
         ]
     );
     // The model's outline: its chassis, 0.78 m by 0.58 m, which holds every

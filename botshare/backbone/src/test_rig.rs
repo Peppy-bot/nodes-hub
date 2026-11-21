@@ -29,7 +29,6 @@ pub const AXES: BaseAxes = BaseAxes {
         max_acceleration: LINEAR_ACCELERATION_M_S2,
         max_deceleration: LINEAR_DECELERATION_M_S2,
         deadband: LINEAR_DEADBAND_M_S,
-        rest: REST_LINEAR_M_S,
     },
     yaw: AxisSpec {
         min_velocity: -MAX_ANGULAR_SPEED_RAD_S,
@@ -37,6 +36,5 @@ pub const AXES: BaseAxes = BaseAxes {
         max_acceleration: ANGULAR_ACCELERATION_RAD_S2,
         max_deceleration: ANGULAR_DECELERATION_RAD_S2,
         deadband: ANGULAR_DEADBAND_RAD_S,
-        rest: REST_ANGULAR_RAD_S,
     },
 };

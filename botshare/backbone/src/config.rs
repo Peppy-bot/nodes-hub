@@ -1,11 +1,12 @@
 //! What the node runs on: its parameters, parsed once at setup ([`BaseParameters`]),
-//! the limits of the base's motion along x and of its yaw, each with its
-//! rest bound, as describe_base answers them and base_state's limiter holds
-//! every velocity to, and the odometry's window; and, once the robot's
-//! initializer names the robot's model, the model's base ([`BaseModel`])
-//! with them ([`BaseConfig`]): the wheel geometry and the odometry it starts
-//! from, and the outline. A launch with a value the node cannot run on is
-//! refused at setup, by parameter name.
+//! the limits of the base's motion along x and of its yaw, as describe_base
+//! answers them and base_state's limiter holds every velocity to, the rest
+//! velocity, and the odometry's window; and, once the robot's initializer
+//! names the robot's model, the model's base ([`BaseModel`]) with them
+//! ([`BaseConfig`]): the wheel geometry and the odometry it starts from, the
+//! rest bounds the geometry gives the rest velocity ([`RestBounds`]), and the
+//! outline. A launch with a value the node cannot run on is refused at setup,
+//! by parameter name.
 
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
@@ -61,8 +62,7 @@ pub enum ConfigError {
 
 /// The limits of one axis of the base's motion, as describe_base answers
 /// them (m/s and m/s^2 along x or y, rad/s and rad/s^2 for yaw): its range,
-/// its acceleration, deceleration and deadband, and `rest`, the largest
-/// magnitude of the measured velocity at which the base counts as at rest.
+/// its acceleration, deceleration and deadband.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AxisSpec {
     pub min_velocity: f64,
@@ -70,19 +70,17 @@ pub struct AxisSpec {
     pub max_acceleration: f64,
     pub max_deceleration: f64,
     pub deadband: f64,
-    pub rest: f64,
 }
 
 impl AxisSpec {
     /// The axis a differential base does not move along, y: its range,
-    /// acceleration, deceleration, deadband and rest are 0.
+    /// acceleration, deceleration and deadband are 0.
     pub const STILL: AxisSpec = AxisSpec {
         min_velocity: 0.0,
         max_velocity: 0.0,
         max_acceleration: 0.0,
         max_deceleration: 0.0,
         deadband: 0.0,
-        rest: 0.0,
     };
 
     /// The axis `name` as base_state's limiter takes it: control_core's
@@ -149,10 +147,36 @@ impl BaseAxes {
         })
         .map_err(ConfigError::Smoothing)
     }
+}
+
+/// base_state's rest bounds of the base, as describe_base answers them: the
+/// largest magnitude of the measured velocity along x (m/s) and of the
+/// measured turn rate (rad/s) at which the base counts as at rest; along y,
+/// which a differential base does not move along, 0.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RestBounds {
+    pub velocity: f64,
+    pub rate: f64,
+}
+
+impl RestBounds {
+    /// The rest bounds of a differential base on `wheels` whose wheels each
+    /// measure at most `rest_velocity` (m/s) along the floor while the base
+    /// stands. The odometry reads the velocity along x as the mean of the two
+    /// wheel speeds and the turn rate as their difference over the wheel
+    /// separation, so a reading that keeps each wheel within
+    /// ±`rest_velocity` gives a velocity within `rest_velocity` and a turn
+    /// rate within 2 × `rest_velocity` / separation.
+    pub fn of_wheels(rest_velocity: f64, wheels: &WheelGeometry) -> Self {
+        Self {
+            velocity: rest_velocity,
+            rate: 2.0 * rest_velocity / wheels.wheel_separation_m.get(),
+        }
+    }
 
     /// The rest bound of each axis of base_states' velocity: x, y and yaw.
-    pub fn rest_bounds(&self) -> [f64; 3] {
-        [self.x.rest, AxisSpec::STILL.rest, self.yaw.rest]
+    pub fn bounds(&self) -> [f64; 3] {
+        [self.velocity, 0.0, self.rate]
     }
 }
 
@@ -181,6 +205,9 @@ impl LimiterSettings {
 #[derive(Debug)]
 pub struct BaseParameters {
     pub axes: BaseAxes,
+    /// x's rest_velocity (m/s): the largest speed each wheel measures along
+    /// the floor while the base stands.
+    rest_velocity: f64,
     pub limiter: LimiterSettings,
     /// One step of base_state's limiter on the node's clock (ns).
     pub step_ns: i64,
@@ -199,6 +226,9 @@ pub struct BaseConfig {
     /// The bundled model the base is built from.
     pub model: &'static robot_description::Model,
     pub axes: BaseAxes,
+    /// base_state's rest bounds, the turn rate's from the wheel geometry
+    /// ([`RestBounds::of_wheels`]).
+    pub rest: RestBounds,
     pub wheels: WheelGeometry,
     /// The odometry at the origin of the odometry frame, its rolling window
     /// parsed: the odometry every odometry frame begins from.
@@ -255,7 +285,6 @@ impl BaseParameters {
                 max_acceleration: x.max_acceleration,
                 max_deceleration: x.max_deceleration,
                 deadband: x.deadband,
-                rest: positive("x.rest_velocity", x.rest_velocity)?,
             },
             yaw: AxisSpec {
                 min_velocity: angular.min_rate,
@@ -263,9 +292,9 @@ impl BaseParameters {
                 max_acceleration: angular.max_acceleration,
                 max_deceleration: angular.max_deceleration,
                 deadband: angular.deadband,
-                rest: positive("angular.rest_rate", angular.rest_rate)?,
             },
         };
+        let rest_velocity = positive("x.rest_velocity", x.rest_velocity)?;
         // What move_base asks of the axes comes first, so an axis of range 0
         // to 0 is told what range to give before the limiter judges its other
         // limits.
@@ -289,6 +318,7 @@ impl BaseParameters {
         let lookup_timeout = wait_parameter("lookup_timeout_s", params.lookup_timeout_s)?;
         Ok(Self {
             axes,
+            rest_velocity,
             limiter,
             step_ns,
             odometry_window,
@@ -315,6 +345,7 @@ impl BaseParameters {
         Ok(BaseConfig {
             model: bundled,
             axes: self.axes,
+            rest: RestBounds::of_wheels(self.rest_velocity, &base.wheels),
             wheels: base.wheels,
             odometry,
             limiter: self.limiter.clone(),

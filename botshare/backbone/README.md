@@ -181,7 +181,9 @@ the node publishes neither.
 
 The base rests while the wheels report and each axis of every `base_states`
 whose stamp lies within 0.2 s of the newest lies within its rest bound,
-`x.rest_velocity`, 0 along y, and `angular.rest_rate` (`rest.rs`).
+`x.rest_velocity`, 0 along y, and for the turn rate 2 × `x.rest_velocity` /
+the wheel separation, the turn of the two wheels each at `x.rest_velocity` as
+the odometry reads it (`config.rs`'s `RestBounds`, `rest.rs`).
 
 The node publishes the transforms it measures on `transforms`, each set in a
 message of its own (`transforms.rs`). Before each `base_states` goes the
@@ -268,8 +270,9 @@ that sends its next goal on the result is admitted.
 
 `describe_base` answers the base's name, `base`, the name of its wheels'
 pairing slot, its odometry source, `measured`, its linear_limits along x and
-y, y 0 to 0, and its angular_limits, each with its rest bound, and the four
-corners of its footprint, counterclockwise, in base_footprint at every time.
+y, y 0 to 0, and its angular_limits, each with its rest bound, the turn's
+derived from x's as above, and the four corners of its footprint,
+counterclockwise, in base_footprint at every time.
 
 ## Module map
 
@@ -299,13 +302,13 @@ corners of its footprint, counterclockwise, in base_footprint at every time.
 
 See `peppy.json5` for the commented list and each range the node enforces.
 Every parameter but `cache_window_s` is a required launcher argument: the
-limits of x and of the turn (`angular`), each with its rest bound, the
-limiter's rate, the odometry window, the rotate-to-heading angle of
-move_base's drive, how long a robot stop waits for the control loop, and how
-long a placement waits for the robot's tree. `cache_window_s` keeps tf2's 10 s
-by default. The `base` slot is required and names the wheels' follower; the
-`leader_base` slot holds one leader or none. `robot_init`, `robot_identity`
-and `other_transforms` bind to the robot's initializer.
+limits of x, with its rest bound, and of the turn (`angular`), the limiter's
+rate, the odometry window, the rotate-to-heading angle of move_base's drive,
+how long a robot stop waits for the control loop, and how long a placement
+waits for the robot's tree. `cache_window_s` keeps tf2's 10 s by default. The
+`base` slot is required and names the wheels' follower; the `leader_base` slot
+holds one leader or none. `robot_init`, `robot_identity` and
+`other_transforms` bind to the robot's initializer.
 
 ## Build, run, test
 

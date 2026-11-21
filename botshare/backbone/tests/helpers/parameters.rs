@@ -13,9 +13,8 @@ pub const ANGULAR_ACCELERATION_RAD_S2: f64 = 3.0;
 pub const ANGULAR_DECELERATION_RAD_S2: f64 = 4.0;
 pub const LINEAR_DEADBAND_M_S: f64 = 0.005;
 pub const ANGULAR_DEADBAND_RAD_S: f64 = 0.01;
-/// The rest velocity and rest rate, each axis's deadband.
+/// The rest velocity, x's deadband.
 pub const REST_LINEAR_M_S: f64 = LINEAR_DEADBAND_M_S;
-pub const REST_ANGULAR_RAD_S: f64 = ANGULAR_DEADBAND_RAD_S;
 /// The limiter's rate: a step every 50 ms.
 pub const SMOOTHING_FREQUENCY_HZ: f64 = 20.0;
 /// Nav2's regulated pure pursuit's default `rotate_to_heading_min_angle`,
@@ -49,7 +48,6 @@ pub fn params() -> peppygen::Parameters {
             max_acceleration: ANGULAR_ACCELERATION_RAD_S2,
             max_deceleration: ANGULAR_DECELERATION_RAD_S2,
             deadband: ANGULAR_DEADBAND_RAD_S,
-            rest_rate: REST_ANGULAR_RAD_S,
         },
         smoothing_frequency_hz: SMOOTHING_FREQUENCY_HZ,
         odometry_velocity_window: 1,

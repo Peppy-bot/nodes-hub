@@ -19,7 +19,7 @@ fn assert_refused(spoiled: &[(&str, Spoil)], refused: fn(&ConfigError, &str) -> 
 }
 
 // The parameters with the bundled base's model: the limiter's step, the
-// axes with their rest bounds, the wheels and the outline of the model.
+// axes, the rest velocity, the wheels and the outline of the model.
 #[test]
 fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
     let parameters = BaseParameters::parse(&parameters()).expect("the parameters are taken");
@@ -28,7 +28,7 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
         .expect("the bundled base");
     assert_eq!(config.step_ns, 50_000_000);
     assert_eq!(config.axes.x.profile().positive_speed, 0.5);
-    assert_eq!(config.axes.rest_bounds(), [0.005, 0.0, 0.01]);
+    assert_eq!(config.rest.velocity, 0.005);
     assert_eq!(
         config.wheels,
         WheelGeometry::parse(0.4, 0.1, 0.1).expect("a wheel geometry")
@@ -45,12 +45,29 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
     );
 }
 
+// base_state's rest bound of the turn rate is the turn of the two wheels each
+// at the rest velocity, 2 x rest_velocity / separation: 0.1 rad/s for the
+// bundled base's 0.4 m track at 0.02 m/s.
+#[test]
+fn the_rest_rate_is_the_turn_of_both_wheels_at_the_rest_velocity() {
+    let mut params = parameters();
+    params.x.rest_velocity = 0.02;
+    let rest = BaseParameters::parse(&params)
+        .expect("the parameters are taken")
+        .configure("botshare_base", SystemTime::UNIX_EPOCH)
+        .expect("the bundled base")
+        .rest;
+    assert_eq!(rest.velocity, 0.02);
+    assert!((rest.rate - 0.1).abs() < 1e-15, "{rest:?}");
+    assert_eq!(rest.bounds(), [0.02, 0.0, rest.rate]);
+}
+
 #[test]
 fn a_positive_number_not_above_zero_is_refused_by_name() {
     assert_refused(
         &[
             ("x.rest_velocity", |p| p.x.rest_velocity = 0.0),
-            ("angular.rest_rate", |p| p.angular.rest_rate = -0.1),
+            ("x.rest_velocity", |p| p.x.rest_velocity = -0.1),
             ("rotate_to_heading_min_angle_rad", |p| {
                 p.rotate_to_heading_min_angle_rad = 0.0
             }),

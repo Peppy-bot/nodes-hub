@@ -24,6 +24,7 @@ use crate::transforms::ROBOT_FRAME;
 /// its outline in the robot frame, which holds at every time.
 fn base_description(config: &BaseConfig) -> describe_base::Response {
     let (x, y, yaw) = (config.axes.x, AxisSpec::STILL, config.axes.yaw);
+    let [rest_x, rest_y, rest_rate] = config.rest.bounds();
     describe_base::Response::new(
         BASE_NAME.to_string(),
         "measured".to_string(),
@@ -33,7 +34,7 @@ fn base_description(config: &BaseConfig) -> describe_base::Response {
             max_acceleration: [x.max_acceleration, y.max_acceleration],
             max_deceleration: [x.max_deceleration, y.max_deceleration],
             deadband: [x.deadband, y.deadband],
-            rest_velocity: [x.rest, y.rest],
+            rest_velocity: [rest_x, rest_y],
         },
         describe_base::ResponseAngularLimits {
             min_rate: yaw.min_velocity,
@@ -41,7 +42,7 @@ fn base_description(config: &BaseConfig) -> describe_base::Response {
             max_acceleration: yaw.max_acceleration,
             max_deceleration: yaw.max_deceleration,
             deadband: yaw.deadband,
-            rest_rate: yaw.rest,
+            rest_rate,
         },
         describe_base::ResponseFootprint {
             frame: ROBOT_FRAME.to_owned(),
