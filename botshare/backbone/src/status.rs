@@ -75,11 +75,14 @@ impl BaseStatus {
         if follower::LEADER_STREAM.streams(state.setpoint_ns, now_ns) {
             return Err(Failure::new(FailureKind::LeaderStreaming, LEADER_STREAMS));
         }
-        if state.resting || !slot.claim() {
+        if state.resting {
             return Err(Failure::new(FailureKind::PreconditionFailed, GOAL_RUNS));
         }
+        let Some(release) = slot.claim() else {
+            return Err(Failure::new(FailureKind::PreconditionFailed, GOAL_RUNS));
+        };
         Ok(Admitted {
-            _release: slot.release_on_drop(),
+            _release: release,
             admitted_ns: now_ns,
             odometry_start,
         })

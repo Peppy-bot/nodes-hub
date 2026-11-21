@@ -5,7 +5,7 @@
 //! refused with `rejected` naming the value as placed and what to send.
 
 use control_core::geometry::{GeometryError, PLANAR_TOLERANCE, Pose, Stamped, Twist};
-use control_core::move_seconds::MoveSeconds;
+use control_core::move_seconds::{MAX_MOVE_DURATION_S, MoveSeconds};
 use control_core::planar_pose::PlanarPose;
 use control_core::positive_finite::PositiveFinite;
 use control_core::robot_tree::Placer;
@@ -16,10 +16,6 @@ use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 
 use crate::config::{AxisSpec, BaseAxes};
 use crate::move_control::{MovePlan, Tolerances, plan_move};
-
-/// The longest a goal may be asked to take or may plan, and to settle after
-/// its planned end (s): the bound base_motion states.
-const MAX_MOVE_DURATION_S: f64 = 60.0;
 
 /// What to send in place of a target off the floor plane, as base_motion says.
 const FLOOR_TARGET: &str = "send a target in odom or the robot frame with a position [x, y, 0] \
@@ -73,15 +69,6 @@ pub struct MoveRequest {
     pub settle_timeout_ns: i64,
     /// The node's `rotate_to_heading_min_angle_rad` (rad).
     pub rotate_to_heading_min_angle: f64,
-}
-
-/// The seconds of `field` off the wire, from 0 to base_motion's bound.
-fn move_seconds(field: &str, value: f64) -> Result<f64, String> {
-    MoveSeconds::from_wire(field, value, MAX_MOVE_DURATION_S).map(MoveSeconds::get)
-}
-
-fn tolerance(field: &str, value: f64) -> Result<f64, String> {
-    PositiveFinite::parse_field(field, value).map(PositiveFinite::get)
 }
 
 /// The velocity `value` of `field`, placed in the robot frame, within `range`
@@ -150,13 +137,9 @@ pub fn drive_fields(
     data: &drive_base::GoalRequestData,
     placer: &Placer,
 ) -> Result<DriveFields, String> {
-    let hold_duration_s = MoveSeconds::positive_from_wire(
-        "hold_duration_s",
-        data.hold_duration_s,
-        MAX_MOVE_DURATION_S,
-    )?
-    .get();
-    let settle_timeout_s = move_seconds("settle_timeout_s", data.settle_timeout_s)?;
+    let hold_duration_s =
+        MoveSeconds::positive_from_wire("hold_duration_s", data.hold_duration_s)?.get();
+    let settle_timeout_s = MoveSeconds::from_wire("settle_timeout_s", data.settle_timeout_s)?.get();
     let velocity = &data.velocity;
     let velocity = Twist::parse(velocity.linear_velocity, velocity.angular_velocity)
         .and_then(|twist| {
@@ -218,18 +201,20 @@ pub fn move_fields(
     data: &move_base::GoalRequestData,
     placer: &Placer,
 ) -> Result<MoveFields, String> {
-    let duration_s = move_seconds("duration_s", data.duration_s)?;
+    let duration_s = MoveSeconds::from_wire("duration_s", data.duration_s)?.get();
     let tolerances = Tolerances {
-        position: tolerance(
+        position: PositiveFinite::parse_field(
             "settle_position_tolerance_m",
             data.settle_position_tolerance_m,
-        )?,
-        yaw: tolerance(
+        )?
+        .get(),
+        yaw: PositiveFinite::parse_field(
             "settle_orientation_tolerance_rad",
             data.settle_orientation_tolerance_rad,
-        )?,
+        )?
+        .get(),
     };
-    let settle_timeout_s = move_seconds("settle_timeout_s", data.settle_timeout_s)?;
+    let settle_timeout_s = MoveSeconds::from_wire("settle_timeout_s", data.settle_timeout_s)?.get();
     let target = &data.target;
     let target = Pose::parse(target.position, target.orientation)
         .and_then(|pose| {
@@ -547,7 +532,7 @@ mod tests {
         );
         assert_eq!(
             no_tolerance,
-            Err("settle_position_tolerance_m must be a positive number, got 0".to_string())
+            Err("settle_position_tolerance_m must be a positive finite number, got 0".to_string())
         );
         let no_unit = move_with(
             &AXES,

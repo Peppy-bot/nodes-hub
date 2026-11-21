@@ -124,10 +124,11 @@ fn a_base_of_two_wheels_and_a_chassis_gives_its_geometry() {
 #[test]
 fn a_base_without_two_wheels_is_refused_naming_them() {
     let one = CHASSIS.to_owned() + &wheel("left", "0 0.2 0.05", "0 1 0", 0.05);
-    assert_eq!(
-        refusal(&one),
-        "its wheels are its continuous joints, two of them, each on a link that fixed joints alone join to its root link base_footprint, and it has [\"left\"]"
-    );
+    let named = NoDifferentialBase::WheelCount {
+        root: "base_footprint".to_owned(),
+        found: vec!["left".to_owned()],
+    };
+    assert_eq!(refusal(&one), named.to_string());
 }
 
 #[test]
