@@ -34,7 +34,7 @@ NODES_DIR="$(cd "${IMAGES_DIR}/.." && pwd)"
 
 # ── Version manifest ──────────────────────────────────────────────────────────
 ISAAC_VERSION="6.2.0.1"  # mirrors nvcr.io/nvidia/isaac-sim upstream version
-ISAAC_IMAGE_REV="3"      # bump when Isaac image content changes without an upstream version bump
+ISAAC_IMAGE_REV="9"      # bump when Isaac image content changes without an upstream version bump
 MUJOCO_IMAGE_REV="10"    # bump when MuJoCo image content changes without an upstream version bump
 IMAGE_NAMESPACE="peppybot"  # Docker Hub namespace these base images are pushed to
 # The mujoco PyPI version that the MuJoCo image installs: the pin of
@@ -209,4 +209,4 @@ echo "    Commit the updated apptainer.def files, then restage + rebuild each si
 echo "    node. A bare 'peppy node build' reuses the snapshot staged by the last"
 echo "    'peppy node add', which predates the From: restamp above:"
 echo "      peppy node add \"${NODES_DIR}/sim_mujoco\" -sb --force"
-echo "      (cd \"${NODES_DIR}/sim_isaac\" && peppy node add . -sb)"
+echo "      peppy node add \"${NODES_DIR}/sim_isaac\" -sb --force"

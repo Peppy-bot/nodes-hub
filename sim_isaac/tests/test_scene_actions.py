@@ -12,7 +12,6 @@ error reply."""
 
 import asyncio
 import contextlib
-import importlib
 import json
 import logging
 import math
@@ -26,10 +25,11 @@ from unittest.mock import Mock, call
 import pyjson5
 import pytest
 from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion
+from sim_robot_core.object_state import ObjectRecord
 from sim_robot_core.world import UnknownFrame, base_target, in_world
 
 from _scene_actions import scene_actions_module
-from _world import refusal_of
+from _world import known, refusal_of, world_module
 from runtime_fakes import CANCEL_REASONS
 
 
@@ -75,14 +75,6 @@ def _target(position, orientation=None, frame="world", timestamp=None):
 _QUARTER_TURN = [0.0, 0.0, 2 ** -0.5, 2 ** -0.5]
 
 
-class _Robot(SimpleNamespace):
-    """A robot as world.py reports it: the name it stands under, its model,
-    and where."""
-
-    def prim(self):
-        return f"/World/{self.instance}"
-
-
 class _World:
     """The stage's robots, as SceneActionIO reads them, and each move it
     hands the stage, as the robot's name and its target."""
@@ -93,6 +85,9 @@ class _World:
 
     def robots(self):
         return list(self._robots)
+
+    def listing(self):
+        return None, list(self._robots)
 
     def move(self, name, target):
         self.moved.append((name, target))
@@ -110,31 +105,36 @@ class _Registry:
 
 
 def _world(*robots):
-    """The stage's robots, each as (instance, model, position, orientation),
-    the pose of its base in world."""
+    """The stage's robots, as world.py holds them, each given as (instance,
+    model, position, orientation), the pose of its base in world, at rest, or
+    with its linear and angular velocities after them."""
+    at_rest = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    robot = world_module().Robot
     return _World(
-        _Robot(
+        robot(
             instance=instance,
-            model=model,
+            known=known(model),
             placement=Pose.parse(position, orientation),
+            linear_velocity=(moving or [at_rest])[0][0],
+            angular_velocity=(moving or [at_rest])[0][1],
         )
-        for instance, model, position, orientation in robots
+        for instance, model, position, orientation, *moving in robots
     )
 
 
 class FakeStamps:
     """SimTopicIO's stamps: a capture's, None while the engine cannot stamp
-    yet, and the robots' placements'."""
+    yet, and the world's records': the step that recorded them, or a
+    capture's before the first such step."""
 
     def __init__(self):
         self.now_s = 10.0
-        self.placements_s = 10.0
 
     def capture_timestamp_s(self):
         return self.now_s
 
-    def placement_timestamp_s(self):
-        return self.placements_s
+    def placement_timestamp_s(self, recorded_s):
+        return self.capture_timestamp_s() if recorded_s is None else recorded_s
 
 
 class FakeReader:
@@ -170,7 +170,7 @@ def provider(monkeypatch):
     io = module.SceneActionIO(object(), Mock(), stamps, world, _Registry("alpha"))
     # The stage by object_id: where the launcher put each object.
     stage = {}
-    reader = FakeReader(stage, importlib.import_module("object_state").ObjectRecord)
+    reader = FakeReader(stage, ObjectRecord)
     io._object_reader = reader
     launcher = Mock()
     launcher._runtime_spawn_isaac_asset.side_effect = lambda command: stage.__setitem__(command["name"], command["position"])
@@ -536,7 +536,7 @@ def test_load_scene_rejects_unknown_or_non_scene_assets_before_touching_the_stag
 
 
 def test_the_listing_names_every_robot_the_stage_stands_in_world_as_of_now(provider):
-    provider.stamps.placements_s = 12.5
+    provider.stamps.now_s = 12.5
 
     response = provider.io._handle_get_robots(None)
 
@@ -546,6 +546,29 @@ def test_the_listing_names_every_robot_the_stage_stands_in_world_as_of_now(provi
         "robot": "alpha", "model": "openarm_v2", "position": [0.0, 0.0, 0.0], "orientation": [0.0, 0.0, 0.0, 1.0],
         "attached": True,
     }
+
+
+def test_a_listing_pairs_the_stamp_of_the_step_that_recorded_a_rolling_robot_with_its_pose(provider):
+    """A listing answered between a step's record_engine_time and its roll
+    gives the previous step with its pose; one after the roll, the new pair."""
+    module = world_module()
+    world = module.World(head_camera_pack=None)
+    world._robots = {
+        "india": module.Robot(instance="india", known=known("botshare_base"), placement=Pose.parse((0.0, 0.0, 0.0), IDENTITY))
+    }
+    provider.io._world = world
+    provider.io._robots = _Registry("india")
+    step_s = 1.0 / 60.0
+    world.roll(1.0, {"india": (Pose.parse((0.1, 0.0, 0.0), IDENTITY), (0.15, 0.0, 0.0), (0.0, 0.0, 0.0))})
+    # The next step's engine time is recorded; its roll has not run yet.
+    provider.stamps.now_s = 1.0 + step_s
+
+    between = provider.io._handle_get_robots(None)
+
+    assert (between.timestamp, between.robots[0].position) == (1.0, [0.1, 0.0, 0.0])
+    world.roll(1.0 + step_s, {"india": (Pose.parse((0.1025, 0.0, 0.0), IDENTITY), (0.15, 0.0, 0.0), (0.0, 0.0, 0.0))})
+    after = provider.io._handle_get_robots(None)
+    assert (after.timestamp, after.robots[0].position) == (1.0 + step_s, [0.1025, 0.0, 0.0])
 
 
 def test_the_object_states_give_each_standing_robot_at_its_placement_at_rest(provider):
@@ -571,6 +594,25 @@ def test_the_object_states_give_each_standing_robot_at_its_placement_at_rest(pro
             "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
         },
     ]
+
+
+def test_a_robot_that_rolls_is_recorded_where_its_wheels_carried_it_moving_as_they_move_it(provider):
+    """The record is the robot's placement and velocities as the stage last
+    read them, the step the snapshot is stamped with."""
+    provider.io._world = _world(
+        ("delta", "botshare_base", (2.0, 1.0, 0.0), _QUARTER_TURN, ((0.0, 0.3, 0.0), (0.0, 0.0, 0.5))),
+    )
+    provider.io._robots = _Registry("delta")
+    provider.io.capture_object_states()
+
+    (robot,) = provider.io._handle_get_object_states(None).robots
+
+    half = math.sqrt(0.5)
+    assert vars(robot) == {
+        "robot": "delta", "model": "botshare_base", "position": [2.0, 1.0, 0.0],
+        "orientation": [0.0, 0.0, pytest.approx(half), pytest.approx(half)],
+        "linear_velocity": [0.0, 0.3, 0.0], "angular_velocity": [0.0, 0.0, 0.5],
+    }
 
 
 def test_the_object_states_give_a_robot_from_when_the_engine_has_stood_it(provider):

@@ -127,6 +127,8 @@ def loop(monkeypatch):
     # launcher is handed one, along with the queue of joins and departures it
     # drains on its own thread.
     state.world = Mock()
+    # No edit asks for the floor to be judged in these loops.
+    state.world.take_floor_judgment.return_value = False
     state.edits = Mock()
     state.edits.drain.side_effect = lambda: phase("edits")
     state.launcher = module.SimLauncher(
@@ -245,6 +247,45 @@ def test_readiness_waits_for_bridge_setup_but_queues_run_each_frame(loop):
         + ["wait"] + _PHASES
     )
     loop.ready.set.assert_called_once_with()
+
+
+def _remove_in_the_first_frame(loop, phase: str, path: str):
+    """The loop's `phase`, which removes the prim at `path` in the first
+    frame; the bridge's view calls go on the loop's trace."""
+    stage = Mock()
+    stage.GetPrimAtPath.return_value.IsValid.return_value = True
+    loop.bridge.unbind.side_effect = lambda: loop.trace.append("unbind")
+    loop.bridge.bind.side_effect = lambda: loop.trace.append("bind")
+    loop.bridge.resolve.side_effect = lambda update, steps: loop.trace.append("resolve")
+
+    def run(*_):
+        loop.trace.append(phase)
+        if len(loop.starts) == 1:
+            assert loop.launcher._remove_prim(stage, path)
+
+    return run
+
+
+def test_a_removal_has_its_views_read_once_after_the_next_update_and_before_the_step(loop):
+    loop.scene.process_pending.side_effect = _remove_in_the_first_frame(loop, "scene", "/World/RuntimeScene")
+    loop.launcher._run_loop()
+
+    assert loop.trace == (
+        ["update", "bridge", "ready", "runtime", "scene", "unbind", "bind", "edits", "forces"]
+        + ["wait", "update", "resolve", "bridge", "runtime", "scene", "edits", "forces"]
+        + ["wait"] + _PHASES
+    )
+    loop.bridge.resolve.assert_called_once_with(loop.app.update, loop.module._STAGE_SETTLE_STEPS)
+
+
+def test_the_floors_take_up_has_the_views_read_before_the_step_of_its_frame(loop, monkeypatch):
+    monkeypatch.setattr(loop.launcher, "_judge_floor", _remove_in_the_first_frame(loop, "judge", "/World/ground"))
+    loop.frames = 1
+    loop.launcher._run_loop()
+
+    assert loop.trace == [
+        "update", "judge", "unbind", "bind", "resolve", "bridge", "ready", "runtime", "scene", "edits", "forces",
+    ]
 
 
 @pytest.mark.parametrize("stalled_phase", ["update", "bridge", "scene"])
@@ -465,3 +506,24 @@ def test_robots_are_taken_once_the_timeline_plays_and_before_the_first_frame(loo
     assert order[:4] == ["warmup", "timeline", "takes robots", "update"]
     loop.boot.takes_robots.assert_called_once_with()
     loop.boot.fails.assert_not_called()
+
+
+def test_the_timeline_plays_on_past_any_run_and_never_loops(loop, monkeypatch):
+    # A new stage ends its timeline at 100 time codes, 1.667 s at 60 codes a
+    # second, and a looping timeline goes back to its start there, the
+    # engine clock with it.
+    timeline = Mock()
+    omni = ModuleType("omni")
+    omni.timeline = ModuleType("omni.timeline")
+    omni.timeline.get_timeline_interface = lambda: timeline
+    monkeypatch.setitem(sys.modules, "omni", omni)
+    monkeypatch.setitem(sys.modules, "omni.timeline", omni.timeline)
+
+    loop.module.SimLauncher._start_timeline(loop.launcher)
+
+    assert loop.module._TIMELINE_END_S >= 1e6
+    assert timeline.method_calls == [
+        ("set_looping", (False,), {}),
+        ("set_end_time", (loop.module._TIMELINE_END_S,), {}),
+        ("play", (), {}),
+    ]

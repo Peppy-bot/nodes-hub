@@ -2,18 +2,20 @@
 
 The Isaac Sim 6.2.0 simulation node. It opens an empty stage and stands every
 robot that attaches to it, of any model it has an entry for, side by side: an
-OpenArm v1, an OpenArm v2 and an SO-101 share one stage, one physics scene and
-the same four pairing slots. It runs headless with WebRTC streaming, renders
+OpenArm v1, an OpenArm v2, an SO-101 and a botshare base share one stage, one
+physics scene and the same five pairing slots. It runs headless with WebRTC streaming, renders
 each robot's own cameras, and serves runtime scene and object editing.
 
 ## Features
 
 - Isaac Sim 6.2.0, from the container image `6.2.0.1`
 - Any number of robots on one stage, each of its own model: `openarm_v1`,
-  `openarm_v2`, `so101`
+  `openarm_v2`, `so101`, `botshare_base`
 - One entry per model under `engine/models/`, beside the entry
   `sim_robot_core` shares with every engine
-- Peppy runtime integration over four pairing slots that name no robot
+- Peppy runtime integration over five pairing slots that name no robot
+- A rolling robot, the botshare base, each wheel run as its driver runs it
+  in profile velocity mode
 - Headless WebRTC streaming
 - Runtime TCP commander on port `5556`
 - Whole-robot root repositioning
@@ -40,7 +42,8 @@ nvcr.io/nvidia/isaac-sim:6.2.0.1
 The node builds on `peppybot/sim-isaac`, which
 `sim_base_images/build_base_images.sh` produces from that image with the robot
 assets, the NGX core library, `sim_robot_core` and `control_core_py` baked in. The robot assets
-sit one directory per robot under `/opt/robot_assets` (`openarm/`, `so101/`),
+sit one directory per robot under `/opt/robot_assets` (`openarm/`, `so101/`,
+`botshare_base/`),
 which is the default of `PEPPY_ROBOT_ASSETS_DIR`.
 
 Systems with less RAM may require additional swap during image build or startup.
@@ -49,7 +52,7 @@ Systems with less RAM may require additional swap during image build or startup.
 
 ```text
 sim_isaac/
-  peppy.json5          the node: its contracts, its four slots, its parameters
+  peppy.json5          the node: its contracts, its five slots, its parameters
   apptainer.def        the node image, on peppybot/sim-isaac
   engine/              the engine, copied to /opt/sim_isaac/engine
     launch.py          the entry point
@@ -61,7 +64,7 @@ sim_isaac/
   tests/               GPU-free suites, their own uv project
 ```
 
-## The four slots
+## The five slots
 
 The engine declares one slot per kind of pair, each `zero_or_more`:
 
@@ -69,11 +72,12 @@ The engine declares one slot per kind of pair, each `zero_or_more`:
 |---|---|---|---|
 | `arms` | `joint_link` | follower | an arm of a robot |
 | `grippers` | `gripper_link` | follower | a gripper of a robot |
+| `bases` | `joint_link` | follower | the base of a rolling robot |
 | `rgb_cameras` | `sim_rgb_camera_link` | camera | a colour camera of a robot |
 | `rgbd_cameras` | `sim_rgbd_camera_link` | camera | a colour and depth camera of a robot |
 
-Nothing in a slot's name says which robot, limb or camera a pair is, so every
-pair is read for it through `sim_robot_core.pairs`:
+Nothing in a slot's name says which robot, limb, base or camera a pair is, so
+every pair is read for it through `sim_robot_core.pairs`:
 
 - a pair's robot is the copy it carries, which is the name the robot attached
   under. A pair with no copy belongs to the only robot on the stage;
@@ -82,18 +86,39 @@ pair is read for it through `sim_robot_core.pairs`:
   `left_gripper`, `right_gripper` on an OpenArm, `arm` and `gripper` on an
   SO-101. Those are the names the robot answers to in `limb_motion` and
   `limb_state`, the names `attach` answers with, and the names the engine logs;
+- a base pair's base is the link it comes from on the robot's side too,
+  `base`, the one name a robot answers to for its base in `base_state`;
 - a camera pair's camera is its relay's name in the copy (`wrist_left`,
   `wrist`): the relay's instance id without the copy's prefix.
 
 A robot's pair grace time (`robot_pair_grace_ms`) starts again only while its
-pairs are its model's: every limb of its model, and nothing its model lacks. A
-camera its model carries may go unpaired, since a camera nobody views is not
-rendered. When the pair grace time runs out the engine takes the robot out
-and fails its goal with `resource_unavailable`, saying either that none of the
-robot's limbs were paired or naming both lists: what its pairs name and what
-its model has. A robot is ready once it stands and holds a pair for every limb
-of its model, so an SO-101 is ready with its one arm and its one gripper. Each
-robot on the stage is held to its own model.
+pairs are its model's: every limb and the base of its model, and nothing its
+model lacks. A camera its model carries may go unpaired, since a camera nobody
+views is not rendered. When the pair grace time runs out the engine takes the
+robot out and fails its goal with `resource_unavailable`, saying either that
+the robot held no pair or naming both lists: what its pairs name and what its
+model has. A robot is ready once it stands and holds a pair
+for every limb and the base of its model, so an SO-101 is ready with its one
+arm and its one gripper, and a botshare base with its base. Each robot on the
+stage is held to its own model.
+
+An arm's or a base's setpoint is taken as `sim_robot_core.setpoints` parses
+it: one position per joint, and no velocities or one per joint, each a
+number no further from 0 than the largest a simulation holds, a base's with
+one velocity per wheel. Any other is dropped with a warning naming the
+robot, the part and why, once until one of that part's setpoints fits. A
+base's wheels follow the velocities of its latest setpoint, as the base's
+driver runs them in profile velocity mode, and the positions go unread.
+They follow as `joint_link`'s follower of a velocity-mode device
+follows: from each setpoint that arrives until more than 0.5 s pass with no
+setpoint, on the engine clock, and then they are held where they stand,
+the integral of each wheel's loop cleared, at rate 0. The setpoint also
+belongs to the pair it came on: once a state tick reads the base's pairs
+without that pair, the log says so, naming the pair's leader, the wheels
+are held the same way, and a pair that comes back drives nothing until its
+leader sends. A robot that leaves takes its
+setpoints with it, so a copy that joins again under its name drives nothing
+until its own leaders send.
 
 An `attach` goal's `placement` is a pose in `world`, the one frame of the
 simulation, which a placement with no frame names, whose orientation turns
@@ -127,8 +152,10 @@ What a robot of a model is made of comes from the description its attach
 goal carries, its URDF and SRDF, through `sim_robot_core`'s entry of that
 model, shared with the MuJoCo node: its limbs under the names the robot
 answers to, the joints each limb moves, where the gripper's closed and open
-states put each finger, its cameras at their optical frames, and the posture
-it starts in, every arm at its home state with its gripper closed.
+states put each finger, the wheels of its base, left then right, its cameras
+at their optical frames, and the posture it starts in, every arm at its home
+state with its gripper closed. A robot whose description gives a
+differential base rolls.
 `sim_robot_core`, `robot_description_py` and `control_core_py` are installed
 in the base image (`sim_base_images/requirements.isaac.txt`), pinned to one
 commit. An attach
@@ -156,7 +183,8 @@ What depends on the robot's description is checked at `attach`, which refuses
 with `rejected` gains whose length is not the number of joints of each arm or
 of fingers that move of their own of each gripper of the description, an
 effort limit of the description that is not positive on a joint whose drive it
-caps, and a camera the description has and no render names, or the reverse. A model with no entry is refused at `attach`
+caps, and a camera the description has and no render names, or the
+reverse. A model with no entry is refused at `attach`
 naming the models the engine stands, and none falls back to another's entry.
 
 Everything downstream of `attach` takes the robot's own model:
@@ -189,7 +217,43 @@ Everything downstream of `attach` takes the robot's own model:
   share; an rgbd camera's geometry gives `depth_to_color`, the identity in the
   camera's frame with no timestamp, since it holds at every time;
 - the head camera pack, which is the business of the models whose entry says
-  `head_camera: true`. The node reads no pack when no model draws it.
+  `head_camera: true`. The node reads no pack when no model draws it;
+- for a robot that rolls, its stance: it stands free on the floor, its
+  wheels carrying it. The stage's floor is a plane collider at z 0 of
+  `world`. It is taken up while the runtime scene's own floor lies within
+  1 mm of z 0 under every robot standing, or under the origin while none
+  stands, as a downward ray from 5 cm above z 0 finds it, the stage's floor
+  and the robots left out; it is laid otherwise. A load, a clear, a join
+  and a move each lay it at once where it is not, and each of them and a
+  leave have it judged again after the next update. Each step the
+  engine reads its robot frame, the description's root link and the root of
+  its articulation: `object_state` takes its pose, tilted as its body is, with
+  its velocities there, and its placement, that position facing the heading
+  its wheels turned it to, is what `get_robots_list` and the spacing of
+  robots take. Before a stand or a leave
+  stops the timeline, which sets every body back on its prim, the engine
+  stands its prim where it rolled, so it stays there. `move_robot` sets it
+  down at rest where it names: its root and its joints still, the integral of
+  each wheel's loop cleared and its base's setpoint dropped;
+- for a robot that rolls, the rate loop of each wheel (`engine/wheel_loop.py`),
+  as its driver runs the wheel in profile velocity mode. Its stage authors
+  the loop: a velocity drive with no stiffness, the proportional gain as its
+  damping and the motor's torque as its maximum force, which PhysX applies
+  as authored, and the integral gain as the joint's
+  `peppy:rateLoop:integralGain`. The engine reads the three as the robot
+  stands (`RateLoopGains`), refusing a wheel whose drive has a stiffness or
+  whose three are no positive numbers. PhysX drives a joint as a PD
+  controller, implicit over the step, capped at its maximum force, and each
+  step the engine sets the drive's target velocity to the rate plus the
+  integral gain over the proportional gain times the integral of the rate's
+  error, so the drive's torque is the proportional gain times the rate's
+  error plus the integral gain times that integral, capped together. The
+  integral is the angle the target rates carry the wheel to less the angle
+  it turned, summed each step from the angles the articulation reads and
+  clamped at the torque over the integral gain either way. PhysX wraps the
+  angle of a joint without limits at a full turn, so the loop counts each
+  step's turn less whole turns: the angle a wheel reports on its pair runs
+  on without a jump, a stand or a leave of another robot included.
 
 ### What a model's USD carries
 
@@ -199,15 +263,18 @@ it through PhysX articulation views, so the USD:
 - is authored z-up in metres and names a default prim, which becomes the
   robot's prim. The robot's base sits at that prim's origin;
 - carries `PhysicsArticulationRootAPI` where `articulation_root` says, and a
-  base fixed to the world;
+  base fixed to the world, or, for a robot that rolls, no joint to the world,
+  its articulation rooted at the rigid body of its robot frame;
 - has one prim per link, named after the URDF link or mapped by `link_prims`,
   with `PhysicsRigidBodyAPI`. A camera is defined under the prim of its parent
   link, so that name is unique under the robot's prim;
 - has one joint prim per joint of the shared entry, named after it, since PhysX
   names a dof after its joint prim. Each is a `PhysicsRevoluteJoint` or a
   `PhysicsPrismaticJoint` with finite limits, which a gripper's span is read
-  from, and a `PhysicsDriveAPI`, which the gains and the start posture are
-  written to;
+  from, or a wheel's `PhysicsRevoluteJoint` without limits, and a
+  `PhysicsDriveAPI`, which the gains and the start posture are written to,
+  and which a wheel's rate loop is read from with the joint's
+  `peppy:rateLoop:integralGain`;
 - keeps links and joints out of instanceable prims; visual and collision
   geometry below a link may be instanceable;
 - carries no physics scene of its own: the stage's one scene runs the CPU
@@ -431,18 +498,19 @@ nothing is spawned or moved. A goal that gives neither a `target` nor a
 Every position, orientation and force of the scene is in `world`, the one
 frame of the simulation. `get_objects_list`, `get_object`, `get_robots_list`,
 `get_object_states` and the `object_states` stream give `frame` `world` and
-`timestamp`, the simulated instant of their values, on the timeline the joint
-states are stamped on; `get_robots_list` gives each robot's `orientation`, a
-turn about +z, and stamps the robots at the start of the timeline while the
+`timestamp`, the simulated instant of their values, on the clock the joint
+states are stamped with; `get_robots_list` gives each robot's `orientation`, a
+turn about +z, and stamps the robots at the start of the engine clock while the
 engine publishes a clock domain and has not stepped yet. A `spawn_object`,
 `move_object`, `move_robot` or `apply_force` goal with no frame is in `world`,
 one in another frame is refused with `unknown_frame` as it arrives, before
 anything changes, and its timestamp, given or left out, places its value in
 `world` at any time. `get_object_states` and the `object_states` stream give
 a record for each robot the engine stands, from the feedback of its attach
-goal that reports it standing: a robot of this engine stands fixed to the
-world, so its record is its placement, the pose of its robot frame, with zero
-velocities.
+goal that reports it standing: its record is its placement, the pose of its
+robot frame, with the velocities there as of the step the snapshot is stamped
+with, zero for a robot fixed to the world, and for a robot that rolls where
+its wheels carried it and how fast they move it.
 An orientation whose squared norm lies 0.01 or more from 1 is refused with
 `rejected`, and each one taken is normalized; a `move_robot` target turns
 about +z alone, and a target with no orientation keeps the heading the base
@@ -489,13 +557,16 @@ completes the goal as usual.
 The Isaac base image downloads one complete, prepared bundle per robot from
 the `isaac-sim-assets` R2 bucket and bakes each under
 `/opt/robot_assets/<robot>/`: the OpenArm bundle under `openarm/`, the
-SO-101's under `so101/`. Their immutable versioned keys and SHA-256s are
-pinned in `sim_base_images/isaac_assets.env`. The Docker build copies that
-file before downloading, so a pin change invalidates the asset layer's cache.
-It checks every pin, downloads and verifies every archive, and only then
-extracts them, never falling back to a mutable asset directory. Robot startup
-uses only the baked files and the head camera pack below, with no GitHub
-access, asset conversion or conversion dependencies.
+SO-101's under `so101/` and the botshare base's under `botshare_base/`. Their
+immutable versioned keys and SHA-256s are
+pinned in `sim_base_images/isaac_assets.env`, with the SHA-256 of the stage
+each of the SO-101's and the botshare base's bundles holds. The Docker build
+copies that file before downloading, so a pin change invalidates the asset
+layer's cache. It checks every pin, downloads and verifies every archive,
+checks the stage of the SO-101's and of the botshare base's bundle, and only
+then extracts them, never falling back to a mutable asset directory. Robot
+startup uses only the baked files and the head camera pack below, with no
+GitHub access, asset conversion or conversion dependencies.
 
 ### OpenArm visual assets
 
@@ -635,6 +706,7 @@ uv run --project sim_isaac/tests --locked --group dev \
   python sim_isaac/scripts/build_so101.py \
   --release /tmp/so101-release \
   --output /tmp/so101-isaac-assets \
+  --date "$(date -I)" \
   --archive /tmp/so101-isaac-assets.tar.gz
 ```
 
@@ -649,15 +721,18 @@ The archive is published under its own SHA-256, as the OpenArm bundle is, at
 `so101/<version>/<sha256>.tar.gz`, and pinned as `SO101_ASSETS_KEY` and
 `SO101_ASSETS_SHA256` in `isaac_assets.env`, with the SHA-256 of its
 `so101.usd` as `SO101_STAGE_SHA256`; the image build then follows the OpenArm
-recipe above. The archive holds the stage, the model's `LICENSE` and
-`bundle_manifest.json`, which records the release and the tree the model came
-from, the digest of the builder, the digest `robot_description_py` gives the
-SO-101's model (its URDF, its SRDF and its collision meshes), and the versions
-of the tools. An archive built again thus differs from the pinned one when
-one of those differs, also when its stage is the same. The stage is what the
-tree is held to: on Linux x86_64 the same model, limits, tool frame, builder
-and tools give the same `so101.usd` byte for byte, and MuJoCo rounds what it
-compiles differently on another architecture.
+recipe above. The archive holds the stage, the model's `LICENSE`,
+`MODIFICATIONS.md`, which says how the stage changes upstream's files, by
+whom and on the `--date` of the build, and `bundle_manifest.json`, which
+records the release and the tree the model came from, the digests of the
+builder and of `scripts/mujoco_usd.py`, the digest `robot_description_py`
+gives the SO-101's model (its URDF, its SRDF and its collision meshes), the
+date, and the versions of the tools. An archive built again thus differs from
+the pinned one when one of those differs, also when its stage is the same,
+and a build of the same release on the same date packs to the same bytes. The
+stage is what the tree is held to: on Linux x86_64 the same model, limits,
+tool frame, builder and tools give the same `so101.usd` byte for byte, and
+MuJoCo rounds what it compiles differently on another architecture.
 
 `tests/test_so101_stage.py` builds the stage from the pinned release, which
 it stages itself over the network, and the description `robot_description_py`
@@ -670,9 +745,65 @@ moves the stage fails the suite until the bundle is built and pinned again:
 uv run --project sim_isaac/tests --locked --group dev pytest sim_isaac/tests/test_so101_stage.py
 ```
 
-`SO101_RELEASE` names a directory the release is staged in. Where
-`PEPPY_ROBOT_ASSETS_DIR` holds a baked stage, as in the image, the suite reads
-that stage.
+`SO101_RELEASE` names the directory the pinned release is staged in; without
+it the suite stages the pinned release. Where `PEPPY_ROBOT_ASSETS_DIR` holds a
+baked stage, as in the image, the suite reads that stage.
+
+### The botshare base's stage
+
+The botshare base's stage is built from its MuJoCo model, as the SO-101's is:
+the one in the release of Waldo's catalogue, which Waldo's
+`tools/botshare_base` writes from the base's URDF, `robot_description`'s, so
+the URDF is the one source of its geometry, and which the MuJoCo node bakes
+and Waldo loads. `scripts/build_botshare_base.py` compiles that MJCF with its
+mount body free and writes the stage from the compiled model: the mount body
+is the robot frame, `base_footprint`, with the sum of the inertials of every
+link fixed to it, and each wheel a body of its own. Each link the URDF fixes
+to a body stands under it as a prim of its name, so the depth camera stands
+under `base_camera_link`. Each wheel turns on a revolute joint without limits
+that carries the rate loop the MJCF runs it with: a velocity drive with no
+stiffness, the `<velocity>` actuator's `kv` as its damping and the joint's
+`actuatorfrcrange` as its maximum force, the `<intvelocity>` actuator's `kp`
+as the joint's `peppy:rateLoop:integralGain` (N m/rad), and the joint's
+armature. The engine reads the three back as the loop it runs. A collider
+that takes no friction in the MJCF, a caster's sphere, takes none on the
+stage, and each tire grips with the friction the MJCF gives it, in a material
+named by that friction. Each mesh is drawn in a material named after it, of
+its MJCF colour. The robot's prim roots the articulation with no joint to the
+world. From the repository root, CPU only, with the release staged by
+`python3 sim_base_images/waldo_catalogue.py fetch /tmp/botshare-release
+--robot botshare_base`:
+
+```bash
+uv run --project sim_isaac/tests --locked --group dev \
+  python sim_isaac/scripts/build_botshare_base.py \
+  --release /tmp/botshare-release \
+  --output /tmp/botshare-base-isaac-assets \
+  --date "$(date -I)" \
+  --archive /tmp/botshare-base-isaac-assets.tar.gz
+```
+
+The archive holds the stage, the `LICENSE`, `LICENSING.md` and `NOTICE.md` of
+botshare's repository, the `PROVENANCE.yaml` of its meshes, whose licence
+block gives their licences, `MODIFICATIONS.md`, which says how the stage
+changes the meshes, by whom and on the `--date` of the build, and
+`bundle_manifest.json`, and is published as the SO-101's is, at
+`botshare_base/<version>/<sha256>.tar.gz`, and pinned as
+`BOTSHARE_BASE_ASSETS_KEY` and `BOTSHARE_BASE_ASSETS_SHA256` in
+`isaac_assets.env`, with the SHA-256 of its `botshare_base.usd` as
+`BOTSHARE_BASE_STAGE_SHA256`, for the image to bake under
+`/opt/robot_assets/botshare_base/`. `tests/test_botshare_base_stage.py` holds
+the stage to the description, its bodies and their masses, the place of every
+link and the wheels' joints, and to the model, the rate loop of each wheel,
+the contact of the tires and the casters and the colour of each mesh, and on
+Linux x86_64 holds its SHA-256 to `BOTSHARE_BASE_STAGE_SHA256`.
+`download_assets.sh` refuses a bundle whose stage is another. So a change of
+the builder, of the release, of the description or of the `mujoco` pin that
+moves the stage fails the suite until the bundle is built and pinned again.
+`BOTSHARE_RELEASE` names the directory the pinned release is staged in;
+without it the suite stages the pinned release. Where
+`PEPPY_ROBOT_ASSETS_DIR` holds a baked stage, as in the image, the suite
+reads that stage.
 
 ## Tests
 

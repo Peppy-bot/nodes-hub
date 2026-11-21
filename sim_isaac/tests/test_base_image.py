@@ -75,15 +75,18 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
     # bundle into a directory of its name, the image bakes them all under
     # /opt/robot_assets, and the node's default points there.
     dockerfile = (IMAGES_DIR / "Dockerfile.isaac").read_text()
-    assert "&& cp -r /tmp/.peppy_openarm_assets_isaac/. /opt/robot_assets/ \\\n" in dockerfile
+    assert "&& cp -r /tmp/.peppy_isaac_bundles/. /opt/robot_assets/ \\\n" in dockerfile
     download = (IMAGES_DIR / "download_assets.sh").read_text()
-    assert "ROBOTS=(openarm so101)" in download
+    assert 'OUTPUT_DIR="${OUTPUT_DIR:-/tmp/.peppy_isaac_bundles}"' in download
+    assert "ROBOTS=(openarm so101 botshare_base)" in download
     pins = (IMAGES_DIR / "isaac_assets.env").read_text()
-    for robot, key in (("openarm", "ISAAC_ASSETS_KEY"), ("so101", "SO101_ASSETS_KEY")):
+    for robot, (pin, _) in _BUNDLES.items():
+        key = f"{pin}_KEY"
         assert f'"${{{key}:?{key} must be set}}"' in download, robot
         # Each bundle is published under its robot and its own checksum.
         assert shell_value(pins, key).startswith(f"{robot}/"), robot
-        assert shell_value(pins, key).endswith(f"/{shell_value(pins, key.replace('_KEY', '_SHA256'))}.tar.gz")
+        checksum = shell_value(pins, f"{pin}_SHA256")
+        assert shell_value(pins, key).endswith(f"/{checksum}.tar.gz"), robot
     definition = (_NODE_DIR / "apptainer.def").read_text()
     assert (
         "export PEPPY_ROBOT_ASSETS_DIR=${PEPPY_ROBOT_ASSETS_DIR:-/opt/robot_assets}\n"
@@ -92,7 +95,7 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
 
 
 def test_base_image_installs_the_packages_the_engines_share():
-    # The registry, the four slots, the model entries, the camera
+    # The registry, the five slots, the model entries, the camera
     # configuration and world come from sim_robot_core, the robots'
     # descriptions from robot_description_py, and the geometry types from
     # control_core_py, each pinned to the commit these suites run the engine
@@ -161,11 +164,8 @@ def test_node_stages_the_head_camera_pack_where_launch_reads_it():
     assert "sim_isaac/engine/assets/head_camera/" in ignored
 
 
-_BUNDLE_KEY = "openarm/bundles/fixture.tar.gz"
-_SO101_BUNDLE_KEY = "so101/bundles/fixture.tar.gz"
-
 # Small opaque USD payloads keep the installer tests independent of USD: the
-# OpenArm bundle's files, and the SO-101's.
+# OpenArm bundle's files, the SO-101's and the botshare base's.
 _OPENARM_FILES = {
     "openarm_bimanual.usd": b"original v1 stage",
     "openarm_bimanual_v2.usd": b"prepared v2 stage",
@@ -184,6 +184,38 @@ _SO101_FILES = {
     "LICENSE": b"upstream license",
     "bundle_manifest.json": b'{"fixture": "so101 provenance"}\n',
 }
+_BOTSHARE_BASE_FILES = {
+    "botshare_base.usd": b"built botshare base stage",
+    "LICENSE": b"meshes license",
+    "LICENSING.md": b"meshes licensing",
+    "NOTICE.md": b"meshes notice",
+    "bundle_manifest.json": b'{"fixture": "botshare base provenance"}\n',
+}
+
+# Each bundle the installer fetches, in its order, by its robot: what the
+# names of its pins in isaac_assets.env start with, and its files.
+_BUNDLES = {
+    "openarm": ("ISAAC_ASSETS", _OPENARM_FILES),
+    "so101": ("SO101_ASSETS", _SO101_FILES),
+    "botshare_base": ("BOTSHARE_BASE_ASSETS", _BOTSHARE_BASE_FILES),
+}
+# Each bundle the installer checks the stage of, in its order, by its robot:
+# the stage's file in the bundle and the pin of its checksum.
+_STAGES = {
+    "so101": ("so101.usd", "SO101_STAGE_SHA256"),
+    "botshare_base": ("botshare_base.usd", "BOTSHARE_BASE_STAGE_SHA256"),
+}
+
+
+def _fixture_key(robot: str) -> str:
+    return f"{robot}/bundles/fixture.tar.gz"
+
+
+def _stage_digest(robot: str) -> str:
+    """The SHA-256 of the stage the fixture's bundle of `robot` holds."""
+    stage, _ = _STAGES[robot]
+    _, files = _BUNDLES[robot]
+    return hashlib.sha256(files[stage]).hexdigest()
 
 
 def _bundle(path: Path, files: dict[str, bytes]) -> str:
@@ -205,40 +237,37 @@ def _run_installer(
     *,
     corrupt=False,
     download_fails=False,
-    checksum=None,
-    stage_checksum=None,
+    pins=None,
     credentials=True,
 ):
-    # The two bundles the installer fetches: what the output holds after a
-    # run, one directory per robot.
-    archive = tmp_path / "bundle.tar.gz"
-    digest = _bundle(archive, _OPENARM_FILES)
-    so101_archive = tmp_path / "so101-bundle.tar.gz"
-    so101_digest = _bundle(so101_archive, _SO101_FILES)
-    files = {f"openarm/{name}": payload for name, payload in _OPENARM_FILES.items()}
-    files.update({f"so101/{name}": payload for name, payload in _SO101_FILES.items()})
+    """Runs the installer on the fixture's bundles, the OpenArm archive
+    corrupted when `corrupt`, with the pins of isaac_assets.env set to the
+    fixture's and `pins` over them."""
+    # The bundles the installer fetches: what the output holds after a run,
+    # one directory per robot.
+    archives = {robot: tmp_path / f"{robot}-bundle.tar.gz" for robot in _BUNDLES}
+    digests = {robot: _bundle(archives[robot], bundle) for robot, (_, bundle) in _BUNDLES.items()}
+    files = {
+        f"{robot}/{name}": payload
+        for robot, (_, bundle) in _BUNDLES.items()
+        for name, payload in bundle.items()
+    }
     if corrupt:
-        archive.write_bytes(archive.read_bytes() + b"corruption")
+        archives["openarm"].write_bytes(archives["openarm"].read_bytes() + b"corruption")
 
     script_dir = tmp_path / "sim_base_images"
     script_dir.mkdir()
     script = script_dir / "download_assets.sh"
     shutil.copyfile(IMAGES_DIR / script.name, script)
-    pins = (IMAGES_DIR / "isaac_assets.env").read_text()
-    for name, value in (
-        ("ISAAC_ASSETS_KEY", _BUNDLE_KEY),
-        ("ISAAC_ASSETS_SHA256", digest if checksum is None else checksum),
-        ("SO101_ASSETS_KEY", _SO101_BUNDLE_KEY),
-        ("SO101_ASSETS_SHA256", so101_digest),
-        (
-            "SO101_STAGE_SHA256",
-            hashlib.sha256(_SO101_FILES["so101.usd"]).hexdigest()
-            if stage_checksum is None
-            else stage_checksum,
-        ),
-    ):
-        pins = re.sub(rf"^{name}=.*$", f'{name}="{value}"', pins, flags=re.MULTILINE)
-    (script_dir / "isaac_assets.env").write_text(pins)
+    env = (IMAGES_DIR / "isaac_assets.env").read_text()
+    for name, value in {
+        **{f"{pin}_KEY": _fixture_key(robot) for robot, (pin, _) in _BUNDLES.items()},
+        **{f"{pin}_SHA256": digests[robot] for robot, (pin, _) in _BUNDLES.items()},
+        **{pin: _stage_digest(robot) for robot, (_, pin) in _STAGES.items()},
+        **(pins or {}),
+    }.items():
+        env = re.sub(rf"^{name}=.*$", f'{name}="{value}"', env, flags=re.MULTILINE)
+    (script_dir / "isaac_assets.env").write_text(env)
 
     output = tmp_path / "output"
     output.mkdir()
@@ -295,8 +324,8 @@ os.execv(os.environ["REAL_TAR"], ["tar", *sys.argv[1:]])
             "MOCK_RCLONE_LOG": str(rclone_log),
             "MOCK_RCLONE_FAIL": "1" if download_fails else "0",
             "MOCK_BUNDLES": json.dumps({
-                f"r2:isaac-sim-assets/{_BUNDLE_KEY}": str(archive),
-                f"r2:isaac-sim-assets/{_SO101_BUNDLE_KEY}": str(so101_archive),
+                f"r2:isaac-sim-assets/{_fixture_key(robot)}": str(archive)
+                for robot, archive in archives.items()
             }),
             "MOCK_TAR_LOG": str(tmp_path / "tar.jsonl"),
             "REAL_TAR": shutil.which("tar", path=os.defpath),
@@ -327,8 +356,7 @@ def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under
     result, calls, files = _run_installer(tmp_path)
     assert result.returncode == 0, result.stderr
     assert [call["args"][:2] for call in calls] == [
-        ["copyto", f"r2:isaac-sim-assets/{_BUNDLE_KEY}"],
-        ["copyto", f"r2:isaac-sim-assets/{_SO101_BUNDLE_KEY}"],
+        ["copyto", f"r2:isaac-sim-assets/{_fixture_key(robot)}"] for robot in _BUNDLES
     ]
     for call in calls:
         assert call["args"][3:] == ["--progress"]
@@ -340,9 +368,9 @@ def test_isaac_installer_fetches_only_pinned_keys_and_extracts_each_bundle_under
         for path in output.rglob("*")
         if path.is_file()
     } == files
-    # The SO-101's stage is read out of its archive to be checked, then each
-    # bundle is extracted.
-    assert [call[0] for call in _tar_calls(tmp_path)] == ["-xzOf", "-xzf", "-xzf"]
+    # The SO-101's stage and the botshare base's are read out of their
+    # archives to be checked, then each bundle is extracted.
+    assert [call[0] for call in _tar_calls(tmp_path)] == ["-xzOf", "-xzOf", "-xzf", "-xzf", "-xzf"]
     assert list((tmp_path / "scratch").iterdir()) == []
 
 
@@ -359,7 +387,7 @@ def test_isaac_installer_failure_does_not_extract_or_fall_back(tmp_path, failure
     assert len(calls) == 1
     assert calls[0]["args"][:2] == [
         "copyto",
-        f"r2:isaac-sim-assets/{_BUNDLE_KEY}",
+        f"r2:isaac-sim-assets/{_fixture_key('openarm')}",
     ]
     assert not (tmp_path / "tar.jsonl").exists()
     assert list((tmp_path / "scratch").iterdir()) == []
@@ -368,28 +396,67 @@ def test_isaac_installer_failure_does_not_extract_or_fall_back(tmp_path, failure
     assert (output / "stale.usd").read_bytes() == b"existing staging contents"
 
 
-@pytest.mark.parametrize("pin", ["checksum", "stage_checksum"])
+@pytest.mark.parametrize(
+    ("pin", "refusal"),
+    [
+        (
+            "ISAAC_ASSETS_SHA256",
+            "the openarm bundle needs a pinned .tar.gz key and SHA-256 checksum: set ISAAC_ASSETS_KEY to "
+            "its <robot>/<version>/<sha256>.tar.gz and ISAAC_ASSETS_SHA256 to its SHA-256 in isaac_assets.env",
+        ),
+        (
+            "BOTSHARE_BASE_ASSETS_SHA256",
+            "the botshare_base bundle needs a pinned .tar.gz key and SHA-256 checksum: set "
+            "BOTSHARE_BASE_ASSETS_KEY to its <robot>/<version>/<sha256>.tar.gz and "
+            "BOTSHARE_BASE_ASSETS_SHA256 to its SHA-256 in isaac_assets.env",
+        ),
+        (
+            "SO101_STAGE_SHA256",
+            "the so101 bundle needs the pinned SHA-256 checksum of its stage: set SO101_STAGE_SHA256 to the "
+            "SHA-256 of its so101.usd in isaac_assets.env",
+        ),
+        (
+            "BOTSHARE_BASE_STAGE_SHA256",
+            "the botshare_base bundle needs the pinned SHA-256 checksum of its stage: set "
+            "BOTSHARE_BASE_STAGE_SHA256 to the SHA-256 of its botshare_base.usd in isaac_assets.env",
+        ),
+    ],
+)
 @pytest.mark.parametrize("value", ["", "REPLACE_WITH_PREPARED_BUNDLE_SHA256"])
-def test_isaac_installer_refuses_missing_or_placeholder_checksum(tmp_path, pin, value):
-    result, calls, _ = _run_installer(tmp_path, **{pin: value})
+def test_isaac_installer_refuses_missing_or_placeholder_checksum(tmp_path, pin, refusal, value):
+    """An empty pin is refused naming it, and a pin that is no checksum
+    naming the pins to set."""
+    result, calls, _ = _run_installer(tmp_path, pins={pin: value})
     assert result.returncode != 0
+    assert (f"{pin} must be set" if value == "" else f"ERROR: {refusal}\n") in result.stderr
     assert calls == []
     assert not (tmp_path / "tar.jsonl").exists()
     assert (tmp_path / "output" / "stale.usd").exists()
 
 
-def test_isaac_installer_refuses_a_bundle_whose_stage_is_not_the_pinned_one(tmp_path):
+# Each bundle whose stage is checked, and the number of stages the installer
+# reads, up to and including the one it refuses.
+@pytest.mark.parametrize(("robot", "stages_read"), [("so101", 1), ("botshare_base", 2)])
+def test_isaac_installer_refuses_a_bundle_whose_stage_is_not_the_pinned_one(
+    tmp_path, robot, stages_read
+):
     # The archive is the pinned one and its stage is not the pinned stage:
     # the state a new bundle leaves when the pin of its stage does not move
     # with it.
     pinned = "0" * 64
-    result, calls, _ = _run_installer(tmp_path, stage_checksum=pinned)
+    _, pin = _STAGES[robot]
+    result, calls, _ = _run_installer(tmp_path, pins={pin: pinned})
     assert result.returncode != 0
-    held = hashlib.sha256(_SO101_FILES["so101.usd"]).hexdigest()
-    assert f"holds the stage {held}, and the pinned stage is {pinned}" in result.stderr
-    # Both archives arrive and pass their own checksum; nothing is extracted.
-    assert len(calls) == 2
-    assert [call[0] for call in _tar_calls(tmp_path)] == ["-xzOf"]
+    held = _stage_digest(robot)
+    bundle = pin.removesuffix("_STAGE_SHA256")
+    assert (
+        f"the {robot} bundle holds the stage {held}, and the pinned stage is {pinned}: pin "
+        f"{bundle}_ASSETS_KEY, {bundle}_ASSETS_SHA256 and {pin} in isaac_assets.env from one build of the bundle\n"
+    ) in result.stderr
+    # Every archive arrives and passes its own checksum, the stages are read
+    # up to the one refused, and nothing is extracted.
+    assert len(calls) == len(_BUNDLES)
+    assert [call[0] for call in _tar_calls(tmp_path)] == ["-xzOf"] * stages_read
     assert list((tmp_path / "scratch").iterdir()) == []
     output = tmp_path / "output"
     assert list(output.iterdir()) == [output / "stale.usd"]

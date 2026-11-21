@@ -3,9 +3,9 @@
 
 A robot joins by attaching with the copy it runs as, the model it is and
 where it stands, and its goal runs for as long as it is in the scene. Its
-limbs reach it through its own pairs, so nothing here carries motion: what
-this serves is who may join, how long they stay, and whether a robot that
-joined is ready to be driven.
+limbs and base reach it through its own pairs, so nothing here carries
+motion: what this serves is who may join, how long they stay, and whether a
+robot that joined is ready to be driven.
 
 The scene belongs to the thread that steps it, so standing a robot and taking
 one out are handed to that thread as edits and waited on here.
@@ -175,7 +175,7 @@ class RobotsIO:
         try:
             self._unbind()
             self._world.remove(name)
-            self._io.forget(name)
+            self._io.setpoints.forget(name)
         finally:
             self._rebind()
         self._robots.renew(self._loop.time())
@@ -532,23 +532,23 @@ class RobotsIO:
         pairs are not its model's now, and were not for the pair grace time.
         They are read here as well as on the watcher's tick, so a robot still
         holding them keeps its place however long the node loop went without
-        starting its pair grace time again, and a robot no limb reached yet
-        keeps its place for as long as its goal runs. A robot holding no pair
-        is told its limbs were gone, and any other which of its pairs and its
-        model's limbs and cameras differ."""
+        starting its pair grace time again, and a robot no limb or base reached
+        yet keeps its place for as long as its goal runs. A robot holding no
+        pair is told so, and any other which of its pairs and its model's
+        limbs, base and cameras differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)
         if mismatch is None:
             self._robots.note_paired({robot.name}, now)
             return None
-        if held.holds_a_limb():
-            self._robots.note_limbs_reached(robot.name, now)
+        if held.holds_a_driven_part():
+            self._robots.note_driven_part_reached(robot.name, now)
         if not robot.pair_grace_ran_out(now, self._pair_grace_s):
             return None
         if held.is_empty():
             return (
-                f"none of this robot's limbs were paired for {self._pair_grace_s:.1f}s, "
+                f"this robot held no pair for {self._pair_grace_s:.1f}s, "
                 "the pair grace time this scene gives"
             )
         return (
@@ -557,9 +557,12 @@ class RobotsIO:
         )
 
     def _forget(self, name: str) -> None:
-        """Drops what this robot's joining held, leaving the scene alone."""
+        """Drops what this robot's joining held, and what it commanded,
+        leaving the scene alone: a robot that joins again under its name
+        drives nothing until its own leaders send."""
         self._handovers.pop(name, None)
         self._promises.pop(name, None)
+        self._io.setpoints.forget(name)
 
     async def _serve_ready(self) -> None:
         """Answers is_ready for the life of the node. When the service stops,
@@ -579,14 +582,14 @@ class RobotsIO:
 
     def _ready(self, request: is_ready.Request) -> is_ready.Response:
         """Whether the asking instance's robot is ready to be driven: it
-        stands in the scene and holds a pair for every limb of its model, so
-        a setpoint reaches each one and its state comes back. A robot's limbs
-        go ready together, so one answer covers them all."""
+        stands in the scene and holds a pair for every limb and the base of its
+        model, so a setpoint reaches each one and its state comes back. A
+        robot's parts go ready together, so one answer covers them all."""
         caller = Caller(core_node=request.core_node, instance_id=request.instance_id)
         robot = self._robots.of_caller(caller)
         ready = (
             robot is not None
             and robot.standing()
-            and robot.entry.holds_every_limb(self._io.held_by(robot.name))
+            and robot.entry.holds_every_driven_part(self._io.held_by(robot.name))
         )
         return is_ready.Response(ready=ready)

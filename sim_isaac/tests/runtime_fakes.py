@@ -6,7 +6,7 @@ the engine imports, once, ahead of the engine's own imports. Every suite that
 needs the runtime imports it, so they all meet the same modules whichever of
 them a session collects first.
 
-The pairing modules follow the node's four slots. A slot's pairs are the
+The pairing modules follow the node's five slots. A slot's pairs are the
 slot's, so every topic module of a slot reads the same members, exactly as the
 generated `peers()` does. A setpoint module hands the engine the arrivals a
 test queued and then ends its subscription, and every publisher records the
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import math
 import sys
 import types
 from dataclasses import dataclass
@@ -25,12 +26,35 @@ from typing import Optional
 SLOT_TOPICS = {
     "arms": ("joint_setpoints", "joint_states"),
     "grippers": ("gripper_setpoints", "gripper_states"),
+    "bases": ("joint_setpoints", "joint_states"),
     "rgb_cameras": ("video_stream", "stream_info", "geometry"),
     "rgbd_cameras": ("video_stream", "depth_stream", "stream_info", "geometry"),
 }
 
 # The core node every fake instance runs on.
 CORE_NODE = "sim16"
+
+
+# peppylib's encoding of the timestamp of every message the engine builds.
+NANOS_PER_SEC = 1_000_000_000
+
+
+@dataclass(frozen=True)
+class WireTime:
+    """A timestamp as the wire carries it: whole seconds and nanoseconds."""
+
+    sec: int
+    nsec: int
+
+
+def convert_time(timestamp: float) -> WireTime:
+    """The whole seconds of `timestamp`, and the rest to the nearest
+    nanosecond, as peppylib encodes a message's timestamp."""
+    sec = math.floor(timestamp)
+    nsec = round((timestamp - sec) * NANOS_PER_SEC)
+    if nsec == NANOS_PER_SEC:
+        return WireTime(sec + 1, 0)
+    return WireTime(sec, nsec)
 
 
 @dataclass(frozen=True)
@@ -85,6 +109,24 @@ class Subscription:
 
     async def next(self):
         return self._arrivals.pop(0) if self._arrivals else None
+
+
+class _Token:
+    """The node's cancellation token, which no test cancels."""
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    async def cancelled(self) -> None:
+        await asyncio.Event().wait()
+
+
+class NodeRunner:
+    """The node runner the engine's transport holds: what it reads of it is
+    the node's cancellation token."""
+
+    def cancellation_token(self) -> _Token:
+        return _Token()
 
 
 class FailureKind(str, enum.Enum):
@@ -221,6 +263,10 @@ def _install() -> None:
     peppylib_clock = types.ModuleType("peppylib.clock")
     peppylib_clock.ClockPublisher = _ClockPublisher
     peppylib.clock = peppylib_clock
+    peppylib_encoding = types.ModuleType("peppylib.encoding")
+    peppylib_encoding.NANOS_PER_SEC = NANOS_PER_SEC
+    peppylib_encoding.convert_time = convert_time
+    peppylib.encoding = peppylib_encoding
 
     peppygen = types.ModuleType("peppygen")
     peppygen.__path__ = []
@@ -254,6 +300,7 @@ def _install() -> None:
     modules = {
         "peppylib": peppylib,
         "peppylib.clock": peppylib_clock,
+        "peppylib.encoding": peppylib_encoding,
         "peppygen": peppygen,
         "peppygen.clock": peppygen_clock,
         "peppygen.exposed_actions": types.ModuleType("peppygen.exposed_actions"),

@@ -226,6 +226,24 @@ class IsaacActuatorCtrl:
             logger.warning(f"Failed to write targets on '{self._prim_path}': {exc}")
             return 0
 
+    def write_velocity_targets(self, velocity_values: dict) -> int:
+        """Write each {name: value} pair into the articulation's joint
+        velocity targets: what a joint whose drive has no stiffness follows."""
+        if not self._ready or self._view is None:
+            return 0
+        names = [name for name in velocity_values if name in self._name_to_idx]
+        if not names:
+            return 0
+        try:
+            self._view.set_joint_velocity_targets(
+                np.array([[float(velocity_values[name]) for name in names]], dtype=np.float32),
+                joint_indices=np.array([self._name_to_idx[name] for name in names]),
+            )
+            return len(names)
+        except Exception as exc:
+            logger.warning(f"Failed to write velocity targets on '{self._prim_path}': {exc}")
+            return 0
+
     @property
     def is_ready(self) -> bool:
         return self._ready
