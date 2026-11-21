@@ -56,7 +56,7 @@ FIRST_PAUSE_S = 1.0
 # too many requests. A server error (5xx) asks the same.
 COME_BACK_STATUSES = (408, 429)
 # The release that private-nodes-hub's waldo/web/public/assets/catalogue.lock.json pins.
-RELEASE_DIGEST = "629787a427ddaade0f10643fadc63e382341714cf8c9d9485dfd9b1e5c91590d"
+RELEASE_DIGEST = "83b0297e3e2017c0c6d1b20575ede419f6454c18e21ce3a005ceb59935e974cc"
 RELEASE_INDEX = "index.json"
 ROBOTS = "robots.json"
 TREE_INDEX = "index.json"
