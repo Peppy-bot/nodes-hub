@@ -48,11 +48,7 @@ control_core::member_failure_kinds!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control_core::geometry::GeometryError;
-    use control_core::robot_tree::{PlaceError, Unplaced};
-    use frame_tree::{
-        BrokenTree, FrameName, HeldStamps, LookupError, LookupTime, Stamp, TransformName,
-    };
+    use control_core::robot_tree::{PlaceKind, Unplaced};
 
     #[test]
     fn each_member_gets_the_kind_of_the_same_name() {
@@ -69,66 +65,19 @@ mod tests {
         }
     }
 
-    fn frame(name: &str) -> FrameName {
-        FrameName::parse(name).expect("a frame name")
-    }
-
-    /// A failure of each kind of a placement, with the name the contracts give it.
-    fn each_place_error() -> [(PlaceError, &'static str); 5] {
-        let transform = TransformName {
-            parent: frame("odom"),
-            child: frame("base_footprint"),
-        };
-        [
-            (
-                PlaceError::Lookup(LookupError::UnknownFrame {
-                    frame: frame("gripper"),
-                    held: Vec::new(),
-                }),
-                "unknown_frame",
-            ),
-            (
-                PlaceError::Lookup(LookupError::NoChain {
-                    target_frame: frame("base_link"),
-                    source_frame: frame("odom"),
-                }),
-                "no_chain",
-            ),
-            (
-                PlaceError::Lookup(LookupError::Extrapolation {
-                    transform: transform.clone(),
-                    requested: LookupTime::At(Stamp::from_nanos(5)),
-                    held: HeldStamps::Empty,
-                }),
-                "extrapolation",
-            ),
-            (
-                PlaceError::Lookup(LookupError::BrokenTree(BrokenTree::Cycle {
-                    transforms: vec![transform],
-                })),
-                "broken_tree",
-            ),
-            (PlaceError::Value(GeometryError::NoFrame), "rejected"),
-        ]
-    }
-
-    /// Each member gets each kind of a placement by the same name, and the
-    /// message that names the value placed, then the placement's cause.
+    /// Each member gets each kind of a placement ([`PlaceKind::ALL`]) by the
+    /// same name, and the message of the placement.
     #[test]
     fn each_member_gets_each_kind_of_a_placement() {
-        for (error, name) in each_place_error() {
-            let (drive, driving) = TargetFailure::from(Unplaced::of("the velocity", &error))
-                .for_member(drive_base::FailureKind::parse);
-            let (movement, moving) = TargetFailure::from(Unplaced::of("the target", &error))
-                .for_member(move_base::FailureKind::parse);
-            assert_eq!([drive.as_str(), movement.as_str()], [name; 2], "{error}");
-            assert_eq!(
-                [driving, moving],
-                [
-                    format!("the velocity: {error}"),
-                    format!("the target: {error}")
-                ]
-            );
+        for kind in PlaceKind::ALL {
+            let unplaced = TargetFailure::from(Unplaced {
+                kind,
+                message: "the target: unplaced".to_string(),
+            });
+            let (drive, driving) = unplaced.clone().for_member(drive_base::FailureKind::parse);
+            let (movement, moving) = unplaced.for_member(move_base::FailureKind::parse);
+            assert_eq!([drive.as_str(), movement.as_str()], [kind.name(); 2]);
+            assert_eq!([driving, moving], ["the target: unplaced"; 2]);
         }
     }
 }
