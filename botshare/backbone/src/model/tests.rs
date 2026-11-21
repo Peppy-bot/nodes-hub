@@ -127,8 +127,15 @@ fn a_base_without_two_wheels_is_refused_naming_them() {
     let named = NoDifferentialBase::WheelCount {
         root: "base_footprint".to_owned(),
         found: vec!["left".to_owned()],
+        grouped: Vec::new(),
     };
     assert_eq!(refusal(&one), named.to_string());
+    assert_eq!(
+        named.to_string(),
+        "its wheels are the two continuous joints that no group of its SRDF holds, on a link \
+         that fixed joints alone join to its root link base_footprint; it has [\"left\"], and \
+         its SRDF's groups hold []"
+    );
 }
 
 #[test]
