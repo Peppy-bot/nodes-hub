@@ -15,6 +15,7 @@ use crate::failure::{Failure, FailureKind};
 use crate::follower;
 
 const WHEELS_SILENT: &str = "the base's wheels are silent: retry once base_states reports";
+const NO_ODOMETRY: &str = "the base's odometry has no report yet: retry once base_states reports";
 const LEADER_STREAMS: &str = "the leader of drive_link streams to the base: stop the leader, or wait until 0.5 s pass after its last setpoint, then retry";
 const GOAL_RUNS: &str =
     "the base runs another goal, or still comes to rest from one: wait for it to end, then retry";
@@ -64,13 +65,14 @@ impl BaseStatus {
         slot: &MoveSlot,
     ) -> Result<Admitted, Failure> {
         let state = lock_ignoring_poison(&self.0);
-        let (Some(now_ns), Some(odometry_start)) =
-            (now_ns.filter(|_| state.wheels_report), placed_by)
-        else {
+        let Some(now_ns) = now_ns.filter(|_| state.wheels_report) else {
             return Err(Failure::new(
                 FailureKind::ResourceUnavailable,
                 WHEELS_SILENT,
             ));
+        };
+        let Some(odometry_start) = placed_by else {
+            return Err(Failure::new(FailureKind::ResourceUnavailable, NO_ODOMETRY));
         };
         if follower::LEADER_STREAM.streams(state.setpoint_ns, now_ns) {
             return Err(Failure::new(FailureKind::LeaderStreaming, LEADER_STREAMS));
@@ -185,18 +187,28 @@ mod tests {
         assert!(!slot.is_claimed(), "the dropped release frees the slot");
     }
 
-    // A goal placed before base_states reported an odometry is refused as one
-    // on silent wheels; an admitted goal names the odometry its handler read
-    // before placing it, whatever odometry the tree places by at its
-    // admission.
+    // A goal placed before base_states reported an odometry, while the wheels
+    // report, is refused for the odometry's missing report, and one on silent
+    // wheels for their silence; an admitted goal names the odometry its
+    // handler read before placing it, whatever odometry the tree places by at
+    // its admission.
     #[test]
     fn a_goal_is_admitted_on_the_odometry_its_handler_read_before_placing_it() {
         let (status, slot) = (BaseStatus::default(), MoveSlot::default());
+        assert_eq!(
+            status.admit(Some(1_000), None, &slot).err(),
+            Some(Failure::new(
+                FailureKind::ResourceUnavailable,
+                WHEELS_SILENT
+            ))
+        );
         status.set_wheels_report(true);
         assert_eq!(status.odometry_start(), None);
         assert_eq!(
-            kind(status.admit(Some(1_000), status.odometry_start(), &slot)),
-            Some(FailureKind::ResourceUnavailable)
+            status
+                .admit(Some(1_000), status.odometry_start(), &slot)
+                .err(),
+            Some(Failure::new(FailureKind::ResourceUnavailable, NO_ODOMETRY))
         );
         let placed_by = SystemTime::UNIX_EPOCH;
         status.set_odometry_start(placed_by + std::time::Duration::from_nanos(1));
