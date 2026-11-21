@@ -446,7 +446,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e255d2b3c9f71fc34e0c7984f241b2083103c106"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#307f79294d261a74c528afc8b174e9acba9a07e4"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -576,7 +576,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e255d2b3c9f71fc34e0c7984f241b2083103c106"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#307f79294d261a74c528afc8b174e9acba9a07e4"
 dependencies = [
  "frame_tree",
  "thiserror 2.0.21",
@@ -1110,7 +1110,7 @@ dependencies = [
 [[package]]
 name = "frame_tree"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e255d2b3c9f71fc34e0c7984f241b2083103c106"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#307f79294d261a74c528afc8b174e9acba9a07e4"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -3150,7 +3150,7 @@ dependencies = [
 [[package]]
 name = "robot_description"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#e255d2b3c9f71fc34e0c7984f241b2083103c106"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#307f79294d261a74c528afc8b174e9acba9a07e4"
 dependencies = [
  "chain_kinematics",
  "frame_tree",
