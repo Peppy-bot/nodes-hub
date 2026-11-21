@@ -186,9 +186,9 @@ gripper's **grasp point** (midway between the pads on the jaw closing axis,
 names it as each arm's grasp link, and each arm's model mounts its tool there,
 so the pose solved for, the pose reported, and the point the EE speed cap
 applies to are one frame. One move per arm at a time (a
-single-flight move slot, control_core's `MoveSlot`, whose release rides a drop guard, held by the move,
-or by the coordinator for a goal it ends before the move starts, so every
-terminal frees it). `move_arm` plans a straight line (`srs_model::plan_line`): a
+single-flight move slot, control_core's `MoveSlot`, whose claim gives the release, a drop
+guard that the goal carries from its admission and the move that runs it then, so every
+terminal frees it, an end before the move starts included). `move_arm` plans a straight line (`srs_model::plan_line`): a
 walk along it in MoveIt's steps and within its Cartesian precision of 1 mm and 0.01 rad,
 each step one descent of the KDL search from the state before. The walk plays as a joint
 trajectory, timed from rest to rest within the joint velocity and acceleration
@@ -678,7 +678,7 @@ The robot's own body is not checked for hiding a point from the camera.
 | `governor/limiters/` | the `Limiter` trait, one module per limiter, and `allowance.rs` (the `Allowance`/`Limits` currency they speak) | everything expressible as a per-DOF fraction lives together |
 | `governor/path_check.rs` | `PathChecker`, a joint path walked against the step floor before the move starts on a copy of the governor's collision model, and `GuardAt`, the guard it is walked against | the floor scan's resolution and floor, over a whole path |
 | `governor/barrier.rs` | the projection and the floor scan | the two stages that are not per-DOF fractions |
-| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names in `actions/mod.rs` | execution belongs to the planner/coordinator that owns the state |
+| `actions/` | the actions and services a caller reaches: move goal admission (validate + claim), the posture and `execute_joint_path` goals run to their one result, and the stop and plan-check services that ask the coordinator; each action's goal fields are parsed off the wire in its module, the times and tolerances every move goal names by control_core's `MoveSeconds` and `PositiveFinite::parse_field` | execution belongs to the planner/coordinator that owns the state |
 | `failure.rs` | the failure kinds of the moves and of `check_arm_move`, each given to every generated member, control_core's failure of a command the robot's tree cannot place in those kinds (`TargetFailure`), whose kind of a placement reaches the members that place a frame, the refusals of a busy limb, and the failure of a follower that stopped reporting | one failure crosses from a posture share to its posture goal; a placement's kind reaches no member that places nothing |
 | `workspace.rs` | the OpenArm's part of the workspace answer from the design: its arms as `workspace_core`'s reach rule asks them, the perception camera, the per-height reach memo it keeps, the parsing of the camera's geometry; `workspace_core::design` parses the request and composes the answer | pure: no messaging, so every answer is unit-tested without a node |
 | `transforms.rs` | `JointTransforms`: the transform of every arm and finger joint at a snapshot's joints and openings, from the description, and the start of every transform | the publisher of a measured joint is the node that measures it; the fixed joints are the initializer's |
