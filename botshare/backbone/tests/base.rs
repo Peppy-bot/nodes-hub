@@ -113,7 +113,7 @@ async fn a_base_holds_its_wheels_where_they_stand_at_their_first_measurement() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_velocity_outside_an_axis_range_is_rejected_naming_the_range() {
+async fn a_velocity_outside_the_bases_limits_is_rejected_saying_what_to_send() {
     let rig = Rig::start([0.0, 0.0]).await;
     for (goal, message) in [
         (
@@ -123,22 +123,25 @@ async fn a_velocity_outside_an_axis_range_is_rejected_naming_the_range() {
         ),
         (
             drive_base::GoalRequestData {
+                velocity: velocity(0.0, -1.6),
+                ..drive_goal(0.0, 1.0)
+            },
+            "the velocity's angular_velocity z, placed in the robot frame, is -1.6, outside the \
+             base's angular_limits of -1.5 to 1.5: send a velocity within them",
+        ),
+        // A differential base moves along no y: the refusal says to send a
+        // velocity with vy 0.
+        (
+            drive_base::GoalRequestData {
                 velocity: peppygen::exposed_actions::base_motion::drive_base::GoalVelocity {
                     linear_velocity: [0.0, 0.1, 0.0],
                     ..velocity(0.0, 0.0)
                 },
                 ..drive_goal(0.0, 1.0)
             },
-            "the velocity's linear_velocity y, placed in the robot frame, is 0.1, outside the \
-             base's linear_limits along y of 0 to 0: send a velocity within them",
-        ),
-        (
-            drive_base::GoalRequestData {
-                velocity: velocity(0.0, -1.6),
-                ..drive_goal(0.0, 1.0)
-            },
-            "the velocity's angular_velocity z, placed in the robot frame, is -1.6, outside the \
-             base's angular_limits of -1.5 to 1.5: send a velocity within them",
+            "the velocity's linear_velocity, placed in the robot frame, moves 0.1 m/s along y: \
+             send a velocity in the robot frame of [vx, vy, 0] and [0, 0, wz], with vy 0 on a \
+             differential base",
         ),
     ] {
         let refused = refusal_of_drive(&rig, goal).await;

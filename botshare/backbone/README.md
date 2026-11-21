@@ -199,15 +199,15 @@ publishes nothing on `static_transforms`.
 
 ## Goals
 
-The handlers check each goal in base_motion's order (`goal.rs`,
-`actions.rs`): they refuse a value the base does not take with `rejected`;
-place the goal by the robot's tree, refusing one the tree cannot place with
-the kind of the lookup, `unknown_frame`, `no_chain`, `extrapolation` or
-`broken_tree`; refuse with `rejected` a target that, placed in odom, lies off
-the floor plane or tilts, a velocity that, placed in the robot frame, moves
-along z or turns about x or y, and a velocity outside describe_base's limits,
-each message naming the value as placed and what to send; then admit it,
-claiming the base's move slot (control_core's `MoveSlot`):
+The handlers check each goal in base_motion's order (`goal.rs`, `actions.rs`):
+they refuse a value the base does not take with `rejected`; place the goal by
+the robot's tree, refusing one the tree cannot place with the kind of the
+lookup, `unknown_frame`, `no_chain`, `extrapolation` or `broken_tree`; refuse
+with `rejected` a target that, placed in odom, lies off the floor plane or
+tilts, a velocity that, placed in the robot frame, moves along z or y or turns
+about x or y, each past 1e-9 of 0, and a velocity outside describe_base's
+limits, each message naming the value as placed and what to send; then admit
+it, claiming the base's move slot (control_core's `MoveSlot`):
 
 - `resource_unavailable` while the wheels are silent, and before
   `base_states` reports their odometry;
@@ -219,13 +219,14 @@ base_motion's refusal while the mode is neither standing nor moving never
 comes from this node, whose mode is one of the two while the wheels report.
 
 `drive_base` takes a velocity whose linear_velocity, placed in the robot
-frame, lies within the x range, 0 along y, and whose angular_velocity's z lies
-within the `angular` range, a hold_duration_s above 0 and at most 60 s, and a
-settle timeout from 0 to 60 s. The base ramps to the velocity, holds it for
-the hold duration from the step at which the command reached it, and comes to
-rest. The drive completes once the base rests, and fails with `timeout` when
-it does not by the settle timeout after the command reached 0, its message
-giving the base's velocity then.
+frame, lies within the x range and within 1e-9 of 0 along y, a y the base
+takes as 0, as it takes z, and whose angular_velocity's z lies within the
+`angular` range, a hold_duration_s above 0 and at most 60 s, and a settle
+timeout from 0 to 60 s. The base ramps to the velocity, holds it for the hold
+duration from the step at which the command reached it, and comes to rest. The
+drive completes once the base rests, and fails with `timeout` when it does not
+by the settle timeout after the command reached 0, its message giving the
+base's velocity then.
 
 `move_base` takes a target, which it places in odom at acceptance and steers
 to there, settle tolerances above 0, and a duration and a settle timeout from

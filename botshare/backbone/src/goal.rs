@@ -4,7 +4,7 @@
 //! `actions`), its placed value held to the floor plane and to the base's limits, each
 //! refused with `rejected` naming the value as placed and what to send.
 
-use control_core::geometry::{GeometryError, Pose, Stamped, Twist};
+use control_core::geometry::{GeometryError, PLANAR_TOLERANCE, Pose, Stamped, Twist};
 use control_core::move_seconds::MoveSeconds;
 use control_core::planar_pose::PlanarPose;
 use control_core::positive_finite::PositiveFinite;
@@ -25,8 +25,10 @@ const MAX_MOVE_DURATION_S: f64 = 60.0;
 const FLOOR_TARGET: &str = "send a target in odom or the robot frame with a position [x, y, 0] \
                             and an orientation [0, 0, sin(yaw/2), cos(yaw/2)]";
 
-/// What to send in place of a velocity off the floor plane, as base_motion says.
-const FLOOR_VELOCITY: &str = "send a velocity in the robot frame of [vx, vy, 0] and [0, 0, wz]";
+/// What to send in place of a velocity off the floor plane, or along y on a
+/// differential base, as base_motion says.
+const FLOOR_VELOCITY: &str = "send a velocity in the robot frame of [vx, vy, 0] and [0, 0, wz], \
+                              with vy 0 on a differential base";
 
 /// A drive_base goal's fields: the velocity in its frame at its time, how long
 /// (ns) to hold it once the command reaches it, and how long (ns) the base may
@@ -173,7 +175,9 @@ pub fn drive_fields(
 }
 
 /// The drive_base goal of `fields`, its velocity `placed` in the robot frame:
-/// on the floor plane, each axis within describe_base's limits along `axes`.
+/// on the floor plane, with no y past base_motion's 1e-9 of 0, the band of z
+/// and of the tilt ([`PLANAR_TOLERANCE`]), and each axis within
+/// describe_base's limits along `axes`. A y within the band is taken as 0.
 pub fn drive_request(
     fields: DriveFields,
     placed: Twist,
@@ -182,17 +186,18 @@ pub fn drive_request(
     let planar = placed
         .planar()
         .map_err(|refusal| velocity_off_the_floor(&refusal))?;
+    let y = planar.linear_y();
+    if y.abs() > PLANAR_TOLERANCE {
+        return Err(format!(
+            "the velocity's linear_velocity, placed in the robot frame, moves {y} m/s along y: \
+             {FLOOR_VELOCITY}"
+        ));
+    }
     let x = within_range(
         "the velocity's linear_velocity x",
         planar.linear_x(),
         "linear_limits along x",
         &axes.x,
-    )?;
-    let y = within_range(
-        "the velocity's linear_velocity y",
-        planar.linear_y(),
-        "linear_limits along y",
-        &AxisSpec::STILL,
     )?;
     let turn = within_range(
         "the velocity's angular_velocity z",
@@ -201,7 +206,7 @@ pub fn drive_request(
         &axes.yaw,
     )?;
     Ok(DriveRequest {
-        velocity: PlanarTwist::new(x, y, turn).expect("placed axes are finite"),
+        velocity: PlanarTwist::new(x, 0.0, turn).expect("placed axes are finite"),
         hold_duration_ns: fields.hold_duration_ns,
         settle_timeout_ns: fields.settle_timeout_ns,
     })
@@ -289,6 +294,8 @@ mod tests {
     use super::*;
 
     use std::f64::consts::PI;
+
+    use frame_tree::arithmetic::{quaternion_of_yaw, rotate};
 
     use crate::test_rig::{AXES, ROTATE_TO_HEADING_MIN_ANGLE_RAD, placer};
 
@@ -408,14 +415,6 @@ mod tests {
                     .to_string()
             )
         );
-        assert_eq!(
-            drive([0.0, 0.1, 0.0], [0.0; 3], 1.0, 1.0),
-            Err(
-                "the velocity's linear_velocity y, placed in the robot frame, is 0.1, outside the \
-                 base's linear_limits along y of 0 to 0: send a velocity within them"
-                    .to_string()
-            )
-        );
         let not_finite = drive([f64::NAN, 0.0, 0.0], [0.0; 3], 1.0, 1.0).unwrap_err();
         assert!(
             not_finite
@@ -429,14 +428,15 @@ mod tests {
         assert_eq!(
             drive([0.1, 0.0, 0.2], [0.0; 3], 1.0, 1.0),
             Err("the velocity's linear_velocity, placed in the robot frame, moves 0.2 m/s along z: \
-                 send a velocity in the robot frame of [vx, vy, 0] and [0, 0, wz]"
+                 send a velocity in the robot frame of [vx, vy, 0] and [0, 0, wz], with vy 0 on a \
+                 differential base"
                 .to_string())
         );
         assert_eq!(
             drive([0.1, 0.0, 0.0], [0.3, 0.0, 0.0], 1.0, 1.0),
             Err("the velocity's angular_velocity, placed in the robot frame, turns 0.3 rad/s about \
                  x and 0 rad/s about y: send a velocity in the robot frame of [vx, vy, 0] and \
-                 [0, 0, wz]"
+                 [0, 0, wz], with vy 0 on a differential base"
                 .to_string())
         );
         assert_eq!(
@@ -458,6 +458,38 @@ mod tests {
                 "the target's orientation, placed in odom, [1, 0, 0, 0] tilts 3.141592653589793 \
                  rad off the vertical: send a target in odom or the robot frame with a position \
                  [x, y, 0] and an orientation [0, 0, sin(yaw/2), cos(yaw/2)]"
+                    .to_string()
+            )
+        );
+    }
+
+    // A y within 1e-9 of 0, placed in the robot frame, is taken as 0, as z and
+    // the tilt are: a velocity along the base's heading given in odom, where
+    // the robot frame stands turned 0.3 rad, places with a y of rounding size
+    // at most. A y past 1e-9 moves the base along y, which a differential
+    // base does not: refused, saying what to send.
+    #[test]
+    fn a_placed_y_within_1e_9_of_0_is_taken_as_0_and_one_past_it_is_refused() {
+        let rounded = drive([0.3, 1e-16, 0.0], [0.0; 3], 1.0, 1.0).expect("a y of rounding size");
+        assert_eq!(rounded.velocity, PlanarTwist::new(0.3, 0.0, 0.0).unwrap());
+        let heading: f64 = 0.3;
+        let along_heading = [0.3 * heading.cos(), 0.3 * heading.sin(), 0.0];
+        let fields = drive_fields(&drive_goal(along_heading, [0.0; 3], 1.0, 1.0), &placer())
+            .expect("the fields");
+        let placed = Twist::parse(rotate(quaternion_of_yaw(-heading), along_heading), [0.0; 3])
+            .expect("a twist");
+        let turned = drive_request(fields, placed, &AXES).expect("a drive along the heading");
+        assert_eq!(turned.velocity.linear_y(), 0.0);
+        assert!(
+            (turned.velocity.linear_x() - 0.3).abs() < 1e-12,
+            "{turned:?}"
+        );
+        assert_eq!(
+            drive([0.3, 2e-9, 0.0], [0.0; 3], 1.0, 1.0),
+            Err(
+                "the velocity's linear_velocity, placed in the robot frame, moves 0.000000002 m/s \
+                 along y: send a velocity in the robot frame of [vx, vy, 0] and [0, 0, wz], with \
+                 vy 0 on a differential base"
                     .to_string()
             )
         );
