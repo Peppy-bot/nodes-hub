@@ -138,7 +138,7 @@
       // base stands: the bound of the noise of the wheels' measurement. The
       // base counts as at rest while its measured velocity along x lies
       // within it and its turn rate within the turn of the two wheels each at
-      // rest_velocity, 2 x rest_velocity / the wheel separation of the
+      // rest_velocity, twice rest_velocity over the wheel separation of the
       // model's URDF, which describe_base answers as angular_limits'
       // rest_rate. move_base drives the base ahead and turns it the shorter
       // way: x's max_velocity is above 0, and angular's min_rate is below 0

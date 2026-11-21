@@ -46,8 +46,8 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
 }
 
 // base_state's rest bound of the turn rate is the turn of the two wheels each
-// at the rest velocity, 2 x rest_velocity / separation: 0.1 rad/s for the
-// bundled base's 0.4 m track at 0.02 m/s.
+// at the rest velocity, twice rest_velocity over the wheel separation: 0.1
+// rad/s for the bundled base's 0.4 m track at 0.02 m/s.
 #[test]
 fn the_rest_rate_is_the_turn_of_both_wheels_at_the_rest_velocity() {
     let mut params = parameters();

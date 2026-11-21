@@ -1654,9 +1654,9 @@ async fn a_goal_after_one_that_failed_is_refused_until_the_base_rests() {
 }
 
 // base_state's rest bounds the turn rate by the turn of the two wheels each at
-// the rest velocity, 2 x rest_velocity / separation: wheels creeping opposite
-// ways, each at 0.8 of the rest velocity, keep the base standing, and at 1.2
-// of it the base moves.
+// the rest velocity, twice rest_velocity over the wheel separation: wheels
+// creeping opposite ways, each at 0.8 of the rest velocity, keep the base
+// standing, and at 1.2 of it the base moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turn_of_wheels_each_within_the_rest_velocity_rests_and_one_past_it_moves() {
     let mut rig = Rig::start([0.0, 0.0]).await;

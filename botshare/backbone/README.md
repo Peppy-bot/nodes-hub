@@ -181,9 +181,10 @@ the node publishes neither.
 
 The base rests while the wheels report and each axis of every `base_states`
 whose stamp lies within 0.2 s of the newest lies within its rest bound,
-`x.rest_velocity`, 0 along y, and for the turn rate 2 × `x.rest_velocity` /
-the wheel separation, the turn of the two wheels each at `x.rest_velocity` as
-the odometry reads it (`config.rs`'s `RestBounds`, `rest.rs`).
+`x.rest_velocity`, 0 along y, and for the turn rate twice `x.rest_velocity`
+over the wheel separation, the turn of the two wheels each at
+`x.rest_velocity` as the odometry reads it (`config.rs`'s `RestBounds`,
+`rest.rs`).
 
 The node publishes the transforms it measures on `transforms`, each set in a
 message of its own (`transforms.rs`). Before each `base_states` goes the

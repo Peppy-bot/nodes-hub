@@ -166,7 +166,7 @@ impl RestBounds {
     /// wheel speeds and the turn rate as their difference over the wheel
     /// separation, so a reading that keeps each wheel within
     /// ±`rest_velocity` gives a velocity within `rest_velocity` and a turn
-    /// rate within 2 × `rest_velocity` / separation.
+    /// rate within twice `rest_velocity` over the separation.
     fn of_wheels(rest_velocity: f64, wheels: &WheelGeometry) -> Self {
         Self {
             velocity: rest_velocity,
