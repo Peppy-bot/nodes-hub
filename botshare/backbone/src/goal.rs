@@ -6,11 +6,12 @@
 
 use control_core::geometry::{GeometryError, Pose, Stamped, Twist};
 use control_core::move_seconds::MoveSeconds;
-use control_core::planar_pose::{PlanarPose, normalize_angle};
+use control_core::planar_pose::PlanarPose;
 use control_core::positive_finite::PositiveFinite;
 use control_core::robot_tree::Placer;
 use control_core::time::nanoseconds;
 use control_core::twist::PlanarTwist;
+use frame_tree::arithmetic::normalize_angle;
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 
 use crate::config::{AxisSpec, BaseAxes};

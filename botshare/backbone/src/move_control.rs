@@ -34,8 +34,9 @@
 use std::f64::consts::PI;
 
 use control_core::chase::rate_limited;
-use control_core::planar_pose::{PlanarPose, normalize_angle};
+use control_core::planar_pose::PlanarPose;
 use control_core::twist::PlanarTwist;
+use frame_tree::arithmetic::normalize_angle;
 
 /// How far above its deadband a floored command stands, as a share of the
 /// deadband: past the rounding of the limiter's sums, which can land a
