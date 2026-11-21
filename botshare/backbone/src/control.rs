@@ -24,6 +24,7 @@ use control_core::odometry::{Odometry, WheelSetpoint};
 use control_core::planar_pose::{PlanarPose, normalize_angle};
 use control_core::robot_tree::RobotTree;
 use control_core::stop_reason::stop_reason;
+use control_core::throttle::{LOG_WINDOW, Throttle};
 use control_core::time::{nanoseconds, seconds};
 use control_core::twist::PlanarTwist;
 use frame_tree::arithmetic::quaternion_of_yaw;
@@ -519,12 +520,51 @@ impl RunningGoal {
     }
 }
 
+/// One topic the loop publishes on, named `what`, with the throttle of its
+/// failure log: a message that fails to build or to publish fails at every
+/// step, and the log says so once per [`LOG_WINDOW`] per topic.
+struct Slot {
+    publisher: TopicPublisher,
+    what: &'static str,
+    error_log: Throttle,
+}
+
+impl Slot {
+    fn new(what: &'static str, publisher: TopicPublisher) -> Self {
+        Self {
+            publisher,
+            what,
+            error_log: Throttle::new(LOG_WINDOW),
+        }
+    }
+
+    /// Emit one failure line for this topic, at most once per [`LOG_WINDOW`].
+    fn log_throttled(&mut self, emit: impl FnOnce()) {
+        if self.error_log.admit() {
+            emit();
+        }
+    }
+
+    /// Publish `message`, the log naming the topic and why when the message
+    /// is not built or not sent.
+    async fn publish(&mut self, message: Result<Payload>) {
+        let what = self.what;
+        let message = match message {
+            Ok(message) => message,
+            Err(e) => return self.log_throttled(|| error!("{what} build: {e}")),
+        };
+        if let Err(e) = self.publisher.publish(message).await {
+            self.log_throttled(|| warn!("{what} publish: {e}"));
+        }
+    }
+}
+
 /// Every publisher the loop owns.
 pub struct Publishers {
-    wheels: TopicPublisher,
-    base_states: TopicPublisher,
-    drive_states: TopicPublisher,
-    transforms: TopicPublisher,
+    wheels: Slot,
+    base_states: Slot,
+    drive_states: Slot,
+    transforms: Slot,
     /// The robot's tree, which takes each message of the base's transforms as
     /// it is published, under `measured_by`.
     tree: Arc<RobotTree>,
@@ -537,28 +577,22 @@ impl Publishers {
     pub async fn declare(runner: &NodeRunner, tree: Arc<RobotTree>) -> Result<Self> {
         let processor = runner.processor();
         Ok(Self {
-            wheels: joint_setpoints::declare_publisher(runner).await?,
-            base_states: base_states::declare_publisher(runner).await?,
-            drive_states: drive_states::declare_publisher(runner).await?,
-            transforms: transforms::declare_publisher(runner).await?,
+            wheels: Slot::new(
+                "wheel joint_setpoints",
+                joint_setpoints::declare_publisher(runner).await?,
+            ),
+            base_states: Slot::new("base_states", base_states::declare_publisher(runner).await?),
+            drive_states: Slot::new(
+                "drive_states",
+                drive_states::declare_publisher(runner).await?,
+            ),
+            transforms: Slot::new("transforms", transforms::declare_publisher(runner).await?),
             tree,
             measured_by: TreePublisher {
                 core_node: processor.bound_core_node().to_owned(),
                 instance_id: processor.bound_instance_id().to_owned(),
             },
         })
-    }
-}
-
-/// Publish `message` on `publisher`, the log naming `topic` and why when the
-/// message is not built or not sent.
-async fn publish_or_warn(publisher: &TopicPublisher, topic: &str, message: Result<Payload>) {
-    let sent = match message {
-        Ok(message) => publisher.publish(message).await,
-        Err(e) => Err(e),
-    };
-    if let Err(e) = sent {
-        warn!("{topic}: {e}");
     }
 }
 
@@ -1098,28 +1132,34 @@ impl Base {
             setpoint.rates,
             Vec::new(),
         );
-        publish_or_warn(&self.publishers.wheels, "wheel joint_setpoints", message).await;
+        self.publishers.wheels.publish(message).await;
     }
 
     /// Publish `message` on transforms, the log naming why a set of
-    /// transforms makes no message.
+    /// transforms makes no message, and take it into the robot's tree.
     async fn publish_transforms(
-        &self,
+        &mut self,
         message: std::result::Result<MovingMessage, TransformsError>,
     ) {
+        let publishers = &mut self.publishers;
         let message = match message {
             Ok(message) => message,
-            Err(e) => return warn!("transforms: {e}"),
+            Err(e) => {
+                return publishers
+                    .transforms
+                    .log_throttled(|| error!("transforms build: {e}"));
+            }
         };
-        let publishers = &self.publishers;
         if let Err(e) = publishers
             .tree
             .take_moving(&publishers.measured_by, &message)
         {
-            warn!("the robot's tree refused the transforms: {e}");
+            publishers
+                .transforms
+                .log_throttled(|| error!("the robot's tree refused the transforms: {e}"));
         }
         let payload = transforms::payload(message);
-        publish_or_warn(&publishers.transforms, "transforms", payload).await;
+        publishers.transforms.publish(payload).await;
     }
 
     /// At `now_ns`, while the wheels report: publish the due report once the
@@ -1188,7 +1228,7 @@ impl Base {
             mode.to_string(),
             true,
         );
-        publish_or_warn(&self.publishers.base_states, "base_states", base).await;
+        self.publishers.base_states.publish(base).await;
         let follow_state = self.follower.state(now_ns, self.slot.is_claimed());
         let drive = drive_states::build_message(
             timestamp,
@@ -1207,7 +1247,7 @@ impl Base {
             true,
             follow_state.as_str().to_string(),
         );
-        publish_or_warn(&self.publishers.drive_states, "drive_states", drive).await;
+        self.publishers.drive_states.publish(drive).await;
         let odometry = transforms::odometry_message(timestamp, pose, odometry_start);
         self.publish_transforms(odometry).await;
     }
