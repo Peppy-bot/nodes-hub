@@ -24,13 +24,14 @@ compiled model:
   other, and a wheel's collider in the friction the MJCF gives it, the larger
   of two winning, as MuJoCo combines two geoms' friction;
 - each hinge is a revolute joint without limits about its axis, with the
-  wheel's armature and its rate loop as its drive. The MJCF runs the loop as a
-  velocity actuator, its kv the loop's proportional gain, and an
-  integrated-velocity actuator, its kp the loop's integral gain, the two
-  capped together by the joint's actuatorfrcrange. The drive is the PD on the
-  wheel's angle that the loop is: its stiffness the integral gain, its
-  damping the proportional gain and its maximum force the cap, which the
-  engine reads back as the loop it runs (engine/wheel_loop.py);
+  wheel's armature and its rate loop. The MJCF runs the loop as a velocity
+  actuator, its kv the loop's proportional gain, and an integrated-velocity
+  actuator, its kp the loop's integral gain, the two capped together by the
+  joint's actuatorfrcrange. The joint's drive is a velocity drive: no
+  stiffness, the proportional gain as its damping and the cap as its maximum
+  force; the integral gain is the joint's attribute of its own,
+  INTEGRAL_GAIN_ATTRIBUTE, per radian. The engine reads the three back as the
+  loop it runs (engine/wheel_loop.py);
 - the robot's prim roots the articulation with no joint to the world: the
   base rolls on its wheels.
 
@@ -82,6 +83,11 @@ MATERIALS_PATH = f"{ROBOT_PATH}/PhysicsMaterials"
 # rest, as LICENSING.md maps them), where the model's tree stages them.
 LICENSES = ("LICENSE", "LICENSING.md", "NOTICE.md")
 LICENSE_DIRECTORY = "license"
+
+# The attribute of a wheel's joint that holds its rate loop's integral gain
+# (N*m/rad): engine/wheel_loop.py's INTEGRAL_GAIN_ATTRIBUTE, which the stage's
+# suite holds this to.
+INTEGRAL_GAIN_ATTRIBUTE = "peppy:rateLoop:integralGain"
 
 # The MJCF's geom groups: what is drawn.
 VISUAL_GROUP = 2
@@ -291,8 +297,9 @@ def define_body(
 
 def define_wheel_joint(stage, model, joint: str, links: dict[str, str]) -> None:
     """A wheel's hinge: a revolute joint without limits between its parent
-    body and the wheel, with the wheel's armature and its rate loop as a PD
-    drive on its angle."""
+    body and the wheel, with the wheel's armature and its rate loop: a
+    velocity drive of its proportional gain capped at its torque, and its
+    integral gain."""
     joint_id = model.joint(joint).id
     child = int(model.jnt_bodyid[joint_id])
     parent = int(model.body_parentid[child])
@@ -313,11 +320,12 @@ def define_wheel_joint(stage, model, joint: str, links: dict[str, str]) -> None:
     prim.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
     drive = UsdPhysics.DriveAPI.Apply(prim.GetPrim(), UsdPhysics.Tokens.angular)
     drive.CreateTypeAttr(UsdPhysics.Tokens.force)
+    drive.CreateStiffnessAttr(0.0)
     # USD writes an angular drive's gains per degree.
-    drive.CreateStiffnessAttr(math.radians(loop.kp))
     drive.CreateDampingAttr(math.radians(loop.kv))
     drive.CreateMaxForceAttr(loop.cap)
     joint_prim = prim.GetPrim()
+    joint_prim.CreateAttribute(INTEGRAL_GAIN_ATTRIBUTE, Sdf.ValueTypeNames.Float, True).Set(loop.kp)
     joint_prim.AddAppliedSchema("PhysxJointAPI")
     joint_prim.CreateAttribute("physxJoint:armature", Sdf.ValueTypeNames.Float, False).Set(
         float(model.dof_armature[int(model.jnt_dofadr[joint_id])])

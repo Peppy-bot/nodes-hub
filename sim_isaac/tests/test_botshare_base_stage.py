@@ -29,6 +29,7 @@ import robot_description_py
 from control_core_py.geometry import rotation_of
 
 from _base_images import IMAGES_DIR
+from _world import known, world_module
 
 pytest.importorskip("mujoco")
 pytest.importorskip("pxr")
@@ -183,22 +184,37 @@ def test_the_robot_roots_its_articulation_and_stands_free(stage):
     assert sorted(prim.GetName() for prim in joints) == list(WHEELS)
 
 
-def test_each_wheels_drive_is_the_rate_loop_its_model_runs_it_with(stage, model, description):
-    """The PD on the wheel's angle the loop is: the integral gain as its
-    stiffness and the proportional gain as its damping, per degree as USD
-    writes an angular drive's, the cap as its maximum force, with the
-    armature of the model's wheel."""
+def test_each_wheel_carries_the_rate_loop_its_model_runs_it_with(stage, model, description):
+    """A velocity drive, no stiffness, of the proportional gain per degree
+    as USD writes an angular drive's, capped at the loop's torque, the
+    integral gain in the joint's attribute of its own, and the armature of
+    the model's wheel."""
     for joint in description.wheels:
         loop = builder.rate_loop_of(model, joint)
         assert loop.kv > 0.0 and loop.kp > 0.0 and loop.cap > 0.0
         prim = stage.GetPrimAtPath(f"{builder.JOINTS_PATH}/{joint}")
         drive = UsdPhysics.DriveAPI(prim, "angular")
         assert drive.GetTypeAttr().Get() == "force"
-        assert drive.GetStiffnessAttr().Get() == pytest.approx(math.radians(loop.kp))
+        assert drive.GetStiffnessAttr().Get() == 0.0
         assert drive.GetDampingAttr().Get() == pytest.approx(math.radians(loop.kv))
         assert drive.GetMaxForceAttr().Get() == pytest.approx(loop.cap)
+        assert prim.GetAttribute(builder.INTEGRAL_GAIN_ATTRIBUTE).Get() == pytest.approx(loop.kp)
         armature = model.dof_armature[int(model.jnt_dofadr[model.joint(joint).id])]
         assert prim.GetAttribute("physxJoint:armature").Get() == pytest.approx(armature)
+
+
+def test_the_engine_runs_the_loop_the_stage_carries(stage, model, description):
+    """What the engine reads back off the stage as each wheel stands is the
+    loop the model runs it with, through the attribute both name alike."""
+    world = world_module()
+    import wheel_loop  # pylint: disable=C0415
+
+    assert builder.INTEGRAL_GAIN_ATTRIBUTE == wheel_loop.INTEGRAL_GAIN_ATTRIBUTE
+    loops = world.World._wheel_loops(stage.GetPrimAtPath(ROBOT), known(builder.ROBOT_ID))
+    expected = [builder.rate_loop_of(model, joint) for joint in description.wheels]
+    assert [(loop.kp, loop.ki, loop.max_torque) for loop in loops] == [
+        (pytest.approx(rate.kv, rel=1e-6), pytest.approx(rate.kp, rel=1e-6), pytest.approx(rate.cap)) for rate in expected
+    ]
 
 
 def _bound_physics(prim):
