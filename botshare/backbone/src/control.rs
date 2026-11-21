@@ -864,9 +864,11 @@ impl Base {
     /// Start a new odometry epoch on `state`: the odometry starts at the
     /// origin, anchored on its angles, the wheel setpoints anchor on them,
     /// the wheels hold where they stand, a setpoint of rate 0 at the measured
-    /// angles sent at once, and base_states' rest and reports start over.
-    /// When an open epoch ran, the wheels' positions started over, and a goal
-    /// in flight fails with `resource_unavailable`.
+    /// angles sent at once, the limiter starts over at rest, so no step
+    /// moves the base again before a goal or the leader asks it to, and
+    /// base_states' rest and reports start over. When an open epoch ran, the
+    /// wheels' positions started over, and a goal in flight fails with
+    /// `resource_unavailable`.
     async fn start_epoch(&mut self, state: WheelState) {
         if self.epoch.as_ref().is_some_and(|epoch| !epoch.closed) {
             warn!(
@@ -874,8 +876,13 @@ impl Base {
                 state.follower, state.timestamp_ns
             );
             let failure = Failure::new(FailureKind::ResourceUnavailable, ODOMETRY_STARTED_OVER);
-            self.fail_goal_now(failure, state.timestamp_ns).await;
+            self.end_goal_now(Outcome::Failed(failure)).await;
         }
+        // The hold stops the base: the limiter's command starts at 0, as
+        // base_state's limiter has it from the step at which the base's
+        // drives stop the base by themselves.
+        self.limits = self.config.limiter.start();
+        self.status.set_resting(false);
         let [left, right] = state.positions;
         self.odometry = self.config.odometry.clone();
         self.odometry

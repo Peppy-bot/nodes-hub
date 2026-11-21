@@ -28,7 +28,8 @@ struct BaseStatusState {
     odometry_start: Option<SystemTime>,
     /// Whether the base comes to rest from an earlier goal: from the end of a
     /// goal that ended while the limiter's command was not 0, completed,
-    /// cancelled or failed, until the command reaches 0.
+    /// cancelled or failed, until the command reaches 0 or the odometry
+    /// starts over, whose hold stops the base.
     resting: bool,
 }
 

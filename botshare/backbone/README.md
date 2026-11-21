@@ -94,7 +94,9 @@ that catches up several steps runs each at its own time. Each step, in order:
    measured angles. Each epoch starts with the wheels held where they stand:
    at its first measurement the node sends a setpoint of rate 0 at the
    measured angles, before any goal, so a follower that still runs the last
-   setpoint of a node that ended stops.
+   setpoint of a node that ended stops, and the limiter starts over at rest,
+   so a goal or the leader's next setpoint moves the base from rest at the
+   acceleration limits, and the base comes to rest from no earlier goal.
 5. **The reports**: see below.
 6. **The goal's end**: a goal that completes or is cancelled ends once the
    base rests: nothing is commanded and base_state's rest holds. A goal past

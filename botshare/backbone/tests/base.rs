@@ -1340,6 +1340,99 @@ async fn wheels_that_start_over_at_a_later_stamp_fail_the_goal_and_start_the_odo
     rig.shutdown().await;
 }
 
+// At each start of the odometry the limiter starts over at rest: the leader
+// streams 0.2 m/s, the wheels start over, and the base holds them where they
+// stand and sends nothing more until the leader's next setpoint, from which
+// it speeds up from rest at its acceleration limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wheels_that_start_over_under_a_streaming_leader_speed_up_again_from_rest() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    rig.lead_until_it_drives([0.2, 0.0, 0.0], 0.0).await;
+    assert_speeds(&mut rig, &[(0.2, 0.2)]).await;
+    // The wheels report 20 rad a step later, farther from their last angles
+    // than a wheel turns in a step within the base's limits: their positions
+    // started over, the leader's setpoint still live.
+    rig.wheels = [20.0, 20.0];
+    rig.step().await;
+    let hold = rig.next_wheel_setpoint().await;
+    assert_eq!(
+        (hold.positions, hold.velocities),
+        ([20.0, 20.0], [0.0, 0.0]),
+        "the start-over holds the wheels"
+    );
+    rig.lead_until_it_drives([0.2, 0.0, 0.0], 0.0).await;
+    rig.step().await;
+    // The first setpoint after the hold that moves the base is the first
+    // step of the ramp from rest toward the leader's next setpoint.
+    let resumed = loop {
+        let setpoint = rig.next_wheel_setpoint().await;
+        if forward_speed(&setpoint) != 0.0 {
+            break setpoint;
+        }
+    };
+    assert_eq!(ns(resumed.timestamp), rig.origin_ns + STEP_NS);
+    assert_close(
+        forward_speed(&resumed),
+        SPEED_UP,
+        "the first speed after the start-over",
+    );
+    rig.shutdown().await;
+}
+
+// A goal in flight when the wheels start over fails, and the hold stops the
+// base where it stands: the base comes to rest from no goal, so the next goal
+// is admitted at once, and its first setpoint, the next after the hold,
+// speeds the base up from rest on the held angles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wheels_that_start_over_under_a_goal_take_the_next_goal_at_once_from_rest() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    let goal = rig.send_drive(&drive_goal(0.2, 5.0)).await;
+    assert!(goal.accepted, "{:?}", goal.refusal);
+    assert_speeds(&mut rig, &[(0.2, 0.2)]).await;
+    // The wheels report 20 rad at the time of the last step, farther from
+    // their last angles than a wheel turns: their positions started over, and
+    // the new odometry's first report goes out with the clock standing still.
+    rig.wheels = [20.0, 20.0];
+    rig.report_wheels().await;
+    rig.state_at(rig.now_ns).await;
+    let result = goal.get_result(ANSWER_BUDGET).await.expect("a result");
+    let drive_base::ResultOutcome::Failed(failure) = result.outcome else {
+        panic!("a goal across a start-over fails: {:?}", result.outcome);
+    };
+    assert_eq!(failure.message, "the base's odometry started over");
+    let hold = rig.next_wheel_setpoint().await;
+    assert_eq!(
+        (hold.positions, hold.velocities),
+        ([20.0, 20.0], [0.0, 0.0])
+    );
+    let next = rig.send_drive(&drive_goal(0.1, 1.0)).await;
+    assert!(
+        next.accepted,
+        "the held base comes to rest from no goal: {:?}",
+        next.refusal
+    );
+    rig.step().await;
+    let first = rig.next_wheel_setpoint().await;
+    assert_eq!(
+        ns(first.timestamp),
+        rig.now_ns,
+        "no wheel setpoint between the hold and the next goal's first"
+    );
+    assert_close(
+        forward_speed(&first),
+        SPEED_UP,
+        "the next goal's first speed",
+    );
+    for position in first.positions {
+        assert_close(
+            position,
+            20.0 + wheel_step(SPEED_UP),
+            "the next goal's first wheel angle",
+        );
+    }
+    rig.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clock_that_goes_back_fails_the_goal_brings_the_base_to_rest_and_starts_the_odometry_over()
  {
@@ -1473,18 +1566,15 @@ async fn a_clock_that_goes_back_keeps_the_leaders_stream_from_its_new_time() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_goal_after_one_that_failed_is_refused_until_the_base_rests() {
     let mut rig = Rig::start([0.0, 0.0]).await;
-    let goal = rig.send_drive(&drive_goal(0.2, 5.0)).await;
+    // The wheels hold still: the move's settle ends at 3 s with the base at
+    // full speed, which fails it, as in
+    // move_base_times_out_after_its_settle_timeout.
+    let goal = rig.send_move(&move_goal(1.0, 0.0, 0.0, 0.625)).await;
     assert!(goal.accepted, "{:?}", goal.refusal);
-    for _ in 0..3 {
-        rig.step_following().await;
-    }
-    // A measurement stamped before the last one: the wheels started over,
-    // and the goal fails with the base moving.
-    rig.wheels = [20.0, 20.0];
-    rig.publish_wheels_stamped(rig.now_ns - STEP_NS).await;
+    rig.step_to(rig.at(3.0)).await;
     let result = goal.get_result(ANSWER_BUDGET).await.expect("a result");
     assert!(
-        matches!(result.outcome, drive_base::ResultOutcome::Failed(_)),
+        matches!(result.outcome, move_base::ResultOutcome::Failed(_)),
         "{:?}",
         result.outcome
     );
@@ -1495,17 +1585,26 @@ async fn a_goal_after_one_that_failed_is_refused_until_the_base_rests() {
         "{}",
         refused.message
     );
+    // Each step slows the base at its deceleration limit, and a goal is
+    // refused until the step at which the limiter's command reaches 0.
     let mut steps = 0;
     loop {
         rig.step().await;
-        if forward_speed(&rig.wheel_setpoint_at(rig.now_ns).await) == 0.0 {
+        let speed = forward_speed(&rig.wheel_setpoint_at(rig.now_ns).await);
+        let next = rig.send_drive(&drive_goal(0.1, 1.0)).await;
+        let Some(refused) = next.refusal else {
+            assert_eq!(speed, 0.0, "a goal is admitted once the base rests");
             break;
-        }
+        };
+        assert_eq!(
+            refused.kind,
+            drive_base::FailureKind::PreconditionFailed,
+            "{}",
+            refused.message
+        );
         steps += 1;
         assert!(steps < 100, "the base comes to rest");
     }
-    let next = rig.send_drive(&drive_goal(0.1, 1.0)).await;
-    assert!(next.accepted, "the base rests: {:?}", next.refusal);
     rig.shutdown().await;
 }
 
