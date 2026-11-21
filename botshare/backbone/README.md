@@ -37,7 +37,7 @@ publishes itself, odom to base_footprint and its wheel joints, each taken
 into the tree as it publishes them (`follow.rs` follows the others, and
 `control.rs` takes its own). Each goal and each
 setpoint is placed by the tree, waiting up to `lookup_timeout_s` on the
-node's clock for it (`placement.rs`): a move_base target in odom and in the
+node's clock for it (control_core's `Placer`): a move_base target in odom and in the
 robot frame, where its frame stands at the latest time or, at a timestamp,
 where it stood then, through the root of its frame's chain; a drive_base
 velocity and each drive_link setpoint in the robot frame, by the place of
@@ -92,7 +92,10 @@ that catches up several steps runs each at its own time. Each step, in order:
    rest. During a silence the setpoints keep coming, each continuing from the
    last, and bring the base to rest at its deceleration limits. The first
    setpoint of an odometry epoch, and the first after a silence, take the
-   measured angles.
+   measured angles. Each epoch starts with the wheels held where they stand:
+   at its first measurement the node sends a setpoint of rate 0 at the
+   measured angles, before any goal, so a follower that still runs the last
+   setpoint of a node that ended stops.
 5. **The reports**: see below.
 6. **The goal's end**: a goal that completes or is cancelled ends once the
    base rests: nothing is commanded and base_state's rest holds. A goal past
@@ -200,7 +203,7 @@ the kind of the lookup, `unknown_frame`, `no_chain`, `extrapolation` or
 the floor plane or tilts, a velocity that, placed in the robot frame, moves
 along z or turns about x or y, and a velocity outside describe_base's limits,
 each message naming the value as placed and what to send; then admit it,
-claiming the base's move slot (`move_slot.rs`, a copy of openarm_backbone's):
+claiming the base's move slot (control_core's `MoveSlot`):
 
 - `resource_unavailable` while the wheels are silent;
 - `leader_streaming` while the leader streams, followed or held;
@@ -268,7 +271,6 @@ corners of its footprint, counterclockwise, in base_footprint at every time.
 | `identity.rs` | the robot's model and the digest of its description, asked of the robot's initializer |
 | `startup.rs` | the wait for the robot's initializer to report the robot ready |
 | `follow.rs` | the other publishers of the robot's tree, taken into it |
-| `placement.rs` | the placement of each goal and setpoint by the robot's tree |
 | `config.rs` | every parameter parsed once, refused by name, and with the model's base, what the node runs on |
 | `model.rs` | the base a model's URDF gives: its wheels and its outline |
 | `control.rs` | the control loop: events, steps, the odometry epochs, the goal in flight, the wheel setpoints, the reports and the transforms |
@@ -278,12 +280,10 @@ corners of its footprint, counterclockwise, in base_footprint at every time.
 | `move_control.rs` | move_base's plan and its steering, pure |
 | `goal.rs` | the base_motion goals parsed off the wire, and their placed values held to the floor plane and the base's limits |
 | `status.rs` | what a goal is admitted on |
-| `move_slot.rs` | the base's move slot, which an admitted goal holds, a copy of openarm_backbone's |
 | `actions.rs` | the drive_base and move_base handlers |
 | `streams.rs` | the wheel and setpoint subscriptions |
 | `services.rs` | describe_base and the robot stop |
-| `geometry.rs` | headings, poses in a frame fixed to the floor, a URDF origin's frame |
-| `failure.rs` | the failure kinds of the goals and of a placement, given to each generated member |
+| `failure.rs` | the failure kinds of the goals, given to each generated member with those of a placement |
 | `clock.rs` | the node's clock, wall or simulated, in integer nanoseconds, and the wire times |
 
 ## Parameters and links

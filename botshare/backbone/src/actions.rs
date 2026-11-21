@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use control_core::move_slot::MoveSlot;
+use control_core::robot_tree::{Placer, Unplaced};
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 use peppygen::{NodeRunner, Result};
 use tokio::sync::mpsc;
@@ -15,13 +17,12 @@ use tracing::error;
 use crate::clock;
 use crate::config::BaseConfig;
 use crate::control::{AcceptedGoal, Event};
-use crate::failure::{Failure, FailureKind, TargetFailure, Unplaced};
+use crate::failure::{Failure, FailureKind, TargetFailure};
 use crate::goal::{
     DriveRequest, MoveRequest, drive_fields, drive_request, move_fields, move_request,
 };
-use crate::move_slot::MoveSlot;
-use crate::placement::Placer;
 use crate::status::{Admitted, BaseStatus};
+use crate::transforms::odometry_frame;
 
 fn rejected(reason: String) -> TargetFailure {
     Failure::new(FailureKind::Rejected, reason).into()
@@ -34,7 +35,7 @@ fn drive(
     config: &BaseConfig,
     placer: &Placer,
 ) -> std::result::Result<DriveRequest, TargetFailure> {
-    let fields = drive_fields(data).map_err(rejected)?;
+    let fields = drive_fields(data, placer).map_err(rejected)?;
     let placed = placer
         .place_velocity_now(&fields.velocity)
         .map_err(|e| Unplaced::of("the velocity", &e))?;
@@ -48,10 +49,10 @@ fn movement(
     config: &BaseConfig,
     placer: &Placer,
 ) -> std::result::Result<MoveRequest, TargetFailure> {
-    let fields = move_fields(data).map_err(rejected)?;
+    let fields = move_fields(data, placer).map_err(rejected)?;
     let unplaced = |e| Unplaced::of("the target", &e);
     let in_odometry = placer
-        .place_in_odometry_now(&fields.target)
+        .place_in_now(&fields.target, &odometry_frame())
         .map_err(unplaced)?
         .value;
     let from_robot = placer.place_now(&fields.target).map_err(unplaced)?.value;
@@ -112,7 +113,7 @@ macro_rules! goal_runner {
                                 }
                                 Err(refusal) => {
                                     let (kind, message) =
-                                        refusal.for_member::<$action::FailureKind>();
+                                        refusal.for_member($action::FailureKind::parse);
                                     $action::GoalDecision::refuse(kind, message)
                                 }
                             },

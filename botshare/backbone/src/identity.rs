@@ -68,14 +68,7 @@ async fn ask(runner: &NodeRunner) -> peppygen::Result<Answer> {
 /// describes.
 fn driven_by(answer: Answer, parameters: &BaseParameters) -> Result<BaseConfig, NodeError> {
     let config = parameters.configure(&answer.model)?;
-    let built = config.model.digest();
-    if answer.digest != built {
-        return Err(NodeError::OtherDescription {
-            model: config.model.id(),
-            served: answer.digest,
-            built: built.to_owned(),
-        });
-    }
+    config.model.hold_digest(&answer.digest)?;
     Ok(config)
 }
 

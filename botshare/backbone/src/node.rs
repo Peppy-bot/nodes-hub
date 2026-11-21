@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use control_core::fault::Fault;
-use control_core::robot_tree::RobotTree;
-use frame_tree::FrameName;
+use control_core::move_slot::MoveSlot;
+use control_core::robot_tree::{Placer, RobotTree};
 use peppygen::{NodeRunner, Parameters, Result};
+use robot_description::OtherDescription;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{error, info};
@@ -22,13 +23,11 @@ use crate::control::{self, Base, Publishers};
 use crate::follow::follow_tree;
 use crate::identity;
 use crate::model::ModelError;
-use crate::move_slot::MoveSlot;
-use crate::placement::Placer;
 use crate::services;
 use crate::startup;
 use crate::status::BaseStatus;
 use crate::streams;
-use crate::transforms::{ODOMETRY_FRAME, ROBOT_FRAME};
+use crate::transforms::robot_frame;
 
 /// Everything this node refuses to run on: a parameter, by name, or the
 /// runtime's own failure, passed through unchanged. A refusal `setup`
@@ -41,16 +40,8 @@ pub enum NodeError {
     #[error("the model the robot's initializer serves")]
     Model(#[from] ModelError),
 
-    #[error(
-        "the robot's initializer serves the description {served} of {model}, and this \
-         backbone was built with {built}: build the backbone and the initializer from one \
-         public-peppy-libs commit"
-    )]
-    OtherDescription {
-        model: &'static str,
-        served: String,
-        built: String,
-    },
+    #[error(transparent)]
+    OtherDescription(#[from] OtherDescription),
 
     #[error(transparent)]
     Runtime(#[from] peppygen::Error),
@@ -146,8 +137,7 @@ async fn run_once_identified(
     );
     let placer = Arc::new(Placer::new(
         tree.clone(),
-        FrameName::parse(ROBOT_FRAME).expect("base_footprint is a frame name"),
-        FrameName::parse(ODOMETRY_FRAME).expect("odom is a frame name"),
+        robot_frame(),
         parameters.lookup_timeout,
     ));
     // What the base is, answered for the life of the node from its parameters and its
@@ -156,8 +146,7 @@ async fn run_once_identified(
         runner.clone(),
         config.clone(),
     ));
-    startup::wait_until_ready(&runner, &token).await;
-    if token.is_cancelled() {
+    if !startup::wait_until_ready(&runner).await {
         return;
     }
     run(runner, config, placer, publishers, started).await;

@@ -10,13 +10,13 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use frame_tree::{FrameTransform, MessageError, MovingMessage, TransformErrorReason};
+use control_core::planar_pose::PlanarPose;
+use frame_tree::arithmetic::quaternion_of_yaw;
+use frame_tree::{FrameName, FrameTransform, MessageError, MovingMessage};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::transforms::transforms;
 use peppylib::{Payload, TopicPublisher};
 use robot_description::{LinkTransform, LinkTransformError, RobotDescription};
-
-use crate::geometry::{Pose2, rpy_orientation};
 
 /// The odometry frame, as base_state names it on transforms.
 pub const ODOMETRY_FRAME: &str = "odom";
@@ -25,11 +25,19 @@ pub const ODOMETRY_FRAME: &str = "odom";
 /// transforms names it.
 pub const ROBOT_FRAME: &str = "base_footprint";
 
+/// The odometry frame, as the robot's tree names it.
+pub fn odometry_frame() -> FrameName {
+    FrameName::parse(ODOMETRY_FRAME).expect("odom is a frame name")
+}
+
+/// The robot frame, as the robot's tree names it.
+pub fn robot_frame() -> FrameName {
+    FrameName::parse(ROBOT_FRAME).expect("base_footprint is a frame name")
+}
+
 /// Why a set of the base's transforms makes no message.
 #[derive(Debug, thiserror::Error)]
 pub enum TransformsError {
-    #[error("the transform from odom to base_footprint: {0}")]
-    Odometry(TransformErrorReason),
     #[error(transparent)]
     Wheel(#[from] LinkTransformError),
     #[error(transparent)]
@@ -79,19 +87,20 @@ impl JointTransforms {
 }
 
 /// The message of the transform odom to base_footprint at `pose`, measured at
-/// `timestamp` and started at `odometry_start`.
+/// `timestamp` and started at `odometry_start`: the pose on the floor, its
+/// heading a turn about +z as tf2's `setRPY(0, 0, yaw)` makes it.
 pub fn odometry_message(
     timestamp: SystemTime,
-    pose: Pose2,
+    pose: PlanarPose,
     odometry_start: SystemTime,
 ) -> Result<MovingMessage, TransformsError> {
     let transform = FrameTransform::parse(
         ODOMETRY_FRAME,
         ROBOT_FRAME,
-        [pose.x, pose.y, 0.0],
-        rpy_orientation([0.0, 0.0, pose.yaw]),
+        [pose.x(), pose.y(), 0.0],
+        quaternion_of_yaw(pose.yaw()),
     )
-    .map_err(TransformsError::Odometry)?;
+    .expect("a planar pose is finite, its quaternion a unit one");
     Ok(MovingMessage::from_transforms(
         timestamp,
         &[transform],
@@ -152,11 +161,7 @@ mod tests {
     // timestamp and the odometry's start.
     #[test]
     fn the_odometry_places_base_footprint_in_odom() {
-        let pose = Pose2 {
-            x: 1.5,
-            y: -0.5,
-            yaw: std::f64::consts::FRAC_PI_2,
-        };
+        let pose = PlanarPose::new(1.5, -0.5, std::f64::consts::FRAC_PI_2).expect("a pose");
         let message = odometry_message(MEASURED, pose, started()).expect("a message");
         let [transform] = message.transforms.as_slice() else {
             panic!("one transform: {:?}", message.transforms);
@@ -207,18 +212,5 @@ mod tests {
         assert!(y.abs() > 1.0 - 1e-9 && x.abs() + z.abs() + w.abs() < 1e-9);
         assert_eq!(right.orientation, [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(message.start_timestamp, started());
-    }
-
-    #[test]
-    fn a_pose_that_is_no_number_makes_no_message() {
-        let pose = Pose2 {
-            x: f64::NAN,
-            y: 0.0,
-            yaw: 0.0,
-        };
-        assert!(matches!(
-            odometry_message(MEASURED, pose, started()),
-            Err(TransformsError::Odometry(_))
-        ));
     }
 }

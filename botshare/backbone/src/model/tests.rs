@@ -60,7 +60,7 @@ fn the_bundled_base_gives_its_wheels_and_its_outline() {
     assert_eq!(bundled.id(), "botshare_base");
     assert_eq!(
         model.wheels,
-        wheel_geometry(0.4, 0.1, 0.1).expect("a wheel geometry")
+        WheelGeometry::parse(0.4, 0.1, 0.1).expect("a wheel geometry")
     );
     let footprint: Vec<[f64; 2]> = model.footprint.points().to_vec();
     let expected = [[0.39, -0.29], [0.39, 0.29], [-0.39, 0.29], [-0.39, -0.29]];
@@ -102,7 +102,7 @@ fn wheels_of_two_radii_give_a_geometry_of_both() {
     let model = BaseModel::parse(base(&unequal)).expect("a base");
     assert_eq!(
         model.wheels,
-        wheel_geometry(0.4, 0.05, 0.06).expect("a wheel geometry")
+        WheelGeometry::parse(0.4, 0.05, 0.06).expect("a wheel geometry")
     );
 }
 
@@ -111,22 +111,12 @@ fn a_base_of_two_wheels_and_a_chassis_gives_its_geometry() {
     let model = BaseModel::parse(base(&(CHASSIS.to_owned() + &two_wheels()))).expect("a base");
     assert_eq!(
         model.wheels,
-        wheel_geometry(0.4, 0.05, 0.05).expect("a wheel geometry")
+        WheelGeometry::parse(0.4, 0.05, 0.05).expect("a wheel geometry")
     );
     // The wheels' outer faces stand 0.22 m to each side, past the chassis.
     let corners = model.footprint.points();
     assert_near([corners[0][0], corners[0][1], 0.0], [0.2, -0.22, 0.0]);
     assert_near([corners[2][0], corners[2][1], 0.0], [-0.2, 0.22, 0.0]);
-}
-
-#[test]
-fn a_wheel_length_not_above_zero_is_refused_by_its_name() {
-    let refused = wheel_geometry(0.4, 0.1, 0.0).expect_err("a wheel of no radius");
-    assert_eq!(
-        refused.to_string(),
-        "the wheel geometry's right_wheel_radius must be a positive finite number, got 0"
-    );
-    assert!(wheel_geometry(f64::NAN, 0.1, 0.1).is_err());
 }
 
 // A description whose wheels robot_description refuses gives no base, the

@@ -4,20 +4,17 @@
 //! `actions`), its placed value held to the floor plane and to the base's limits, each
 //! refused with `rejected` naming the value as placed and what to send.
 
-use std::time::SystemTime;
-
 use control_core::geometry::{GeometryError, Pose, Stamped, Twist};
-use control_core::non_negative_finite::NonNegativeFinite;
-use control_core::planar_pose::PlanarPose;
+use control_core::move_seconds::MoveSeconds;
+use control_core::planar_pose::{PlanarPose, normalize_angle};
 use control_core::positive_finite::PositiveFinite;
+use control_core::robot_tree::Placer;
 use control_core::time::nanoseconds;
 use control_core::twist::PlanarTwist;
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 
 use crate::config::{AxisSpec, BaseAxes};
-use crate::geometry::{Pose2, wrap_angle};
 use crate::move_control::{MovePlan, Tolerances, plan_move};
-use crate::transforms::ROBOT_FRAME;
 
 /// The longest a goal may be asked to take or may plan, and to settle after
 /// its planned end (s): the bound base_motion states.
@@ -67,7 +64,7 @@ pub struct MoveFields {
 /// them after the planned end.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoveRequest {
-    pub target: Pose2,
+    pub target: PlanarPose,
     pub plan: MovePlan,
     pub tolerances: Tolerances,
     pub settle_timeout_ns: i64,
@@ -75,47 +72,13 @@ pub struct MoveRequest {
     pub rotate_to_heading_min_angle: f64,
 }
 
-/// A number of seconds from 0 to 60, or the refusal naming `field`.
-fn move_seconds_from_wire(field: &str, value: f64) -> Result<f64, String> {
-    NonNegativeFinite::parse(value)
-        .ok()
-        .map(NonNegativeFinite::get)
-        .filter(|seconds| *seconds <= MAX_MOVE_DURATION_S)
-        .ok_or_else(|| {
-            format!(
-                "{field} must be a number of seconds from 0 to {MAX_MOVE_DURATION_S:.0}, got {value}"
-            )
-        })
-}
-
-/// A number of seconds above 0 and at most 60, or the refusal naming
-/// `field`.
-fn positive_move_seconds_from_wire(field: &str, value: f64) -> Result<f64, String> {
-    PositiveFinite::parse(value)
-        .ok()
-        .map(PositiveFinite::get)
-        .filter(|seconds| *seconds <= MAX_MOVE_DURATION_S)
-        .ok_or_else(|| {
-            format!(
-                "{field} must be a number of seconds above 0 and at most {MAX_MOVE_DURATION_S:.0}, got {value}"
-            )
-        })
+/// The seconds of `field` off the wire, from 0 to base_motion's bound.
+fn move_seconds(field: &str, value: f64) -> Result<f64, String> {
+    MoveSeconds::from_wire(field, value, MAX_MOVE_DURATION_S).map(MoveSeconds::get)
 }
 
 fn tolerance(field: &str, value: f64) -> Result<f64, String> {
-    PositiveFinite::parse(value)
-        .map(PositiveFinite::get)
-        .map_err(|_| format!("{field} must be a positive number, got {value}"))
-}
-
-/// `value` in the frame a command names, or in the robot frame for none, at
-/// `timestamp`, or at the latest time for none.
-pub fn stamped<T>(
-    frame: Option<&str>,
-    timestamp: Option<SystemTime>,
-    value: Result<T, GeometryError>,
-) -> Result<Stamped<T>, GeometryError> {
-    value.and_then(|value| Stamped::parse(frame.unwrap_or(ROBOT_FRAME), timestamp, value))
+    PositiveFinite::parse_field(field, value).map(PositiveFinite::get)
 }
 
 /// The velocity `value` of `field`, placed in the robot frame, within `range`
@@ -173,25 +136,34 @@ pub fn velocity_off_the_floor(refusal: &GeometryError) -> String {
 
 /// `pose` on the floor plane as the control loop steers by it, its heading
 /// wrapped.
-fn floor_pose(pose: PlanarPose) -> Pose2 {
-    Pose2 {
-        x: pose.x(),
-        y: pose.y(),
-        yaw: wrap_angle(pose.yaw()),
-    }
+fn floor_pose(pose: PlanarPose) -> PlanarPose {
+    PlanarPose::new(pose.x(), pose.y(), normalize_angle(pose.yaw()))
+        .expect("a finite heading wraps to a finite heading")
 }
 
-/// A drive_base goal's fields off the wire.
-pub fn drive_fields(data: &drive_base::GoalRequestData) -> Result<DriveFields, String> {
-    let hold_duration_s = positive_move_seconds_from_wire("hold_duration_s", data.hold_duration_s)?;
-    let settle_timeout_s = move_seconds_from_wire("settle_timeout_s", data.settle_timeout_s)?;
+/// A drive_base goal's fields off the wire, its velocity in the frame
+/// `placer` reads the goal's frame as.
+pub fn drive_fields(
+    data: &drive_base::GoalRequestData,
+    placer: &Placer,
+) -> Result<DriveFields, String> {
+    let hold_duration_s = MoveSeconds::positive_from_wire(
+        "hold_duration_s",
+        data.hold_duration_s,
+        MAX_MOVE_DURATION_S,
+    )?
+    .get();
+    let settle_timeout_s = move_seconds("settle_timeout_s", data.settle_timeout_s)?;
     let velocity = &data.velocity;
-    let velocity = stamped(
-        velocity.frame.as_deref(),
-        velocity.timestamp,
-        Twist::parse(velocity.linear_velocity, velocity.angular_velocity),
-    )
-    .map_err(|e| format!("the velocity: {e}"))?;
+    let velocity = Twist::parse(velocity.linear_velocity, velocity.angular_velocity)
+        .and_then(|twist| {
+            Stamped::parse(
+                placer.frame_of(velocity.frame.as_deref()),
+                velocity.timestamp,
+                twist,
+            )
+        })
+        .map_err(|e| format!("the velocity: {e}"))?;
     Ok(DriveFields {
         velocity,
         hold_duration_ns: nanoseconds(hold_duration_s),
@@ -234,9 +206,13 @@ pub fn drive_request(
     })
 }
 
-/// A move_base goal's fields off the wire.
-pub fn move_fields(data: &move_base::GoalRequestData) -> Result<MoveFields, String> {
-    let duration_s = move_seconds_from_wire("duration_s", data.duration_s)?;
+/// A move_base goal's fields off the wire, its target in the frame `placer`
+/// reads the goal's frame as.
+pub fn move_fields(
+    data: &move_base::GoalRequestData,
+    placer: &Placer,
+) -> Result<MoveFields, String> {
+    let duration_s = move_seconds("duration_s", data.duration_s)?;
     let tolerances = Tolerances {
         position: tolerance(
             "settle_position_tolerance_m",
@@ -247,14 +223,17 @@ pub fn move_fields(data: &move_base::GoalRequestData) -> Result<MoveFields, Stri
             data.settle_orientation_tolerance_rad,
         )?,
     };
-    let settle_timeout_s = move_seconds_from_wire("settle_timeout_s", data.settle_timeout_s)?;
+    let settle_timeout_s = move_seconds("settle_timeout_s", data.settle_timeout_s)?;
     let target = &data.target;
-    let target = stamped(
-        target.frame.as_deref(),
-        target.timestamp,
-        Pose::parse(target.position, target.orientation),
-    )
-    .map_err(|e| format!("the target: {e}"))?;
+    let target = Pose::parse(target.position, target.orientation)
+        .and_then(|pose| {
+            Stamped::parse(
+                placer.frame_of(target.frame.as_deref()),
+                target.timestamp,
+                pose,
+            )
+        })
+        .map_err(|e| format!("the target: {e}"))?;
     Ok(MoveFields {
         target,
         duration_s,
@@ -309,10 +288,7 @@ mod tests {
 
     use std::f64::consts::PI;
 
-    use hegel::TestCase;
-    use hegel::generators as gs;
-
-    use crate::test_rig::{AXES, ROTATE_TO_HEADING_MIN_ANGLE_RAD};
+    use crate::test_rig::{AXES, ROTATE_TO_HEADING_MIN_ANGLE_RAD, placer};
 
     const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 
@@ -342,12 +318,15 @@ mod tests {
         hold_duration_s: f64,
         settle_timeout_s: f64,
     ) -> Result<DriveRequest, String> {
-        let fields = drive_fields(&drive_goal(
-            linear_velocity,
-            angular_velocity,
-            hold_duration_s,
-            settle_timeout_s,
-        ))?;
+        let fields = drive_fields(
+            &drive_goal(
+                linear_velocity,
+                angular_velocity,
+                hold_duration_s,
+                settle_timeout_s,
+            ),
+            &placer(),
+        )?;
         let placed = *fields.velocity.value();
         drive_request(fields, placed, &AXES)
     }
@@ -378,7 +357,7 @@ mod tests {
         axes: &BaseAxes,
         data: &move_base::GoalRequestData,
     ) -> Result<MoveRequest, String> {
-        let fields = move_fields(data)?;
+        let fields = move_fields(data, &placer())?;
         let placed = *fields.target.value();
         move_request(
             fields,
@@ -513,7 +492,10 @@ mod tests {
             ),
         )
         .expect("any heading");
-        assert!((wrapped.target.yaw.abs() - PI).abs() < 1e-12, "{wrapped:?}");
+        assert!(
+            (wrapped.target.yaw().abs() - PI).abs() < 1e-12,
+            "{wrapped:?}"
+        );
     }
 
     #[test]
@@ -553,7 +535,7 @@ mod tests {
     #[test]
     fn a_move_steers_to_its_target_in_odom_and_plans_from_the_robot_frame() {
         let data = move_goal([2.0, 0.0, 0.0], IDENTITY, 0.0, 0.0);
-        let fields = move_fields(&data).expect("the fields");
+        let fields = move_fields(&data, &placer()).expect("the fields");
         let in_odometry = Pose::parse([2.0, 0.0, 0.0], IDENTITY).unwrap();
         let from_robot = Pose::parse([1.0, 0.0, 0.0], IDENTITY).unwrap();
         let request = move_request(
@@ -564,14 +546,7 @@ mod tests {
             ROTATE_TO_HEADING_MIN_ANGLE_RAD,
         )
         .expect("a move");
-        assert_eq!(
-            request.target,
-            Pose2 {
-                x: 2.0,
-                y: 0.0,
-                yaw: 0.0
-            }
-        );
+        assert_eq!(request.target, PlanarPose::new(2.0, 0.0, 0.0).unwrap());
         let one_meter = movement([1.0, 0.0, 0.0], 0.0, 0.0).expect("a move");
         assert_eq!(request.plan, one_meter.plan);
     }
@@ -603,31 +578,5 @@ mod tests {
         // Asked for 60 s, the same move plans 60 s.
         let asked = at([2.5, 0.0, 0.0], 60.0).expect("within 60 s");
         assert_eq!(asked.plan.duration_s, 60.0);
-    }
-
-    // Seconds off the wire are taken exactly when finite from 0 to 60, above 0
-    // for drive_base's hold, and a tolerance exactly when positive and
-    // finite; each is kept as it came.
-    #[hegel::test]
-    fn seconds_and_tolerances_are_taken_exactly_in_their_ranges(tc: TestCase) {
-        let value: f64 = tc.draw(gs::floats());
-        let in_seconds = value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value);
-        let positive = value.is_finite() && value > 0.0;
-        let kept = |parsed: Result<f64, String>| parsed.map(|taken| taken == value);
-        assert_eq!(
-            kept(move_seconds_from_wire("settle_timeout_s", value)).is_ok_and(|kept| kept),
-            in_seconds,
-            "{value}"
-        );
-        assert_eq!(
-            kept(positive_move_seconds_from_wire("hold_duration_s", value)).is_ok_and(|kept| kept),
-            in_seconds && positive,
-            "{value}"
-        );
-        assert_eq!(
-            kept(tolerance("settle_position_tolerance_m", value)).is_ok_and(|kept| kept),
-            positive,
-            "{value}"
-        );
     }
 }

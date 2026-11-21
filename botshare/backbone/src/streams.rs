@@ -12,8 +12,9 @@
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
-use control_core::geometry::Twist;
+use control_core::geometry::{Stamped, Twist};
 use control_core::receiving::receive;
+use control_core::robot_tree::Placer;
 use control_core::twist::PlanarTwist;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::base::joint_states;
@@ -23,8 +24,7 @@ use tracing::{error, warn};
 
 use crate::clock;
 use crate::control::{Event, WheelState};
-use crate::goal::{stamped, velocity_off_the_floor};
-use crate::placement::Placer;
+use crate::goal::velocity_off_the_floor;
 
 /// Receive the wheels' measured angles until the node cancels.
 pub async fn run_wheel_listener(runner: Arc<NodeRunner>, events: mpsc::Sender<Event>) {
@@ -100,13 +100,16 @@ async fn placed_setpoint(
     placer: &Placer,
     message: drive_setpoints::Message,
 ) -> Option<PlanarTwist> {
-    let stamped = stamped(
-        message.frame.as_deref(),
-        message.timestamp,
-        Twist::parse(message.linear_velocity, message.angular_velocity),
-    )
-    .inspect_err(|e| warn!("drive_setpoints: dropping a setpoint: {e}"))
-    .ok()?;
+    let stamped = Twist::parse(message.linear_velocity, message.angular_velocity)
+        .and_then(|twist| {
+            Stamped::parse(
+                placer.frame_of(message.frame.as_deref()),
+                message.timestamp,
+                twist,
+            )
+        })
+        .inspect_err(|e| warn!("drive_setpoints: dropping a setpoint: {e}"))
+        .ok()?;
     let placed = placer
         .place_velocity(&stamped)
         .await

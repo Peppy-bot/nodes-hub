@@ -12,17 +12,16 @@ use std::num::NonZeroUsize;
 use std::time::SystemTime;
 
 use frame_tree::Transform;
+use frame_tree::arithmetic::{quaternion_of_yaw, yaw_of_quaternion};
 
 use control_core::odometry::{Odometry, WheelGeometry};
-use control_core::positive_finite::PositiveFinite;
 use helpers::{
     ANCHOR_BOUND_RAD, ANGULAR_ACCELERATION_RAD_S2, ANGULAR_DEADBAND_RAD_S,
     ANGULAR_DECELERATION_RAD_S2, ANSWER_BUDGET, BaseState, DT, LEADER_STREAMING_WINDOW_NS,
     LINEAR_ACCELERATION_M_S2, LINEAR_DEADBAND_M_S, LINEAR_DECELERATION_M_S2,
     MAX_ANGULAR_SPEED_RAD_S, MAX_LINEAR_SPEED_M_S, MODEL, REPORTING_SILENT_STEPS,
     REST_ANGULAR_RAD_S, REST_LINEAR_M_S, Rig, START_NS, STEP_NS, WHEEL_LINKS, WHEEL_RADIUS_M,
-    WHEEL_SEPARATION_M, drive_goal, forward_speed, heading_of, move_goal, ns, target, turn_rate,
-    velocity,
+    WHEEL_SEPARATION_M, drive_goal, forward_speed, move_goal, ns, target, turn_rate, velocity,
 };
 use peppygen::fixtures::exposed_actions::base_motion::{drive_base, move_base};
 use peppygen::fixtures::exposed_services::base_state::describe_base;
@@ -94,6 +93,23 @@ async fn assert_speeds(rig: &mut Rig, speeds: &[(f64, f64)]) {
 /// The follow_state drive_states tells the leader at the rig's time.
 async fn follow_state(rig: &mut Rig) -> String {
     rig.drive_state_at(rig.now_ns).await.follow_state
+}
+
+// A follower still runs the last setpoint of a backbone that ended: its
+// wheels turn as this one starts, with no goal and no setpoint of the leader.
+// At their first measurement the base holds them where they stand, a setpoint
+// of rate 0 at the measured angles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_base_holds_its_wheels_where_they_stand_at_their_first_measurement() {
+    let mut rig = Rig::boot([0.7, -0.3]).await;
+    rig.publish_wheels_turning(START_NS, vec![1.5, 1.5]).await;
+    let hold = rig.next_wheel_setpoint().await;
+    assert_eq!(
+        (hold.positions, hold.velocities),
+        ([0.7, -0.3], [0.0, 0.0]),
+        "the first wheel setpoint holds the wheels"
+    );
+    rig.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -380,8 +396,9 @@ async fn move_base_completes_at_its_planned_end_at_rest_within_its_tolerances() 
         distance <= request.settle_position_tolerance_m,
         "the base rests {distance} m from the target"
     );
-    let yaw =
-        (heading_of(data.final_pose.orientation) - heading_of(request.target.orientation)).abs();
+    let yaw = (yaw_of_quaternion(data.final_pose.orientation)
+        - yaw_of_quaternion(request.target.orientation))
+    .abs();
     assert!(
         yaw <= request.settle_orientation_tolerance_rad,
         "the base rests {yaw} rad from the target yaw"
@@ -435,7 +452,7 @@ async fn a_robot_stop_ends_a_running_move_base_cancelled() {
     assert_eq!(
         (
             data.final_pose.position,
-            heading_of(data.final_pose.orientation)
+            yaw_of_quaternion(data.final_pose.orientation)
         ),
         ([0.0, 0.0, 0.0], 0.0)
     );
@@ -571,7 +588,7 @@ async fn a_caller_cancel_ends_the_goal_cancelled_at_rest() {
     assert_eq!(
         (
             data.final_pose.position,
-            heading_of(data.final_pose.orientation)
+            yaw_of_quaternion(data.final_pose.orientation)
         ),
         ([0.0, 0.0, 0.0], 0.0)
     );
@@ -631,7 +648,7 @@ async fn a_move_already_within_its_tolerances_completes_with_no_settle_time() {
     assert_eq!(
         (
             data.final_pose.position,
-            heading_of(data.final_pose.orientation)
+            yaw_of_quaternion(data.final_pose.orientation)
         ),
         ([0.0, 0.0, 0.0], 0.0)
     );
@@ -673,12 +690,8 @@ async fn move_base_times_out_after_its_settle_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn odometry_follows_the_measured_wheels() {
     let mut rig = Rig::start([0.0, 0.0]).await;
-    let radius = PositiveFinite::parse(WHEEL_RADIUS_M).unwrap();
-    let geometry = WheelGeometry {
-        wheel_separation_m: PositiveFinite::parse(WHEEL_SEPARATION_M).unwrap(),
-        left_wheel_radius_m: radius,
-        right_wheel_radius_m: radius,
-    };
+    let geometry =
+        WheelGeometry::parse(WHEEL_SEPARATION_M, WHEEL_RADIUS_M, WHEEL_RADIUS_M).unwrap();
     let mut expected = Odometry::new(geometry, NonZeroUsize::MIN);
     expected.anchor_wheels(0.0, 0.0).unwrap();
     // The base stands: it rests, and nothing of a limb lies outside its
@@ -705,7 +718,7 @@ async fn odometry_follows_the_measured_wheels() {
         // The heading wrapped by whole turns into (-pi, pi].
         (
             "yaw",
-            heading_of(last.pose.orientation),
+            yaw_of_quaternion(last.pose.orientation),
             heading - 2.0 * PI * (heading / (2.0 * PI)).round(),
         ),
         (
@@ -753,7 +766,7 @@ async fn odometry_follows_the_measured_wheels() {
     }
     assert_same_rotation(
         &odom_transform.orientation,
-        rotation_about([0.0, 0.0, 1.0], heading_of(last.pose.orientation)),
+        rotation_about([0.0, 0.0, 1.0], yaw_of_quaternion(last.pose.orientation)),
         "odom's heading",
     );
     assert_eq!(odom.start_timestamp, last.odometry_start_timestamp);
@@ -766,7 +779,7 @@ async fn odometry_follows_the_measured_wheels() {
         (
             drive.odometry_start_timestamp,
             drive.pose.position,
-            heading_of(drive.pose.orientation),
+            yaw_of_quaternion(drive.pose.orientation),
             drive.twist.linear_velocity,
             drive.twist.angular_velocity[2],
             drive.mode.as_str(),
@@ -775,7 +788,7 @@ async fn odometry_follows_the_measured_wheels() {
         (
             last.odometry_start_timestamp,
             last.pose.position,
-            heading_of(last.pose.orientation),
+            yaw_of_quaternion(last.pose.orientation),
             last.twist.linear_velocity,
             last.twist.angular_velocity[2],
             last.mode.as_str(),
@@ -1165,7 +1178,7 @@ async fn a_restarted_backbone_starts_a_new_odometry() {
     assert_eq!(
         (
             after_restart.pose.position,
-            heading_of(after_restart.pose.orientation)
+            yaw_of_quaternion(after_restart.pose.orientation)
         ),
         ([0.0, 0.0, 0.0], 0.0)
     );
@@ -1271,7 +1284,7 @@ async fn wheels_that_start_over_fail_the_goal_and_start_the_odometry_over() {
     assert_eq!(
         (
             restarted.pose.position,
-            heading_of(restarted.pose.orientation)
+            yaw_of_quaternion(restarted.pose.orientation)
         ),
         ([0.0, 0.0, 0.0], 0.0)
     );
@@ -1318,7 +1331,7 @@ async fn wheels_that_start_over_at_a_later_stamp_fail_the_goal_and_start_the_odo
     assert_eq!(
         (
             restarted.pose.position,
-            heading_of(restarted.pose.orientation)
+            yaw_of_quaternion(restarted.pose.orientation)
         ),
         ([0.0, 0.0, 0.0], 0.0)
     );
@@ -1374,15 +1387,21 @@ async fn a_clock_that_goes_back_fails_the_goal_brings_the_base_to_rest_and_start
     rig.publish_wheels().await;
     let state = rig.state_at(rig.now_ns).await;
     assert_eq!(
-        (state.pose.position, heading_of(state.pose.orientation)),
+        (
+            state.pose.position,
+            yaw_of_quaternion(state.pose.orientation)
+        ),
         ([0.0, 0.0, 0.0], 0.0)
     );
     assert_ne!(
         state.odometry_start_timestamp,
         before.odometry_start_timestamp
     );
-    // The next goal runs, and its first setpoint, the next the base sends,
-    // anchors on the new angles.
+    // The new epoch holds the wheels where they stand; the next goal runs,
+    // and its first setpoint, the next the base sends, anchors on the new
+    // angles.
+    let hold = rig.next_wheel_setpoint().await;
+    assert_eq!((hold.positions, hold.velocities), ([0.0, 0.0], [0.0, 0.0]));
     let next = rig.send_drive(&drive_goal(0.1, 1.0)).await;
     assert!(next.accepted, "{:?}", next.refusal);
     rig.step().await;
@@ -1824,7 +1843,7 @@ async fn a_target_in_the_camera_frame_at_a_state_time_is_placed_in_odom_by_the_t
     }
     // The target in odom, and the same pose seen from the camera as the base
     // stood at the state's time.
-    let in_odom = Transform::new([0.6, 0.4, 0.0], helpers::about_z(0.8)).expect("a pose");
+    let in_odom = Transform::new([0.6, 0.4, 0.0], quaternion_of_yaw(0.8)).expect("a pose");
     let camera = Transform::new(seen.pose.position, seen.pose.orientation)
         .expect("the odometry's pose")
         .compose(&fixed_place("base_camera_optical_frame"));
@@ -1851,7 +1870,7 @@ async fn a_target_in_the_camera_frame_at_a_state_time_is_placed_in_odom_by_the_t
         (x - 0.6).hypot(y - 0.4) <= 0.02,
         "the base rests at ({x}, {y}), the target at (0.6, 0.4) in odom"
     );
-    let heading = heading_of(data.final_pose.orientation);
+    let heading = yaw_of_quaternion(data.final_pose.orientation);
     assert!(
         (heading - 0.8).abs() <= 0.03,
         "the base rests turned {heading} rad, the target 0.8 rad in odom"

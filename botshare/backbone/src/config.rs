@@ -15,7 +15,7 @@ use control_core::limiter::{AxisLimits, AxisLimitsParams, Limiter, LimiterError,
 use control_core::non_negative_finite::{NonNegativeFinite, NotNonNegativeFinite};
 use control_core::odometry::{Odometry, WheelGeometry};
 use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
-use control_core::time::{DurationError, duration_from_secs, seconds, wait_from_secs};
+use control_core::time::{SecondsParameterError, duration_parameter, seconds, wait_parameter};
 use peppygen::Parameters;
 
 use crate::follower::LEADER_STREAMING_WINDOW_NS;
@@ -57,12 +57,8 @@ pub enum ConfigError {
     Smoothing(#[source] LimiterError),
     #[error("parameter odometry_velocity_window must be at least 1")]
     EmptyWindow,
-    #[error("parameter stop_answer_timeout_s must be a number of seconds a timer holds, got {0}")]
-    StopAnswerTimeout(f64),
-    #[error("parameter cache_window_s")]
-    CacheWindow(#[source] DurationError),
-    #[error("parameter lookup_timeout_s")]
-    LookupTimeout(#[source] DurationError),
+    #[error(transparent)]
+    Seconds(#[from] SecondsParameterError),
 }
 
 /// The limits of one axis of the base's motion, as describe_base answers
@@ -149,9 +145,6 @@ impl BaseAxes {
     /// axis within its limits, and to rest once the leader sends nothing for
     /// [`LEADER_STREAMING_WINDOW_NS`].
     pub fn limiter_settings(&self, frequency_hz: f64) -> Result<LimiterSettings, ConfigError> {
-        let still = AxisSpec::STILL
-            .limits("y")
-            .expect("a range of 0 to 0 with nothing else is a still axis");
         let smoothing_frequency_hz =
             PositiveFinite::parse(frequency_hz).map_err(|source| ConfigError::NotPositive {
                 name: "smoothing_frequency_hz",
@@ -161,7 +154,7 @@ impl BaseAxes {
             .expect("drive_link's stream gap is a finite time of at least 0");
         LimiterSettings::parse(LimiterParams {
             linear_x: self.x.moving("x")?,
-            linear_y: still,
+            linear_y: AxisLimits::STILL,
             angular_z: self.yaw.moving("angular")?,
             smoothing_frequency_hz,
             velocity_timeout_s,
@@ -176,19 +169,23 @@ impl BaseAxes {
 }
 
 /// base_state's limiter of the base as the node's parameters set it, which
-/// control_core's [`Limiter::parse`] took at setup.
+/// control_core's [`Limiter::parse`] took at setup, and the period of its
+/// steps on the node's clock (ns).
 #[derive(Clone, Debug)]
-pub struct LimiterSettings(LimiterParams);
+pub struct LimiterSettings {
+    params: LimiterParams,
+    period_ns: i64,
+}
 
 impl LimiterSettings {
     fn parse(params: LimiterParams) -> Result<Self, LimiterError> {
-        Limiter::parse(params.clone())?;
-        Ok(Self(params))
+        let period_ns = Limiter::parse(params.clone())?.period_ns();
+        Ok(Self { params, period_ns })
     }
 
     /// A limiter of these settings at rest, before its first step.
     pub fn start(&self) -> Limiter {
-        Limiter::parse(self.0.clone()).expect("settings the limiter took at setup parse again")
+        Limiter::parse(self.params.clone()).expect("settings the limiter took at setup parse again")
     }
 }
 
@@ -287,19 +284,17 @@ impl BaseParameters {
         if axes.yaw.min_velocity >= 0.0 || axes.yaw.max_velocity <= 0.0 {
             return Err(ConfigError::OneWayTurn);
         }
-        let step_ns = (1e9 / params.smoothing_frequency_hz).round() as i64;
+        let step_ns = limiter.period_ns;
         let odometry_window = NonZeroUsize::new(params.odometry_velocity_window as usize)
             .ok_or(ConfigError::EmptyWindow)?;
         let rotate_to_heading_min_angle_rad = positive(
             "rotate_to_heading_min_angle_rad",
             params.rotate_to_heading_min_angle_rad,
         )?;
-        let stop_answer_timeout = duration_from_secs(params.stop_answer_timeout_s)
-            .map_err(|_| ConfigError::StopAnswerTimeout(params.stop_answer_timeout_s))?;
-        let cache_window =
-            duration_from_secs(params.cache_window_s).map_err(ConfigError::CacheWindow)?;
-        let lookup_timeout =
-            wait_from_secs(params.lookup_timeout_s).map_err(ConfigError::LookupTimeout)?;
+        let stop_answer_timeout =
+            duration_parameter("stop_answer_timeout_s", params.stop_answer_timeout_s)?;
+        let cache_window = duration_parameter("cache_window_s", params.cache_window_s)?;
+        let lookup_timeout = wait_parameter("lookup_timeout_s", params.lookup_timeout_s)?;
         Ok(Self {
             axes,
             limiter,

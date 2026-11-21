@@ -36,12 +36,12 @@ const STEP_NS: i64 = 50_000_000;
 /// within its tolerances at the latest (s).
 const TAIL_S: f64 = 10.0;
 
-fn pose(x: f64, y: f64, yaw: f64) -> Pose2 {
-    Pose2 { x, y, yaw }
+fn pose(x: f64, y: f64, yaw: f64) -> PlanarPose {
+    PlanarPose::new(x, y, yaw).expect("a finite pose")
 }
 
 /// The steering of the fastest move to `target` within [`TOLERANCES`].
-fn fastest_move_to(target: Pose2) -> MoveController {
+fn fastest_move_to(target: PlanarPose) -> MoveController {
     let plan = plan_move(target, TOLERANCES.position, LINEAR, ANGULAR, 0.0);
     MoveController::new(
         target,
@@ -239,7 +239,7 @@ fn the_drive_velocity_is_nav2_drive_on_headings() {
 #[test]
 fn a_target_behind_is_turned_toward_before_the_drive() {
     let mut controller = fastest_move_to(pose(-1.0, 0.0, 0.0));
-    let first = controller.command(Pose2::default(), DT);
+    let first = controller.command(PlanarPose::IDENTITY, DT);
     assert_eq!(first.linear_x(), 0.0);
     assert_eq!(first.angular_z(), 1.5);
 }
@@ -248,14 +248,14 @@ fn a_target_behind_is_turned_toward_before_the_drive() {
 fn a_target_ahead_within_the_yaw_tolerance_of_the_heading_is_driven_to_at_once() {
     // A bearing of 25 mrad, within the 30 mrad tolerance.
     let mut controller = fastest_move_to(pose(2.0, 0.05, 0.0));
-    let first = controller.command(Pose2::default(), DT);
+    let first = controller.command(PlanarPose::IDENTITY, DT);
     assert_eq!((first.linear_x(), first.angular_z()), (0.05, 0.0));
 }
 
 #[test]
 fn a_drive_whose_bearing_leaves_the_yaw_tolerance_turns_toward_the_target_again() {
     let mut controller = fastest_move_to(pose(2.0, 0.0, 0.0));
-    controller.command(Pose2::default(), DT);
+    controller.command(PlanarPose::IDENTITY, DT);
     // 1 m on, slipped 2 cm to the left: a bearing of 20 mrad, within the
     // 30 mrad tolerance, and the drive goes on, at 0.1 m/s.
     let aimed = controller.command(pose(1.0, 0.02, 0.0), DT);
@@ -292,7 +292,7 @@ fn a_drive_whose_bearing_leaves_the_yaw_tolerance_turns_toward_the_target_again(
 #[test]
 fn a_drive_runs_to_its_end_within_the_position_tolerance() {
     let mut controller = fastest_move_to(pose(1.0, 0.0, 0.5));
-    controller.command(Pose2::default(), DT);
+    controller.command(PlanarPose::IDENTITY, DT);
     // 1 cm short, within the 2 cm tolerance: the drive goes on to the
     // target before the turn to its yaw.
     assert!(controller.command(pose(0.99, 0.0, 0.0), DT).linear_x() > 0.0);
@@ -313,7 +313,7 @@ fn a_drive_with_its_heading_free_turns_toward_a_target_past_the_rotate_to_headin
         ROTATE_TO_HEADING_MIN_ANGLE_RAD,
         PlanarTwist::ZERO,
     );
-    assert!(controller.command(Pose2::default(), DT).linear_x() > 0.0);
+    assert!(controller.command(PlanarPose::IDENTITY, DT).linear_x() > 0.0);
     // Turned 0.78 rad off the target, within 0.785 rad: the drive goes on.
     let within = controller.command(pose(0.0, 0.0, 0.78), DT);
     assert_eq!(within.angular_z(), 0.0);
@@ -331,7 +331,7 @@ fn a_drive_with_its_heading_free_turns_toward_a_target_past_the_rotate_to_headin
 fn the_turn_to_the_yaw_runs_past_the_yaw_tolerance_to_its_end() {
     let target = pose(0.0, 0.0, 0.5);
     let mut controller = fastest_move_to(target);
-    assert!(controller.command(Pose2::default(), DT).angular_z() > 0.0);
+    assert!(controller.command(PlanarPose::IDENTITY, DT).angular_z() > 0.0);
     // 10 mrad short of the yaw, within the 30 mrad tolerance: still turning.
     let near = controller.command(pose(0.0, 0.0, 0.49), DT);
     assert!(near.angular_z() > 0.0);
@@ -384,7 +384,7 @@ fn a_slow_plan_commands_just_above_the_deadband() {
         PlanarTwist::ZERO,
     );
     assert_eq!(
-        controller.command(Pose2::default(), DT),
+        controller.command(PlanarPose::IDENTITY, DT),
         PlanarTwist::new(0.005 * (1.0 + ABOVE_DEADBAND), 0.0, 0.0).unwrap()
     );
 }
@@ -403,7 +403,7 @@ fn a_drive_keeps_its_scaled_speed_and_the_acceleration() {
         PlanarTwist::ZERO,
     );
     let dt = 0.02;
-    let mut pose = Pose2::default();
+    let mut pose = PlanarPose::IDENTITY;
     let mut last = 0.0;
     for _ in 0..2000 {
         let command = controller.command(pose, dt).linear_x();
@@ -413,19 +413,19 @@ fn a_drive_keeps_its_scaled_speed_and_the_acceleration() {
             "from {last} to {command}"
         );
         last = command;
-        pose.x += command * dt;
+        pose = self::pose(pose.x() + command * dt, pose.y(), pose.yaw());
     }
 }
 
 /// `pose` moved by `velocity` for `dt` (s): the turn, then the drive along
 /// the new heading.
-fn moved(pose: Pose2, velocity: PlanarTwist, dt: f64) -> Pose2 {
-    let yaw = pose.yaw + velocity.angular_z() * dt;
-    Pose2 {
-        x: pose.x + velocity.linear_x() * dt * yaw.cos(),
-        y: pose.y + velocity.linear_x() * dt * yaw.sin(),
-        yaw: wrap_angle(yaw),
-    }
+fn moved(pose: PlanarPose, velocity: PlanarTwist, dt: f64) -> PlanarPose {
+    let yaw = pose.yaw() + velocity.angular_z() * dt;
+    self::pose(
+        pose.x() + velocity.linear_x() * dt * yaw.cos(),
+        pose.y() + velocity.linear_x() * dt * yaw.sin(),
+        normalize_angle(yaw),
+    )
 }
 
 // A move to any target within reach, for any duration up to 60 s and
@@ -478,7 +478,7 @@ fn a_move_through_the_limiter_rests_within_its_tolerances(tc: TestCase) {
         .start();
     let planned_end_ns = nanoseconds(plan.duration_s);
     let last_step = ((plan.duration_s + TAIL_S) / DT).ceil() as i64;
-    let mut pose = Pose2::default();
+    let mut pose = PlanarPose::IDENTITY;
     for step in 1..=last_step {
         let now_ns = step * STEP_NS;
         limiter.take_setpoint(controller.command(pose, DT), now_ns);
@@ -512,7 +512,7 @@ fn a_move_started_rolling_ahead_winds_the_roll_down_before_it_turns() {
         ROTATE_TO_HEADING_MIN_ANGLE_RAD,
         rolling,
     );
-    let first = controller.command(Pose2::default(), DT);
+    let first = controller.command(PlanarPose::IDENTITY, DT);
     assert_eq!(first.angular_z(), 0.0, "{first:?}");
     assert!(
         (first.linear_x() - (0.3 - LINEAR.deceleration * DT)).abs() < 1e-12,

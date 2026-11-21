@@ -17,16 +17,16 @@
 //! - follower goal: a goal of base_motion holds the base while it runs; the
 //!   caller says whether one does.
 
+use control_core::stream_window::StreamWindow;
+
 /// How long the leader's silence ends its stream and the holds that wait on
 /// it (ns): drive_link's 0.5 s.
 pub const LEADER_STREAMING_WINDOW_NS: i64 = 500_000_000;
 
-/// Whether a leader whose newest setpoint arrived at `last_ns` streams at
-/// `now_ns`: until more than [`LEADER_STREAMING_WINDOW_NS`] pass with no setpoint. A
-/// setpoint that arrived after `now_ns` streams too.
-pub fn streaming(last_ns: Option<i64>, now_ns: i64) -> bool {
-    last_ns.is_some_and(|last_ns| now_ns - last_ns <= LEADER_STREAMING_WINDOW_NS)
-}
+/// The leader's stream, on the node's clock: live from each setpoint that
+/// arrives until more than [`LEADER_STREAMING_WINDOW_NS`] pass with no
+/// setpoint, a setpoint that arrived after the time asked about included.
+pub const LEADER_STREAM: StreamWindow<i64> = StreamWindow::new(LEADER_STREAMING_WINDOW_NS);
 
 /// Whether the base follows the leader, as drive_states tells it: the first
 /// that holds.
@@ -84,7 +84,7 @@ impl Default for Follower {
 impl Follower {
     /// Whether the leader streams at `now_ns`.
     pub fn streams_at(&self, now_ns: i64) -> bool {
-        streaming(self.last_ns, now_ns)
+        LEADER_STREAM.streams(self.last_ns, now_ns)
     }
 
     /// Ends each hold whose pause has passed by `now_ns`, for good: a later
@@ -92,7 +92,7 @@ impl Follower {
     fn release(&mut self, now_ns: i64) {
         if let Some(stop_ns) = self.stop_ns {
             let quiet_from = self.last_ns.map_or(stop_ns, |last_ns| last_ns.max(stop_ns));
-            if now_ns - quiet_from > LEADER_STREAMING_WINDOW_NS {
+            if !LEADER_STREAM.streams(Some(quiet_from), now_ns) {
                 self.stop_ns = None;
             }
         }

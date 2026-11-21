@@ -7,11 +7,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use control_core::move_slot::{MoveSlot, SlotRelease};
 use control_core::sync::lock_ignoring_poison;
 
 use crate::failure::{Failure, FailureKind};
 use crate::follower;
-use crate::move_slot::{MoveSlot, SlotRelease};
 
 const WHEELS_SILENT: &str = "the base's wheels are silent: retry once base_states reports";
 const LEADER_STREAMS: &str = "the leader of drive_link streams to the base: stop the leader, or wait until 0.5 s pass after its last setpoint, then retry";
@@ -50,7 +50,7 @@ impl BaseStatus {
                 WHEELS_SILENT,
             ));
         };
-        if follower::streaming(state.setpoint_ns, now_ns) {
+        if follower::LEADER_STREAM.streams(state.setpoint_ns, now_ns) {
             return Err(Failure::new(FailureKind::LeaderStreaming, LEADER_STREAMS));
         }
         if state.resting || !slot.claim() {

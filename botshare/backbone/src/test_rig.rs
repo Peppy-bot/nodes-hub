@@ -5,7 +5,22 @@
 mod parameters;
 pub use parameters::*;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use control_core::node_clock::NodeClock;
+use control_core::robot_tree::{Placer, RobotTree};
+
 use crate::config::{AxisSpec, BaseAxes};
+use crate::transforms::robot_frame;
+
+/// A placer in the robot frame on an empty robot's tree on the wall clock,
+/// which places a value in the robot frame as it is given.
+pub fn placer() -> Placer {
+    let tree =
+        RobotTree::new(Duration::from_secs(10), NodeClock::wall()).expect("a window above 0");
+    Placer::new(Arc::new(tree), robot_frame(), Duration::ZERO)
+}
 
 pub const AXES: BaseAxes = BaseAxes {
     x: AxisSpec {

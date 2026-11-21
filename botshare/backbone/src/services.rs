@@ -5,6 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::asking::ask_loop;
 use control_core::serving;
 use control_core::sync::wait_for;
 use peppygen::NodeRunner;
@@ -67,35 +68,22 @@ pub async fn serve_describe_base(runner: Arc<NodeRunner>, config: Arc<BaseConfig
 }
 
 /// Hand the robot stop to the control loop and return the parts it stopped,
-/// or why it could not, the loop taken and answered within `timeout`. The
-/// stop waits within `timeout` for its place in the loop's one queue, which
-/// the wheels' measurements and the leader's setpoints share:
-/// - the loop is not running, or it dropped the stop;
-/// - it did not take and answer the stop within `timeout`.
+/// or why it could not, the loop taken and answered within `timeout`
+/// ([`ask_loop`]): the stop waits within `timeout` for its place in the loop's
+/// one queue, which the wheels' measurements and the leader's setpoints share.
 fn stop_moves(
     events: &mpsc::Sender<Event>,
     reason: String,
     timeout: Duration,
 ) -> Result<Vec<String>, String> {
     let (reply, answer) = oneshot::channel();
-    wait_for(async {
-        let asked = async {
-            events
-                .send(Event::Stop { reason, reply })
-                .await
-                .map_err(|_| "the control loop is not running".to_string())?;
-            answer
-                .await
-                .map_err(|_| "the control loop dropped the stop".to_string())
-        };
-        tokio::time::timeout(timeout, asked)
-            .await
-            .unwrap_or_else(|_| {
-                Err(format!(
-                    "the control loop did not answer within {timeout:?}"
-                ))
-            })
-    })
+    wait_for(ask_loop(
+        "control loop",
+        events,
+        Event::Stop { reason, reply },
+        answer,
+        timeout,
+    ))
     .inspect_err(|reason| error!("stop: {reason}"))
 }
 
@@ -116,59 +104,4 @@ pub async fn run_robot_stop(
         })
     })
     .await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A control loop that takes no stop within the answer time, its one
-    /// queue full: the stop fails naming that time, and the loop never takes
-    /// it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stop_the_loop_does_not_take_in_its_answer_time_fails_naming_it() {
-        let (events, mut queued) = mpsc::channel(1);
-        let (held, _answer) = oneshot::channel();
-        events
-            .try_send(Event::Stop {
-                reason: "a stop before".to_string(),
-                reply: held,
-            })
-            .expect("a free queue");
-        let timeout = Duration::from_millis(10);
-        assert_eq!(
-            stop_moves(&events, "the operator asked".to_string(), timeout),
-            Err(format!(
-                "the control loop did not answer within {timeout:?}"
-            ))
-        );
-        let Ok(Event::Stop { reason, .. }) = queued.try_recv() else {
-            panic!("the stop before stays queued");
-        };
-        assert_eq!(reason, "a stop before");
-        assert!(
-            queued.try_recv().is_err(),
-            "the timed-out stop never queued"
-        );
-    }
-
-    /// A control loop that takes the stop answers it with the parts it
-    /// stopped.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stop_the_loop_takes_answers_the_parts_it_stopped() {
-        let (events, mut queued) = mpsc::channel(1);
-        tokio::spawn(async move {
-            if let Some(Event::Stop { reply, .. }) = queued.recv().await {
-                let _ = reply.send(vec![BASE_NAME.to_string()]);
-            }
-        });
-        assert_eq!(
-            stop_moves(
-                &events,
-                "the operator asked".to_string(),
-                Duration::from_secs(30)
-            ),
-            Ok(vec![BASE_NAME.to_string()])
-        );
-    }
 }

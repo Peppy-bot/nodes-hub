@@ -4,10 +4,11 @@
 //! compares times.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use control_core::fault::Fault;
 use control_core::node_clock::{NodeClock, follow_ticks};
+use frame_tree::Stamp;
 use peppygen::NodeRunner;
 use peppylib::messaging::TopicBuffer;
 use peppylib::runtime::CancellationToken;
@@ -55,17 +56,18 @@ pub fn now_ns() -> Option<i64> {
         .and_then(|now| i64::try_from(now).ok())
 }
 
-/// A wire time as nanoseconds on the node's clock, or `None` for a time
-/// before the clock's origin.
+/// A wire time as nanoseconds on the node's clock, as its [`Stamp`] counts
+/// them, or `None` for a time no stamp holds: one before the clock's origin.
 pub fn ns_from_wire(time: SystemTime) -> Option<i64> {
-    time.duration_since(SystemTime::UNIX_EPOCH)
+    Stamp::from_time(time)
         .ok()
-        .and_then(|since| i64::try_from(since.as_nanos()).ok())
+        .and_then(|stamp| i64::try_from(stamp.as_nanos()).ok())
 }
 
-/// Nanoseconds on the node's clock as a wire time.
+/// Nanoseconds on the node's clock as a wire time: the time of their
+/// [`Stamp`], the clock's origin for a time before it.
 pub fn wire_from_ns(time_ns: i64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_nanos(time_ns.max(0).unsigned_abs())
+    Stamp::from_nanos(time_ns.max(0).unsigned_abs()).time()
 }
 
 #[cfg(test)]
@@ -80,7 +82,7 @@ mod tests {
 
     #[test]
     fn a_time_before_the_clock_origin_reads_none() {
-        let before = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
+        let before = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
         assert_eq!(ns_from_wire(before), None);
     }
     #[tokio::test]

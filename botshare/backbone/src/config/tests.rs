@@ -2,8 +2,8 @@ use super::*;
 
 use peppygen::parameters::x::X;
 
-use crate::model::wheel_geometry;
 use crate::test_rig::params as parameters;
+use control_core::odometry::WheelGeometry;
 
 /// What spoils one parameter of a base the node takes.
 type Spoil = fn(&mut Parameters);
@@ -33,7 +33,7 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
     assert_eq!(config.axes.rest_bounds(), [0.005, 0.0, 0.01]);
     assert_eq!(
         config.wheels,
-        wheel_geometry(0.4, 0.1, 0.1).expect("a wheel geometry")
+        WheelGeometry::parse(0.4, 0.1, 0.1).expect("a wheel geometry")
     );
     assert_eq!(config.footprint.points().len(), 4);
     let refused = parameters.configure("so101").expect_err("an arm");
@@ -60,19 +60,19 @@ fn a_positive_number_not_above_zero_is_refused_by_name() {
 }
 
 // A stop timeout below 0, too small for a timer to hold, or past what one
-// holds is refused with one text, naming the value.
+// holds is refused naming the parameter, then why.
 #[test]
 fn a_stop_answer_timeout_no_timer_holds_is_refused() {
     for seconds in [-1.0, 1e-10, 1e300] {
         let mut params = parameters();
         params.stop_answer_timeout_s = seconds;
         let refused = BaseParameters::parse(&params).expect_err("no timer holds it");
-        assert_eq!(
-            refused.to_string(),
-            format!(
-                "parameter stop_answer_timeout_s must be a number of seconds a timer holds, got \
-                 {seconds}"
-            )
+        assert_eq!(refused.to_string(), "parameter stop_answer_timeout_s");
+        assert!(
+            std::error::Error::source(&refused)
+                .is_some_and(|why| why.to_string().contains(&format!("{seconds:e}"))
+                    || why.to_string().contains(&seconds.to_string())),
+            "{refused:?}"
         );
     }
 }

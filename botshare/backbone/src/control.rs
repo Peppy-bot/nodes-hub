@@ -19,11 +19,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use control_core::limiter::Limiter;
+use control_core::move_slot::MoveSlot;
 use control_core::odometry::{Odometry, WheelSetpoint};
+use control_core::planar_pose::{PlanarPose, normalize_angle};
 use control_core::robot_tree::RobotTree;
 use control_core::stop_reason::stop_reason;
 use control_core::time::{nanoseconds, seconds};
 use control_core::twist::PlanarTwist;
+use frame_tree::arithmetic::quaternion_of_yaw;
 use frame_tree::{MovingMessage, Publisher as TreePublisher};
 use peppygen::emitted_topics::base_state::base_states;
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
@@ -39,10 +42,8 @@ use crate::clock::{self, wire_from_ns};
 use crate::config::BaseConfig;
 use crate::failure::{Failure, FailureKind};
 use crate::follower::{Follower, LEADER_STREAMING_WINDOW_NS};
-use crate::geometry::{Pose2, rpy_orientation, wrap_angle};
 use crate::goal::{DriveRequest, MoveRequest};
 use crate::move_control::MoveController;
-use crate::move_slot::MoveSlot;
 use crate::rest::RestWindow;
 use crate::status::{Admitted, BaseStatus};
 use crate::transforms::{self, TransformsError};
@@ -197,12 +198,19 @@ impl GoalMotion {
     }
 }
 
+/// `pose`, a pose of the robot frame in odom, in the goal's frame: the robot
+/// frame at `start` in odom when the goal started.
+fn seen_from_start(pose: PlanarPose, start: PlanarPose) -> PlanarPose {
+    pose.seen_from(start)
+        .expect("two poses the odometry reaches lie a finite distance apart")
+}
+
 /// The motion an accepted goal runs from the time it was admitted at, a move
 /// steering in the goal's frame, the robot frame at `start` in odom, on from
 /// `command`, the limiter's velocity as it starts, and its claim on the base.
 fn goal_motion(
     accepted: AcceptedGoal,
-    start: Pose2,
+    start: PlanarPose,
     command: PlanarTwist,
 ) -> (GoalMotion, Admitted) {
     match accepted {
@@ -232,7 +240,7 @@ fn goal_motion(
                 GoalMotion::Move {
                     ctx,
                     controller: MoveController::new(
-                        request.target.seen_from(start),
+                        seen_from_start(request.target, start),
                         plan,
                         request.tolerances,
                         request.rotate_to_heading_min_angle,
@@ -252,7 +260,7 @@ fn goal_motion(
 /// the end of the settle of a cancelled goal, and the claim on the base it
 /// releases when it ends.
 struct RunningGoal {
-    start: Pose2,
+    start: PlanarPose,
     started: Instant,
     ending: Option<Ending>,
     /// The goal's settle timeout after the first step that found it
@@ -278,7 +286,7 @@ fn reached(velocity: PlanarTwist, target: PlanarTwist) -> bool {
 /// newest measurement: the final pose of a goal.
 #[derive(Clone, Copy, Debug)]
 struct Located {
-    pose: Pose2,
+    pose: PlanarPose,
     timestamp: SystemTime,
 }
 
@@ -292,8 +300,8 @@ macro_rules! end_goal {
         let final_pose = $action::$final_pose {
             frame: transforms::ODOMETRY_FRAME.to_owned(),
             timestamp,
-            position: [pose.x, pose.y, 0.0],
-            orientation: rpy_orientation([0.0, 0.0, pose.yaw]),
+            position: [pose.x(), pose.y(), 0.0],
+            orientation: quaternion_of_yaw(pose.yaw()),
         };
         match $outcome {
             Outcome::Ending(Ending::Completed) => $ctx.complete(final_pose, $action_time).await,
@@ -309,7 +317,7 @@ macro_rules! end_goal {
 impl RunningGoal {
     /// The accepted goal, started with the robot frame at `start` and the
     /// limiter at `command`.
-    fn new(accepted: AcceptedGoal, start: Pose2, command: PlanarTwist) -> Self {
+    fn new(accepted: AcceptedGoal, start: PlanarPose, command: PlanarTwist) -> Self {
         let (motion, claim) = goal_motion(accepted, start, command);
         Self {
             start,
@@ -386,7 +394,7 @@ impl RunningGoal {
 
     /// The setpoint of the step at `now_ns`, with the robot frame at `pose`
     /// in the goal's frame: zero once the goal has an ending.
-    fn setpoint(&mut self, pose: Pose2, now_ns: i64, dt: f64) -> PlanarTwist {
+    fn setpoint(&mut self, pose: PlanarPose, now_ns: i64, dt: f64) -> PlanarTwist {
         if self.ending.is_some() {
             return PlanarTwist::ZERO;
         }
@@ -436,7 +444,12 @@ impl RunningGoal {
     /// `measured`: the `timeout` of a goal past its settle. A move's settle
     /// ends `settle_timeout_s` after its planned end while it runs; a
     /// completed drive's, that long after its command came to 0.
-    fn settle_failure(&self, pose: Pose2, measured: PlanarTwist, now_ns: i64) -> Option<Failure> {
+    fn settle_failure(
+        &self,
+        pose: PlanarPose,
+        measured: PlanarTwist,
+        now_ns: i64,
+    ) -> Option<Failure> {
         let message = match &self.motion {
             GoalMotion::Move {
                 controller,
@@ -473,7 +486,7 @@ impl RunningGoal {
     /// `pose` in the goal's frame, or `None` while it runs on: its ending
     /// once the base rests, and a move's completion once, at or after its
     /// planned end, the base rests within both tolerances.
-    fn ready_ending(&self, pose: Pose2, now_ns: i64, at_rest: bool) -> Option<Ending> {
+    fn ready_ending(&self, pose: PlanarPose, now_ns: i64, at_rest: bool) -> Option<Ending> {
         if !at_rest {
             return None;
         }
@@ -492,7 +505,7 @@ impl RunningGoal {
         }
     }
 
-    async fn publish_feedback(&self, pose: Pose2) {
+    async fn publish_feedback(&self, pose: PlanarPose) {
         let GoalMotion::Move {
             ctx, controller, ..
         } = &self.motion
@@ -599,7 +612,7 @@ impl Epoch {
 struct StateReport {
     timestamp_ns: i64,
     odometry_start: SystemTime,
-    pose: Pose2,
+    pose: PlanarPose,
     linear: f64,
     angular: f64,
 }
@@ -672,12 +685,13 @@ impl Base {
     }
 
     /// The robot frame in the odometry frame, its heading wrapped.
-    fn pose(&self) -> Pose2 {
-        Pose2 {
-            x: self.odometry.x(),
-            y: self.odometry.y(),
-            yaw: wrap_angle(self.odometry.heading()),
-        }
+    fn pose(&self) -> PlanarPose {
+        PlanarPose::new(
+            self.odometry.x(),
+            self.odometry.y(),
+            normalize_angle(self.odometry.heading()),
+        )
+        .expect("the odometry takes finite updates alone")
     }
 
     /// Where the odometry places the robot frame in odom, at the time of the
@@ -818,9 +832,10 @@ impl Base {
 
     /// Start a new odometry epoch on `state`: the odometry starts at the
     /// origin, anchored on its angles, the wheel setpoints anchor on them,
-    /// and base_states' rest and reports start over. When an open epoch ran,
-    /// the wheels' positions started over, and a goal in flight fails with
-    /// `resource_unavailable`.
+    /// the wheels hold where they stand, a setpoint of rate 0 at the measured
+    /// angles sent at once, and base_states' rest and reports start over.
+    /// When an open epoch ran, the wheels' positions started over, and a goal
+    /// in flight fails with `resource_unavailable`.
     async fn start_epoch(&mut self, state: WheelState) {
         if self.epoch.as_ref().is_some_and(|epoch| !epoch.closed) {
             warn!(
@@ -837,6 +852,7 @@ impl Base {
             .expect("the wheel stream drops every measurement whose angles are not finite");
         let odometry_start = self.new_odometry_start();
         self.status.set_odometry_start(odometry_start);
+        let held_ns = clock::now_ns().unwrap_or(state.timestamp_ns);
         self.epoch = Some(Epoch {
             follower: state.follower.clone(),
             odometry_start,
@@ -848,6 +864,10 @@ impl Base {
         self.due_report = None;
         self.published = None;
         self.rest.clear();
+        // A follower can still run the last setpoint of a node that ended
+        // before this one started: the hold stops it before any goal.
+        self.send_wheel_setpoint(PlanarTwist::ZERO, true, held_ns)
+            .await;
     }
 
     /// Integrate `state` into the odometry over the time since the epoch's
@@ -1017,7 +1037,7 @@ impl Base {
             if let Some(reason) = goal.cancel_reason() {
                 goal.cancel(reason);
             }
-            let setpoint = goal.setpoint(pose.seen_from(goal.start), now_ns, dt);
+            let setpoint = goal.setpoint(seen_from_start(pose, goal.start), now_ns, dt);
             self.limits.take_setpoint(setpoint, now_ns);
         }
         let output = self.limits.tick(now_ns);
@@ -1033,7 +1053,7 @@ impl Base {
         let measured = self.measured_velocity();
         let Some(goal) = &mut self.goal else { return };
         goal.note_command(command, now_ns);
-        let pose = pose.seen_from(goal.start);
+        let pose = seen_from_start(pose, goal.start);
         // Completion is decided first: a base that rests within its
         // tolerances when its settle ends completes.
         if let Some(ending) = goal.ready_ending(pose, now_ns, at_rest) {
@@ -1145,9 +1165,8 @@ impl Base {
             linear,
             angular,
         } = report;
-        let Pose2 { x, y, yaw } = pose;
         let timestamp = wire_from_ns(timestamp_ns);
-        let (position, orientation) = ([x, y, 0.0], rpy_orientation([0.0, 0.0, yaw]));
+        let (position, orientation) = ([pose.x(), pose.y(), 0.0], quaternion_of_yaw(pose.yaw()));
         let (linear_velocity, angular_velocity) = ([linear, 0.0, 0.0], [0.0, 0.0, angular]);
         let mode = match self.rest.rests(self.config.axes.rest_bounds()) {
             true => "standing",

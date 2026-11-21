@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use control_core::fault::Fault;
+use frame_tree::Stamp;
+use frame_tree::arithmetic::quaternion_of_yaw;
 use peppygen::fixtures::emitted_topics::transforms::transforms;
 use peppygen::fixtures::exposed_actions::base_motion::{drive_base, move_base};
 use peppygen::fixtures::exposed_services::robot_stop::stop;
@@ -61,15 +63,15 @@ pub const ANCHOR_BOUND_RAD: f64 =
 /// a bound on a test that fails, never a pass condition.
 pub const ANSWER_BUDGET: Duration = Duration::from_secs(30);
 
-/// A wire time as nanoseconds.
+/// A wire time as nanoseconds, as its stamp counts them.
 pub fn ns(time: SystemTime) -> i64 {
-    time.duration_since(SystemTime::UNIX_EPOCH)
-        .expect("a time after the origin")
-        .as_nanos() as i64
+    let stamp = Stamp::from_time(time).expect("a time a stamp holds");
+    i64::try_from(stamp.as_nanos()).expect("a time of the rig's clock")
 }
 
+/// Nanoseconds of the rig's clock as a wire time.
 fn wire(time_ns: i64) -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_nanos(time_ns as u64)
+    Stamp::from_nanos(u64::try_from(time_ns).expect("a time of the rig's clock")).time()
 }
 
 /// The forward speed (m/s) of a wheel setpoint's rates.
@@ -80,16 +82,6 @@ pub fn forward_speed(setpoint: &base::joint_setpoints::Message) -> f64 {
 /// The turn rate (rad/s) of a wheel setpoint's rates.
 pub fn turn_rate(setpoint: &base::joint_setpoints::Message) -> f64 {
     (setpoint.velocities[1] - setpoint.velocities[0]) * WHEEL_RADIUS_M / WHEEL_SEPARATION_M
-}
-
-/// The orientation of a turn of `yaw` (rad) about +z, [x, y, z, w].
-pub fn about_z(yaw: f64) -> [f64; 4] {
-    [0.0, 0.0, (yaw / 2.0).sin(), (yaw / 2.0).cos()]
-}
-
-/// The heading (rad) of an orientation that turns about +z alone.
-pub fn heading_of([_, _, z, w]: [f64; 4]) -> f64 {
-    2.0 * z.atan2(w)
 }
 
 /// A velocity in the robot frame at the latest time: `linear_x` (m/s) ahead
@@ -126,7 +118,7 @@ pub fn target(
         frame: None,
         timestamp: None,
         position: [x, y, 0.0],
-        orientation: about_z(yaw),
+        orientation: quaternion_of_yaw(yaw),
     }
 }
 
@@ -327,13 +319,20 @@ impl Rig {
 
     /// Publish the wheels' measurement, stamped `stamp_ns`.
     pub async fn publish_wheels_stamped(&self, stamp_ns: i64) {
+        self.publish_wheels_turning(stamp_ns, Vec::new()).await;
+    }
+
+    /// Publish the wheels' measurement, stamped `stamp_ns`, the wheels
+    /// turning at `rates` (rad/s), as a follower that runs a setpoint reports
+    /// them.
+    pub async fn publish_wheels_turning(&self, stamp_ns: i64, rates: Vec<f64>) {
         self.pairings
             .base
             .joint_states
             .publish(&base::joint_states::Message {
                 timestamp: wire(stamp_ns),
                 positions: self.wheels,
-                velocities: Vec::new(),
+                velocities: rates,
                 efforts: Vec::new(),
             })
             .await

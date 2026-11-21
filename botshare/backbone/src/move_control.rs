@@ -33,9 +33,9 @@
 
 use std::f64::consts::PI;
 
+use control_core::chase::rate_limited;
+use control_core::planar_pose::{PlanarPose, normalize_angle};
 use control_core::twist::PlanarTwist;
-
-use crate::geometry::{Pose2, wrap_angle};
 
 /// How far above its deadband a floored command stands, as a share of the
 /// deadband: past the rounding of the limiter's sums, which can land a
@@ -204,20 +204,20 @@ pub struct MovePlan {
 /// toward it, the drive ahead to it and the turn to its yaw (rad, m, rad),
 /// each turn the shorter way, clockwise when negative. A target within
 /// `position_tolerance` of the origin is a turn in place.
-fn legs(target: Pose2, position_tolerance: f64) -> [f64; 3] {
-    let distance = target.x.hypot(target.y);
+fn legs(target: PlanarPose, position_tolerance: f64) -> [f64; 3] {
+    let distance = target.x().hypot(target.y());
     if distance <= position_tolerance {
-        return [0.0, 0.0, wrap_angle(target.yaw)];
+        return [0.0, 0.0, normalize_angle(target.yaw())];
     }
-    let bearing = target.y.atan2(target.x);
-    [bearing, distance, wrap_angle(target.yaw - bearing)]
+    let bearing = target.y().atan2(target.x());
+    [bearing, distance, normalize_angle(target.yaw() - bearing)]
 }
 
 /// Plan the move to `target` under the base's linear and angular limits,
 /// each leg at the speed of the way it goes, taking `requested_s` (s),
 /// floored at the fastest the limits allow.
 pub fn plan_move(
-    target: Pose2,
+    target: PlanarPose,
     position_tolerance: f64,
     linear: AxisProfile,
     angular: AxisProfile,
@@ -297,13 +297,13 @@ struct Offset {
 }
 
 impl Offset {
-    fn of(target: Pose2, pose: Pose2) -> Self {
-        let (dx, dy) = (target.x - pose.x, target.y - pose.y);
-        let (sin, cos) = pose.yaw.sin_cos();
+    fn of(target: PlanarPose, pose: PlanarPose) -> Self {
+        let (dx, dy) = (target.x() - pose.x(), target.y() - pose.y());
+        let [ahead, _] = pose.apply_inverse([target.x(), target.y()]);
         Self {
-            distance: dx.hypot(dy),
-            bearing: wrap_angle(dy.atan2(dx) - pose.yaw),
-            ahead: cos * dx + sin * dy,
+            distance: pose.distance_to(target),
+            bearing: normalize_angle(dy.atan2(dx) - pose.yaw()),
+            ahead,
             yaw: pose.yaw_to(target),
         }
     }
@@ -312,7 +312,7 @@ impl Offset {
 /// The steering of one move, in the goal's frame.
 #[derive(Debug)]
 pub struct MoveController {
-    target: Pose2,
+    target: PlanarPose,
     plan: MovePlan,
     tolerances: Tolerances,
     /// The largest bearing (rad) at which the drive goes on toward its
@@ -327,7 +327,7 @@ pub struct MoveController {
 
 impl MoveController {
     pub fn new(
-        target: Pose2,
+        target: PlanarPose,
         plan: MovePlan,
         tolerances: Tolerances,
         rotate_to_heading_min_angle: f64,
@@ -345,7 +345,7 @@ impl MoveController {
 
     /// The distance (m) and the magnitude of the shorter angle (rad) from
     /// `pose` to the target.
-    pub fn remaining(&self, pose: Pose2) -> (f64, f64) {
+    pub fn remaining(&self, pose: PlanarPose) -> (f64, f64) {
         (
             pose.distance_to(self.target),
             pose.yaw_to(self.target).abs(),
@@ -353,7 +353,7 @@ impl MoveController {
     }
 
     /// Whether `pose` stands within both tolerances of the target.
-    pub fn within_tolerances(&self, pose: Pose2) -> bool {
+    pub fn within_tolerances(&self, pose: PlanarPose) -> bool {
         let (distance, yaw) = self.remaining(pose);
         distance <= self.tolerances.position && yaw <= self.tolerances.yaw
     }
@@ -386,7 +386,7 @@ impl MoveController {
         let steering = if offset.ahead >= 0.0 {
             offset.bearing
         } else {
-            wrap_angle(offset.bearing + PI)
+            normalize_angle(offset.bearing + PI)
         };
         match self.leg {
             Some(Leg::TurnToward(turning)) if turning.remaining(offset.bearing) >= turn_done => {
@@ -409,7 +409,7 @@ impl MoveController {
     /// other brought down by its deceleration over each step meanwhile, so
     /// each leg runs on one axis through base_state's limiter, which scales
     /// the axes together.
-    pub fn command(&mut self, pose: Pose2, dt: f64) -> PlanarTwist {
+    pub fn command(&mut self, pose: PlanarPose, dt: f64) -> PlanarTwist {
         let offset = Offset::of(self.target, pose);
         let leg = self.next_leg(offset, dt);
         let MovePlan {
@@ -430,9 +430,8 @@ impl MoveController {
             ),
             Leg::Arrived => (0.0, 0.0),
         };
-        let wound_down = |last: f64, axis: AxisProfile| {
-            last.signum() * (last.abs() - axis.deceleration * dt).max(0.0)
-        };
+        let wound_down =
+            |last: f64, axis: AxisProfile| rate_limited(last, 0.0, axis.deceleration, dt);
         let (last_linear, last_angular) = (self.last.linear_x(), self.last.angular_z());
         let (linear_x, angular_z) = if angular_z != 0.0 && last_linear != 0.0 {
             (wound_down(last_linear, linear), 0.0)
