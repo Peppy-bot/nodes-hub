@@ -27,7 +27,7 @@ from wheel_loop import RateLoopGains, WheelLoop  # noqa: E402  pylint: disable=C
 
 # A wheel's loop as a test stage authors it, and the inertia its drive turns
 # (kg m^2): test inputs.
-GAINS = RateLoopGains(kp=128.0, ki=128.0, max_torque=16.0)
+GAINS = RateLoopGains(proportional_gain=128.0, integral_gain=128.0, max_torque=16.0)
 INERTIA_KG_M2 = 0.05
 # The engine's step at a 60 Hz timeline (s).
 STEP_S = 1.0 / 60.0
@@ -48,11 +48,11 @@ class Wheel:
         velocity) at the velocity the step ends at, implicit as PhysX's is,
         capped at the maximum force."""
         if self.stalled:
-            return max(-GAINS.max_torque, min(GAINS.kp * (target - 0.0), GAINS.max_torque))
-        ended = (INERTIA_KG_M2 * self.velocity + STEP_S * (GAINS.kp * target + load)) / (
-            INERTIA_KG_M2 + STEP_S * GAINS.kp
+            return max(-GAINS.max_torque, min(GAINS.proportional_gain * (target - 0.0), GAINS.max_torque))
+        ended = (INERTIA_KG_M2 * self.velocity + STEP_S * (GAINS.proportional_gain * target + load)) / (
+            INERTIA_KG_M2 + STEP_S * GAINS.proportional_gain
         )
-        return max(-GAINS.max_torque, min(GAINS.kp * (target - ended), GAINS.max_torque))
+        return max(-GAINS.max_torque, min(GAINS.proportional_gain * (target - ended), GAINS.max_torque))
 
     def stepped(self, target: float, load: float = 0.0) -> Wheel:
         """The wheel a step later, its drive at `target` and `load` (N m) on
@@ -97,7 +97,7 @@ def test_a_wheel_against_a_steady_load_reaches_its_rate_through_the_integral():
     loop, wheel = run(5.0, RATE_RAD_S, load=drag)
 
     assert wheel.velocity == pytest.approx(RATE_RAD_S, abs=1e-3)
-    assert loop.integral == pytest.approx(-drag / GAINS.ki, abs=1e-3)
+    assert loop.integral == pytest.approx(-drag / GAINS.integral_gain, abs=1e-3)
 
 
 def test_a_stalled_wheel_pushes_at_its_cap_and_released_holds_where_it_stands():

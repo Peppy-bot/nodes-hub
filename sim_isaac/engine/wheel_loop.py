@@ -13,16 +13,17 @@ gain as the joint's attribute INTEGRAL_GAIN_ATTRIBUTE
 (scripts/build_botshare_base.py); the engine reads the three as the wheel's
 RateLoopGains when the robot stands, and PhysX applies the drive as
 authored. Each step the engine sets the drive's target velocity to the rate
-plus the integral term over the damping:
+plus the integral term over the damping, which is the proportional gain:
 
-    damping * (rate + ki / kp * integral - velocity)
-        = kp * (rate - velocity) + ki * integral
+    proportional_gain * (rate + integral_gain / proportional_gain * integral - velocity)
+        = proportional_gain * (rate - velocity) + integral_gain * integral
 
 which is the loop's action, capped at the drive's maximum force, the motor's
 torque. The integral of the rate's error is the angle the target rates carry
 the wheel to less the angle it turned; the engine sums it at each step from
-the angles the articulation reads, and clamps it at the cap over ki either
-way, as a drive clamps its integral at its current limit.
+the angles the articulation reads, and clamps it at the cap over the
+integral gain either way, as a drive clamps its integral at its current
+limit.
 
 PhysX wraps the angle of a revolute joint without limits at a full turn, and
 sets every joint back to its stage's state when the timeline stops. The loop
@@ -49,16 +50,16 @@ class RateLoopGains:
 
     # The proportional gain, on the rate's error (N*m*s/rad): the drive's
     # damping.
-    kp: float
+    proportional_gain: float
     # The integral gain, on the error's integral (N*m/rad).
-    ki: float
+    integral_gain: float
     # The motor's torque (N*m): the drive's maximum force.
     max_torque: float
 
     def windup(self) -> float:
         """How far the integral may stand either way (rad): what the cap
         holds through the integral gain alone."""
-        return self.max_torque / self.ki
+        return self.max_torque / self.integral_gain
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,7 @@ class WheelLoop:
     def velocity_target(self, gains: RateLoopGains) -> float:
         """The target velocity of the wheel's drive: the rate, and the integral
         term over the drive's damping."""
-        return self.rate + gains.ki / gains.kp * self.integral
+        return self.rate + gains.integral_gain / gains.proportional_gain * self.integral
 
     def let_go(self) -> WheelLoop:
         """The loop of a wheel whose stage lets go of its joints, or which is

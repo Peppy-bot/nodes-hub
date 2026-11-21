@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
 from wheel_loop import RateLoopGains, WheelLoop  # noqa: E402  pylint: disable=C0413
 
-GAINS = RateLoopGains(kp=128.0, ki=128.0, max_torque=16.0)
+GAINS = RateLoopGains(proportional_gain=128.0, integral_gain=128.0, max_torque=16.0)
 STEP_S = 1.0 / 60.0
 
 
@@ -32,8 +32,8 @@ def test_the_drive_delivers_the_loops_proportional_and_integral_action():
     """damping * (target - velocity) is kp * (rate - velocity) + ki * integral."""
     loop = WheelLoop(integral=0.05, rate=1.5, read=0.0)
     velocity = 1.2
-    torque = GAINS.kp * (loop.velocity_target(GAINS) - velocity)
-    assert torque == pytest.approx(GAINS.kp * (1.5 - velocity) + GAINS.ki * 0.05)
+    torque = GAINS.proportional_gain * (loop.velocity_target(GAINS) - velocity)
+    assert torque == pytest.approx(GAINS.proportional_gain * (1.5 - velocity) + GAINS.integral_gain * 0.05)
 
 
 def test_the_integral_is_the_angle_the_rates_carry_the_wheel_to_less_its_turn():
@@ -49,7 +49,7 @@ def test_the_integral_is_clamped_at_what_the_torque_cap_holds(rate):
     loop = _anchored().driven_at(rate)
     for _ in range(60):
         loop = loop.advanced(0.0, STEP_S, GAINS)
-    assert loop.integral == pytest.approx(math.copysign(GAINS.max_torque / GAINS.ki, rate))
+    assert loop.integral == pytest.approx(math.copysign(GAINS.max_torque / GAINS.integral_gain, rate))
 
 
 def test_a_turn_across_the_wrap_counts_on_without_a_jump():
@@ -86,4 +86,4 @@ def test_a_step_of_no_time_anchors_the_loop():
 
 
 def test_the_windup_is_the_cap_over_the_integral_gain():
-    assert RateLoopGains(kp=1.0, ki=4.0, max_torque=16.0).windup() == 4.0
+    assert RateLoopGains(proportional_gain=1.0, integral_gain=4.0, max_torque=16.0).windup() == 4.0

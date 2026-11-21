@@ -625,8 +625,8 @@ class World:
                 )
             loops.append(
                 RateLoopGains(
-                    kp=math.degrees(values["damping"]),
-                    ki=float(values[INTEGRAL_GAIN_ATTRIBUTE]),
+                    proportional_gain=math.degrees(values["damping"]),
+                    integral_gain=float(values[INTEGRAL_GAIN_ATTRIBUTE]),
                     max_torque=float(values["maximum force"]),
                 )
             )

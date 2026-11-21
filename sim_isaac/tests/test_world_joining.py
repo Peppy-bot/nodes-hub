@@ -489,7 +489,7 @@ class TestAWheelsLoop:
         loops = world.World._wheel_loops(root, model_known)
 
         assert world.INTEGRAL_GAIN_ATTRIBUTE == _INTEGRAL_GAIN
-        assert [(loop.kp, loop.ki, loop.max_torque) for loop in loops] == [
+        assert [(loop.proportional_gain, loop.integral_gain, loop.max_torque) for loop in loops] == [
             (pytest.approx(128.0), pytest.approx(64.0), pytest.approx(16.0)),
             (pytest.approx(96.0), pytest.approx(32.0), pytest.approx(12.0)),
         ]

@@ -430,7 +430,10 @@ class TestRigs:
 
 # Each wheel's rate loop as a stage authors it: other gains on each wheel, so
 # nothing of one wheel's loop reaches the other.
-_LOOPS = (RateLoopGains(kp=128.0, ki=64.0, max_torque=16.0), RateLoopGains(kp=96.0, ki=32.0, max_torque=12.0))
+_LOOPS = (
+    RateLoopGains(proportional_gain=128.0, integral_gain=64.0, max_torque=16.0),
+    RateLoopGains(proportional_gain=96.0, integral_gain=32.0, max_torque=12.0),
+)
 
 
 @pytest.fixture(name="rolling")

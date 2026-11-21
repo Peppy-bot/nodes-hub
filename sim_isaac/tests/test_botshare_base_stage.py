@@ -262,7 +262,7 @@ def test_the_engine_runs_the_loop_the_stage_carries(stage, model, description):
     world = world_module()
     loops = world.World._wheel_loops(stage.GetPrimAtPath(ROBOT), known(builder.ROBOT_ID))
     expected = [builder.rate_loop_of(model, joint) for joint in description.wheels]
-    assert [(loop.kp, loop.ki, loop.max_torque) for loop in loops] == [
+    assert [(loop.proportional_gain, loop.integral_gain, loop.max_torque) for loop in loops] == [
         (
             pytest.approx(rate.proportional_gain, rel=1e-6),
             pytest.approx(rate.integral_gain, rel=1e-6),

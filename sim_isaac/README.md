@@ -233,19 +233,20 @@ Everything downstream of `attach` takes the robot's own model:
   each wheel's loop cleared and its base's setpoint dropped;
 - for a robot that rolls, the rate loop of each wheel (`engine/wheel_loop.py`),
   as its driver runs the wheel in profile velocity mode. Its stage authors
-  the loop: a velocity drive with no stiffness, the proportional gain `kp`
-  as its damping and the motor's torque as its maximum force, which PhysX
-  applies as authored, and the integral gain `ki` as the joint's
+  the loop: a velocity drive with no stiffness, the proportional gain as its
+  damping and the motor's torque as its maximum force, which PhysX applies
+  as authored, and the integral gain as the joint's
   `peppy:rateLoop:integralGain`. The engine reads the three as the robot
-  stands, refusing a wheel whose drive has a stiffness or whose three are no
-  positive numbers. PhysX drives a joint as a PD controller, implicit over
-  the step, capped at its maximum force, and each step the engine sets the
-  drive's target velocity to the rate plus `ki` / `kp` times the integral of
-  the rate's error, so the drive's torque is `kp` times the rate's error plus
-  `ki` times that integral, capped together. The integral is the angle the
-  target rates carry the wheel to less the angle it turned, summed each step
-  from the angles the articulation reads and clamped at the torque over `ki`
-  either way. PhysX wraps the angle of a joint without limits at a full turn,
+  stands (`RateLoopGains`), refusing a wheel whose drive has a stiffness or
+  whose three are no positive numbers. PhysX drives a joint as a PD
+  controller, implicit over the step, capped at its maximum force, and each
+  step the engine sets the drive's target velocity to the rate plus the
+  integral gain over the proportional gain times the integral of the rate's
+  error, so the drive's torque is the proportional gain times the rate's
+  error plus the integral gain times that integral, capped together. The
+  integral is the angle the target rates carry the wheel to less the angle
+  it turned, summed each step from the angles the articulation reads and
+  clamped at the torque over the integral gain either way. PhysX wraps the angle of a joint without limits at a full turn,
   so the loop counts each step's turn less whole turns: the angle a wheel
   reports on its pair runs on without a jump, a stand or a leave of another
   robot included.
