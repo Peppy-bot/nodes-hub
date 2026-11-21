@@ -246,10 +246,10 @@ Everything downstream of `attach` takes the robot's own model:
   error plus the integral gain times that integral, capped together. The
   integral is the angle the target rates carry the wheel to less the angle
   it turned, summed each step from the angles the articulation reads and
-  clamped at the torque over the integral gain either way. PhysX wraps the angle of a joint without limits at a full turn,
-  so the loop counts each step's turn less whole turns: the angle a wheel
-  reports on its pair runs on without a jump, a stand or a leave of another
-  robot included.
+  clamped at the torque over the integral gain either way. PhysX wraps the
+  angle of a joint without limits at a full turn, so the loop counts each
+  step's turn less whole turns: the angle a wheel reports on its pair runs
+  on without a jump, a stand or a leave of another robot included.
 
 ### What a model's USD carries
 
