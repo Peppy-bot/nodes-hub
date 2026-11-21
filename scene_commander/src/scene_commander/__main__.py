@@ -217,9 +217,10 @@ def _stamp(data) -> dict:
 
 
 async def _fetch_objects(node_runner: NodeRunner) -> dict:
-    """The provider's object state snapshot: its frame, its capture time and
-    its records. Every error reply of get_object_states says that the
-    provider has no snapshot to give."""
+    """The provider's object state snapshot: its frame, its capture time, the
+    record of each object it spawned and the record of each robot standing
+    in it. Every error reply of get_object_states says that the provider has
+    no snapshot to give."""
 
     producer = get_object_states.bound_producer(node_runner)
 
@@ -238,6 +239,7 @@ async def _fetch_objects(node_runner: NodeRunner) -> dict:
     return {
         **_stamp(data),
         "objects": [_object_record(record) for record in data.objects],
+        "robots": [_robot_record(record) for record in data.robots],
     }
 
 
@@ -279,6 +281,19 @@ def _object_record(record) -> dict:
         "physics": record.physics,
         "mass": record.mass,
         "scale": record.scale,
+        "position": list(record.position),
+        "orientation": list(record.orientation),
+        "linear_velocity": list(record.linear_velocity),
+        "angular_velocity": list(record.angular_velocity),
+    }
+
+
+def _robot_record(record) -> dict:
+    """A standing robot's record: the name it stands under, its model, and
+    the pose of its robot frame with its velocities there."""
+    return {
+        "robot": record.robot,
+        "model": record.model,
         "position": list(record.position),
         "orientation": list(record.orientation),
         "linear_velocity": list(record.linear_velocity),
@@ -1435,6 +1450,7 @@ async def _api_objects(request: web.Request) -> web.Response:
             "success": True,
             "objects": objects,
             "count": len(objects),
+            "robots": snapshot["robots"],
             "frame": snapshot["frame"],
             "timestamp": snapshot["timestamp"],
         }
