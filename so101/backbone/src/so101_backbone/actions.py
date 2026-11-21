@@ -1182,7 +1182,10 @@ class ActionLayer:
         try:
             return await asyncio.wait_for(answer, timeout_s)
         except TimeoutError:
-            message = f"the control loop did not answer within {timeout_s:g} s"
+            message = (
+                f"the control loop did not answer within {timeout_s:g}s: call again, and check "
+                "the node's log for what holds up the control loop"
+            )
             log(f"stop: {message}")
             raise Refusal(FailureKind.ATTEMPT_FAILED, message) from None
 
@@ -1201,7 +1204,11 @@ class ActionLayer:
                 log(f"robot stop failed: {e!r}")
                 if not answer.done():
                     answer.set_exception(
-                        Refusal(FailureKind.ATTEMPT_FAILED, f"the robot stop failed: {e!r}")
+                        Refusal(
+                            FailureKind.ATTEMPT_FAILED,
+                            f"the control loop failed the robot stop: {e!r}: call again, and check "
+                            "the node's log for what holds up the control loop",
+                        )
                     )
                 continue
             if not answer.done():
