@@ -265,4 +265,5 @@ class TestTheBotshareBase:
         world.add("india", _known("botshare_base"), placement_at(0.0))
         world.add("alpha", _known("openarm_v2"), placement_at(3.0))
         compiled = world.compose().compile()
-        assert compiled.joint("india").id >= 0 and compiled.joint("alpha/openarm_left_joint1").id >= 0
+        joints = {compiled.joint(joint).name for joint in range(compiled.njnt)}
+        assert {"india", "india/left_wheel_joint", "alpha/openarm_left_joint1"} <= joints

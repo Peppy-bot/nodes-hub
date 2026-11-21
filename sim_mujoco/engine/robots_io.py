@@ -567,9 +567,12 @@ class RobotsIO:
         )
 
     def _forget(self, name: str) -> None:
-        """Drops what this robot's joining held, leaving the scene alone."""
+        """Drops what this robot's joining held, and what it commanded,
+        leaving the scene alone: a robot that joins again under its name
+        drives nothing until its own leaders send."""
         self._handovers.pop(name, None)
         self._promises.pop(name, None)
+        self._io.forget(name)
 
     async def _serve_ready(self) -> None:
         """Answers is_ready for the life of the node. When the service stops,

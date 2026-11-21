@@ -142,6 +142,16 @@ class MujocoWheelDrive:
             self._data.ctrl[loop.proportional] = rate
             self._data.ctrl[loop.integral] = rate
 
+    def hold(self) -> None:
+        """Holds each wheel where it stands: its target rate 0 and the
+        integral of its rate's error 0, the integral actuator's activation
+        set to the wheel's angle, so its loop holds the wheel there and
+        pushes nothing."""
+        for loop in self._loops:
+            self._data.ctrl[loop.proportional] = 0.0
+            self._data.ctrl[loop.integral] = 0.0
+            self._data.act[loop.integral_act] = self._data.qpos[loop.qpos]
+
     def clamp_integrals(self) -> None:
         """Clamps the integral of each wheel's rate error at what its torque
         cap holds: the integral actuator's activation within the cap over the

@@ -58,8 +58,8 @@ class Member:
     copy: Optional[str]
 
 
-def member(instance: str, link: str, copy: Optional[str]) -> Member:
-    return Member(info=Peer(producer=Producer(CORE_NODE, instance), peer_link_id=link), copy=copy)
+def member(instance: str, link: str, copy: Optional[str], core_node: str = CORE_NODE) -> Member:
+    return Member(info=Peer(producer=Producer(core_node, instance), peer_link_id=link), copy=copy)
 
 
 class Publisher:

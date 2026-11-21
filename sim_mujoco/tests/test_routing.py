@@ -499,6 +499,20 @@ class TestTheBase:
 
         assert scene.io.latest_base_command("india") is None
 
+    def test_a_part_whose_setpoints_do_not_fit_is_warned_of_once_until_one_fits(self, scene, caplog):
+        _admit(scene, "india", "botshare_base")
+        pair("bases", INDIA_BASE)
+        unfit = _arm_setpoint(INDIA_BASE, [0.0], [1.0])
+
+        with caplog.at_level("WARNING"):
+            _serve(scene, bases=[unfit, unfit, _arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.0]), unfit])
+
+        dropped = [record.getMessage() for record in caplog.records if "dropping" in record.getMessage()]
+        assert dropped == [
+            "dropping the setpoints for 'india' base until one fits: it has 2 wheels, and the command "
+            "carries 1 positions"
+        ] * 2
+
     def test_a_base_pair_of_a_robot_with_no_base_drives_nothing(self, scene):
         _admit(scene, "charlo", "so101")
         stray = member("charlo_base_inst", "base", "charlo")
@@ -519,6 +533,7 @@ class TestTheBase:
         scene.io.keep_paired_bases()
 
         assert scene.io.latest_base_command("india") is None
+        assert scene.io.take_base_release("india")
 
     def test_a_base_pair_that_comes_back_drives_nothing_until_its_leader_sends(self, scene):
         _admit(scene, "india", "botshare_base")
@@ -526,15 +541,11 @@ class TestTheBase:
         _serve(scene, bases=[_arm_setpoint(INDIA_BASE, [0.0, 0.0], [1.0, 1.5])])
 
         # The base node came back on a pair of its own between two readings.
-        back = runtime_fakes.Member(
-            info=runtime_fakes.Peer(
-                producer=runtime_fakes.Producer("sim17", "india_base_inst"), peer_link_id="base"
-            ),
-            copy="india",
-        )
+        back = member("india_base_inst", "base", "india", core_node="sim17")
         pair("bases", back)
         scene.io.keep_paired_bases()
         assert scene.io.latest_base_command("india") is None
+        assert scene.io.take_base_release("india"), "its wheels are held where they stand"
 
         _serve(scene, bases=[_arm_setpoint(back, [0.0, 0.0], [0.5, 0.5])])
         scene.io.keep_paired_bases()

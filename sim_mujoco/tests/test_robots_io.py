@@ -105,6 +105,9 @@ def _robots_io() -> RobotsIO:
     io._handovers = {}
     io._promises = {}
     io._admitted = None
+    # The pairs, of which admitting a robot and giving its name back touch
+    # what it commanded alone.
+    io._io = Mock(spec=["forget"])
     return io
 
 
@@ -997,9 +1000,11 @@ class TestHowOftenAStayChecksItsPairGrace:
             assert io._pair_grace_check_period() <= max(pair_grace_s, 0.05)
 
 
-def test_forgetting_a_robot_drops_its_spot_and_its_signal():
+def test_forgetting_a_robot_drops_its_spot_its_signal_and_its_setpoints():
     """What a robot's joining held is a spot promised and a signal its own
-    goal waits on, and a name given back leaves neither behind."""
+    goal waits on, and a name given back leaves neither behind, nor what the
+    robot commanded: a robot joining again under its name drives nothing
+    until its own leaders send."""
     io = _robots_io()
     io._promises["alpha"] = _promised()
     io._handover("alpha")
@@ -1008,6 +1013,7 @@ def test_forgetting_a_robot_drops_its_spot_and_its_signal():
 
     assert io._promises == {}
     assert io._handovers == {}
+    io._io.forget.assert_called_once_with("alpha")
 
 
 class TestHowAStayEnds:

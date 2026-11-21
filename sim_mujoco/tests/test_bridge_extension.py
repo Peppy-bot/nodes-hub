@@ -121,6 +121,8 @@ class FakeIO:
         self.arm_commands: dict[tuple[str, str], tuple] = {}
         self.gripper_commands: dict[tuple[str, str], tuple] = {}
         self.base_commands: dict[str, JointSetpoint] = {}
+        # The robots whose wheels a dropped setpoint released.
+        self.released: set[str] = set()
         self.engine_times: list[float] = []
         self.clock_ticks = 0
         self.arm_states: list[tuple] = []
@@ -132,6 +134,11 @@ class FakeIO:
 
     def latest_base_command(self, robot):
         return self.base_commands.get(robot)
+
+    def take_base_release(self, robot):
+        released = robot in self.released
+        self.released.discard(robot)
+        return released
 
     def publish_base_states(self, robot, positions, velocities):
         self.base_states.append((robot, positions, velocities))
@@ -678,6 +685,30 @@ class TestTheWheelsOfABase:
         bridge.step()
 
         assert _wheel_ctrls(model, data) == [0.0, 0.0, 0.0, 0.0]
+
+    def test_released_wheels_are_held_where_they_stand_their_integrals_cleared(self):
+        """A base whose leader is gone stalled against something: its loop
+        stored the integral its cap holds. Released, its wheels push nothing
+        and hold where they stand."""
+        io = FakeIO()
+        io.base_commands[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
+        model, data, _, bridge = _wheeled(io)
+        bridge.step()
+        integrals = [
+            int(model.actuator_actadr[model.actuator(f"{ROBOT}/{side}_wheel_integral").id])
+            for side in ("left", "right")
+        ]
+        for act in integrals:
+            data.act[act] += WHEEL_CAP_NM / WHEEL_INTEGRAL_GAIN
+        del io.base_commands[ROBOT]
+        io.released.add(ROBOT)
+
+        angles = [_qpos(model, data, "left_wheel"), _qpos(model, data, "right_wheel")]
+        bridge.step()
+
+        assert _wheel_ctrls(model, data) == [0.0, 0.0, 0.0, 0.0]
+        assert [float(data.act[act]) for act in integrals] == pytest.approx(angles)
+        assert not io.released, "a release is held once"
 
     def test_the_integral_of_each_wheel_is_clamped_at_what_its_torque_cap_holds(self):
         model, data, _, bridge = _wheeled()

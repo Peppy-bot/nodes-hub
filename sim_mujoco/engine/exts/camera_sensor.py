@@ -71,16 +71,22 @@ def add_cameras(spec, known, xml_path: Path) -> None:
     camera's name is that camera, where the file puts it, at the field of
     view of its render: a model written from its description, such as the
     botshare base, carries its cameras where the description puts them, on a
-    body that holds every link its fixed joints join. The robot is attached
-    into the scene under its own prefix, so these are the cameras of that
-    robot alone.
+    body that holds every link its fixed joints join. Such a camera projecting
+    through a sensor size of its own is refused, since its field of view is
+    then the file's. The robot is attached into the scene under its own
+    prefix, so these are the cameras of that robot alone.
 
-    The baked MJCF is never modified: the cameras go on an mjSpec parsed from
-    it, so a camera-less launch compiles the scene without them.
+    The baked MJCF is never modified: the cameras added here go on an mjSpec
+    parsed from it, so a camera-less launch compiles the scene without them.
     """
     cameras = list(known.entry.cameras)
     for camera in cameras:
         defined = spec.camera(camera.name)
+        if defined is not None and any(defined.sensor_size):
+            raise RuntimeError(
+                f"camera '{camera.name}' of {xml_path.name} projects through its sensorsize: give "
+                "it a fovy and no sensorsize, so it renders at its render's field of view"
+            )
         if defined is not None:
             defined.fovy = camera.fovy_deg
             continue

@@ -18,7 +18,7 @@ from pathlib import Path
 import mujoco
 import pytest
 import viewer_fakes
-from entries import WHEELED, WHEELED_ENTRY, WHEELED_MOUNT, camera, entry, known as known_model
+from entries import camera, entry, known as known_model, wheeled
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the launcher imports)
 
@@ -99,6 +99,9 @@ class FakeIO:
     def latest_base_command(self, robot):
         return None
 
+    def take_base_release(self, robot):
+        return False
+
     def publish_base_states(self, robot, positions, velocities):
         return None
 
@@ -136,9 +139,7 @@ def _known(robot=None, **release):
 
 
 def _wheeled():
-    scene = mujoco_models.ASSETS_DIR / "wheeled.xml"
-    scene.write_text(WHEELED)
-    return known_model("wheeled", WHEELED_ENTRY, scene, WHEELED_MOUNT)
+    return wheeled(mujoco_models.ASSETS_DIR)
 
 
 def _launcher(world: World) -> SimLauncher:

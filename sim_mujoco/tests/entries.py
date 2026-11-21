@@ -173,3 +173,11 @@ WHEELED = f"""<mujoco model="wheeled">
 </mujoco>"""
 WHEELED_MOUNT = "chassis"
 WHEELED_ENTRY = entry("wheeled", wheels=("left_wheel", "right_wheel"))
+
+
+def wheeled(directory: Path, xml: str = WHEELED) -> MujocoModel:
+    """The wheeled base as this engine stands it, its MJCF `xml` written into
+    `directory`."""
+    scene = directory / "wheeled.xml"
+    scene.write_text(xml)
+    return known("wheeled", WHEELED_ENTRY, scene, WHEELED_MOUNT)

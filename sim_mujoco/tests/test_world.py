@@ -15,15 +15,7 @@ from pathlib import Path
 
 import mujoco
 import pytest
-from entries import (
-    WHEELED,
-    WHEELED_ENTRY,
-    WHEELED_MOUNT,
-    camera,
-    entry,
-    known as known_model,
-    placement_at,
-)
+from entries import camera, entry, known as known_model, placement_at, wheeled
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the world imports)
 
@@ -489,9 +481,7 @@ class TestTheRecordOfWhoStands:
 
 
 def _wheeled():
-    scene = mujoco_models.ASSETS_DIR / "wheeled.xml"
-    scene.write_text(WHEELED)
-    return known_model("wheeled", WHEELED_ENTRY, scene, WHEELED_MOUNT)
+    return wheeled(mujoco_models.ASSETS_DIR)
 
 
 class TestARobotThatRolls:
@@ -533,6 +523,10 @@ class TestARobotThatRolls:
         assert india.placement == placement_at(1.0, 0.5, yaw=1.0)
         assert world.occupied(placement_at(1.0, 0.5 + SPOT_PITCH_M / 2))
         assert not world.occupied(placement_at(0.0, -SPOT_PITCH_M / 2))
+
+    def test_no_robot_stands_under_the_name_of_the_scenes_world_body(self):
+        with pytest.raises(ValueError, match="'world' is the name of the scene's own body: join under another name"):
+            World(renders=False).add("world", _wheeled(), placement_at(0.0))
 
     def test_a_robot_that_left_is_followed_nowhere(self):
         world = World(renders=False)

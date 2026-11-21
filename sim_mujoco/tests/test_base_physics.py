@@ -128,6 +128,9 @@ class _Driver:
     def latest_base_command(self, _robot):
         return self.base
 
+    def take_base_release(self, _robot) -> bool:
+        return False
+
     def latest_arm_command(self, _robot, _arm):
         return None
 

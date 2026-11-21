@@ -9,7 +9,9 @@ robot that rolls stands.
 
 Every robot is driven through its own limb and base pairs and publishes its
 state back on them. A base's wheels run at the rates of its pair's latest
-setpoint, and at rate 0 while it holds none (sim_robot_core.setpoints). A
+setpoint, and at rate 0 while it holds none; once a reading of the pairs
+finds that pair gone, they are held where they stand, the integral of each
+wheel's rate loop cleared (sim_robot_core.setpoints). A
 robot's joints, actuators and cameras carry its own prefix in the scene,
 which is what tells one robot's limbs from another's when two robots of the
 same model stand together. Transport is typed peppygen via
@@ -139,6 +141,14 @@ class _RobotLimbs:
 
             free = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, self.robot.instance)
             self.free_qpos = int(self._model.jnt_qposadr[free])
+
+    def measured(self, states, joints) -> tuple[list[float], list[float]]:
+        """The positions and velocities of `joints` of this robot, out of
+        `states`, the scene's joint positions and velocities in its joint
+        order."""
+        positions, velocities = states
+        indices = [self.joint_index[joint] for joint in joints]
+        return [positions[index] for index in indices], [velocities[index] for index in indices]
 
     def rolled_placement(self):
         """Where the wheels of a robot that rolls carried it: the origin of
@@ -294,6 +304,8 @@ class MujocoBridgeExtension:
                 limbs.actuator.write_targets(dict(zip(joints, positions)), velocity_values)
 
             if limbs.wheels is not None:
+                if self._io.take_base_release(robot):
+                    limbs.wheels.hold()
                 setpoint = self._io.latest_base_command(robot)
                 stopped = (0.0,) * len(limbs.entry.wheel_joints())
                 limbs.wheels.drive(stopped if setpoint is None else setpoint.rates())
@@ -324,21 +336,11 @@ class MujocoBridgeExtension:
         for limbs in self._limbs.values():
             robot = limbs.robot.instance
             if states is not None:
-                positions, velocities = states
                 for arm in limbs.entry.arms:
-                    indices = [limbs.joint_index[joint] for joint in arm.joints]
-                    self._io.publish_arm_states(
-                        robot,
-                        arm.name,
-                        [positions[index] for index in indices],
-                        [velocities[index] for index in indices],
-                    )
+                    self._io.publish_arm_states(robot, arm.name, *limbs.measured(states, arm.joints))
                 if limbs.wheels is not None:
-                    indices = [limbs.joint_index[joint] for joint in limbs.entry.wheel_joints()]
                     self._io.publish_base_states(
-                        robot,
-                        [positions[index] for index in indices],
-                        [velocities[index] for index in indices],
+                        robot, *limbs.measured(states, limbs.entry.wheel_joints())
                     )
 
             for name, sensor in limbs.gripper_sensors.items():

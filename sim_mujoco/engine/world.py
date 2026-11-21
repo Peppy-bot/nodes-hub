@@ -52,6 +52,9 @@ _STAGE_XML = '<mujoco model="stage"><compiler angle="radian"/><worldbody/></mujo
 # lattice, so a fleet stands alike on both.
 SPOT_PITCH_M = 1.5
 
+# MuJoCo's name of the body every scene hangs from.
+_WORLD_BODY = "world"
+
 # What stands between a robot's name and the name of anything it carries,
 # in the composed scene: `alpha/left_joint1` is alpha's.
 PREFIX_SEPARATOR = "/"
@@ -96,9 +99,15 @@ class Robot:
 def name_in_the_scene(instance: str) -> str:
     """The name a robot stands under. Every name it answers to in the scene
     is this name and the separator, so a name carrying the separator names
-    two robots at once."""
+    two robots at once, and a robot that rolls names its own body by it, so
+    the name of the scene's world body names no robot."""
     if not instance:
         raise ValueError("a robot stands under the name of the copy it runs as")
+    if instance == _WORLD_BODY:
+        raise ValueError(
+            f"'{_WORLD_BODY}' is the name of the scene's own body: join under another name, "
+            f"`peppy stack join LAUNCHER -i {_WORLD_BODY}_robot`"
+        )
     if PREFIX_SEPARATOR in instance:
         plain = instance.replace(PREFIX_SEPARATOR, "_")
         raise ValueError(

@@ -192,6 +192,10 @@ class SimTopicIO:
         # The latest setpoint of each robot's base, held for the pair it came
         # on.
         self._base_cmd = BaseSetpoints()
+        # The parts whose setpoints the parse refuses since one of them last
+        # went through, by (robot, part): each is warned of once. Node loop
+        # only.
+        self._refusing: set[tuple[str, str]] = set()
         self._cmd_lock = threading.Lock()
         # Camera publishers and their in-flight guards, keyed by (slot, topic)
         # and (robot, camera, surface); a slot's publisher reaches every
@@ -276,7 +280,7 @@ class SimTopicIO:
                 take(peer, *named, msg)
 
     def _take_arm(self, _peer, robot: str, arm: str, msg) -> None:
-        setpoint = self._setpoint(robot, arm, self._arm_joint_count(robot, arm), "joints", msg)
+        setpoint = self._setpoint(robot, ARMS, arm, "joints", msg)
         if setpoint is None:
             return
         slot = self._command_slot(self._arm_cmd, arm, robot)
@@ -300,41 +304,32 @@ class SimTopicIO:
         slot.set((msg.opening, msg.max_effort))
 
     def _take_base(self, peer, robot: str, base: str, msg) -> None:
-        setpoint = self._setpoint(robot, base, self._wheel_count(robot, base), "wheels", msg)
+        setpoint = self._setpoint(robot, BASES, base, "wheels", msg)
         if setpoint is not None and self._base_cmd.put(robot, peer, setpoint):
             logger.info(f"first setpoint for '{robot}' {base}")
 
-    def _arm_joint_count(self, robot: str, arm: str) -> Optional[int]:
-        """How many joints the arm `arm` of `robot`'s model moves, or None
-        for an arm the model lacks or a robot the scene does not hold."""
+    def _setpoint(self, robot: str, slot: str, part: str, joints: str, msg) -> Optional[JointSetpoint]:
+        """The setpoint `msg` gives the arm or the base `part` of `robot` on
+        `slot`, whose joints a refusal calls `joints` (joints, wheels), or
+        None: for a robot the scene does not hold or a part its model lacks,
+        which drives nothing, and for a setpoint the parse refuses, which is
+        dropped, the log saying why the first time since one of the part's
+        setpoints last went through."""
         held = self._robots.of_name(robot)
-        if held is None:
-            return None
-        return next((len(each.joints) for each in held.entry.arms if each.name == arm), None)
-
-    def _wheel_count(self, robot: str, base: str) -> Optional[int]:
-        """How many wheels the base `base` of `robot`'s model drives, or None
-        for a base the model lacks or a robot the scene does not hold."""
-        held = self._robots.of_name(robot)
-        if held is None or held.entry.base is None or held.entry.base.name != base:
-            return None
-        return len(held.entry.base.wheels)
-
-    @staticmethod
-    def _setpoint(
-        robot: str, part: str, count: Optional[int], joints: str, msg
-    ) -> Optional[JointSetpoint]:
-        """The setpoint `msg` gives `robot`'s arm or base `part` of `count`
-        `joints` (joints, wheels), or None: for a part its model lacks, which
-        drives nothing, and for a setpoint the parse refuses, which is dropped
-        and the log says why."""
-        if count is None:
+        moved = None if held is None else held.entry.joints_of(slot, part)
+        if moved is None:
             return None
         try:
-            return JointSetpoint.parse(msg.positions, msg.velocities, count, joints)
+            setpoint = JointSetpoint.parse(msg.positions, msg.velocities, len(moved), joints)
         except ValueError as error:
-            logger.warning(f"dropping a setpoint for '{robot}' {part}: it {error}")
+            if (robot, part) not in self._refusing:
+                self._refusing.add((robot, part))
+                logger.warning(
+                    f"dropping the setpoints for '{robot}' {part} until one fits: it {error}"
+                )
             return None
+        self._refusing.discard((robot, part))
+        return setpoint
 
     def _command_slot(self, slots: dict, limb: str, robot: str) -> "_LatestSlot":
         with self._cmd_lock:
@@ -348,10 +343,10 @@ class SimTopicIO:
 
     def keep_paired_bases(self) -> None:
         """Drops each base's setpoint whose pair is gone, on the node loop's
-        reading of the pairs: its wheels hold at rate 0 until its pair's
-        leader sends again."""
+        reading of the pairs, which releases its wheels: they are held where
+        they stand until its pair's leader sends again."""
         for robot in self._base_cmd.keep_paired(self._pairs):
-            logger.info(f"the base pair of '{robot}' is gone: its wheels hold at rate 0")
+            logger.info(f"the base pair of '{robot}' is gone: its wheels hold where they stand")
 
     # --- called from the physics thread ---
 
@@ -369,6 +364,12 @@ class SimTopicIO:
         """The setpoint `robot`'s wheels follow, or None while they hold at
         rate 0."""
         return self._base_cmd.latest(robot)
+
+    def take_base_release(self, robot: str) -> bool:
+        """Whether `robot`'s wheels were released since the physics thread
+        last asked, once: their pair's setpoint was dropped, and they are to
+        be held where they stand."""
+        return self._base_cmd.take_release(robot)
 
     def forget(self, robot: str) -> None:
         """Drops what a robot that left the scene had commanded, so a robot
