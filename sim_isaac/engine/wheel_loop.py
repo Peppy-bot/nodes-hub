@@ -24,14 +24,6 @@ the wheel to less the angle it turned; the engine sums it at each step from
 the angles the articulation reads, and clamps it at the cap over ki either
 way, as a drive clamps its integral at its current limit.
 
-The integral term rides the target velocity. The angle the target rates
-carry the wheel to runs without end, and PhysX holds a revolute joint
-without limits wrapped at a full turn, takes a target position of at most
-two turns on it, and drives toward a target position by its plain
-difference from the position (PhysX's
-NpArticulationJointReducedCoordinate::setDriveTarget and
-FeatherstoneArticulation::setupInternalConstraintsRecursive).
-
 PhysX wraps the angle of a revolute joint without limits at a full turn, and
 sets every joint back to its stage's state when the timeline stops. The loop
 counts each step's turn, the change of the read angle less whole turns, so
@@ -105,6 +97,7 @@ class WheelLoop:
         return self.rate + gains.ki / gains.kp * self.integral
 
     def let_go(self) -> WheelLoop:
-        """The loop of a wheel whose stage lets go of its joints: the next read
-        anchors it afresh, at rest, and its angle runs on from there."""
+        """The loop of a wheel whose stage lets go of its joints, or which is
+        released to hold where it stands: the next read anchors it afresh, at
+        rest, its integral cleared, and its angle runs on from there."""
         return replace(self, integral=0.0, read=None)

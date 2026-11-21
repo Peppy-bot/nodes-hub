@@ -57,7 +57,6 @@ from peppygen.exposed_services.scene import (
     get_robots_list,
     get_scene,
 )
-from sim_robot_core.object_state import RobotRecord
 from sim_robot_core.world import WORLD, UnknownFrame, base_target, failure_kind_of, in_world
 
 from object_state import IsaacObjectReader, ObjectStateSnapshot
@@ -988,16 +987,7 @@ class SceneActionIO:
             timestamp_s=timestamp_s,
             objects=tuple(records),
             robots=tuple(
-                RobotRecord(
-                    robot=robot.instance,
-                    model=robot.model,
-                    position=robot.placement.position.position,
-                    orientation=robot.placement.orientation.quaternion,
-                    linear_velocity=robot.linear_velocity,
-                    angular_velocity=robot.angular_velocity,
-                )
-                for robot in self._world.robots()
-                if robot.instance in standing
+                robot.record() for robot in self._world.robots() if robot.instance in standing
             ),
         )
 

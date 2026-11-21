@@ -11,22 +11,26 @@ snapshot of every spawned object and standing robot.
 
 Every robot is commanded through its own limb and base pairs and publishes
 its state back on them; the copy a pair carries is the robot it belongs to,
-and the parts it is driven by are its own model's. Transport is typed
-peppygen via SimTopicIO; there is no JSON and no raw peppylib on the path.
+and the parts it is driven by are its own model's. A base's wheels run at the
+rates of its pair's latest setpoint, and at rate 0 while it holds none; once
+a reading of the pairs finds that pair gone, or the setpoint outlives its
+leader's window on the engine's clock, they are held where they stand, the
+integral of each wheel's loop cleared (sim_robot_core.setpoints). Transport is
+typed peppygen via SimTopicIO; there is no JSON and no raw peppylib on the
+path.
 """
 from __future__ import annotations
 
 import gc
 import logging
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+from control_core_py.geometry import Pose
 from robot_description_py import FingerSpan
 from sim_robot_core.cameras import FramePacer
 from sim_robot_core.registry import Registry
-from sim_robot_core.setpoints import JointSetpoint
-from sim_robot_core.world import rolled_placement
+from sim_robot_core.setpoints import GripperSetpoint, JointSetpoint
 
 from wheel_loop import WheelLoop
 from world import Robot, World
@@ -36,15 +40,6 @@ if TYPE_CHECKING:  # the transport, which carries the node runtime with it
     from sim_topics import SimTopicIO
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class GripperSetpoint:
-    """One gripper's commanded opening fraction and the force it may apply;
-    0 leaves the model's own limit as the only one."""
-
-    opening: float
-    max_effort: float
 
 
 class RobotLimbs:
@@ -295,7 +290,7 @@ class IsaacBridgeExtension:
             return
 
         self._set_down_moved()
-        self._apply_commands(ready, elapsed_s)
+        self._apply_commands(ready, now_s, elapsed_s)
         # Every step, so each capture and listing is of the instant it is
         # stamped with.
         self._roll(ready)
@@ -307,8 +302,8 @@ class IsaacBridgeExtension:
             return
         # The camera and base pairs are read once per state tick: a rig
         # follows its pair within a tick of it forming or dissolving, and a
-        # base whose pair is gone holds its wheels at rate 0.
-        self._io.keep_base_pairs()
+        # base whose pair is gone holds its wheels where they stand.
+        self._io.setpoints.keep_paired_bases()
         self._reconcile_rigs()
         # Published before the state it stamps; a stopped timeline stops the
         # domain's clock with it.
@@ -321,19 +316,21 @@ class IsaacBridgeExtension:
 
         return float(omni.timeline.get_timeline_interface().get_current_time())
 
-    def _apply_commands(self, ready: list[RobotLimbs], elapsed_s: float) -> None:
+    def _apply_commands(self, ready: list[RobotLimbs], now_s: float, elapsed_s: float) -> None:
         standing = self._robots.standing()
         for limbs in ready:
             if limbs.robot.instance not in standing:
                 continue
             self._apply(limbs, *self._setpoints(limbs))
             if limbs.base_actuator is not None:
-                self._drive_base(limbs, elapsed_s)
+                self._drive_base(limbs, now_s, elapsed_s)
 
-    def _drive_base(self, limbs: RobotLimbs, elapsed_s: float) -> None:
+    def _drive_base(self, limbs: RobotLimbs, now_s: float, elapsed_s: float) -> None:
         """Runs each wheel's rate loop over the `elapsed_s` since the last
-        step and writes its drive's target velocity: the rate of the latest
-        setpoint of the robot's base, or rate 0 while it has none."""
+        step and writes its drive's target velocity: the rate of the setpoint
+        the robot's base follows at `now_s`, or rate 0 while it has none.
+        Wheels released since the last step are held where they stand: each
+        loop's integral cleared, anchored at its read of this step."""
         robot = limbs.robot.instance
         wheels = limbs.entry.base.wheels
         gains = limbs.robot.wheel_loops
@@ -341,7 +338,9 @@ class IsaacBridgeExtension:
         if states is None:
             return
         positions, _ = states
-        setpoint = self._io.latest_base_command(robot)
+        setpoint = self._io.setpoints.base(robot, now_s)
+        if self._io.setpoints.take_base_release(robot):
+            self._let_go_of_wheels(robot)
         rates = (0.0,) * len(wheels) if setpoint is None else setpoint.rates()
         loops = tuple(
             loop.advanced(positions[limbs.joint_index[wheel]], elapsed_s, gain).driven_at(rate)
@@ -367,9 +366,8 @@ class IsaacBridgeExtension:
             if state is None:
                 continue
             position, orientation, linear, angular = state
-            self._world.roll(
-                limbs.robot.instance, rolled_placement(position, orientation), linear, angular
-            )
+            frame = Pose.parse(position, orientation)
+            self._world.roll(limbs.robot.instance, frame, linear, angular)
 
     def _set_down_moved(self) -> None:
         """Sets each robot that rolls and was moved since the last step down
@@ -384,26 +382,30 @@ class IsaacBridgeExtension:
             limbs.articulation.set_down_at(
                 robot.placement.position.position, robot.placement.orientation.quaternion
             )
-            self._wheels[name] = tuple(loop.let_go() for loop in self._wheels.get(name, ()))
-            self._io.drop_base_command(name)
+            self._let_go_of_wheels(name)
+            self._io.setpoints.drop_base(name)
             logger.info("robot '%s' is set down at rest where it was moved", name)
+
+    def _let_go_of_wheels(self, robot: str) -> None:
+        """Clears the integral of each wheel's loop of `robot`, the loop
+        anchored afresh at its next read. A robot whose wheels no step read
+        yet has no loop to clear."""
+        loops = self._wheels.get(robot)
+        if loops is not None:
+            self._wheels[robot] = tuple(loop.let_go() for loop in loops)
 
     def _setpoints(self, limbs: RobotLimbs):
         """One robot's latest setpoints, from the pairs its backbone leads,
         limb by limb of its model. A limb nothing has commanded holds where
         it stands."""
         robot = limbs.robot.instance
+        setpoints = self._io.setpoints
         arms: list[Optional[JointSetpoint]] = [
-            self._io.latest_arm_command(robot, arm.name) for arm in limbs.entry.arms
+            setpoints.arm(robot, arm.name) for arm in limbs.entry.arms
         ]
-        grippers = []
-        for gripper in limbs.entry.grippers:
-            command = self._io.latest_gripper_command(robot, gripper.name)
-            grippers.append(
-                None
-                if command is None
-                else GripperSetpoint(opening=command[0], max_effort=command[1])
-            )
+        grippers: list[Optional[GripperSetpoint]] = [
+            setpoints.gripper(robot, gripper.name) for gripper in limbs.entry.grippers
+        ]
         return arms, grippers
 
     def _apply(self, limbs: RobotLimbs, arms, grippers) -> None:
@@ -483,7 +485,6 @@ class IsaacBridgeExtension:
             return
         self._io.publish_base_states(
             limbs.robot.instance,
-            base.name,
             [loop.angle for loop in loops],
             [velocities[limbs.joint_index[wheel]] for wheel in base.wheels],
         )

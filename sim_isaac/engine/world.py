@@ -19,7 +19,8 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, wxyz_of_xyzw
-from sim_robot_core.object_state import AT_REST
+from sim_robot_core.object_state import AT_REST, RobotRecord
+from sim_robot_core.world import rolled_placement
 
 import head_camera
 from isaac_models import IsaacModel
@@ -215,10 +216,28 @@ class Robot:
     linear_velocity: tuple[float, float, float] = AT_REST
     angular_velocity: tuple[float, float, float] = AT_REST
     wheel_loops: tuple[RateLoopGains, ...] = ()
+    # The pose of its robot frame in world as the articulation's root last
+    # read it, tilted as its body is; None while the robot frame stands at
+    # its placement: a robot fixed to the world, and a robot that rolls
+    # until a step reads it and from each move until the next.
+    rolled_frame: Optional[Pose] = None
 
     @property
     def model(self) -> str:
         return self.known.model
+
+    def record(self) -> RobotRecord:
+        """Its record on object_state: the pose of its robot frame in world,
+        its tilt included, with its velocities there."""
+        frame = self.placement if self.rolled_frame is None else self.rolled_frame
+        return RobotRecord(
+            robot=self.instance,
+            model=self.model,
+            position=frame.position.position,
+            orientation=frame.orientation.quaternion,
+            linear_velocity=self.linear_velocity,
+            angular_velocity=self.angular_velocity,
+        )
 
     def prim(self) -> str:
         """The prim this robot's stage is referenced under."""
@@ -421,6 +440,7 @@ class World:
             placement=Pose(target.position, heading),
             linear_velocity=AT_REST,
             angular_velocity=AT_REST,
+            rolled_frame=None,
         )
 
         import omni.usd  # pylint: disable=C0415
@@ -447,13 +467,17 @@ class World:
     def roll(
         self,
         instance: str,
-        placement: Pose,
+        frame: Pose,
         linear_velocity: tuple[float, float, float],
         angular_velocity: tuple[float, float, float],
     ) -> None:
-        """Records where the wheels of a robot that rolls carried it, and how
-        fast it moves there: what the scene reports of it, and where the next
-        robot is given room from. A robot that left is not recorded again."""
+        """Records where the wheels of a robot that rolls carried it, `frame`
+        the pose of its robot frame in world, tilted as its body is, and how
+        fast it moves there: what the scene reports of it, and its placement,
+        that position facing the heading its wheels turned it to, where the
+        next robot is given room from. A robot that left is not recorded
+        again."""
+        placement = rolled_placement(frame.position.position, frame.orientation.quaternion)
         with self._lock:
             robot = self._robots.get(instance)
             if robot is None:
@@ -463,6 +487,7 @@ class World:
                 placement=placement,
                 linear_velocity=linear_velocity,
                 angular_velocity=angular_velocity,
+                rolled_frame=frame,
             )
 
     def take_set_down(self) -> set[str]:

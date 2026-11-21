@@ -8,13 +8,26 @@ import sys
 from types import ModuleType
 
 import pytest
-from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, quaternion_of_yaw
+from control_core_py.geometry import (
+    IDENTITY,
+    Point,
+    Pose,
+    PoseTarget,
+    UnitQuaternion,
+    product,
+    quaternion_of_yaw,
+    yaw_of_quaternion,
+)
 from pxr import Gf, Usd, UsdGeom
 
 from _world import known, placement_at
 from _world import world_module as _world_module
 
 QUARTER_TURN = math.pi / 2
+# A base turned a quarter, its body pitched 0.1 rad nose down on its casters.
+TILTED = Pose.parse(
+    (3.0, 0.5, 0.01), product(quaternion_of_yaw(QUARTER_TURN), (0.0, math.sin(0.05), 0.0, math.cos(0.05)))
+)
 
 
 @pytest.fixture(name="place")
@@ -383,24 +396,42 @@ def test_a_prim_placed_with_an_orientation_about_x_lies_on_its_side(place):
     assert above[2] == pytest.approx(0.0, abs=1e-6), above
 
 
-def test_a_robot_that_rolls_is_recorded_where_its_wheels_carried_it():
+def test_a_robot_that_rolls_is_recorded_where_its_wheels_carried_it_tilted_as_its_body_is():
     world_module = _world_module()
     world = world_module.World(head_camera_pack=None)
     world._robots = {"delta": world_module.Robot(instance="delta", known=known("botshare_base"), placement=placement_at(0.0))}
-    rolled = Pose.parse((3.0, 0.5, 0.0), quaternion_of_yaw(QUARTER_TURN))
 
-    world.roll("delta", rolled, (0.2, 0.0, 0.0), (0.0, 0.0, 0.3))
+    world.roll("delta", TILTED, (0.2, 0.0, 0.0), (0.0, 0.0, 0.3))
 
     (robot,) = world.robots()
-    assert robot.placement == rolled
-    assert (robot.linear_velocity, robot.angular_velocity) == ((0.2, 0.0, 0.0), (0.0, 0.0, 0.3))
+    record = robot.record()
+    assert (record.position, record.orientation) == (TILTED.position.position, TILTED.orientation.quaternion)
+    assert (record.linear_velocity, record.angular_velocity) == ((0.2, 0.0, 0.0), (0.0, 0.0, 0.3))
+    # It stands at that position, facing the heading its wheels turned it to.
+    assert robot.placement.position.position == (3.0, 0.5, 0.01)
+    assert robot.placement.orientation.quaternion[:2] == (0.0, 0.0)
+    assert yaw_of_quaternion(robot.placement.orientation.quaternion) == pytest.approx(QUARTER_TURN)
     # The next robot is given room from where it rolled to.
     assert world.occupied(placement_at(3.0, 0.5))
     assert not world.occupied(placement_at(0.0))
     # A robot that left is not recorded again.
     world._robots.clear()
-    world.roll("delta", rolled, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    world.roll("delta", TILTED, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
     assert world.robots() == []
+
+
+def test_a_robot_fixed_to_the_world_is_recorded_at_its_placement_at_rest():
+    placement = Pose.parse((1.0, 0.0, 0.0), quaternion_of_yaw(QUARTER_TURN))
+    robot = _world_module().Robot(instance="alpha", known=known("so101"), placement=placement)
+
+    record = robot.record()
+
+    assert (record.robot, record.model) == ("alpha", "so101")
+    assert (record.position, record.orientation) == (
+        robot.placement.position.position,
+        robot.placement.orientation.quaternion,
+    )
+    assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
 
 
 def test_a_robot_that_rolls_is_set_down_once_it_is_moved_and_a_standing_one_is_not(monkeypatch, place):
@@ -409,11 +440,19 @@ def test_a_robot_that_rolls_is_set_down_once_it_is_moved_and_a_standing_one_is_n
         monkeypatch, world_module, placement_at(0.0), placement_at(3.0), models=("botshare_base", "so101")
     )
 
-    world.move("alpha", PoseTarget.parse((2.0, -1.0, 0.0), None))
+    world.roll("alpha", TILTED, (0.2, 0.0, 0.0), (0.0, 0.0, 0.3))
+    moved = world.move("alpha", PoseTarget.parse((2.0, -1.0, 0.0), None))
     world.move("bravo", PoseTarget.parse((4.0, 0.0, 0.0), None))
 
     assert world.take_set_down() == {"alpha"}
     assert world.take_set_down() == set()
+    # Set down at its new placement, at rest.
+    record = moved.record()
+    assert (record.position, record.orientation) == (
+        moved.placement.position.position,
+        moved.placement.orientation.quaternion,
+    )
+    assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
 
 
 def test_a_robot_that_rolls_is_stood_where_it_rolled_before_the_stage_is_edited(monkeypatch, place):

@@ -96,8 +96,8 @@ pairs are its model's: every limb and the base of its model, and nothing its
 model lacks. A camera its model carries may go unpaired, since a camera nobody
 views is not rendered. When the pair grace time runs out the engine takes the
 robot out and fails its goal with `resource_unavailable`, saying either that
-none of the robot's limbs were paired or naming both lists: what its pairs
-name and what its model has. A robot is ready once it stands and holds a pair
+the robot held no pair or naming both lists: what its pairs name and what its
+model has. A robot is ready once it stands and holds a pair
 for every limb and the base of its model, so an SO-101 is ready with its one
 arm and its one gripper, and a botshare base with its base. Each robot on the
 stage is held to its own model.
@@ -105,13 +105,19 @@ stage is held to its own model.
 An arm's or a base's setpoint is taken as `sim_robot_core.setpoints` parses
 it: one position per joint, and no velocities or one per joint, each a
 number no further from 0 than the largest a simulation holds. Any other is
-dropped with a warning naming the robot, the part and why. A base's wheels
-follow the velocities of its latest setpoint, as the base's driver runs them
-in profile velocity mode, and the positions go unread; a setpoint that
-carries no velocities runs them at rate 0. The setpoint belongs to the pair it
-came on: once a state tick reads the base's pairs without that pair, the
-wheels hold at rate 0, and a pair that comes back drives nothing until its
-leader sends.
+dropped with a warning naming the robot, the part and why, once until one of
+that part's setpoints fits. A base's wheels follow the velocities of its
+latest setpoint, as the base's driver runs them in profile velocity mode,
+and the positions go unread; a setpoint that carries no velocities runs them
+at rate 0. They follow as `joint_link`'s follower of a velocity-mode device
+follows: from each setpoint that arrives until more than 0.5 s pass with no
+setpoint, on the timeline, and then they are held where they stand, the
+integral of each wheel's loop cleared, at rate 0. The setpoint also belongs
+to the pair it came on: once a state tick reads the base's pairs without
+that pair, the wheels are held the same way, and a pair that comes back
+drives nothing until its leader sends. A robot that leaves takes its
+setpoints with it, so a copy that joins again under its name drives nothing
+until its own leaders send.
 
 An `attach` goal's `placement` is a pose in `world`, the one frame of the
 simulation, which a placement with no frame names, whose orientation turns
@@ -217,9 +223,10 @@ Everything downstream of `attach` takes the robot's own model:
   does carries no collider, and taken up while a scene that carries
   colliders, an environment with a floor of its own, stands there. Each step the
   engine reads its robot frame, the description's root link and the root of
-  its articulation, into its placement, the position and the heading its
-  wheels turned it to, with its velocities there, which `get_robots_list`,
-  `object_state` and the spacing of robots take. Before a stand or a leave
+  its articulation: `object_state` takes its pose, tilted as its body is, with
+  its velocities there, and its placement, that position facing the heading
+  its wheels turned it to, is what `get_robots_list` and the spacing of
+  robots take. Before a stand or a leave
   stops the timeline, which sets every body back on its prim, the engine
   stands its prim where it rolled, so it stays there. `move_robot` sets it
   down at rest where it names: its root and its joints still, the integral of
@@ -235,15 +242,13 @@ Everything downstream of `attach` takes the robot's own model:
   the step, capped at its maximum force, and each step the engine sets the
   drive's target velocity to the rate plus `ki` / `kp` times the integral of
   the rate's error, so the drive's torque is `kp` times the rate's error plus
-  `ki` times that integral, capped together. The integral rides the target
-  velocity: PhysX holds a revolute joint without limits wrapped at a full
-  turn and takes no target position past two turns on it, so a target
-  position cannot follow the angle the rates carry the wheel to. The integral is the angle the target rates carry
-  the wheel to less the angle it turned, summed each step from the angles the
-  articulation reads and clamped at the torque over `ki` either way. PhysX
-  wraps the angle of a joint without limits at a full turn, so the loop
-  counts each step's turn less whole turns: the angle a wheel reports on its
-  pair runs on without a jump, a stand or a leave of another robot included.
+  `ki` times that integral, capped together. The integral is the angle the
+  target rates carry the wheel to less the angle it turned, summed each step
+  from the angles the articulation reads and clamped at the torque over `ki`
+  either way. PhysX wraps the angle of a joint without limits at a full turn,
+  so the loop counts each step's turn less whole turns: the angle a wheel
+  reports on its pair runs on without a jump, a stand or a leave of another
+  robot included.
 
 ### What a model's USD carries
 

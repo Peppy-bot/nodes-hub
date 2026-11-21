@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -196,29 +197,73 @@ def test_each_wheel_carries_the_rate_loop_its_model_runs_it_with(stage, model, d
     the model's wheel."""
     for joint in description.wheels:
         loop = builder.rate_loop_of(model, joint)
-        assert loop.kv > 0.0 and loop.kp > 0.0 and loop.cap > 0.0
+        assert loop.proportional_gain > 0.0 and loop.integral_gain > 0.0 and loop.cap > 0.0
         prim = stage.GetPrimAtPath(f"{builder.JOINTS_PATH}/{joint}")
         drive = UsdPhysics.DriveAPI(prim, "angular")
         assert drive.GetTypeAttr().Get() == "force"
         assert drive.GetStiffnessAttr().Get() == 0.0
-        assert drive.GetDampingAttr().Get() == pytest.approx(math.radians(loop.kv))
+        assert drive.GetDampingAttr().Get() == pytest.approx(math.radians(loop.proportional_gain))
         assert drive.GetMaxForceAttr().Get() == pytest.approx(loop.cap)
-        assert prim.GetAttribute(builder.INTEGRAL_GAIN_ATTRIBUTE).Get() == pytest.approx(loop.kp)
+        assert prim.GetAttribute(builder.INTEGRAL_GAIN_ATTRIBUTE).Get() == pytest.approx(loop.integral_gain)
         armature = model.dof_armature[int(model.jnt_dofadr[model.joint(joint).id])]
         assert prim.GetAttribute("physxJoint:armature").Get() == pytest.approx(armature)
 
 
+# A wheel on a hinge whose actuator force its range caps, driven by the
+# actuators a test gives it.
+_WHEEL_MJCF = """<mujoco><worldbody><body><joint name="wheel" type="hinge" actuatorfrclimited="true"
+actuatorfrcrange="-16 16"/><geom type="sphere" size="0.1"/></body></worldbody>
+<actuator>{actuators}</actuator></mujoco>"""
+
+
+def _wheel_driven_by(actuators: str):
+    import mujoco  # pylint: disable=C0415
+
+    return mujoco.MjModel.from_xml_string(_WHEEL_MJCF.format(actuators=actuators))
+
+
+def test_a_wheel_driven_as_the_engines_run_it_gives_its_loop():
+    model = _wheel_driven_by('<velocity joint="wheel" kv="64"/><intvelocity joint="wheel" kp="128"/>')
+
+    assert builder.rate_loop_of(model, "wheel") == builder.RateLoop(
+        proportional_gain=64.0, integral_gain=128.0, cap=16.0
+    )
+
+
+@pytest.mark.parametrize(
+    ("actuators", "refusal"),
+    [
+        (
+            '<position joint="wheel" kp="64"/><intvelocity joint="wheel" kp="128"/>',
+            "the MJCF's wheel 'wheel' is driven by 2 actuators: drive it with one <velocity> actuator",
+        ),
+        (
+            '<velocity joint="wheel" kv="64"/><intvelocity joint="wheel" kp="128" actrange="-1 1"/>',
+            "the MJCF's wheel 'wheel' clamps the activation of its <intvelocity>: a wheel turns without end",
+        ),
+    ],
+    ids=["position_servo", "clamped_integral"],
+)
+def test_a_wheel_the_mujoco_node_refuses_is_refused(actuators, refusal):
+    """The MuJoCo node holds the same MJCF to these rules, so a bundle never
+    bakes a wheel that engine refuses."""
+    with pytest.raises(ValueError, match=f"^{re.escape(refusal)}"):
+        builder.rate_loop_of(_wheel_driven_by(actuators), "wheel")
+
+
 def test_the_engine_runs_the_loop_the_stage_carries(stage, model, description):
     """What the engine reads back off the stage as each wheel stands is the
-    loop the model runs it with, through the attribute both name alike."""
+    loop the model runs it with."""
     world = world_module()
-    import wheel_loop  # pylint: disable=C0415
-
-    assert builder.INTEGRAL_GAIN_ATTRIBUTE == wheel_loop.INTEGRAL_GAIN_ATTRIBUTE
     loops = world.World._wheel_loops(stage.GetPrimAtPath(ROBOT), known(builder.ROBOT_ID))
     expected = [builder.rate_loop_of(model, joint) for joint in description.wheels]
     assert [(loop.kp, loop.ki, loop.max_torque) for loop in loops] == [
-        (pytest.approx(rate.kv, rel=1e-6), pytest.approx(rate.kp, rel=1e-6), pytest.approx(rate.cap)) for rate in expected
+        (
+            pytest.approx(rate.proportional_gain, rel=1e-6),
+            pytest.approx(rate.integral_gain, rel=1e-6),
+            pytest.approx(rate.cap),
+        )
+        for rate in expected
     ]
 
 

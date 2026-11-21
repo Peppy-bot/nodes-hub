@@ -17,13 +17,13 @@ def entry(
     grippers: dict | None = None,
     cameras: tuple[CameraConfig, ...] = (),
     start_posture: dict | None = None,
-    wheels: tuple[str, ...] | None = None,
+    wheels: tuple[str, ...] = (),
 ) -> ModelEntry:
     """The entry of a robot of `model`: `arms` maps each arm to its joints,
     `grippers` each gripper to its fingers, each finger a joint that moves
     of its own with the position it closes at and the one it opens at, and
-    `wheels` are the joints of its base's wheels, left then right, for a
-    robot that rolls."""
+    `wheels` are the joints of its base's wheels, left then right, none for
+    a robot without a base."""
     return ModelEntry(
         model=model,
         arms=tuple(Arm(name=name, joints=tuple(joints)) for name, joints in (arms or {}).items()),
@@ -38,6 +38,6 @@ def entry(
         ),
         cameras=cameras,
         start_posture=dict(start_posture or {}),
-        base=None if wheels is None else Base(name=BASE_NAME, wheels=tuple(wheels)),
+        base=Base(name=BASE_NAME, wheels=tuple(wheels)) if wheels else None,
     )
 

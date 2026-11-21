@@ -7,16 +7,17 @@ stand-in views, so nothing of one leaks into another.
 """
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
-from control_core_py.geometry import quaternion_of_yaw
+from control_core_py.geometry import product, quaternion_of_yaw
 from robot_description_py import model as bundled
 from sim_robot_core.models import shipped_entry
-from sim_robot_core.setpoints import JointSetpoint
+from sim_robot_core.setpoints import GripperSetpoint, JointSetpoint
 
 import _world
 
@@ -275,8 +276,8 @@ def _fleet(engine, monkeypatch):
     world.take_set_down.return_value = set()
     registry.standing.return_value = {"alpha": Mock(), "charlo": Mock()}
     io.camera_robots.return_value = set()
-    io.latest_arm_command.return_value = None
-    io.latest_gripper_command.return_value = None
+    io.setpoints.arm.return_value = None
+    io.setpoints.gripper.return_value = None
     objects = Mock()
     objects.capture_object_states.return_value = None
     bridge = engine.IsaacBridgeExtension(world, io, registry, objects, state_rate_hz=60, renders=True)
@@ -297,8 +298,8 @@ class TestDrivingAFleet:
         asked = {
             (call.args[0], call.args[1])
             for call in (
-                *fleet._io.latest_arm_command.call_args_list,
-                *fleet._io.latest_gripper_command.call_args_list,
+                *fleet._io.setpoints.arm.call_args_list,
+                *fleet._io.setpoints.gripper.call_args_list,
             )
         }
         assert asked == {
@@ -315,7 +316,7 @@ class TestDrivingAFleet:
             ("charlo", "arm"): JointSetpoint(positions=(0.1, 0.2, 0.3, 0.4, 0.5), velocities=()),
             ("alpha", "right_arm"): JointSetpoint(positions=(0.7,) * 7, velocities=(0.01,) * 7),
         }
-        fleet._io.latest_arm_command.side_effect = lambda robot, arm: commands.get((robot, arm))
+        fleet._io.setpoints.arm.side_effect = lambda robot, arm: commands.get((robot, arm))
 
         fleet.step()
 
@@ -336,10 +337,11 @@ class TestDrivingAFleet:
         _writes(engine, "left_arm_alpha").assert_not_called()
 
     def test_an_opening_is_mapped_onto_the_fingers_of_its_own_gripper(self, engine, fleet):
-        commands = {("charlo", "gripper"): (0.5, 0.0), ("alpha", "right_gripper"): (1.0, 0.0)}
-        fleet._io.latest_gripper_command.side_effect = (
-            lambda robot, gripper: commands.get((robot, gripper))
-        )
+        commands = {
+            ("charlo", "gripper"): GripperSetpoint(opening=0.5, max_effort=0.0),
+            ("alpha", "right_gripper"): GripperSetpoint(opening=1.0, max_effort=0.0),
+        }
+        fleet._io.setpoints.gripper.side_effect = lambda robot, gripper: commands.get((robot, gripper))
 
         fleet.step()
 
@@ -445,7 +447,8 @@ def _rolling(engine, monkeypatch):
     world.take_set_down.return_value = set()
     registry.standing.return_value = {"delta": Mock()}
     io.camera_robots.return_value = set()
-    io.latest_base_command.return_value = None
+    io.setpoints.base.return_value = None
+    io.setpoints.take_base_release.return_value = False
     objects = Mock()
     objects.capture_object_states.return_value = None
     bridge = engine.IsaacBridgeExtension(world, io, registry, objects, state_rate_hz=60, renders=False)
@@ -485,7 +488,7 @@ class TestDrivingABase:
         """The integral clamps at the cap over ki, so the target velocity
         stands at most the cap over kp above the rate, each wheel by its own
         loop."""
-        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -2.0))
+        rolling._io.setpoints.base.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -2.0))
         for step in range(120):
             _step_at(rolling, step * _STEP_S)
 
@@ -496,7 +499,7 @@ class TestDrivingABase:
         }
 
     def test_each_wheel_follows_the_rate_of_its_setpoint_through_its_loop(self, engine, rolling):
-        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -1.0))
+        rolling._io.setpoints.base.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -1.0))
 
         _step_at(rolling, 0.0)
         # A first read anchors each loop at rest: the drive's target is the rate.
@@ -513,36 +516,67 @@ class TestDrivingABase:
             "right_wheel_joint": pytest.approx(-1.0 + 32.0 / 96.0 * right),
         }
 
+    def test_each_step_reads_the_bases_setpoint_at_the_timelines_time(self, engine, rolling):
+        """The leader's window runs on the engine's clock, the simulation
+        clock."""
+        _step_at(rolling, 2.5)
+
+        rolling._io.setpoints.base.assert_called_once_with("delta", 2.5)
+
     def test_a_base_with_no_setpoint_holds_its_wheels_at_rate_0(self, engine, rolling):
         _step_at(rolling, 0.0)
 
         _wheel_targets(engine).assert_called_with(dict.fromkeys(_WHEELS, 0.0))
+
+    def test_released_wheels_hold_where_they_stand_their_integrals_cleared(self, engine, rolling):
+        """A stalled wheel stores its loop's integral at the clamp; once its
+        setpoint is dropped and its wheels released, the drive's target is 0,
+        and the loop holds the wheel at its angle from there."""
+        rolling._io.setpoints.base.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -2.0))
+        for step in range(120):
+            _step_at(rolling, step * _STEP_S)
+        assert [loop.integral for loop in rolling._wheels["delta"]] == [
+            pytest.approx(16.0 / 64.0),
+            pytest.approx(-12.0 / 32.0),
+        ]
+
+        rolling._io.setpoints.base.return_value = None
+        rolling._io.setpoints.take_base_release.return_value = True
+        _step_at(rolling, 120 * _STEP_S)
+
+        _wheel_targets(engine).assert_called_with(dict.fromkeys(_WHEELS, 0.0))
+        assert [loop.integral for loop in rolling._wheels["delta"]] == [0.0, 0.0]
+        rolling._io.setpoints.take_base_release.return_value = False
+        _step_at(rolling, 121 * _STEP_S, left=0.01)
+        (targets,) = _wheel_targets(engine).call_args.args
+        assert targets["left_wheel_joint"] == pytest.approx(64.0 / 128.0 * -0.01), "pushed back to where it stood"
 
     def test_the_wheels_state_is_their_counted_angle_and_measured_rate(self, engine, rolling):
         engine.views.velocities[("/World/delta", "left_wheel_joint")] = 1.5
         _step_at(rolling, 0.0, left=3.1)
         _step_at(rolling, _STEP_S, left=-3.1)
 
-        robot, base, angles, rates = rolling._io.publish_base_states.call_args.args
-        assert (robot, base) == ("delta", "base")
+        robot, angles, rates = rolling._io.publish_base_states.call_args.args
+        assert robot == "delta"
         assert angles == [pytest.approx(2 * 3.141592653589793 - 6.2), 0.0]
         assert rates == [1.5, 0.0]
 
-    def test_the_robot_is_recorded_where_its_wheels_carried_it_each_step(self, engine, rolling):
-        yaw = quaternion_of_yaw(0.5)
-        engine.views.roots["/World/delta"] = ((1.0, 2.0, 0.01), yaw, (0.2, 0.0, 0.0), (0.0, 0.0, 0.1))
+    def test_the_robot_is_recorded_where_its_wheels_carried_it_each_step_tilt_and_all(self, engine, rolling):
+        """Its robot frame as the root reads it, pitched on its casters."""
+        tilted = product(quaternion_of_yaw(0.5), (0.0, math.sin(0.05), 0.0, math.cos(0.05)))
+        engine.views.roots["/World/delta"] = ((1.0, 2.0, 0.01), tilted, (0.2, 0.0, 0.0), (0.0, 0.0, 0.1))
         rolling._state_pacer = Mock(take_if_due=Mock(return_value=False))
 
         _step_at(rolling, 0.0)
 
-        name, placement, linear, angular = rolling._world.roll.call_args.args
+        name, frame, linear, angular = rolling._world.roll.call_args.args
         assert name == "delta"
-        assert placement.position.position == (1.0, 2.0, 0.01)
-        assert placement.orientation.quaternion == pytest.approx(yaw)
+        assert frame.position.position == (1.0, 2.0, 0.01)
+        assert frame.orientation.quaternion == pytest.approx(tilted)
         assert (linear, angular) == ((0.2, 0.0, 0.0), (0.0, 0.0, 0.1))
 
     def test_a_robot_moved_since_the_last_step_is_set_down_at_rest(self, engine, rolling):
-        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, 2.0))
+        rolling._io.setpoints.base.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, 2.0))
         _step_at(rolling, 0.0)
         _step_at(rolling, _STEP_S, left=0.01, right=0.01)
         rolling._world.take_set_down.return_value = {"delta"}
@@ -551,7 +585,7 @@ class TestDrivingABase:
 
         (where,) = engine.views.set_downs
         assert where == ("/World/delta", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
-        rolling._io.drop_base_command.assert_called_once_with("delta")
+        rolling._io.setpoints.drop_base.assert_called_once_with("delta")
         # Each loop reads the stage afresh: no turn counted, its integral clear.
         assert [loop.integral for loop in rolling._wheels["delta"]] == [0.0, 0.0]
         assert [loop.angle for loop in rolling._wheels["delta"]] == [pytest.approx(0.01)] * 2
@@ -575,7 +609,7 @@ class TestDrivingABase:
     ):
         """A prim removal drops the views and takes them again with the
         timeline playing: the wheels stand where they turned."""
-        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, 2.0))
+        rolling._io.setpoints.base.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, 2.0))
         _step_at(rolling, 0.0, left=0.5)
         _step_at(rolling, _STEP_S, left=0.51)
         integral = rolling._wheels["delta"][0].integral

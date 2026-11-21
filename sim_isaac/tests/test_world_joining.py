@@ -198,6 +198,7 @@ def _rig_of_followers(*pairs):
         ),
         cameras=(),
         start_posture={joint: 0.0 for joint in joints},
+        base=None,
     )
     raw = {"stage": "rig/rig.usd", "articulation_root": "."}
     return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {}, "base_link")

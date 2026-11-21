@@ -87,6 +87,9 @@ def _robots_io(world) -> RobotsIO:
     io._handovers = {}
     io._promises = {}
     io._admitted = None
+    # The pairs, of which admitting a robot and giving its name back touch
+    # what it commanded alone.
+    io._io = Mock(spec=["setpoints"])
     return io
 
 
@@ -508,7 +511,7 @@ def test_a_robot_whose_goal_is_cancelled_is_taken_out_and_its_goal_ends_cancelle
 @pytest.mark.parametrize(
     ("ending", "why"),
     [
-        (Ending.LAPSED, "none of this robot's limbs were paired for 2.0s"),
+        (Ending.LAPSED, "this robot held no pair for 2.0s"),
         (Ending.FAILED, "the robot's holder could not be told it stands: the holder is away"),
         (Ending.STOPPED, "the engine stopped"),
     ],
@@ -531,6 +534,7 @@ def _bare_io() -> RobotsIO:
     io = RobotsIO.__new__(RobotsIO)
     io._promises = {}
     io._handovers = {}
+    io._io = Mock(spec=["setpoints"])
     return io
 
 
@@ -562,9 +566,11 @@ class TestHowOftenAStayChecksItsPairGrace:
             assert io._pair_grace_check_period() <= max(pair_grace_s, 0.05)
 
 
-def test_forgetting_a_robot_drops_its_spot_and_its_signal():
+def test_forgetting_a_robot_drops_its_spot_its_signal_and_its_setpoints():
     """What a robot's joining held is a spot promised and a signal its own
-    goal waits on, and a name given back leaves neither behind."""
+    goal waits on, and a name given back leaves neither behind, nor what the
+    robot commanded: a robot joining again under its name drives nothing
+    until its own leaders send."""
     io = _bare_io()
     io._promises["alpha"] = _promised()
     io._handover("alpha")
@@ -573,6 +579,7 @@ def test_forgetting_a_robot_drops_its_spot_and_its_signal():
 
     assert io._promises == {}
     assert io._handovers == {}
+    io._io.setpoints.forget.assert_called_once_with("alpha")
 
 
 class _Leaving(_Answers):
@@ -631,7 +638,11 @@ def test_the_stay_taking_a_robot_over_ends_the_one_hosting_it_and_not_itself():
 
 
 class _HoldsEverything:
-    """Pairs that answer for whichever robot is asked, all of them held."""
+    """Pairs that answer for whichever robot is asked, all of them held, and
+    the setpoints of every robot."""
+
+    def __init__(self) -> None:
+        self.setpoints = Mock(spec=["forget"])
 
     def held_by(self, robot: str) -> Held:
         return Held(

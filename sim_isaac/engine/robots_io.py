@@ -175,7 +175,7 @@ class RobotsIO:
         try:
             self._unbind()
             self._world.remove(name)
-            self._io.forget(name)
+            self._io.setpoints.forget(name)
         finally:
             self._rebind()
         self._robots.renew(self._loop.time())
@@ -534,8 +534,8 @@ class RobotsIO:
         holding them keeps its place however long the node loop went without
         starting its pair grace time again, and a robot no limb or base reached
         yet keeps its place for as long as its goal runs. A robot holding no
-        pair is told its limbs were gone, and any other which of its pairs and
-        its model's limbs, base and cameras differ."""
+        pair is told so, and any other which of its pairs and its model's
+        limbs, base and cameras differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)
@@ -548,7 +548,7 @@ class RobotsIO:
             return None
         if held.is_empty():
             return (
-                f"none of this robot's limbs were paired for {self._pair_grace_s:.1f}s, "
+                f"this robot held no pair for {self._pair_grace_s:.1f}s, "
                 "the pair grace time this scene gives"
             )
         return (
@@ -557,9 +557,12 @@ class RobotsIO:
         )
 
     def _forget(self, name: str) -> None:
-        """Drops what this robot's joining held, leaving the scene alone."""
+        """Drops what this robot's joining held, and what it commanded,
+        leaving the scene alone: a robot that joins again under its name
+        drives nothing until its own leaders send."""
         self._handovers.pop(name, None)
         self._promises.pop(name, None)
+        self._io.setpoints.forget(name)
 
     async def _serve_ready(self) -> None:
         """Answers is_ready for the life of the node. When the service stops,

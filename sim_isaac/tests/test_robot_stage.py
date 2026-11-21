@@ -46,7 +46,7 @@ def _robots_io(world):
     io = RobotsIO.__new__(RobotsIO)
     io._world = world
     io._robots = Mock(spec=["renew", "release"])
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._loop = Mock()
     io._loop.time.return_value = 0.0
     io._bind = Mock()
@@ -113,7 +113,7 @@ def test_taking_a_robot_out_is_all_the_stage_is_asked_for():
     io = _robots_io(world)
     order = []
     world.remove.side_effect = lambda *_: order.append("left the stage")
-    io._io.forget.side_effect = lambda *_: order.append("setpoints dropped")
+    io._io.setpoints.forget.side_effect = lambda *_: order.append("setpoints dropped")
 
     io._rebind = Mock(side_effect=lambda: order.append("scene resolved"))
 
@@ -380,10 +380,11 @@ SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], bases [], r
 
 class _Pairs:
     """What each robot holds on the five slots, as the engine reads its
-    pairs."""
+    pairs, and the setpoints of every robot."""
 
     def __init__(self, held: dict) -> None:
         self.held = dict(held)
+        self.setpoints = Mock(spec=["forget"])
 
     def held_by(self, robot: str) -> Held:
         return self.held.get(robot, Held())
@@ -431,7 +432,7 @@ def test_a_robot_that_left_before_it_stood_gives_back_its_name_and_its_spot():
     """Its stand still waits for the thread that steps the scene, so the
     stand is withdrawn: nothing stood, and the next copy takes the name."""
     io = _joining_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
 
     stood = asyncio.run(io._stand(_Withdrawing(), "alpha", "openarm_v2"))
 
@@ -444,7 +445,7 @@ def test_a_robot_the_stage_refused_gives_back_its_name_and_its_spot():
     """The stage answered the stand with why it will not take the robot, so
     what the admission held goes back with the answer."""
     io = _joining_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["release", "stand", "renew"])
     io._unbind = lambda: None
     io._rebind = lambda: None
@@ -470,7 +471,7 @@ def test_a_robot_that_stood_is_recorded_as_standing():
     """What marks it standing is what tells a copy re-registering that its
     own robot is there to be handed over."""
     io = _joining_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["release", "stand", "renew"])
     io._unbind = lambda: None
     io._rebind = lambda: None
@@ -627,7 +628,7 @@ class TestPairGrace:
         io = _fleet_io_at(now_s=10.0, fleet={"alpha": ("openarm_v2", Held())})
 
         assert io._lapse(io._robots.of_name("alpha")) == (
-            f"none of this robot's limbs were paired for {PAIR_GRACE}"
+            f"this robot held no pair for {PAIR_GRACE}"
         )
 
     def test_a_robot_has_the_pair_grace_time_to_pair_its_limbs(self):

@@ -71,6 +71,10 @@ from control_core_py.geometry import wxyz_of_xyzw
 from mujoco_usd import define_geom, pack, release_source, set_pose, sha256
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
 
+# The engine's wheel loop, pure Python, names the attribute the stage carries.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
+from wheel_loop import INTEGRAL_GAIN_ATTRIBUTE  # noqa: E402  pylint: disable=C0413
+
 ROBOT_ID = "botshare_base"
 STAGE_FILENAME = "botshare_base.usd"
 MANIFEST_FILENAME = "bundle_manifest.json"
@@ -83,11 +87,6 @@ MATERIALS_PATH = f"{ROBOT_PATH}/PhysicsMaterials"
 # rest, as LICENSING.md maps them), where the model's tree stages them.
 LICENSES = ("LICENSE", "LICENSING.md", "NOTICE.md")
 LICENSE_DIRECTORY = "license"
-
-# The attribute of a wheel's joint that holds its rate loop's integral gain
-# (N*m/rad): engine/wheel_loop.py's INTEGRAL_GAIN_ATTRIBUTE, which the stage's
-# suite holds this to.
-INTEGRAL_GAIN_ATTRIBUTE = "peppy:rateLoop:integralGain"
 
 # The MJCF's geom groups: what is drawn.
 VISUAL_GROUP = 2
@@ -113,12 +112,13 @@ class Description:
 
 @dataclass(frozen=True)
 class RateLoop:
-    """A wheel's rate loop as the MJCF runs it: the proportional gain of its
-    velocity actuator (N*m*s/rad), the integral gain of its
-    integrated-velocity actuator (N*m/rad) and the cap of the two (N*m)."""
+    """A wheel's rate loop as the MJCF runs it: the proportional gain, its
+    velocity actuator's kv (N*m*s/rad), the integral gain, its
+    integrated-velocity actuator's kp (N*m/rad), and the cap of the two
+    (N*m)."""
 
-    kv: float
-    kp: float
+    proportional_gain: float
+    integral_gain: float
     cap: float
 
 
@@ -178,11 +178,36 @@ def links_of_bodies(model: mujoco.MjModel, mount: str, description: Description)
     return links
 
 
+def _part(model: mujoco.MjModel, actuator: int) -> str | None:
+    """The part `actuator` plays in a wheel's rate loop, by the rule the
+    MuJoCo node holds the same MJCF to (sim_mujoco/engine/exts/wheel_drive.py):
+    "proportional" for a velocity servo, whose bias is [0, 0, -kv], and
+    "integral" for an integrated-velocity servo, whose bias is [0, -kp, 0],
+    each of a fixed gain that is a positive number; None for any other."""
+    gain = float(model.actuator_gainprm[actuator][0])
+    fixed_affine = (
+        model.actuator_gaintype[actuator] == mujoco.mjtGain.mjGAIN_FIXED
+        and model.actuator_biastype[actuator] == mujoco.mjtBias.mjBIAS_AFFINE
+        and math.isfinite(gain)
+        and gain > 0.0
+    )
+    if not fixed_affine:
+        return None
+    bias = [float(value) for value in model.actuator_biasprm[actuator][:3]]
+    dynamics = model.actuator_dyntype[actuator]
+    if dynamics == mujoco.mjtDyn.mjDYN_NONE and bias == [0.0, 0.0, -gain]:
+        return "proportional"
+    if dynamics == mujoco.mjtDyn.mjDYN_INTEGRATOR and bias == [0.0, -gain, 0.0]:
+        return "integral"
+    return None
+
+
 def rate_loop_of(model: mujoco.MjModel, joint: str) -> RateLoop:
     """The rate loop the MJCF runs the wheel `joint` with: one velocity
-    actuator and one integrated-velocity actuator on it, both of gear 1,
-    capped together by its actuatorfrcrange, the same either way. Anything
-    else is refused naming what the wheel needs."""
+    servo and one integrated-velocity servo on it, both of gear 1, the
+    integrated one's activation unclamped, capped together by its
+    actuatorfrcrange, the same either way, as a PhysX drive's one maximum
+    force caps it. Anything else is refused naming what the wheel needs."""
     joint_id = model.joint(joint).id
     where = f"the MJCF's wheel '{joint}'"
     drivers = [
@@ -191,21 +216,25 @@ def rate_loop_of(model: mujoco.MjModel, joint: str) -> RateLoop:
         if model.actuator_trntype[actuator] == mujoco.mjtTrn.mjTRN_JOINT
         and int(model.actuator_trnid[actuator][0]) == joint_id
     ]
-    proportional = [a for a in drivers if model.actuator_dyntype[a] == mujoco.mjtDyn.mjDYN_NONE]
-    integral = [a for a in drivers if model.actuator_dyntype[a] == mujoco.mjtDyn.mjDYN_INTEGRATOR]
-    if len(drivers) != 2 or len(proportional) != 1 or len(integral) != 1:
+    parts = {_part(model, actuator): actuator for actuator in drivers}
+    if len(drivers) != 2 or set(parts) != {"proportional", "integral"}:
         raise ValueError(
             f"{where} is driven by {len(drivers)} actuators: drive it with one <velocity> actuator, its kv "
             "the loop's proportional gain, and one <intvelocity> actuator, its kp the loop's integral gain"
         )
     if any(not np.allclose(model.actuator_gear[a], (1, 0, 0, 0, 0, 0)) for a in drivers):
         raise ValueError(f"{where} has an actuator of a gear other than 1: a wheel's setpoints are its rates")
+    if model.actuator_actlimited[parts["integral"]]:
+        raise ValueError(
+            f"{where} clamps the activation of its <intvelocity>: a wheel turns without end, "
+            "so give it no actrange"
+        )
     low, high = (float(value) for value in model.jnt_actfrcrange[joint_id])
     if not model.jnt_actfrclimited[joint_id] or low != -high or high <= 0.0:
         raise ValueError(f"{where} caps its actuators at [{low:g}, {high:g}]: give it an actuatorfrcrange of -cap cap")
     return RateLoop(
-        kv=float(model.actuator_gainprm[proportional[0]][0]),
-        kp=float(model.actuator_gainprm[integral[0]][0]),
+        proportional_gain=float(model.actuator_gainprm[parts["proportional"]][0]),
+        integral_gain=float(model.actuator_gainprm[parts["integral"]][0]),
         cap=high,
     )
 
@@ -322,10 +351,12 @@ def define_wheel_joint(stage, model, joint: str, links: dict[str, str]) -> None:
     drive.CreateTypeAttr(UsdPhysics.Tokens.force)
     drive.CreateStiffnessAttr(0.0)
     # USD writes an angular drive's gains per degree.
-    drive.CreateDampingAttr(math.radians(loop.kv))
+    drive.CreateDampingAttr(math.radians(loop.proportional_gain))
     drive.CreateMaxForceAttr(loop.cap)
     joint_prim = prim.GetPrim()
-    joint_prim.CreateAttribute(INTEGRAL_GAIN_ATTRIBUTE, Sdf.ValueTypeNames.Float, True).Set(loop.kp)
+    joint_prim.CreateAttribute(INTEGRAL_GAIN_ATTRIBUTE, Sdf.ValueTypeNames.Float, True).Set(
+        loop.integral_gain
+    )
     joint_prim.AddAppliedSchema("PhysxJointAPI")
     joint_prim.CreateAttribute("physxJoint:armature", Sdf.ValueTypeNames.Float, False).Set(
         float(model.dof_armature[int(model.jnt_dofadr[joint_id])])

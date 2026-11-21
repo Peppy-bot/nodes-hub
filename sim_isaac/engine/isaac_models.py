@@ -102,7 +102,7 @@ class IsaacModel:
     def rolls(self) -> bool:
         """Whether a robot of this model rolls on the wheels of its base: it
         stands free on the floor, where its wheels carry it."""
-        return self.entry.base is not None
+        return self.entry.rolls
 
     def stage_path(self) -> Path:
         """The USD on disk."""
