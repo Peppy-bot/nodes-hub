@@ -6,10 +6,10 @@ the engine imports, once, ahead of the engine's own imports. Every suite that
 needs the runtime imports it, so they all meet the same modules whichever of
 them a session collects first.
 
-The pairing modules follow the node's four slots. A slot's pairs are the
+The pairing modules follow the node's five slots. A slot's pairs are the
 slot's, so every topic module of a slot reads the same members, exactly as the
 generated `peers()` does. A setpoint module hands the engine the arrivals a
-test queued and then ends its subscription, and every publisher records the
+test queued and then ends its subscription, saying so, and every publisher records the
 peer each payload was addressed to, so nothing here waits on a clock.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import math
 import sys
 import types
 from dataclasses import dataclass
@@ -25,12 +26,35 @@ from typing import Optional
 SLOT_TOPICS = {
     "arms": ("joint_setpoints", "joint_states"),
     "grippers": ("gripper_setpoints", "gripper_states"),
+    "bases": ("joint_setpoints", "joint_states"),
     "rgb_cameras": ("video_stream", "stream_info", "geometry"),
     "rgbd_cameras": ("video_stream", "depth_stream", "stream_info", "geometry"),
 }
 
 # The core node every fake instance runs on.
 CORE_NODE = "sim16"
+
+
+# peppylib's encoding of the timestamp of every message the engine builds.
+NANOS_PER_SEC = 1_000_000_000
+
+
+@dataclass(frozen=True)
+class WireTime:
+    """A timestamp as the wire carries it: whole seconds and nanoseconds."""
+
+    sec: int
+    nsec: int
+
+
+def convert_time(timestamp: float) -> WireTime:
+    """The whole seconds of `timestamp`, and the rest to the nearest
+    nanosecond, as peppylib encodes a message's timestamp."""
+    sec = math.floor(timestamp)
+    nsec = round((timestamp - sec) * NANOS_PER_SEC)
+    if nsec == NANOS_PER_SEC:
+        return WireTime(sec + 1, 0)
+    return WireTime(sec, nsec)
 
 
 @dataclass(frozen=True)
@@ -57,29 +81,66 @@ class Member:
     copy: Optional[str]
 
 
-def member(instance: str, link: str, copy: Optional[str]) -> Member:
-    return Member(info=Peer(producer=Producer(CORE_NODE, instance), peer_link_id=link), copy=copy)
+def member(instance: str, link: str, copy: Optional[str], core_node: str = CORE_NODE) -> Member:
+    return Member(info=Peer(producer=Producer(core_node, instance), peer_link_id=link), copy=copy)
 
 
 class Publisher:
-    """A pairing publisher: records the peer each payload was addressed to."""
+    """A publisher: records the peer each payload was addressed to, None for
+    a topic the node emits to whoever consumes it."""
 
     def __init__(self) -> None:
-        self.sent: list[tuple[Peer, object]] = []
+        self.sent: list[tuple[Optional[Peer], object]] = []
 
     async def publish_to(self, peer: Peer, payload) -> None:
         self.sent.append((peer, payload))
 
+    async def publish(self, payload) -> None:
+        self.sent.append((None, payload))
+
+
+class ServiceFailure(Exception):
+    """A service's error reply, as a generated service module raises it: a
+    failure kind and a message."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
 
 class Subscription:
     """A slot's setpoint subscription: hands over what the test queued, in
-    order, then ends."""
+    order, then ends, setting `ended` once its consumer took every
+    arrival."""
 
-    def __init__(self, arrivals: list) -> None:
+    def __init__(self, arrivals: list, ended: asyncio.Event) -> None:
         self._arrivals = arrivals
+        self._ended = ended
 
     async def next(self):
-        return self._arrivals.pop(0) if self._arrivals else None
+        if self._arrivals:
+            return self._arrivals.pop(0)
+        self._ended.set()
+        return None
+
+
+class _Token:
+    """The node's cancellation token, which no test cancels."""
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    async def cancelled(self) -> None:
+        await asyncio.Event().wait()
+
+
+class NodeRunner:
+    """The node runner the engine's transport holds: what it reads of it is
+    the node's cancellation token."""
+
+    def cancellation_token(self) -> _Token:
+        return _Token()
 
 
 class FailureKind(str, enum.Enum):
@@ -151,9 +212,9 @@ class _AttachHandle:
         return None
 
 
-async def _no_readiness_request(_runner, _handler) -> None:
-    """The readiness service of an engine nobody asks: it waits for a request
-    that never comes."""
+async def _no_request(_runner, _handler) -> None:
+    """A service of an engine nobody asks: it waits for a request that never
+    comes."""
     await asyncio.Event().wait()
 
 
@@ -193,13 +254,14 @@ def _topic_module(slot_module: types.ModuleType, slot: str, topic: str) -> types
     module = types.ModuleType(f"peppygen.paired_topics.{slot}.{topic}")
     module.LINK_ID = slot
     module.arrivals = []
+    module.ended = asyncio.Event()
     module.publisher = Publisher()
     module.peers = lambda _runner: list(slot_module.members)
     module.build_message = _payload
     module.MessageHeader = lambda **fields: types.SimpleNamespace(**fields)
 
     async def subscribe(_runner) -> Subscription:
-        return Subscription(module.arrivals)
+        return Subscription(module.arrivals, module.ended)
 
     async def declare_publisher(_runner) -> Publisher:
         return module.publisher
@@ -217,6 +279,10 @@ def _install() -> None:
     peppylib_clock = types.ModuleType("peppylib.clock")
     peppylib_clock.ClockPublisher = _ClockPublisher
     peppylib.clock = peppylib_clock
+    peppylib_encoding = types.ModuleType("peppylib.encoding")
+    peppylib_encoding.NANOS_PER_SEC = NANOS_PER_SEC
+    peppylib_encoding.convert_time = convert_time
+    peppylib.encoding = peppylib_encoding
     peppylib_runtime = types.ModuleType("peppylib.runtime")
     peppylib_runtime.NodeBuilder = object
     peppylib.runtime = peppylib_runtime
@@ -238,16 +304,37 @@ def _install() -> None:
     attach.GoalDecision = _GoalDecision
     is_ready = types.ModuleType("peppygen.exposed_services.robots.is_ready")
     is_ready.Response = _ReadyResponse
-    is_ready.handle_requests = _no_readiness_request
+    is_ready.handle_requests = _no_request
     actions_robots = types.ModuleType("peppygen.exposed_actions.robots")
     actions_robots.attach = attach
     services_robots = types.ModuleType("peppygen.exposed_services.robots")
     services_robots.is_ready = is_ready
 
+    object_states = types.ModuleType("peppygen.emitted_topics.objects.object_states")
+    object_states.TOPIC_NAME = "object_states"
+    object_states.publisher = Publisher()
+    object_states.build_message = _payload
+    object_states.MessageRobotsItem = lambda **fields: fields
+
+    async def declare_object_states_publisher(_runner) -> Publisher:
+        return object_states.publisher
+
+    object_states.declare_publisher = declare_object_states_publisher
+    emitted_objects = types.ModuleType("peppygen.emitted_topics.objects")
+    emitted_objects.object_states = object_states
+    get_object_states = types.ModuleType("peppygen.exposed_services.objects.get_object_states")
+    get_object_states.Response = lambda **fields: types.SimpleNamespace(**fields)
+    get_object_states.ResponseRobotsItem = lambda **fields: fields
+    get_object_states.Failure = ServiceFailure
+    get_object_states.handle_requests = _no_request
+    services_objects = types.ModuleType("peppygen.exposed_services.objects")
+    services_objects.get_object_states = get_object_states
+
     paired = types.ModuleType("peppygen.paired_topics")
     modules = {
         "peppylib": peppylib,
         "peppylib.clock": peppylib_clock,
+        "peppylib.encoding": peppylib_encoding,
         "peppylib.runtime": peppylib_runtime,
         "peppygen": peppygen,
         "peppygen.clock": peppygen_clock,
@@ -255,6 +342,11 @@ def _install() -> None:
         "peppygen.exposed_actions.robots": actions_robots,
         "peppygen.exposed_services": types.ModuleType("peppygen.exposed_services"),
         "peppygen.exposed_services.robots": services_robots,
+        "peppygen.exposed_services.objects": services_objects,
+        "peppygen.exposed_services.objects.get_object_states": get_object_states,
+        "peppygen.emitted_topics": types.ModuleType("peppygen.emitted_topics"),
+        "peppygen.emitted_topics.objects": emitted_objects,
+        "peppygen.emitted_topics.objects.object_states": object_states,
         "peppygen.paired_topics": paired,
     }
     for slot, topics in SLOT_TOPICS.items():
@@ -285,6 +377,15 @@ def pair(slot: str, *members: Member) -> None:
     _slot(slot).members = list(members)
 
 
+def queue(slot: str, name: str, arrivals) -> asyncio.Event:
+    """Queues `arrivals` on the setpoint topic `name` of `slot`, and gives
+    the event its next subscription sets once it handed them all over."""
+    module = topic(slot, name)
+    module.arrivals = list(arrivals)
+    module.ended = asyncio.Event()
+    return module.ended
+
+
 def reset() -> None:
     """Empties every slot, its queued arrivals and what it published."""
     for slot, topics in SLOT_TOPICS.items():
@@ -293,3 +394,4 @@ def reset() -> None:
             module = topic(slot, name)
             module.arrivals = []
             module.publisher = Publisher()
+    sys.modules["peppygen.emitted_topics.objects.object_states"].publisher = Publisher()

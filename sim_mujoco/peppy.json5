@@ -5,15 +5,20 @@
     tag: "v1",
     description: [
       "The MuJoCo simulation: it stands any number of robots, of any model it has an entry for, in one composed scene, and serves a viser viewer to a browser. It needs no GPU, but it renders the robot cameras much faster on an NVIDIA GPU.",
-      "Each robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine composes its scene from the models standing in it and steps them for as long as they stay. The engine plays the follower role of every limb pairing of every robot: a robot's backbone leads each pair and the simulation's measured state streams back on it. Whether a robot stands with a pair for every limb of its model is its readiness, answered on the same contract.",
+      "Each robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine composes its scene from the models standing in it and steps them for as long as they stay. The engine plays the follower role of every limb pairing and every base pairing of every robot: a robot's backbone leads each limb's pair, its base node leads its base's, and the simulation's measured state streams back on each. Whether a robot stands with a pair for every limb and the base of its model is its readiness, answered on the same contract.",
+      "It implements object_state, streamed and on demand: one record per robot standing, the world pose of its robot frame and its velocities there, and no objects, since nothing is spawned in its scene.",
     ],
     implements: [
       // How a robot joins this scene: it attaches with the copy it runs as,
       // its model and the spot it stands on, and stays for as long as its
       // goal runs. A robot that asks for no spot takes a free one of the
-      // engine's own. Whether it stands with every limb paired is its
-      // readiness.
+      // engine's own. Whether it stands with every limb and its base paired
+      // is its readiness.
       { name: "simulation_robot", tag: "v1", link_id: "robots" },
+      // The ground truth of the robots standing: where each robot frame is
+      // and how fast it moves, captured on the state rate. Its scene spawns
+      // no object, so every snapshot lists none.
+      { name: "object_state", tag: "v1", link_id: "objects" },
     ],
     depends_on: {
       pairings: [
@@ -23,10 +28,16 @@
         // the same pair. A pair's robot is the copy it carries and its limb
         // is the link it comes from on the robot's side (left_arm, arm), so
         // nothing on the wire carries an arm_id or a robot id, and a robot
-        // of any model pairs here. A robot whose pairs are not the limbs and
-        // cameras of its model does not stay.
+        // of any model pairs here. A robot whose pairs are not the limbs, the
+        // base and the cameras of its model does not stay.
         { name: "joint_link", tag: "v1", role: "follower", link_id: "arms", cardinality: "zero_or_more" },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "grippers", cardinality: "zero_or_more" },
+        // A rolling robot's base: each wheel runs at the velocity its base
+        // node streams for it, as the base's driver runs it in profile
+        // velocity mode, and the measured wheel angles and rates stream back
+        // on the same pair. A pair's base is the link it comes from on the
+        // robot's side, `base`, the one name a robot answers to for its base.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "bases", cardinality: "zero_or_more" },
         // Robot-mounted cameras rendered from the live scene, one slot per
         // kind of camera: the engine plays the camera role and a per-camera
         // relay presents the rgb/rgbd contract. A pair's camera is its
@@ -42,6 +53,7 @@
     services: {
       exposes: [
         { link_id: "robots", name: "is_ready" },
+        { link_id: "objects", name: "get_object_states" },
       ],
     },
     actions: {
@@ -53,6 +65,7 @@
       emits: [
         { link_id: "arms", name: "joint_states" },
         { link_id: "grippers", name: "gripper_states" },
+        { link_id: "bases", name: "joint_states" },
         { link_id: "rgb_cameras", name: "video_stream" },
         { link_id: "rgb_cameras", name: "stream_info" },
         { link_id: "rgb_cameras", name: "geometry" },
@@ -60,10 +73,12 @@
         { link_id: "rgbd_cameras", name: "depth_stream" },
         { link_id: "rgbd_cameras", name: "stream_info" },
         { link_id: "rgbd_cameras", name: "geometry" },
+        { link_id: "objects", name: "object_states" },
       ],
       consumes: [
         { link_id: "arms", name: "joint_setpoints" },
         { link_id: "grippers", name: "gripper_setpoints" },
+        { link_id: "bases", name: "joint_setpoints" },
       ],
     },
   },
@@ -87,7 +102,8 @@
       viewer: { kind: "page", description: "The viser viewer of the scene, HTTP and WebSocket." },
     },
     parameters: {
-      // Rate (Hz) of the measured-state streams (joint_states / gripper_states).
+      // Rate (Hz) of the measured-state streams (the arms' and the bases'
+      // joint_states, gripper_states).
       // Where the deployment names this simulation its clock domain's
       // publisher, the same rate is how often that domain advances, so it
       // also sets how finely every instance bound to it can read time.
@@ -107,11 +123,11 @@
       cameras_enabled: "bool",
       // The pair grace time: how long the standing robot may go without
       // holding the pairs its model asks for before it leaves the scene, once
-      // a limb first reached it. A robot's pairs dissolve when its nodes
-      // stop, so a robot whose process is gone leaves within this window, and
-      // one paired as another model stays this long before its stay ends
-      // naming both lists; a robot no limb reached yet stays for as long as
-      // its goal does.
+      // a limb or its base first reached it. A robot's pairs dissolve when
+      // its nodes stop, so a robot whose process is gone leaves within this
+      // window, and one paired as another model stays this long before its
+      // stay ends naming both lists; a robot no limb or base reached yet
+      // stays for as long as its goal does.
       robot_pair_grace_ms: { $type: "u32", $default: 2000 },
     },
   },

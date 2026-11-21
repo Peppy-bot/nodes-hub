@@ -56,7 +56,7 @@ FIRST_PAUSE_S = 1.0
 # too many requests. A server error (5xx) asks the same.
 COME_BACK_STATUSES = (408, 429)
 # The release that private-nodes-hub's waldo/web/public/assets/catalogue.lock.json pins.
-RELEASE_DIGEST = "88cec0d95f98e7397b1a14d5964b03df796c9f35289b45615bdd80fee820a87a"
+RELEASE_DIGEST = "8212f2c4bfbd6a515519ee3fc7bfe75b77d477722a6c73a7240195dabace6bc7"
 RELEASE_INDEX = "index.json"
 ROBOTS = "robots.json"
 TREE_INDEX = "index.json"
@@ -118,6 +118,8 @@ def read_release_index(data: bytes, digest: str) -> list[StoredFile]:
     """The inventory of a release's index, refused unless the index is the
     release `digest` names."""
     index = json.loads(data)
+    if not isinstance(index, dict):
+        raise ValueError(f"the release index is not a JSON object naming catalogues/{digest}")
     if index.get("prefix") != f"catalogues/{digest}":
         raise ValueError(
             f"the release index names {index.get('prefix')!r}, not catalogues/{digest}"

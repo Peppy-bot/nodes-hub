@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from sim_robot_core.registry import Registry
 
-import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime sim_topics imports)
+import runtime_fakes  # installs the runtime sim_topics imports
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 
@@ -106,6 +106,19 @@ def test_publish_lands_the_recorded_instant_in_nanoseconds(io, loop):
     io.publish_clock_tick()
     loop.run_until_complete(_drain())
     assert io._clock_publisher.published == [2_500_000_000]
+
+
+@pytest.mark.parametrize("engine_time_s, stamp_ns", [(2.01, 2_010_000_000), (4.1, 4_100_000_000)])
+def test_the_tick_carries_the_instant_of_the_stamps_of_its_step(io, loop, engine_time_s, stamp_ns):
+    """As a float, 4.1 s lies just under 4 100 000 000 ns: the wire carries a
+    stamp of it at the nearest nanosecond, and the tick carries that same
+    instant, so a consumer whose clock reads the tick has reached the stamp."""
+    io.record_engine_time(engine_time_s)
+    io.publish_clock_tick()
+    loop.run_until_complete(_drain())
+    stamp = runtime_fakes.convert_time(io.timestamp_s())
+    assert stamp.sec * runtime_fakes.NANOS_PER_SEC + stamp.nsec == stamp_ns
+    assert io._clock_publisher.published == [stamp_ns]
 
 
 def test_a_tick_arriving_mid_flight_is_latched_never_reordered(io, loop):

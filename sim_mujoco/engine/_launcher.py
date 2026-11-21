@@ -5,8 +5,9 @@ scene.
 The scene opens empty and stays up. A robot standing and a robot leaving
 both compose it again on this thread, which is the only one that may compile
 a model while physics reads it, and the robots that stay carry their state
-onto the new one: their joint positions, their velocities and the targets
-their actuators hold. The engine's clock carries too, so the fleet's time
+onto the new one: their joint positions, their velocities, the targets their
+actuators hold and the activations of the actuators that integrate, such as
+the integral of a wheel's rate loop. The engine's clock carries too, so the fleet's time
 never goes back.
 
 The scene is watched in a browser, on the viewer's server. The server serves
@@ -158,7 +159,7 @@ class SimLauncher:
             model,
             data,
             self._io,
-            robots,
+            self._world,
             self._state_rate_hz,
             renders=self._world.renders,
             time_base_s=self._time_base_s,
@@ -168,7 +169,7 @@ class SimLauncher:
         # The scene is taken up whole: nothing of it is installed until every
         # part of it is built, so a scene that cannot be built leaves nothing
         # running behind the one the engine keeps stepping.
-        view = self._open_view(model, data, extension)
+        view = self._open_view(model, data, extension, robots)
         self._model, self._data, self._extension, self._view = model, data, extension, view
         logger.info(
             "the scene stands %d robot(s): %s",
@@ -200,17 +201,22 @@ class SimLauncher:
             _carry(data.qvel, model, joint, self._data.qvel, self._model, previous, "dof")
             carried.add(_robot_of(name))
         # The targets the actuators hold, so an arm that was commanded holds
-        # its setpoint in the scene it is carried into.
+        # its setpoint in the scene it is carried into, and the activations of
+        # the actuators that integrate, so a wheel's rate loop keeps its
+        # integral.
         for actuator in range(model.nu):
             name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, actuator)
             if name is None:
                 continue
             previous = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-            if previous >= 0:
-                data.ctrl[actuator] = self._data.ctrl[previous]
+            if previous < 0:
+                continue
+            data.ctrl[actuator] = self._data.ctrl[previous]
+            here, there = _activation(model, actuator), _activation(self._model, previous)
+            data.act[here[0] : here[1]] = self._data.act[there[0] : there[1]]
         return carried
 
-    def _open_view(self, model, data, extension: MujocoBridgeExtension):
+    def _open_view(self, model, data, extension: MujocoBridgeExtension, robots):
         """How this scene is watched: in a browser, on the viewer's server,
         whether or not a robot stands in it, so the address the node
         announces always shows the scene as it is.
@@ -219,7 +225,9 @@ class SimLauncher:
         robots standing keep their physics, their state and the clock this
         engine publishes, and the operator is told why they have no picture."""
         try:
-            return _BrowserView(model, data, extension, self._viewer_server)
+            return _BrowserView(
+                model, data, extension, self._viewer_server, {robot.instance for robot in robots}
+            )
         except Exception as error:  # pylint: disable=W0718
             logger.error(
                 "the scene is stepped unwatched: its view could not open: %s", error
@@ -277,7 +285,11 @@ class _BrowserView:
         data,
         extension: MujocoBridgeExtension,
         viewer_server: ViewerServer,
+        robots: set[str],
     ) -> None:
+        # The names of the robots standing, which a robot that rolls names
+        # its free joint by.
+        self._robots = robots
         self._model = model
         self._data = data
         self._extension = extension
@@ -311,13 +323,15 @@ class _BrowserView:
         self._viewer = mjviser.Viewer(
             model, data, server=server, step_fn=lambda _m, _d: extension.step()
         )
-        # Free joints are the scene props (every robot joint is driven);
-        # snapshot their spawn pose so the viewer button can restage the
-        # scene without touching the arms.
+        # The free joints other than the ones robots that roll hang on are
+        # the scene props (every robot joint is driven); snapshot their spawn
+        # pose so the viewer button can restage the scene without touching
+        # the robots.
         self._free_joints = [
             (model.jnt_qposadr[joint], model.jnt_dofadr[joint])
             for joint in range(model.njnt)
             if model.jnt_type[joint] == mujoco.mjtJoint.mjJNT_FREE
+            and mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, joint) not in self._robots
         ]
         self._spawn_qpos = [data.qpos[q : q + 7].copy() for q, _ in self._free_joints]
         self._reset_requested = threading.Event()
@@ -336,6 +350,10 @@ class _BrowserView:
         self._viewer._setup_gui()  # pylint: disable=W0212
         mujoco.mj_forward(model, data)
         self._viewer._render()  # pylint: disable=W0212
+        # The viewer's tick steps the scene for the time since its last tick,
+        # which Viewer.run() starts as its loop starts: the view starts it as
+        # it shows the scene.
+        self._viewer._last_tick = time.perf_counter()  # pylint: disable=W0212
 
         # viser sends batched position updates as delta messages only:
         # new/refreshing clients receive initial zero positions unless we
@@ -405,6 +423,13 @@ def _robot_of(scene_name: str) -> str:
     answers to carries its own prefix, and a robot's name carries no
     separator of its own (`world.name_in_the_scene` refuses one)."""
     return scene_name.split(PREFIX_SEPARATOR, 1)[0]
+
+
+def _activation(model, actuator: int) -> tuple[int, int]:
+    """Where one actuator's activations sit in `act`: none for an actuator
+    without dynamics, which MuJoCo gives the address -1."""
+    start = int(model.actuator_actadr[actuator])
+    return (0, 0) if start < 0 else (start, start + int(model.actuator_actnum[actuator]))
 
 
 def _span(model, joint: int, kind: str) -> tuple[int, int]:
