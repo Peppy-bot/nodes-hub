@@ -241,9 +241,9 @@ class SimTopicIO:
             ],
         )
         self._tasks = [
-            asyncio.create_task(self._consume_arms()),
-            asyncio.create_task(self._consume_grippers()),
-            asyncio.create_task(self._consume_bases()),
+            asyncio.create_task(self._consume(arm_setpoints, ARMS, self._take_arm)),
+            asyncio.create_task(self._consume(gripper_setpoints, GRIPPERS, self._take_gripper)),
+            asyncio.create_task(self._consume(base_setpoints, BASES, self._take_base)),
         ]
 
     async def stop(self) -> None:
@@ -252,8 +252,13 @@ class SimTopicIO:
         # Let the cancellations land so the consume loops exit before teardown.
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _consume_arms(self) -> None:
-        subscription = await arm_setpoints.subscribe(self._node_runner)
+    async def _consume(self, setpoints, slot: str, take) -> None:
+        """Holds `setpoints`' subscription of the slot `slot` and hands each
+        setpoint of a pair the slot holds for a robot to `take`, with the
+        peer it came from and the robot and part its pair names. A frame that
+        does not read is logged and dropped, and the pause after it keeps a
+        fault that persists from spinning the loop."""
+        subscription = await setpoints.subscribe(self._node_runner)
         while True:
             try:
                 pair = await subscription.next()
@@ -262,84 +267,42 @@ class SimTopicIO:
             except asyncio.CancelledError:
                 return
             except Exception as exc:
-                # A corrupt frame is dropped and logged rather than killing
-                # this consume task; the pause keeps a persistent fault from
-                # hot-spinning the loop.
-                logger.warning(f"{ARMS} setpoint consume error: {exc}")
+                logger.warning(f"{slot} setpoint consume error: {exc}")
                 await asyncio.sleep(0.1)
                 continue
             peer, msg = pair
-            named = self._pairs.pair_of(ARMS, peer)
-            if named is None:
-                continue
-            robot, arm = named
-            setpoint = self._setpoint(robot, arm, self._arm_joint_count(robot, arm), "joints", msg)
-            if setpoint is None:
-                continue
-            slot = self._command_slot(self._arm_cmd, arm, robot)
-            if slot.get() is None:
-                logger.info(f"first setpoint for '{robot}' {arm}")
-            slot.set((list(setpoint.positions), list(setpoint.velocities)))
+            named = self._pairs.pair_of(slot, peer)
+            if named is not None:
+                take(peer, *named, msg)
 
-    async def _consume_grippers(self) -> None:
-        subscription = await gripper_setpoints.subscribe(self._node_runner)
-        while True:
-            try:
-                pair = await subscription.next()
-                if pair is None:
-                    return
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                # A corrupt frame is dropped and logged rather than killing
-                # this consume task; the pause keeps a persistent fault from
-                # hot-spinning the loop.
-                logger.warning(f"{GRIPPERS} setpoint consume error: {exc}")
-                await asyncio.sleep(0.1)
-                continue
-            peer, msg = pair
-            named = self._pairs.pair_of(GRIPPERS, peer)
-            if named is None:
-                continue
-            robot, gripper = named
-            if not (
-                math.isfinite(msg.opening)
-                and math.isfinite(msg.max_effort)
-                and msg.max_effort >= 0.0
-            ):
-                logger.warning(f"dropping unusable setpoint for '{robot}' {gripper}")
-                continue
-            # max_effort caps the finger drive effort in engine units; 0
-            # (unset on the wire) leaves the engine's own force ceiling.
-            slot = self._command_slot(self._gripper_cmd, gripper, robot)
-            if slot.get() is None:
-                logger.info(f"first setpoint for '{robot}' {gripper}")
-            slot.set((msg.opening, msg.max_effort))
+    def _take_arm(self, _peer, robot: str, arm: str, msg) -> None:
+        setpoint = self._setpoint(robot, arm, self._arm_joint_count(robot, arm), "joints", msg)
+        if setpoint is None:
+            return
+        slot = self._command_slot(self._arm_cmd, arm, robot)
+        if slot.get() is None:
+            logger.info(f"first setpoint for '{robot}' {arm}")
+        slot.set((list(setpoint.positions), list(setpoint.velocities)))
 
-    async def _consume_bases(self) -> None:
-        subscription = await base_setpoints.subscribe(self._node_runner)
-        while True:
-            try:
-                pair = await subscription.next()
-                if pair is None:
-                    return
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                # A corrupt frame is dropped and logged rather than killing
-                # this consume task; the pause keeps a persistent fault from
-                # hot-spinning the loop.
-                logger.warning(f"{BASES} setpoint consume error: {exc}")
-                await asyncio.sleep(0.1)
-                continue
-            peer, msg = pair
-            named = self._pairs.pair_of(BASES, peer)
-            if named is None:
-                continue
-            robot, base = named
-            setpoint = self._setpoint(robot, base, self._wheel_count(robot, base), "wheels", msg)
-            if setpoint is not None and self._base_cmd.put(robot, peer, setpoint):
-                logger.info(f"first setpoint for '{robot}' {base}")
+    def _take_gripper(self, _peer, robot: str, gripper: str, msg) -> None:
+        if not (
+            math.isfinite(msg.opening)
+            and math.isfinite(msg.max_effort)
+            and msg.max_effort >= 0.0
+        ):
+            logger.warning(f"dropping unusable setpoint for '{robot}' {gripper}")
+            return
+        # max_effort caps the finger drive effort in engine units; 0
+        # (unset on the wire) leaves the engine's own force ceiling.
+        slot = self._command_slot(self._gripper_cmd, gripper, robot)
+        if slot.get() is None:
+            logger.info(f"first setpoint for '{robot}' {gripper}")
+        slot.set((msg.opening, msg.max_effort))
+
+    def _take_base(self, peer, robot: str, base: str, msg) -> None:
+        setpoint = self._setpoint(robot, base, self._wheel_count(robot, base), "wheels", msg)
+        if setpoint is not None and self._base_cmd.put(robot, peer, setpoint):
+            logger.info(f"first setpoint for '{robot}' {base}")
 
     def _arm_joint_count(self, robot: str, arm: str) -> Optional[int]:
         """How many joints the arm `arm` of `robot`'s model moves, or None
@@ -364,7 +327,7 @@ class SimTopicIO:
         """The setpoint `msg` gives `robot`'s arm or base `part` of `count`
         `joints` (joints, wheels), or None: for a part its model lacks, which
         drives nothing, and for a setpoint the parse refuses, which is dropped
-        saying why rather than written into the simulation."""
+        and the log says why."""
         if count is None:
             return None
         try:

@@ -217,7 +217,7 @@ class World:
 
     def follow(self, instance: str, placement: Pose) -> None:
         """Records where a robot that rolls stands now: its wheels carried it
-        to `placement`. A robot no longer in the scene is left out."""
+        to `placement`. A name the scene holds no robot under is left out."""
         with self._lock:
             robot = self._robots.get(instance)
             if robot is not None:

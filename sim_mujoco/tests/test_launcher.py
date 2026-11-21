@@ -505,8 +505,9 @@ class TestTheSceneOnTheViewersServer:
         assert len(viser.connect_callbacks) == 2
 
     def test_the_free_joint_of_a_robot_that_rolls_is_no_prop_to_reset(self):
-        """The button that restages the scene's props would teleport the
-        robot: a robot's own free joint is left to its wheels."""
+        """The button that restages the scene's props puts each free joint
+        it holds back at its spawn pose: a robot's own free joint is left to
+        its wheels, so a scene standing no prop shows no button."""
         viewer_server = _viewer_server()
         world = World(renders=False)
         launcher = _watched(world, viewer_server)
