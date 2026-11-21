@@ -20,18 +20,16 @@ from __future__ import annotations
 
 import math
 import os
-import platform
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pytest
 import robot_description_py
 from control_core_py.geometry import wxyz_of_xyzw
 
-from _base_images import IMAGES_DIR, shell_value
+from _base_images import IMAGES_DIR, baked_stage, only_on_linux_x86_64, shell_value
 
 mujoco = pytest.importorskip("mujoco")
 pytest.importorskip("pxr")
@@ -54,21 +52,6 @@ LINKS = (
     "moving_jaw_so101_v1_link",
 )
 
-# The bundle is built on Linux x86_64, the platform of the Isaac image. MuJoCo
-# rounds what it compiles differently on another architecture, so only there
-# is the stage built here the bundle's byte for byte.
-_BUILDS_THE_BUNDLES_BYTES = sys.platform == "linux" and platform.machine() == "x86_64"
-
-
-def _baked_stage() -> Optional[Path]:
-    """The stage the base image bakes, where the assets directory holds one."""
-    assets = os.environ.get("PEPPY_ROBOT_ASSETS_DIR")
-    if not assets:
-        return None
-    path = Path(assets) / "so101" / build_so101.STAGE_FILENAME
-    return path if path.is_file() else None
-
-
 @pytest.fixture(scope="module")
 def description() -> build_so101.Description:
     return build_so101.read_description()
@@ -76,7 +59,7 @@ def description() -> build_so101.Description:
 
 @pytest.fixture(scope="module")
 def stage_path(tmp_path_factory, description) -> Path:
-    baked = _baked_stage()
+    baked = baked_stage(build_so101.ROBOT_ID, build_so101.STAGE_FILENAME)
     if baked is not None:
         return baked
     staged = os.environ.get("SO101_RELEASE")
@@ -160,10 +143,7 @@ def urdf_tool_frame_in_world(
     return _matrix(data.xpos[body], data.xquat[body]) @ fixed
 
 
-@pytest.mark.skipif(
-    not _BUILDS_THE_BUNDLES_BYTES,
-    reason="the bundle is built on Linux x86_64, and MuJoCo rounds differently elsewhere",
-)
+@only_on_linux_x86_64
 def test_the_stage_is_the_one_the_pinned_bundle_holds(stage_path):
     """isaac_assets.env pins the bundle the image bakes and the digest of the
     stage in it, and download_assets.sh refuses a bundle whose stage is

@@ -1,9 +1,9 @@
 """The botshare base's stage scripts/build_botshare_base.py writes from its
 MuJoCo model, held to its description, the URDF robot_description bundles
 (the bodies its fixed joints fuse with the sum of their masses, every link
-at its place, the wheels' continuous joints), and to the model (each wheel's
+at its place, the wheels' continuous joints), to the model (each wheel's
 rate loop as its drive, the contact of its tires and casters, and the
-colour of each mesh).
+colour of each mesh), and to the bundle the base image bakes.
 
 The stage is read as baked where PEPPY_ROBOT_ASSETS_DIR holds one (the base
 image's suite), and built here otherwise, from the base's model in the
@@ -21,14 +21,13 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pytest
 import robot_description_py
 from control_core_py.geometry import rotation_of
 
-from _base_images import IMAGES_DIR
+from _base_images import IMAGES_DIR, baked_stage, only_on_linux_x86_64, shell_value
 from _world import known, world_module
 
 pytest.importorskip("mujoco")
@@ -44,15 +43,6 @@ import waldo_catalogue  # noqa: E402  pylint: disable=C0413
 ROBOT = builder.ROBOT_PATH
 BODIES = ("base_footprint", "left_wheel_link", "right_wheel_link")
 WHEELS = ("left_wheel_joint", "right_wheel_joint")
-
-
-def _baked_stage() -> Optional[Path]:
-    """The stage the base image bakes, where the assets directory holds one."""
-    assets = os.environ.get("PEPPY_ROBOT_ASSETS_DIR")
-    if not assets:
-        return None
-    path = Path(assets) / builder.ROBOT_ID / builder.STAGE_FILENAME
-    return path if path.is_file() else None
 
 
 @pytest.fixture(scope="module")
@@ -77,12 +67,16 @@ def model(release):
 
 
 @pytest.fixture(scope="module")
-def stage(tmp_path_factory, description, release) -> Usd.Stage:
-    baked = _baked_stage()
+def stage_path(tmp_path_factory, description, release) -> Path:
+    baked = baked_stage(builder.ROBOT_ID, builder.STAGE_FILENAME)
     if baked is not None:
-        return Usd.Stage.Open(str(baked))
-    path = builder.build_stage(release, description, tmp_path_factory.mktemp("botshare_stage"))
-    return Usd.Stage.Open(str(path))
+        return baked
+    return builder.build_stage(release, description, tmp_path_factory.mktemp("botshare_stage"))
+
+
+@pytest.fixture(scope="module")
+def stage(stage_path) -> Usd.Stage:
+    return Usd.Stage.Open(str(stage_path))
 
 
 @pytest.fixture(scope="module")
@@ -118,6 +112,17 @@ def _urdf_link_in_root(description: builder.Description, link: str) -> np.ndarra
 def _mass_of(urdf: ET.Element, link: str) -> float:
     mass = urdf.find(f"link[@name='{link}']/inertial/mass")
     return 0.0 if mass is None else float(mass.get("value"))
+
+
+@only_on_linux_x86_64
+def test_the_stage_is_the_one_the_pinned_bundle_holds(stage_path):
+    """isaac_assets.env pins the bundle the image bakes and the digest of the
+    stage in it, and download_assets.sh refuses a bundle whose stage is
+    another. A change of the builder, of the release, of the description
+    or of the mujoco pin that moves the stage fails here until the bundle is
+    built and pinned again (README, the botshare base's stage)."""
+    pins = (IMAGES_DIR / "isaac_assets.env").read_text()
+    assert builder.sha256(stage_path.read_bytes()) == shell_value(pins, "BOTSHARE_BASE_STAGE_SHA256")
 
 
 def test_the_stage_is_z_up_in_metres_with_the_robot_as_its_default_prim(stage):

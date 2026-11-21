@@ -549,12 +549,14 @@ the `isaac-sim-assets` R2 bucket and bakes each under
 `/opt/robot_assets/<robot>/`: the OpenArm bundle under `openarm/`, the
 SO-101's under `so101/` and the botshare base's under `botshare_base/`. Their
 immutable versioned keys and SHA-256s are
-pinned in `sim_base_images/isaac_assets.env`. The Docker build copies that
-file before downloading, so a pin change invalidates the asset layer's cache.
-It checks every pin, downloads and verifies every archive, and only then
-extracts them, never falling back to a mutable asset directory. Robot startup
-uses only the baked files and the head camera pack below, with no GitHub
-access, asset conversion or conversion dependencies.
+pinned in `sim_base_images/isaac_assets.env`, with the SHA-256 of the stage
+each of the SO-101's and the botshare base's bundles holds. The Docker build
+copies that file before downloading, so a pin change invalidates the asset
+layer's cache. It checks every pin, downloads and verifies every archive,
+checks the stage of the SO-101's and of the botshare base's bundle, and only
+then extracts them, never falling back to a mutable asset directory. Robot
+startup uses only the baked files and the head camera pack below, with no
+GitHub access, asset conversion or conversion dependencies.
 
 ### OpenArm visual assets
 
@@ -767,13 +769,22 @@ uv run --project sim_isaac/tests --locked --group dev \
 
 The archive holds the stage, the licenses of the meshes and
 `bundle_manifest.json`, and is published as the SO-101's is, at
-`botshare_base/<version>/<sha256>.tar.gz`, for the image to bake under
+`botshare_base/<version>/<sha256>.tar.gz`, and pinned as
+`BOTSHARE_BASE_ASSETS_KEY` and `BOTSHARE_BASE_ASSETS_SHA256` in
+`isaac_assets.env`, with the SHA-256 of its `botshare_base.usd` as
+`BOTSHARE_BASE_STAGE_SHA256`, for the image to bake under
 `/opt/robot_assets/botshare_base/`. `tests/test_botshare_base_stage.py`
 holds the stage to the description, its bodies and their masses, the place of
 every link and the wheels' joints, and to the model, the rate loop of each
-wheel, the contact of the tires and the casters and the colour of each mesh.
+wheel, the contact of the tires and the casters and the colour of each mesh,
+and on Linux x86_64 holds its SHA-256 to `BOTSHARE_BASE_STAGE_SHA256`.
+`download_assets.sh` refuses a bundle whose stage is another. So a change of
+the builder, of the release, of the description or of the `mujoco` pin that
+moves the stage fails the suite until the bundle is built and pinned again.
 `BOTSHARE_RELEASE` names a directory a release holding the base is staged
-in; without it the suite stages the pinned release.
+in; without it the suite stages the pinned release. Where
+`PEPPY_ROBOT_ASSETS_DIR` holds a baked stage, as in the image, the suite
+reads that stage.
 
 ## Tests
 
