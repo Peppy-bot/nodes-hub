@@ -68,6 +68,18 @@ fn wheel_step(speed: f64) -> f64 {
     speed / WHEEL_RADIUS_M * DT
 }
 
+/// The rig's wheels, as the model's URDF gives them.
+fn rig_wheels() -> WheelGeometry {
+    WheelGeometry::parse(WHEEL_SEPARATION_M, WHEEL_RADIUS_M, WHEEL_RADIUS_M)
+        .expect("the rig's wheels")
+}
+
+/// base_state's rest bound of the turn rate: the turn of the two wheels each
+/// at the rest velocity in opposite directions.
+fn rest_rate() -> f64 {
+    rig_wheels().turn_rate_at_opposite_wheel_speeds(REST_LINEAR_M_S)
+}
+
 async fn refusal_of_drive(rig: &Rig, goal: drive_base::GoalRequestData) -> drive_base::Failure {
     rig.send_drive(&goal)
         .await
@@ -694,9 +706,7 @@ async fn move_base_times_out_after_its_settle_timeout() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn odometry_follows_the_measured_wheels() {
     let mut rig = Rig::start([0.0, 0.0]).await;
-    let geometry =
-        WheelGeometry::parse(WHEEL_SEPARATION_M, WHEEL_RADIUS_M, WHEEL_RADIUS_M).unwrap();
-    let mut expected = Odometry::new(geometry, NonZeroUsize::MIN);
+    let mut expected = Odometry::new(rig_wheels(), NonZeroUsize::MIN);
     expected.anchor_wheels(0.0, 0.0).unwrap();
     // The base stands: it rests, and nothing of a limb lies outside its
     // footprint, the base having no limb.
@@ -1654,13 +1664,13 @@ async fn a_goal_after_one_that_failed_is_refused_until_the_base_rests() {
 }
 
 // base_state's rest bounds the turn rate by the turn of the two wheels each at
-// the rest velocity, twice rest_velocity over the wheel separation: wheels
-// creeping opposite ways, each at 0.8 of the rest velocity, keep the base
-// standing, and at 1.2 of it the base moves.
+// the rest velocity in opposite directions: wheels creeping opposite ways,
+// each at 0.8 of the rest velocity, keep the base standing, and at 1.2 of it
+// the base moves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_turn_of_wheels_each_within_the_rest_velocity_rests_and_one_past_it_moves() {
     let mut rig = Rig::start([0.0, 0.0]).await;
-    let rest_rate = 2.0 * REST_LINEAR_M_S / WHEEL_SEPARATION_M;
+    let rest_rate = rest_rate();
     for (share, mode) in [(0.8, "standing"), (1.2, "moving")] {
         let creep = share * REST_LINEAR_M_S / WHEEL_RADIUS_M * DT;
         // More steps than the 0.2 s of base_states the rest judges.
@@ -1726,7 +1736,7 @@ async fn describe_base_answers_the_limits_and_rest_bounds_of_its_parameters_and_
             ANGULAR_ACCELERATION_RAD_S2,
             ANGULAR_DECELERATION_RAD_S2,
             ANGULAR_DEADBAND_RAD_S,
-            2.0 * REST_LINEAR_M_S / WHEEL_SEPARATION_M,
+            rest_rate(),
         ]
     );
     // The model's outline: its chassis, 0.78 m by 0.58 m, which holds every

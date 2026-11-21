@@ -163,14 +163,15 @@ impl RestBounds {
     /// The rest bounds of a differential base on `wheels` whose wheels each
     /// measure at most `rest_velocity` (m/s) along the floor while the base
     /// stands. The odometry reads the velocity along x as the mean of the two
-    /// wheel speeds and the turn rate as their difference over the wheel
-    /// separation, so a reading that keeps each wheel within
-    /// ±`rest_velocity` gives a velocity within `rest_velocity` and a turn
-    /// rate within twice `rest_velocity` over the separation.
+    /// wheel speeds and the turn rate from their difference, so a reading
+    /// that keeps each wheel within ±`rest_velocity` gives a velocity within
+    /// `rest_velocity` and a turn rate within the one of the two wheels at
+    /// `rest_velocity` in opposite directions
+    /// ([`WheelGeometry::turn_rate_at_opposite_wheel_speeds`]).
     fn of_wheels(rest_velocity: f64, wheels: &WheelGeometry) -> Self {
         Self {
             velocity: rest_velocity,
-            rate: 2.0 * rest_velocity / wheels.wheel_separation_m.get(),
+            rate: wheels.turn_rate_at_opposite_wheel_speeds(rest_velocity),
         }
     }
 
