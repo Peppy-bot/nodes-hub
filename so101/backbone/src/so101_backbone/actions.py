@@ -1207,7 +1207,7 @@ class ActionLayer:
                         Refusal(
                             FailureKind.ATTEMPT_FAILED,
                             f"the control loop failed the robot stop: {e!r}: call again, and check "
-                            "the node's log for what holds up the control loop",
+                            "the node's log for the failure",
                         )
                     )
                 continue

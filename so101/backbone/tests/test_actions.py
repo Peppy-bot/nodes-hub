@@ -2318,7 +2318,7 @@ async def test_a_stop_that_raises_answers_its_own_caller_and_the_stops_after_it_
     assert refusal_of(refused) == (
         FailureKind.ATTEMPT_FAILED,
         "the control loop failed the robot stop: RuntimeError('the plan lock is gone'): call again, "
-        "and check the node's log for what holds up the control loop",
+        "and check the node's log for the failure",
     )
     assert await second == ["arm"]
     assert plan.stopped == "stopped: the second"
