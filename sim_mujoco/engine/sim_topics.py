@@ -41,7 +41,6 @@ import logging
 import math
 import threading
 import time
-from dataclasses import dataclass
 from typing import Optional
 
 import peppylib
@@ -64,7 +63,7 @@ from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
 from sim_robot_core.cameras import DISTORTION_MODEL
-from sim_robot_core.object_state import RobotRecord
+from sim_robot_core.object_state import ObjectStateSnapshot, RobotRecord
 from sim_robot_core.pairs import (
     ARMS,
     BASE_NAME,
@@ -106,15 +105,6 @@ _NOT_CAPTURED = (
     "the scene steps"
 )
 _PRECONDITION_FAILED = "precondition_failed"
-
-
-@dataclass(frozen=True)
-class ObjectStateSnapshot:
-    """One capture of object_state: the simulated instant it was taken at,
-    and every robot standing then. The scene spawns no object."""
-
-    timestamp_s: float
-    robots: tuple[RobotRecord, ...]
 
 
 # How long one publish batch may stay in flight before the surface holding it
@@ -425,6 +415,7 @@ class SimTopicIO:
         standing = self._robots.standing()
         snapshot = ObjectStateSnapshot(
             timestamp_s=self.timestamp_s(),
+            objects=(),
             robots=tuple(record for record in robots if record.robot in standing),
         )
         with self._snapshot_lock:
