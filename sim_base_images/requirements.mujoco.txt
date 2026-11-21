@@ -14,11 +14,11 @@ pyjson5==2.0.1
 viser==1.1.1
 # What the node knows about the robots it stands, whatever its physics, pinned
 # to one commit so the image is reproducible.
-sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@0680f96af2b8c0c6f8a286b929388fedde6a41be#subdirectory=sim_robot_core
+sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@3e8aae0fb1b4884dfd5f58c384c6126be0cef26c#subdirectory=sim_robot_core
 # The robots' descriptions sim_robot_core reads, from the same commit: a Rust
 # extension that pip builds from its source with the toolchain the image
 # installs for the build alone.
-robot_description_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@0680f96af2b8c0c6f8a286b929388fedde6a41be#subdirectory=robot_description_py
+robot_description_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@3e8aae0fb1b4884dfd5f58c384c6126be0cef26c#subdirectory=robot_description_py
 # The geometry types of the contracts and the rotation arithmetic the engine
 # places poses with, from the same commit.
-control_core_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@0680f96af2b8c0c6f8a286b929388fedde6a41be#subdirectory=control_core_py
+control_core_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@3e8aae0fb1b4884dfd5f58c384c6126be0cef26c#subdirectory=control_core_py
