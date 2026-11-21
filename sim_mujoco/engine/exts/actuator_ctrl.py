@@ -166,7 +166,9 @@ class MujocoActuatorCtrl:
                 self._model.actuator_forcerange[ctrl_id] = self._default_forcerange[ctrl_id]
         return True
 
-    def controls(self, actuator_values: dict, velocity_values: dict | None = None) -> dict[int, float]:
+    def controls(
+        self, actuator_values: dict, velocity_values: dict | None = None
+    ) -> dict[int, float]:
         """The control of each actuator of the {name: value} pairs, by ctrl
         index. When a velocity setpoint is supplied for a gain-configured
         joint, it is folded into the control as q_des + (kd/kp)*dq_des.
