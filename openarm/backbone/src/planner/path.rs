@@ -2275,7 +2275,7 @@ mod tests {
     async fn the_shares_of_a_judged_path_hold_until_the_judgment_and_start_on_it() {
         let mut planners = planners_holding(BOTH_HELD);
         let arms = order(&["left_arm", "right_arm"]);
-        let (move_slots, claims) = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let second = Duration::from_secs(1);
         let goal = path_goal(&arms, &BOTH_TO, second, reply, claims);
