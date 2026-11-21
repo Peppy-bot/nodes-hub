@@ -223,7 +223,9 @@ def _wheel_driven_by(actuators: str):
 
 
 def test_a_wheel_driven_as_the_engines_run_it_gives_its_loop():
-    model = _wheel_driven_by('<velocity joint="wheel" kv="64"/><intvelocity joint="wheel" kp="128"/>')
+    model = _wheel_driven_by(
+        '<velocity name="p" joint="wheel" kv="64"/><intvelocity name="i" joint="wheel" kp="128"/>'
+    )
 
     assert builder.rate_loop_of(model, "wheel") == builder.RateLoop(
         proportional_gain=64.0, integral_gain=128.0, cap=16.0
@@ -234,19 +236,22 @@ def test_a_wheel_driven_as_the_engines_run_it_gives_its_loop():
     ("actuators", "refusal"),
     [
         (
-            '<position joint="wheel" kp="64"/><intvelocity joint="wheel" kp="128"/>',
-            "the MJCF's wheel 'wheel' is driven by 2 actuators: drive it with one <velocity> actuator",
+            '<position name="p" joint="wheel" kp="64"/>'
+            '<intvelocity name="i" joint="wheel" kp="128"/>',
+            "wheel 'wheel': 2 actuators drive it; drive the wheel with one <velocity> actuator",
         ),
         (
-            '<velocity joint="wheel" kv="64"/><intvelocity joint="wheel" kp="128" actrange="-1 1"/>',
-            "the MJCF's wheel 'wheel' clamps the activation of its <intvelocity>: a wheel turns without end",
+            '<velocity name="p" joint="wheel" kv="64"/>'
+            '<intvelocity name="i" joint="wheel" kp="128" actrange="-1 1"/>',
+            "wheel 'wheel': its actuator 'i' clamps its activation; a wheel turns without end",
         ),
     ],
     ids=["position_servo", "clamped_integral"],
 )
 def test_a_wheel_the_mujoco_node_refuses_is_refused(actuators, refusal):
-    """The MuJoCo node holds the same MJCF to these rules, so a bundle never
-    bakes a wheel that engine refuses."""
+    """The builder holds the MJCF to the rule the MuJoCo node holds it to
+    (sim_robot_core.rate_loop), so a bundle never bakes a wheel that engine
+    refuses."""
     with pytest.raises(ValueError, match=f"^{re.escape(refusal)}"):
         builder.rate_loop_of(_wheel_driven_by(actuators), "wheel")
 

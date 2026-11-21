@@ -88,6 +88,24 @@ class Subscription:
         return self._arrivals.pop(0) if self._arrivals else None
 
 
+class _Token:
+    """The node's cancellation token, which no test cancels."""
+
+    def is_cancelled(self) -> bool:
+        return False
+
+    async def cancelled(self) -> None:
+        await asyncio.Event().wait()
+
+
+class NodeRunner:
+    """The node runner the engine's transport holds: what it reads of it is
+    the node's cancellation token."""
+
+    def cancellation_token(self) -> _Token:
+        return _Token()
+
+
 class FailureKind(str, enum.Enum):
     """The failure kinds of attach: the kinds of peppy, then the kinds of
     simulation_robot that attach lists, as the generated module names them."""

@@ -38,8 +38,8 @@ compiled model:
 The hinges are the wheels of the description's differential base, and the
 stage refuses any other.
 
-CPU only: it needs the `mujoco`, `usd-core`, `numpy`, `robot_description_py`
-and `control_core_py` packages, no Isaac Sim.
+CPU only: it needs the `mujoco`, `usd-core`, `numpy`, `robot_description_py`,
+`control_core_py` and `sim_robot_core` packages, no Isaac Sim.
 
     python3 build_botshare_base.py --release <staged release> --output <directory> \\
         [--archive <bundle.tar.gz>]
@@ -70,6 +70,7 @@ import robot_description_py
 from control_core_py.geometry import wxyz_of_xyzw
 from mujoco_usd import define_geom, pack, release_source, set_pose, sha256
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
+from sim_robot_core.rate_loop import wheel_rate_loop
 
 # The engine's wheel loop, pure Python, names the attribute the stage carries.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
@@ -178,64 +179,22 @@ def links_of_bodies(model: mujoco.MjModel, mount: str, description: Description)
     return links
 
 
-def _part(model: mujoco.MjModel, actuator: int) -> str | None:
-    """The part `actuator` plays in a wheel's rate loop, by the rule the
-    MuJoCo node holds the same MJCF to (sim_mujoco/engine/exts/wheel_drive.py):
-    "proportional" for a velocity servo, whose bias is [0, 0, -kv], and
-    "integral" for an integrated-velocity servo, whose bias is [0, -kp, 0],
-    each of a fixed gain that is a positive number; None for any other."""
-    gain = float(model.actuator_gainprm[actuator][0])
-    fixed_affine = (
-        model.actuator_gaintype[actuator] == mujoco.mjtGain.mjGAIN_FIXED
-        and model.actuator_biastype[actuator] == mujoco.mjtBias.mjBIAS_AFFINE
-        and math.isfinite(gain)
-        and gain > 0.0
-    )
-    if not fixed_affine:
-        return None
-    bias = [float(value) for value in model.actuator_biasprm[actuator][:3]]
-    dynamics = model.actuator_dyntype[actuator]
-    if dynamics == mujoco.mjtDyn.mjDYN_NONE and bias == [0.0, 0.0, -gain]:
-        return "proportional"
-    if dynamics == mujoco.mjtDyn.mjDYN_INTEGRATOR and bias == [0.0, -gain, 0.0]:
-        return "integral"
-    return None
-
-
 def rate_loop_of(model: mujoco.MjModel, joint: str) -> RateLoop:
-    """The rate loop the MJCF runs the wheel `joint` with: one velocity
-    servo and one integrated-velocity servo on it, both of gear 1, the
-    integrated one's activation unclamped, capped together by its
-    actuatorfrcrange, the same either way, as a PhysX drive's one maximum
-    force caps it. Anything else is refused naming what the wheel needs."""
+    """The rate loop the MJCF runs the wheel `joint` with, as
+    sim_robot_core.rate_loop's rule holds its actuators, the rule the MuJoCo
+    node holds the same MJCF to, capped together by its actuatorfrcrange,
+    the same either way, as a PhysX drive's one maximum force caps it.
+    Anything else is refused naming what the wheel needs."""
     joint_id = model.joint(joint).id
-    where = f"the MJCF's wheel '{joint}'"
-    drivers = [
-        actuator
-        for actuator in range(model.nu)
-        if model.actuator_trntype[actuator] == mujoco.mjtTrn.mjTRN_JOINT
-        and int(model.actuator_trnid[actuator][0]) == joint_id
-    ]
-    parts = {_part(model, actuator): actuator for actuator in drivers}
-    if len(drivers) != 2 or set(parts) != {"proportional", "integral"}:
-        raise ValueError(
-            f"{where} is driven by {len(drivers)} actuators: drive it with one <velocity> actuator, its kv "
-            "the loop's proportional gain, and one <intvelocity> actuator, its kp the loop's integral gain"
-        )
-    if any(not np.allclose(model.actuator_gear[a], (1, 0, 0, 0, 0, 0)) for a in drivers):
-        raise ValueError(f"{where} has an actuator of a gear other than 1: a wheel's setpoints are its rates")
-    if model.actuator_actlimited[parts["integral"]]:
-        raise ValueError(
-            f"{where} clamps the activation of its <intvelocity>: a wheel turns without end, "
-            "so give it no actrange"
-        )
+    loop = wheel_rate_loop(model, joint, joint_id)
     low, high = (float(value) for value in model.jnt_actfrcrange[joint_id])
     if not model.jnt_actfrclimited[joint_id] or low != -high or high <= 0.0:
-        raise ValueError(f"{where} caps its actuators at [{low:g}, {high:g}]: give it an actuatorfrcrange of -cap cap")
+        raise ValueError(
+            f"wheel '{joint}': its actuators are capped at [{low:g}, {high:g}]; give the joint an "
+            "actuatorfrcrange of -cap cap"
+        )
     return RateLoop(
-        proportional_gain=float(model.actuator_gainprm[parts["proportional"]][0]),
-        integral_gain=float(model.actuator_gainprm[parts["integral"]][0]),
-        cap=high,
+        proportional_gain=loop.proportional_gain, integral_gain=loop.integral_gain, cap=high
     )
 
 

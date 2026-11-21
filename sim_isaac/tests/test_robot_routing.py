@@ -55,7 +55,7 @@ def scene_fixture():
     runtime_fakes.reset()
     loop = asyncio.new_event_loop()
     robots = Registry()
-    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=robots)
+    io = sim_topics.SimTopicIO(node_runner=runtime_fakes.NodeRunner(), loop=loop, robots=robots)
     yield SimpleNamespace(io=io, robots=robots, loop=loop)
     loop.close()
 
