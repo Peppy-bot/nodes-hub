@@ -324,26 +324,35 @@ pub struct ArmMoveRequest {
     pub duration: Duration,
 }
 
-/// A goal accepted by an action handler and handed to the planner.
+/// A goal accepted by an action handler and handed to the planner, with the
+/// release of the claim its admission made on the arm's move slot, so
+/// dropping the goal frees the slot.
 pub enum Goal {
     Joint {
         target: JointVec,
         duration: Duration,
         reply: JointReply,
+        move_slot: SlotRelease,
     },
     Cartesian {
         request: ArmMoveRequest,
         settle: Settle<PoseTolerance>,
         contact: ContactGap,
         ctx: Box<move_arm::GoalContext>,
+        move_slot: SlotRelease,
     },
 }
 
 impl Goal {
-    /// A posture share to `target` over one second, reporting on `done_tx`:
-    /// the goal of the unit tests of the planner and the coordinator.
+    /// A posture share to `target` over one second, reporting on `done_tx`,
+    /// holding `move_slot`: the goal of the unit tests of the planner and the
+    /// coordinator.
     #[cfg(test)]
-    pub fn posture_share(target: JointVec, done_tx: mpsc::Sender<Outcome>) -> Self {
+    pub fn posture_share(
+        target: JointVec,
+        done_tx: mpsc::Sender<Outcome>,
+        move_slot: SlotRelease,
+    ) -> Self {
         Goal::Joint {
             target,
             duration: Duration::from_secs(1),
@@ -351,11 +360,11 @@ impl Goal {
                 done_tx,
                 cancelled: Arc::new(AtomicBool::new(false)),
             }),
+            move_slot,
         }
     }
 
-    /// Fail unstarted with `failure`, with no result. The move slot is the
-    /// caller's concern.
+    /// Fail unstarted with `failure`, with no result, freeing the move slot.
     pub async fn fail(self, failure: Failure, planner: &Planner) {
         match self {
             Goal::Joint { reply, .. } => reply.fail(planner.arm, failure).await,
@@ -364,8 +373,7 @@ impl Goal {
     }
 
     /// End unstarted as cancelled by the robot stop, for `reason`, which
-    /// names the stop, reporting `measured`. The move slot is the caller's
-    /// concern.
+    /// names the stop, reporting `measured`, freeing the move slot.
     pub async fn stop(self, reason: &str, measured: Measurement, planner: &Planner) {
         let outcome = Outcome::Cancelled(reason.to_string());
         match self {
@@ -681,12 +689,9 @@ impl Planner {
         // Drain fully: every queued goal is answered, never left parked.
         while let Ok(goal) = goals.try_recv() {
             if let Some(reason) = move_slot.take_stop() {
-                let _release = move_slot.release_on_drop();
                 goal.stop(&reason, Ok(measured), self).await;
             } else if matches!(mode, Mode::Follow) {
-                mode = self
-                    .start_goal(goal, move_slot.release_on_drop(), now)
-                    .await;
+                mode = self.start_goal(goal, now).await;
             } else {
                 let failure = Failure::new(FailureKind::PreconditionFailed, ANOTHER_MOVE_IN_FLIGHT);
                 goal.fail(failure, self).await;
@@ -1008,14 +1013,16 @@ impl Planner {
         )
     }
 
-    /// Start an accepted goal in the mode that executes it.
-    async fn start_goal(&mut self, goal: Goal, move_slot: SlotRelease, now: Instant) -> Mode {
+    /// Start an accepted goal in the mode that executes it, the mode taking
+    /// the release of the goal's claim.
+    async fn start_goal(&mut self, goal: Goal, now: Instant) -> Mode {
         self.stream_smoothing.reset();
         match goal {
             Goal::Joint {
                 target,
                 duration,
                 reply,
+                move_slot,
             } => {
                 let traj = JointTrajectory::through(
                     &[self.setpoint, target],
@@ -1044,6 +1051,7 @@ impl Planner {
                 settle,
                 contact,
                 ctx,
+                move_slot,
             } => {
                 self.start_cartesian(request, settle, contact, ctx, move_slot, now)
                     .await
@@ -1281,9 +1289,9 @@ mod tests {
         let mut planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         goal_tx
-            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx, claim))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1322,10 +1330,10 @@ mod tests {
         let mut planner = test_planner(held);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         move_slot.stop_unstarted("stopped: operator");
         goal_tx
-            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx, claim))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1346,9 +1354,9 @@ mod tests {
         let mut planner = test_planner(held);
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         goal_tx
-            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx, claim))
             .await
             .expect("queue the goal");
         let start = Instant::now();
@@ -1379,12 +1387,11 @@ mod tests {
 
         // The stop does not latch: a goal that arrives after it runs.
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        assert!(
-            move_slot.claim(),
-            "the next goal's admission claims the slot"
-        );
+        let claim = move_slot
+            .claim()
+            .expect("the next goal's admission claims the slot");
         goal_tx
-            .send(Goal::posture_share([0.2; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.2; ARM_DOF], done_tx, claim))
             .await
             .expect("queue the goal");
         planner
@@ -1415,10 +1422,10 @@ mod tests {
         );
         planner.commit(held);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (done_tx, mut done_rx) = mpsc::channel(1);
         goal_tx
-            .send(Goal::posture_share([0.5; ARM_DOF], done_tx))
+            .send(Goal::posture_share([0.5; ARM_DOF], done_tx, claim))
             .await
             .expect("queue the goal");
         planner
@@ -1455,12 +1462,12 @@ mod tests {
         let target = [0.5; ARM_DOF];
         let mut planner = test_planner(held);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
 
         // The governor holds every step: no candidate is committed.
         let (done_tx, mut done_rx) = mpsc::channel(1);
         goal_tx
-            .send(Goal::posture_share(target, done_tx))
+            .send(Goal::posture_share(target, done_tx, claim))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1503,12 +1510,11 @@ mod tests {
 
         // The governor lets every step through, but the arm stands still.
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        assert!(
-            move_slot.claim(),
-            "the next goal's admission claims the slot"
-        );
+        let claim = move_slot
+            .claim()
+            .expect("the next goal's admission claims the slot");
         goal_tx
-            .send(Goal::posture_share(target, done_tx))
+            .send(Goal::posture_share(target, done_tx, claim))
             .await
             .expect("queue the goal");
         let now = Instant::now();
@@ -1560,6 +1566,7 @@ mod tests {
         target: JointVec,
         cancelled: &Arc<AtomicBool>,
         move_slot: &MoveSlot,
+        claim: SlotRelease,
         now: Instant,
     ) -> (mpsc::Receiver<Outcome>, Instant, Instant) {
         let (done_tx, done_rx) = mpsc::channel(1);
@@ -1573,6 +1580,7 @@ mod tests {
                 target,
                 duration: Duration::from_secs(1),
                 reply: JointReply::Posture(share),
+                move_slot: claim,
             })
             .await
             .expect("queue the goal");
@@ -1675,10 +1683,17 @@ mod tests {
         let target = [0.5; ARM_DOF];
         let stood = [0.1; ARM_DOF];
         let mut planner = test_planner([0.0; ARM_DOF]);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let never = Arc::new(AtomicBool::new(false));
-        let (mut done_rx, motion_start, planned_end) =
-            started_share(&mut planner, target, &never, &move_slot, Instant::now()).await;
+        let (mut done_rx, motion_start, planned_end) = started_share(
+            &mut planner,
+            target,
+            &never,
+            &move_slot,
+            claim,
+            Instant::now(),
+        )
+        .await;
         let cycle = plan_config().cycle_period;
 
         let mut at = motion_start;
@@ -1725,10 +1740,17 @@ mod tests {
         let target = [0.5; ARM_DOF];
         let stood = [0.1; ARM_DOF];
         let mut planner = test_planner([0.0; ARM_DOF]);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (_done_rx, motion_start, planned_end) =
-            started_share(&mut planner, target, &cancelled, &move_slot, Instant::now()).await;
+        let (_done_rx, motion_start, planned_end) = started_share(
+            &mut planner,
+            target,
+            &cancelled,
+            &move_slot,
+            claim,
+            Instant::now(),
+        )
+        .await;
         let cycle = plan_config().cycle_period;
         let mut at = motion_start;
         while at < planned_end {
@@ -1772,13 +1794,14 @@ mod tests {
         let cycle = plan_config().cycle_period;
         let ended_short = async || {
             let mut planner = test_planner([0.0; ARM_DOF]);
-            let move_slot = claimed_move_slot();
+            let (move_slot, claim) = claimed_move_slot();
             let cancelled = Arc::new(AtomicBool::new(false));
             let (_done_rx, motion_start, planned_end) = started_share(
                 &mut planner,
                 [0.5; ARM_DOF],
                 &cancelled,
                 &move_slot,
+                claim,
                 Instant::now(),
             )
             .await;
@@ -1796,14 +1819,13 @@ mod tests {
 
         let (mut planner, move_slot, at) = ended_short().await;
         let on_the_way = planner.setpoint();
-        assert!(
-            move_slot.claim(),
-            "the next goal's admission claims the slot"
-        );
+        let claim = move_slot
+            .claim()
+            .expect("the next goal's admission claims the slot");
         let never = Arc::new(AtomicBool::new(false));
         let target = [0.5; ARM_DOF];
         let (mut done_rx, _, planned_end) =
-            started_share(&mut planner, target, &never, &move_slot, at + cycle).await;
+            started_share(&mut planner, target, &never, &move_slot, claim, at + cycle).await;
         assert_eq!(
             planner.setpoint(),
             on_the_way,
@@ -1850,13 +1872,14 @@ mod tests {
     async fn a_cancelled_move_holds_the_arm_where_it_stands() {
         let stood = [0.03; ARM_DOF];
         let mut planner = test_planner([0.0; ARM_DOF]);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (mut done_rx, motion_start, planned_end) = started_share(
             &mut planner,
             [0.5; ARM_DOF],
             &cancelled,
             &move_slot,
+            claim,
             Instant::now(),
         )
         .await;
@@ -1881,7 +1904,7 @@ mod tests {
         // tick, and the command goes to the measured joints, a step away.
         let held = [0.0; ARM_DOF];
         let mut planner = test_planner(held);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
         let share = PostureShare {
@@ -1893,6 +1916,7 @@ mod tests {
                 target: [0.5; ARM_DOF],
                 duration: Duration::from_secs(1),
                 reply: JointReply::Posture(share),
+                move_slot: claim,
             })
             .await
             .expect("queue the goal");
@@ -1916,13 +1940,14 @@ mod tests {
         let stood = [0.03; ARM_DOF];
         let cycle = plan_config().cycle_period;
         let mut planner = test_planner([0.0; ARM_DOF]);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let cancelled = Arc::new(AtomicBool::new(false));
         let (_done_rx, motion_start, planned_end) = started_share(
             &mut planner,
             [0.5; ARM_DOF],
             &cancelled,
             &move_slot,
+            claim,
             Instant::now(),
         )
         .await;
@@ -1936,10 +1961,9 @@ mod tests {
         tick_measuring(&mut planner, stood, &move_slot, at).await;
         assert_ne!(planner.setpoint(), stood, "the command is on its way");
 
-        assert!(
-            move_slot.claim(),
-            "the next goal's admission claims the slot"
-        );
+        let claim = move_slot
+            .claim()
+            .expect("the next goal's admission claims the slot");
         let (done_tx, mut done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
         let share = PostureShare {
@@ -1951,6 +1975,7 @@ mod tests {
                 target: [0.5; ARM_DOF],
                 duration: Duration::from_secs(1),
                 reply: JointReply::Posture(share),
+                move_slot: claim,
             })
             .await
             .expect("queue the goal");
@@ -1968,11 +1993,11 @@ mod tests {
     #[tokio::test]
     async fn a_stop_without_a_fresh_measurement_holds_the_last_command() {
         let mut planner = test_planner([0.0; ARM_DOF]);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let never = Arc::new(AtomicBool::new(false));
         let now = Instant::now();
         let (_done_rx, motion_start, planned_end) =
-            started_share(&mut planner, [0.5; ARM_DOF], &never, &move_slot, now).await;
+            started_share(&mut planner, [0.5; ARM_DOF], &never, &move_slot, claim, now).await;
         let halfway = motion_start + (planned_end - motion_start) / 2;
         let commanded = tick_measuring(&mut planner, [0.1; ARM_DOF], &move_slot, halfway).await;
 
@@ -2089,7 +2114,8 @@ mod tests {
     async fn a_queued_goal_is_stopped_unstarted_for_the_reason() {
         let planner = test_planner([0.0; ARM_DOF]);
         let (done_tx, mut done_rx) = mpsc::channel(1);
-        Goal::posture_share([0.5; ARM_DOF], done_tx)
+        let (move_slot, claim) = claimed_move_slot();
+        Goal::posture_share([0.5; ARM_DOF], done_tx, claim)
             .stop(
                 "stopped: operator",
                 Ok(standing_at([0.1; ARM_DOF])),
@@ -2098,6 +2124,7 @@ mod tests {
             .await;
         let outcome = done_rx.recv().await.expect("the stopped goal reports");
         assert_eq!(outcome, Outcome::Cancelled("stopped: operator".to_string()));
+        assert!(!move_slot.is_claimed(), "the stopped goal frees its slot");
     }
 
     /// A goal that reaches the planner while a move is in flight on its arm
@@ -2108,10 +2135,16 @@ mod tests {
         let (goal_tx, mut goals) = mpsc::channel(2);
         let (running_tx, mut running_rx) = mpsc::channel(1);
         let (second_tx, mut second_rx) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
-        for (target, done_tx) in [([0.5; ARM_DOF], running_tx), ([0.2; ARM_DOF], second_tx)] {
+        let (move_slot, claim) = claimed_move_slot();
+        // An admission claims one goal per slot, so the goal behind holds a
+        // claim of its own.
+        let (_behind_slot, behind_claim) = claimed_move_slot();
+        for (target, done_tx, claim) in [
+            ([0.5; ARM_DOF], running_tx, claim),
+            ([0.2; ARM_DOF], second_tx, behind_claim),
+        ] {
             goal_tx
-                .send(Goal::posture_share(target, done_tx))
+                .send(Goal::posture_share(target, done_tx, claim))
                 .await
                 .expect("queue the goal");
         }
@@ -2208,9 +2241,9 @@ mod tests {
         // While a move executes, the check is refused as a goal is.
         let (done_tx, _done_rx) = mpsc::channel(1);
         let (goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         goal_tx
-            .send(Goal::posture_share(POSE_TEST_Q, done_tx))
+            .send(Goal::posture_share(POSE_TEST_Q, done_tx, claim))
             .await
             .expect("queue the goal");
         planner
@@ -2488,7 +2521,7 @@ mod tests {
                 standing_at(lagging),
                 None,
                 &mut goals,
-                &claimed_move_slot(),
+                &MoveSlot::default(),
                 Instant::now(),
             )
             .await;
@@ -2769,7 +2802,7 @@ mod tests {
                 let mut planner = launcher_planner(arm, start);
                 let (done_tx, _done_rx) = mpsc::channel(1);
                 let (goal_tx, mut goals) = mpsc::channel(1);
-                let move_slot = claimed_move_slot();
+                let (move_slot, claim) = claimed_move_slot();
                 let goal = Goal::Joint {
                     target,
                     duration: Duration::ZERO,
@@ -2777,6 +2810,7 @@ mod tests {
                         done_tx,
                         cancelled: Arc::new(AtomicBool::new(false)),
                     }),
+                    move_slot: claim,
                 };
                 goal_tx.send(goal).await.expect("queue the goal");
                 let t0 = Instant::now();

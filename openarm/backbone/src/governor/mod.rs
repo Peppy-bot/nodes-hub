@@ -1553,7 +1553,7 @@ mod tests {
         );
         let mut planners = PerArm::from_fn(|arm| planner_holding(arm, taken.arms[arm]));
         let arms = ArmOrder::parse(&["left_arm"]).expect("the left arm");
-        let move_slots = claimed(&arms);
+        let (_, claims) = claimed(&arms);
         let (reply, mut done_rx) = share_reply(&Arc::new(AtomicBool::new(false)));
         let settle = Settle {
             tolerance: vec![0.1; ARM_DOF],
@@ -1565,7 +1565,7 @@ mod tests {
             Duration::ZERO,
             settle,
             reply,
-            |arm| &move_slots[arm],
+            claims,
         );
         let measuring = |q: &GovState| PerArm::from_fn(|arm| Ok(standing_at(q.arms[arm])));
         let judgment =
@@ -2374,8 +2374,8 @@ max={} us | over budget {over}/{}",
         // legs of both arms into the band and back, as many as the
         // launcher's joint limits run within 60 s.
         {
-            use crate::actions::MAX_MOVE_DURATION_S;
             use crate::planner::{PathPlan, judge_path};
+            use control_core::move_seconds::MAX_MOVE_DURATION_S;
 
             let mut g = v2_governor(true);
             let mut checker = g.path_checker();
@@ -3754,7 +3754,7 @@ max={} us | over budget {over}/{}",
         };
         let mut governor = v2_governor(false);
         let (_goal_tx, mut goals) = mpsc::channel(1);
-        let move_slot = claimed_move_slot();
+        let (move_slot, _claim) = claimed_move_slot();
         let t0 = std::time::Instant::now();
         let period = std::time::Duration::from_secs_f64(DT);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3852,7 +3852,7 @@ max={} us | over budget {over}/{}",
             };
             let mut governor = v2_governor(true);
             let (_goal_tx, mut goals) = mpsc::channel(1);
-            let move_slot = claimed_move_slot();
+            let (move_slot, _claim) = claimed_move_slot();
             let t0 = std::time::Instant::now();
             let period = std::time::Duration::from_secs_f64(DT);
             let mut held = at(start);

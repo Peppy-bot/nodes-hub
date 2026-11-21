@@ -20,12 +20,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use crate::robot::{ARMS, arm_in};
+use control_core::asking::ask_loop;
 use control_core::geometry::{PoseTarget, Stamped};
+use control_core::move_seconds::MoveSeconds;
 use control_core::move_slot::MoveSlot;
 use control_core::positive_finite::PositiveFinite;
 use control_core::robot_tree::{Placer, Unplaced};
 use control_core::serving;
-use control_core::sync::lock_ignoring_poison;
+use control_core::sync::{lock_ignoring_poison, wait_for};
 use peppygen::exposed_actions::limb_motion::{move_arm, move_arm_joints};
 use peppygen::exposed_services::limb_motion::check_arm_move;
 use peppygen::{NodeRunner, Result};
@@ -37,8 +39,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
 use crate::actions::{
-    ARM_WORDS, COORDINATOR_REPLY_TIMEOUT, admit_limb, blocking_ask_coordinator, check_limb_free,
-    contact_gap_from_wire, move_seconds_from_wire, tolerance_from_wire,
+    ARM_WORDS, COORDINATOR, COORDINATOR_REPLY_TIMEOUT, admit_limb, check_limb_free,
+    contact_gap_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind, TargetFailure};
@@ -54,8 +56,12 @@ fn settle_tolerance_from_wire(
     orientation_rad: f64,
 ) -> std::result::Result<PoseTolerance, String> {
     Ok(PoseTolerance {
-        position_m: tolerance_from_wire("settle_position_tolerance_m", position_m)?,
-        orientation_rad: tolerance_from_wire("settle_orientation_tolerance_rad", orientation_rad)?,
+        position_m: PositiveFinite::parse_field("settle_position_tolerance_m", position_m)?.get(),
+        orientation_rad: PositiveFinite::parse_field(
+            "settle_orientation_tolerance_rad",
+            orientation_rad,
+        )?
+        .get(),
     })
 }
 
@@ -103,7 +109,9 @@ fn arm_move_fields(
     let target = PoseTarget::parse(target.position, target.orientation)
         .and_then(|value| Stamped::parse(target.frame, target.timestamp, value))
         .map_err(|e| rejected(format!("the target: {e}")))?;
-    let duration = move_seconds_from_wire("duration_s", duration_s).map_err(rejected)?;
+    let duration = MoveSeconds::from_wire("duration_s", duration_s)
+        .map_err(rejected)?
+        .duration();
     Ok(ArmMoveFields {
         arm,
         target,
@@ -156,8 +164,9 @@ fn move_arm_goal(
         d.settle_orientation_tolerance_rad,
     )
     .map_err(rejected)?;
-    let timeout =
-        move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s).map_err(rejected)?;
+    let timeout = MoveSeconds::from_wire("settle_timeout_s", d.settle_timeout_s)
+        .map_err(rejected)?
+        .duration();
     let contact = contact_gap_from_wire(d.contact_gap_m).map_err(rejected)?;
     Ok(MoveArmGoal {
         request: placed_request(placer, fields)?,
@@ -185,12 +194,12 @@ fn joint_move_request(
     if !d.joint_positions.iter().all(|v| v.is_finite()) {
         return Err("non-finite joint target".to_string());
     }
-    let duration = move_seconds_from_wire("duration_s", d.duration_s)?;
+    let duration = MoveSeconds::from_wire("duration_s", d.duration_s)?.duration();
     let target = take_targets(&limits[arm], &d.joint_positions)
         .map_err(|outside| format!("the target puts {outside}"))?;
     let settle = Settle {
         tolerance: joint_tolerances_from_wire(d.settle_tolerances_rad)?,
-        timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
+        timeout: MoveSeconds::from_wire("settle_timeout_s", d.settle_timeout_s)?.duration(),
     };
     Ok(JointMoveRequest {
         arm,
@@ -202,7 +211,8 @@ fn joint_move_request(
 }
 
 /// Expose `move_arm_joints`: validate + claim, then hand the goal to the arm's
-/// planner. The planner releases the move slot when the move ends.
+/// planner with the release of its claim. The planner releases the move slot
+/// when the move ends.
 pub async fn run_move_arm_joints(
     runner: Arc<NodeRunner>,
     goal_txs: PerArm<mpsc::Sender<Goal>, ARMS>,
@@ -213,38 +223,41 @@ pub async fn run_move_arm_joints(
 ) -> Result<()> {
     let mut handle = move_arm_joints::ActionHandle::expose(&runner).await?;
     loop {
+        let accepted_goal = Mutex::new(None);
         let accepted = handle
             .handle_goal_next_request(|req| {
                 let admitted = joint_move_request(&req.data, &limits)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
                     .and_then(|request| {
                         let arm = request.arm;
-                        admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)
+                        let move_slot =
+                            admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)?;
+                        Ok((request, move_slot))
                     });
                 Ok(match admitted {
-                    Ok(()) => move_arm_joints::GoalDecision::accept(),
+                    Ok(goal) => {
+                        *lock_ignoring_poison(&accepted_goal) = Some(goal);
+                        move_arm_joints::GoalDecision::accept()
+                    }
                     Err(f) => move_arm_joints::GoalDecision::refuse(f.kind.into(), f.message),
                 })
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let request =
-            joint_move_request(&ctx.request().data, &limits).expect("validated on accept");
-        let arm = request.arm;
-        if goal_txs[arm]
-            .send(Goal::Joint {
-                target: request.target,
-                duration: request.duration,
-                reply: JointReply::MoveArmJoints {
-                    ctx: Box::new(ctx),
-                    settle: request.settle,
-                    contact: request.contact,
-                },
-            })
-            .await
-            .is_err()
-        {
-            move_slots[arm].release();
+        let (request, move_slot) = lock_ignoring_poison(&accepted_goal)
+            .take()
+            .expect("the decider keeps the goal it accepts");
+        let goal = Goal::Joint {
+            target: request.target,
+            duration: request.duration,
+            reply: JointReply::MoveArmJoints {
+                ctx: Box::new(ctx),
+                settle: request.settle,
+                contact: request.contact,
+            },
+            move_slot,
+        };
+        if goal_txs[request.arm].send(goal).await.is_err() {
             error!("move_arm_joints: coordinator channel closed");
             return Ok(());
         }
@@ -253,8 +266,9 @@ pub async fn run_move_arm_joints(
 
 /// Expose `move_arm` (Cartesian): validate, place its target + claim, then
 /// hand the goal to the arm's planner, which plans IK along the path and runs
-/// it governed. The goal carries its target as the decider placed it: the
-/// tree places a target once, when the backbone accepts its goal.
+/// it governed. The goal carries its target as the decider placed it, the
+/// tree placing a target once, when the backbone accepts its goal, and the
+/// release of its claim.
 pub async fn run_move_arm(
     runner: Arc<NodeRunner>,
     placer: Arc<Placer>,
@@ -270,8 +284,9 @@ pub async fn run_move_arm(
             .handle_goal_next_request(|req| {
                 let admitted = move_arm_goal(&placer, &req.data).and_then(|goal| {
                     let arm = goal.request.arm;
-                    admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)?;
-                    Ok(goal)
+                    let move_slot =
+                        admit_limb(&fresh[arm], &activity[arm], &move_slots[arm], &ARM_WORDS)?;
+                    Ok((goal, move_slot))
                 });
                 Ok(match admitted {
                     Ok(goal) => {
@@ -286,25 +301,24 @@ pub async fn run_move_arm(
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let MoveArmGoal {
-            request,
-            settle,
-            contact,
-        } = lock_ignoring_poison(&accepted_goal)
-            .take()
-            .expect("the decider keeps the goal it accepts");
-        let arm = request.arm;
-        if goal_txs[arm]
-            .send(Goal::Cartesian {
+        let (
+            MoveArmGoal {
                 request,
                 settle,
                 contact,
-                ctx: Box::new(ctx),
-            })
-            .await
-            .is_err()
-        {
-            move_slots[arm].release();
+            },
+            move_slot,
+        ) = lock_ignoring_poison(&accepted_goal)
+            .take()
+            .expect("the decider keeps the goal it accepts");
+        let goal = Goal::Cartesian {
+            request,
+            settle,
+            contact,
+            ctx: Box::new(ctx),
+            move_slot,
+        };
+        if goal_txs[request.arm].send(goal).await.is_err() {
             error!("move_arm: coordinator channel closed");
             return Ok(());
         }
@@ -360,12 +374,13 @@ fn check_plan(
         &ARM_WORDS,
     )?;
     let (reply, answer) = oneshot::channel();
-    let checked = blocking_ask_coordinator(
+    let checked = wait_for(ask_loop(
+        COORDINATOR,
         requests,
         CoordinatorRequest::CheckArmMove { request, reply },
         answer,
         COORDINATOR_REPLY_TIMEOUT,
-    )
+    ))
     .map_err(|reason| {
         error!("check_arm_move: {reason}");
         Failure::new(FailureKind::AttemptFailed, reason)
@@ -521,11 +536,11 @@ mod tests {
     fn a_settle_tolerance_names_the_axis_it_refuses() {
         assert_eq!(
             settle_tolerance_from_wire(0.0, 0.1).unwrap_err(),
-            "settle_position_tolerance_m must be a positive number, got 0"
+            "settle_position_tolerance_m must be a positive finite number, got 0"
         );
         assert_eq!(
             settle_tolerance_from_wire(0.01, -1.0).unwrap_err(),
-            "settle_orientation_tolerance_rad must be a positive number, got -1"
+            "settle_orientation_tolerance_rad must be a positive finite number, got -1"
         );
         assert_eq!(
             settle_tolerance_from_wire(0.005, 0.087),

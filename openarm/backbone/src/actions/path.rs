@@ -14,12 +14,14 @@
 //! each arm's joints as its share reports them and the time since the path
 //! started.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::arm_order::ArmOrder;
 use crate::robot::{ARMS, LIMBS};
-use control_core::move_slot::MoveSlot;
+use control_core::move_seconds::MoveSeconds;
+use control_core::move_slot::{MoveSlot, SlotRelease};
+use control_core::sync::lock_ignoring_poison;
 use peppygen::exposed_actions::limb_motion::execute_joint_path::{
     self, ExecuteJointPathResultArmsItem,
 };
@@ -33,7 +35,6 @@ use tracing::error;
 use crate::actions::arm::joint_tolerances_from_wire;
 use crate::actions::{
     ARM_WORDS, check_limb_free, claim_slots, collect_ends, contact_gap_from_wire,
-    move_seconds_from_wire,
 };
 use crate::coordinator::CoordinatorRequest;
 use crate::failure::{Failure, FailureKind, PathFailure};
@@ -99,12 +100,12 @@ fn execute_joint_path_goal(
         path: JointPath {
             arms: order,
             waypoints,
-            duration: move_seconds_from_wire("duration_s", d.duration_s)?,
+            duration: MoveSeconds::from_wire("duration_s", d.duration_s)?.duration(),
         },
         expected_starts,
         settle: Settle {
             tolerance,
-            timeout: move_seconds_from_wire("settle_timeout_s", d.settle_timeout_s)?,
+            timeout: MoveSeconds::from_wire("settle_timeout_s", d.settle_timeout_s)?.duration(),
         },
         contact: contact_gap_from_wire(d.contact_gap_m)?,
     })
@@ -148,15 +149,16 @@ fn expected_start(arm: ArmId, joints: &[f64]) -> std::result::Result<Option<Join
 }
 
 /// Admit a goal on the arms `arms` names: each free in the goal's order
-/// ([`check_limb_free`]), then each claimed ([`claim_slots`]), or refused
-/// with `precondition_failed` for the first busy arm. On a goal of both arms
-/// a refusal names the arm ([`PathOrder::failure_of`]).
+/// ([`check_limb_free`]), then each claimed ([`claim_slots`]), giving the
+/// release of each claim in the goal's order, or refused with
+/// `precondition_failed` for the first busy arm. On a goal of both arms a
+/// refusal names the arm ([`PathOrder::failure_of`]).
 fn admit_arms(
     arms: &ArmOrder,
     fresh: &PerArm<Arc<AtomicBool>, ARMS>,
     activity: &PerArm<LeaderActivity, ARMS>,
     move_slots: &PerArm<MoveSlot, ARMS>,
-) -> std::result::Result<(), Failure> {
+) -> std::result::Result<Vec<SlotRelease>, Failure> {
     for &arm in arms.ids() {
         check_limb_free(
             fresh[arm].load(Ordering::Acquire),
@@ -261,16 +263,16 @@ fn path_cancel_reason(reason: String, reports: &[ShareReport]) -> String {
     }
 }
 
-/// Hand `goal`, whose arms' slots its admission claimed in `move_slots`, to
-/// the coordinator, waiting for it however long the coordinator takes, and
-/// give how the goal ends: the coordinator's failure when it does not start
-/// the path, else as [`summarize`] judges the share reports. `cancel_signal`
-/// resolves on the goal's cancel, and `cancel_reason` reads its reason once
-/// the shares ended.
+/// Hand `goal`, with `move_slots`, the releases of the claims its admission
+/// made on its arms in the order of its arms, to the coordinator, waiting for
+/// it however long the coordinator takes, and give how the goal ends: the
+/// coordinator's failure when it does not start the path, else as
+/// [`summarize`] judges the share reports. `cancel_signal` resolves on the
+/// goal's cancel, and `cancel_reason` reads its reason once the shares ended.
 async fn run_path(
     requests: &mpsc::Sender<CoordinatorRequest>,
     goal: ExecuteJointPathGoal,
-    move_slots: &PerArm<MoveSlot, ARMS>,
+    move_slots: Vec<SlotRelease>,
     cancel_signal: impl Future<Output = ()>,
     cancel_reason: impl FnOnce() -> Option<String>,
 ) -> PathEnd {
@@ -285,11 +287,7 @@ async fn run_path(
     let cancelled = Arc::new(AtomicBool::new(false));
     let (done_tx, mut done_rx) = mpsc::channel(shares);
     let goal = PathGoal {
-        move_slots: arms
-            .ids()
-            .iter()
-            .map(|&arm| move_slots[arm].release_on_drop())
-            .collect(),
+        move_slots,
         path,
         expected_starts,
         settle,
@@ -332,24 +330,31 @@ pub async fn run_execute_joint_path(
 ) -> Result<()> {
     let mut handle = execute_joint_path::ActionHandle::expose(&runner).await?;
     loop {
+        let accepted_goal = Mutex::new(None);
         let accepted = handle
             .handle_goal_next_request(|req| {
                 let admitted = execute_joint_path_goal(&req.data, &limits)
                     .map_err(|reason| Failure::new(FailureKind::Rejected, reason))
-                    .and_then(|goal| admit_arms(&goal.path.arms, &fresh, &activity, &move_slots));
+                    .and_then(|goal| {
+                        let claims = admit_arms(&goal.path.arms, &fresh, &activity, &move_slots)?;
+                        Ok((goal, claims))
+                    });
                 Ok(match admitted {
-                    Ok(()) => execute_joint_path::GoalDecision::accept(),
+                    Ok(goal) => {
+                        *lock_ignoring_poison(&accepted_goal) = Some(goal);
+                        execute_joint_path::GoalDecision::accept()
+                    }
                     Err(f) => execute_joint_path::GoalDecision::refuse(f.kind.into(), f.message),
                 })
             })
             .await?;
         let Some(ctx) = accepted else { return Ok(()) };
-        let goal =
-            execute_joint_path_goal(&ctx.request().data, &limits).expect("validated on accept");
+        let (goal, claims) = lock_ignoring_poison(&accepted_goal)
+            .take()
+            .expect("the decider keeps the goal it accepts");
         let requests = requests.clone();
-        let move_slots = move_slots.clone();
         tokio::spawn(async move {
-            let ending = run_path(&requests, goal, &move_slots, ctx.cancel_signal(), || {
+            let ending = run_path(&requests, goal, claims, ctx.cancel_signal(), || {
                 ctx.cancel_cause().map(|cause| cause.reason().to_string())
             })
             .await;
@@ -613,19 +618,19 @@ mod tests {
         ]);
         let stale = Failure::new(FailureKind::ResourceUnavailable, ARM_WORDS.no_fresh_state);
         assert_eq!(
-            admit_arms(&both, &right_stale, &idle, &move_slots),
-            Err(stale.clone().labelled(LIMBS.arm_name(RIGHT)))
+            admit_arms(&both, &right_stale, &idle, &move_slots).err(),
+            Some(stale.clone().labelled(LIMBS.arm_name(RIGHT)))
         );
         assert_eq!(
-            admit_arms(&right, &right_stale, &idle, &move_slots),
-            Err(stale)
+            admit_arms(&right, &right_stale, &idle, &move_slots).err(),
+            Some(stale)
         );
 
         let left_streamed = PerArm::from_fn(|_| LeaderActivity::default());
         left_streamed[LEFT].note();
         assert_eq!(
-            admit_arms(&both, &fresh, &left_streamed, &move_slots),
-            Err(
+            admit_arms(&both, &fresh, &left_streamed, &move_slots).err(),
+            Some(
                 Failure::new(FailureKind::LeaderStreaming, ARM_WORDS.leader_streaming)
                     .labelled(LIMBS.arm_name(LEFT))
             )
@@ -636,13 +641,12 @@ mod tests {
         );
 
         let right_busy = PerArm::from_fn(|_| MoveSlot::default());
-        assert!(
-            right_busy[RIGHT].claim(),
-            "another move holds the right arm"
-        );
+        let _other = right_busy[RIGHT]
+            .claim()
+            .expect("another move holds the right arm");
         assert_eq!(
-            admit_arms(&both, &fresh, &idle, &right_busy),
-            Err(Failure::new(
+            admit_arms(&both, &fresh, &idle, &right_busy).err(),
+            Some(Failure::new(
                 FailureKind::PreconditionFailed,
                 "right_arm: arm is already executing a motion"
             ))
@@ -652,15 +656,21 @@ mod tests {
             "the refusal releases the left arm it claimed"
         );
         assert_eq!(
-            admit_arms(&right, &fresh, &idle, &right_busy),
-            Err(Failure::new(
+            admit_arms(&right, &fresh, &idle, &right_busy).err(),
+            Some(Failure::new(
                 FailureKind::PreconditionFailed,
                 ARM_WORDS.busy
             ))
         );
 
-        assert_eq!(admit_arms(&both, &fresh, &idle, &move_slots), Ok(()));
+        let claims = admit_arms(&both, &fresh, &idle, &move_slots).expect("free arms");
+        assert_eq!(claims.len(), 2);
         assert!(move_slots.iter().all(MoveSlot::is_claimed));
+        drop(claims);
+        assert!(
+            move_slots.iter().all(|slot| !slot.is_claimed()),
+            "the claims free the arms"
+        );
     }
 
     /// A report of the arm `arm` ending on `outcome`, `elapsed_s` after

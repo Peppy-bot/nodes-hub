@@ -137,11 +137,7 @@ control_core::member_failure_kinds!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control_core::geometry::GeometryError;
-    use control_core::robot_tree::{PlaceError, PlaceKind, Unplaced};
-    use frame_tree::{
-        BrokenTree, FrameName, HeldStamps, LookupError, LookupTime, Stamp, TransformName,
-    };
+    use control_core::robot_tree::{PlaceKind, Unplaced};
     use peppygen::exposed_services::workspace::check_positions;
 
     use crate::robot::LIMBS;
@@ -196,72 +192,29 @@ mod tests {
         );
     }
 
-    fn frame(name: &str) -> FrameName {
-        FrameName::parse(name).expect("a frame name")
-    }
-
-    /// A failure of each kind of a placement, with the name the contracts give it.
-    fn each_place_error() -> [(PlaceError, &'static str); 5] {
-        let transform = TransformName {
-            parent: frame("odom"),
-            child: frame("base_footprint"),
-        };
-        [
-            (
-                PlaceError::Lookup(LookupError::UnknownFrame {
-                    frame: frame("gripper"),
-                    held: Vec::new(),
-                }),
-                "unknown_frame",
-            ),
-            (
-                PlaceError::Lookup(LookupError::NoChain {
-                    target_frame: frame("base_link"),
-                    source_frame: frame("odom"),
-                }),
-                "no_chain",
-            ),
-            (
-                PlaceError::Lookup(LookupError::Extrapolation {
-                    transform: transform.clone(),
-                    requested: LookupTime::At(Stamp::from_nanos(5)),
-                    held: HeldStamps::Empty,
-                }),
-                "extrapolation",
-            ),
-            (
-                PlaceError::Lookup(LookupError::BrokenTree(BrokenTree::Cycle {
-                    transforms: vec![transform],
-                })),
-                "broken_tree",
-            ),
-            (PlaceError::Value(GeometryError::NoFrame), "rejected"),
-        ]
-    }
-
-    /// A member that places a frame gets each kind of a placement by the same
-    /// name, and the message that names the command, then the placement's
-    /// cause.
+    /// A member that places a frame gets each kind of a placement
+    /// ([`PlaceKind::ALL`]) by the same name, and the message of the
+    /// placement.
     #[test]
     fn a_member_that_places_a_frame_gets_each_kind_of_a_placement() {
-        for (error, name) in each_place_error() {
-            let unplaced = TargetFailure::from(Unplaced::of("the target", &error));
+        for kind in PlaceKind::ALL {
+            let unplaced = TargetFailure::from(Unplaced {
+                kind,
+                message: "the target: unplaced".to_string(),
+            });
             let (move_arm, moving) = unplaced.clone().for_member(move_arm::FailureKind::parse);
             let (check_arm_move, checking) =
                 unplaced.for_member(check_arm_move::FailureKind::parse);
-            let check_positions =
-                PlaceKind::of(&error).of_member(check_positions::FailureKind::parse);
+            let check_positions = kind.of_member(check_positions::FailureKind::parse);
             assert_eq!(
                 [
                     move_arm.as_str(),
                     check_arm_move.as_str(),
                     check_positions.as_str()
                 ],
-                [name; 3],
-                "{error}"
+                [kind.name(); 3]
             );
-            let cause = format!("the target: {error}");
-            assert_eq!([moving, checking], [cause.clone(), cause]);
+            assert_eq!([moving, checking], ["the target: unplaced"; 2]);
         }
     }
 

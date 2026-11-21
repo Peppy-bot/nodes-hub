@@ -14,31 +14,34 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use control_core::asking::ask_loop;
 use control_core::serving;
+use control_core::sync::wait_for;
 use peppygen::NodeRunner;
 use peppygen::exposed_services::robot_stop::stop;
 use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::actions::blocking_ask_coordinator;
+use crate::actions::COORDINATOR;
 use crate::coordinator::CoordinatorRequest;
 
 /// Hand a stop to the coordinator, which ends the moves at the start of its
 /// next tick, and return the limbs it stopped, or why it could not, the
-/// coordinator taken and answered within `answer_timeout`.
+/// coordinator taken and answered within `answer_timeout` ([`ask_loop`]).
 fn stop_moves(
     requests: &mpsc::Sender<CoordinatorRequest>,
     reason: String,
     answer_timeout: Duration,
 ) -> Result<Vec<String>, String> {
     let (reply, answer) = oneshot::channel();
-    blocking_ask_coordinator(
+    wait_for(ask_loop(
+        COORDINATOR,
         requests,
         CoordinatorRequest::Stop { reason, reply },
         answer,
         answer_timeout,
-    )
+    ))
     .inspect_err(|reason| error!("stop: {reason}"))
 }
 
@@ -75,7 +78,8 @@ mod tests {
         assert_eq!(
             stop_moves(&requests, "the operator asked".to_string(), answer_timeout),
             Err(format!(
-                "the coordinator did not answer within {answer_timeout:?}"
+                "the coordinator did not answer within {answer_timeout:?}: call again, and check \
+                 the node's log for what holds up the coordinator"
             ))
         );
         let Ok(CoordinatorRequest::Stop { reason, .. }) = queued.try_recv() else {

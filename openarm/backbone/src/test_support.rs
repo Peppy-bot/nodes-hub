@@ -14,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
-use control_core::move_slot::MoveSlot;
+use control_core::move_slot::{MoveSlot, SlotRelease};
 use control_core::path_timing::RoundedPath;
 use robot_description::{ArmId, Driven, PerArm, RobotDescription};
 use srs_model::{ARM_DOF, Arm, JointVec, Limit};
@@ -177,21 +177,25 @@ pub(crate) fn distance_to_segment(q: &[f64], a: &[f64], b: &[f64]) -> f64 {
         .sqrt()
 }
 
-/// A move slot claimed as an action handler claims it when it admits a goal.
-pub(crate) fn claimed_move_slot() -> MoveSlot {
+/// A move slot claimed as an action handler claims it when it admits a goal,
+/// and the release of the claim, which the goal carries.
+pub(crate) fn claimed_move_slot() -> (MoveSlot, SlotRelease) {
     let move_slot = MoveSlot::default();
-    assert!(move_slot.claim(), "a new slot is free");
-    move_slot
+    let release = move_slot.claim().expect("a new slot is free");
+    (move_slot, release)
 }
 
 /// The move slots of both arms, those of `arms` claimed as the action's
-/// admission claims them.
-pub(crate) fn claimed(arms: &ArmOrder) -> PerArm<MoveSlot, ARMS> {
+/// admission claims them, and the releases of the claims in the order of
+/// `arms`.
+pub(crate) fn claimed(arms: &ArmOrder) -> (PerArm<MoveSlot, ARMS>, Vec<SlotRelease>) {
     let move_slots = PerArm::from_fn(|_| MoveSlot::default());
-    for &arm in arms.ids() {
-        assert!(move_slots[arm].claim(), "a new slot is free");
-    }
-    move_slots
+    let claims = arms
+        .ids()
+        .iter()
+        .map(|&arm| move_slots[arm].claim().expect("a new slot is free"))
+        .collect();
+    (move_slots, claims)
 }
 
 /// Where the shares of a test path report, flagging the goal's cancel on
@@ -225,14 +229,15 @@ pub(crate) fn array_of(arms: &ArmOrder, joints: &PerArm<JointVec, ARMS>) -> Vec<
 
 /// A goal of a path of `arms` through `waypoints` over `duration` at least,
 /// with no expected start and no contact check, settling under `settle`,
-/// reporting on `reply`, holding the slot `slot_of` gives each of its arms.
-pub(crate) fn path_goal_through<'a>(
+/// reporting on `reply`, holding `claims`, the releases of the claims on its
+/// arms in the order of `arms`.
+pub(crate) fn path_goal_through(
     arms: &ArmOrder,
     waypoints: &[PerArm<JointVec, ARMS>],
     duration: Duration,
     settle: Settle<Vec<f64>>,
     reply: ShareReply,
-    slot_of: impl Fn(ArmId) -> &'a MoveSlot,
+    claims: Vec<SlotRelease>,
 ) -> PathGoal {
     PathGoal {
         path: JointPath {
@@ -244,11 +249,7 @@ pub(crate) fn path_goal_through<'a>(
         settle,
         contact: ContactGap::NONE,
         reply,
-        move_slots: arms
-            .ids()
-            .iter()
-            .map(|&arm| slot_of(arm).release_on_drop())
-            .collect(),
+        move_slots: claims,
     }
 }
 
