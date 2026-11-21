@@ -1194,12 +1194,12 @@ impl Base {
         }
     }
 
-    /// Publish `report` at `now_ns`: first on transforms as the transform
-    /// odom to base_footprint, which the robot's tree takes, and from which
-    /// the goals are placed by the report's odometry
-    /// ([`BaseStatus::odometry_start`]), so a goal sent on a report is placed
-    /// by its odometry; then on base_states, and on drive_states to the
-    /// leader, with its follow_state. The mode is standing while the base
+    /// Publish `report` at `now_ns`: first the transform odom to
+    /// base_footprint on transforms, which the robot's tree takes, the goals
+    /// placed by the report's odometry from then
+    /// ([`BaseStatus::odometry_start`]); then base_states, and drive_states to
+    /// the leader with its follow_state. A goal sent on a base_states is so
+    /// placed by the odometry it reports. The mode is standing while the base
     /// rests by base_state's rule as of the report and moving otherwise: the
     /// node senses no state of the base's drives. The base carries no limb,
     /// so its parts stand within its footprint.

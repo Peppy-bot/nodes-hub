@@ -26,9 +26,8 @@ struct BaseStatusState {
     /// followed or dropped.
     setpoint_ns: Option<i64>,
     /// The odometry_start_timestamp of the transform odom to base_footprint
-    /// the robot's tree took last, which the base takes before the
-    /// base_states of the same odometry goes out: the odometry a goal is
-    /// placed by. `None` before the first base_states.
+    /// the robot's tree took last, ahead of the base_states that reports it:
+    /// the odometry a goal is placed by. `None` before the first base_states.
     odometry_start: Option<SystemTime>,
     /// Whether the base comes to rest from an earlier goal: from the end of a
     /// goal that ended while the limiter's command was not 0, completed,
