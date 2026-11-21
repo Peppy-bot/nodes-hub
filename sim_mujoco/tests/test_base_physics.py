@@ -260,8 +260,8 @@ class DrivenBase:
         for step in range(self._steps(seconds)):
             before = self.angles()
             if step % per_setpoint == 0:
-                self.driver.setpoints.latest = JointSetpoint.parse(
-                    before, rates(step * self.timestep_s), 2, "wheels"
+                self.driver.setpoints.latest = JointSetpoint.parse_wheels(
+                    before, rates(step * self.timestep_s), 2
                 )
             self.bridge.step()
             after = self.angles()

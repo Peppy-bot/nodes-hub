@@ -376,7 +376,7 @@ class MujocoBridgeExtension:
                 if setpoints.take_base_release(robot):
                     limbs.wheels.hold()
                 stopped = (0.0,) * len(limbs.entry.wheel_joints())
-                limbs.wheels.drive(stopped if setpoint is None else setpoint.rates())
+                limbs.wheels.drive(stopped if setpoint is None else setpoint.velocities)
                 limbs.wheels.clamp_integrals()
 
             for gripper in limbs.entry.grippers:

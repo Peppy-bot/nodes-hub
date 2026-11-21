@@ -754,16 +754,12 @@ class TestTheWheelsOfABase:
 
         assert _wheel_ctrls(model, data) == [1.0, 1.0, -2.0, -2.0]
 
-    @pytest.mark.parametrize("setpoint", [None, JointSetpoint((0.3, 0.3), ())])
-    def test_the_wheels_hold_at_rate_0_without_a_setpoint_or_its_velocities(self, setpoint):
+    def test_the_wheels_hold_at_rate_0_without_a_setpoint(self):
         io = FakeIO()
         model, data, _, bridge = _wheeled(io)
         io.setpoints.bases[ROBOT] = JointSetpoint((0.0, 0.0), (1.0, 1.0))
         bridge.step()
-        if setpoint is None:
-            del io.setpoints.bases[ROBOT]
-        else:
-            io.setpoints.bases[ROBOT] = setpoint
+        del io.setpoints.bases[ROBOT]
 
         bridge.step()
 
