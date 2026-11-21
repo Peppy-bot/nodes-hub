@@ -10,14 +10,13 @@ import sys
 from pathlib import Path
 
 import pytest
-from sim_robot_core.object_state import RobotRecord
+from sim_robot_core.object_state import ObjectRecord, ObjectStateSnapshot, RobotRecord
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime sim_topics imports)
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 
-import object_state  # noqa: E402  (beside sim_topics on the engine path)
 import sim_topics  # noqa: E402  (needs the runtime fakes)
 
 
@@ -206,8 +205,8 @@ def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight
     robot = RobotRecord.fixed("alpha", "openarm_v2", (0.0, -1.5, 0.0), (0.0, 0.0, 0.0, 1.0))
 
     def snapshot(timestamp_s, *object_ids, robots=()):
-        return object_state.ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
-            object_state.ObjectRecord(
+        return ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
+            ObjectRecord(
                 object_id=object_id, name=object_id, asset_id="props/blocks/red_block", physics="dynamic", mass=0.1,
                 scale=1.0,
                 position=(0.5, 0.0, 0.8), orientation=(0.0, 0.0, 0.0, 1.0),

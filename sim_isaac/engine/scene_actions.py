@@ -57,9 +57,10 @@ from peppygen.exposed_services.scene import (
     get_robots_list,
     get_scene,
 )
+from sim_robot_core.object_state import ObjectStateSnapshot
 from sim_robot_core.world import WORLD, UnknownFrame, base_target, failure_kind_of, in_world
 
-from object_state import IsaacObjectReader, ObjectStateSnapshot
+from object_state import IsaacObjectReader
 
 
 logger = logging.getLogger(__name__)

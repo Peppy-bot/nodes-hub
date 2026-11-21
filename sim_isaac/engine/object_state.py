@@ -5,10 +5,11 @@ robots standing in the scene, read on Isaac's main thread.
 A snapshot is one capture of every spawned object and every standing robot,
 stamped on the timeline the joint states use: the object_states stream
 publishes it on the state tick and get_object_states answers it until the
-next capture. A robot's record is its placement, the pose of its robot frame,
-with its velocities there: a robot fixed to the world at rest, and a robot
-that rolls where its wheels carried it as of the capture's step, moving as
-they move it.
+next capture, its records sim_robot_core.object_state's. A robot's record is
+the pose of its robot frame with its velocities there: a robot fixed to the
+world at its placement, at rest, and a robot that rolls where its wheels
+carried it as of the capture's step, tilted as its body is and moving as they
+move it.
 
 Engine reads live in three small functions below. A dynamic object's pose
 and velocities come from PhysX through a tensor rigid-body view: the USD
@@ -19,65 +20,13 @@ pose authored on the USD stage, which is where it is, and zero velocities.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from control_core_py.geometry import rotate, xyzw_of_wxyz
-from sim_robot_core.object_state import AT_REST, RobotRecord
+from sim_robot_core.object_state import AT_REST, ObjectRecord
 
 # The stage root of runtime objects. The launcher spawns, moves and removes
 # each scene_manipulation object at object_prim_path(object_id), the path the
 # reader reads it from.
 RUNTIME_OBJECTS_PATH = "/World/RuntimeObjects"
-
-@dataclass(frozen=True)
-class ObjectRecord:
-    """One spawned object in a snapshot: its pose in world (orientation a
-    unit quaternion x, y, z, w), its velocities along world's axes at its
-    origin, and the name, asset, physics, mass and scale it was spawned
-    with."""
-
-    object_id: str
-    name: str
-    asset_id: str
-    physics: str
-    mass: float
-    scale: float
-    position: tuple[float, float, float]
-    orientation: tuple[float, float, float, float]
-    linear_velocity: tuple[float, float, float]
-    angular_velocity: tuple[float, float, float]
-
-    def fields(self) -> dict:
-        """The record as the generated object_state item types take it."""
-        return {
-            "object_id": self.object_id,
-            "asset_id": self.asset_id,
-            "physics": self.physics,
-            "mass": self.mass,
-            "scale": self.scale,
-            "position": list(self.position),
-            "orientation": list(self.orientation),
-            "linear_velocity": list(self.linear_velocity),
-            "angular_velocity": list(self.angular_velocity),
-        }
-
-
-@dataclass(frozen=True)
-class ObjectStateSnapshot:
-    """Every spawned object and every standing robot at one capture, in
-    world, and the simulated instant of that capture."""
-
-    timestamp_s: float
-    objects: tuple[ObjectRecord, ...]
-    robots: tuple[RobotRecord, ...]
-
-    def record_of(self, object_id: str) -> ObjectRecord | None:
-        """The record of the object `object_id`, or None when the capture
-        holds no such object."""
-        return next(
-            (record for record in self.objects if record.object_id == object_id),
-            None,
-        )
 
 
 def object_prim_path(object_id: str) -> str:

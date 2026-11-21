@@ -12,7 +12,6 @@ error reply."""
 
 import asyncio
 import contextlib
-import importlib
 import json
 import logging
 import math
@@ -26,6 +25,7 @@ from unittest.mock import Mock, call
 import pyjson5
 import pytest
 from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion
+from sim_robot_core.object_state import ObjectRecord
 from sim_robot_core.world import UnknownFrame, base_target, in_world
 
 from _scene_actions import scene_actions_module
@@ -174,7 +174,7 @@ def provider(monkeypatch):
     io = module.SceneActionIO(object(), Mock(), stamps, world, _Registry("alpha"))
     # The stage by object_id: where the launcher put each object.
     stage = {}
-    reader = FakeReader(stage, importlib.import_module("object_state").ObjectRecord)
+    reader = FakeReader(stage, ObjectRecord)
     io._object_reader = reader
     launcher = Mock()
     launcher._runtime_spawn_isaac_asset.side_effect = lambda command: stage.__setitem__(command["name"], command["position"])
