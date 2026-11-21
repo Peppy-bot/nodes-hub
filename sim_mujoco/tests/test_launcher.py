@@ -102,6 +102,9 @@ class FakeIO:
     def take_base_release(self, robot):
         return False
 
+    def publish_object_states(self, robots):
+        return None
+
     def publish_base_states(self, robot, positions, velocities):
         return None
 

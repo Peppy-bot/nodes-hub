@@ -15,7 +15,7 @@ import mujoco
 import numpy as np
 import pytest
 import robot_description_py
-from control_core_py.geometry import normalized, product, rotate
+from control_core_py.geometry import normalized
 from entries import placement_at, staged_release
 from sim_robot_core.cameras import camera_pose
 
@@ -225,19 +225,6 @@ class TestTheOpenArmV2HeadCamera:
         assert rotation == pytest.approx(described.reshape(3, 3), abs=ORIENTATION_TOLERANCE)
 
 
-def _in_root(description, link: str):
-    """Where the fixed joints of `description` place `link` in its root
-    link's frame: a position and an orientation (x, y, z, w)."""
-    placed = {transform.child: transform for transform in description.fixed_transforms()}
-    position, orientation = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)
-    while link != description.root_link:
-        joint = placed[link]
-        position = tuple(a + b for a, b in zip(joint.position, rotate(joint.orientation, position)))
-        orientation = product(joint.orientation, orientation)
-        link = joint.parent
-    return position, orientation
-
-
 class TestTheBotshareBase:
     def test_its_camera_is_the_models_own_where_the_description_puts_its_optical_frame(self):
         """The model's MJCF carries the base camera on the body that holds its
@@ -252,7 +239,10 @@ class TestTheBotshareBase:
         camera = compiled.camera(f"{ROBOT}/{described.name}")
         carrier = compiled.body(f"{ROBOT}/{known.body_of(description.root_link)}")
         assert compiled.cam_bodyid[camera.id] == carrier.id
-        position, orientation = camera_pose(*_in_root(description, described.frame))
+        optical = next(
+            frame for frame in description.link_frames_at_zero() if frame.child == described.frame
+        )
+        position, orientation = camera_pose(optical.position, optical.orientation)
 
         assert compiled.cam_pos[camera.id] == pytest.approx(position, abs=POSITION_TOLERANCE_M)
         assert compiled.cam_quat[camera.id] == pytest.approx(

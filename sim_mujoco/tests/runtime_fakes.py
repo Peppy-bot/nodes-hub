@@ -63,13 +63,27 @@ def member(instance: str, link: str, copy: Optional[str], core_node: str = CORE_
 
 
 class Publisher:
-    """A pairing publisher: records the peer each payload was addressed to."""
+    """A publisher: records the peer each payload was addressed to, None for
+    a topic the node emits to whoever consumes it."""
 
     def __init__(self) -> None:
-        self.sent: list[tuple[Peer, object]] = []
+        self.sent: list[tuple[Optional[Peer], object]] = []
 
     async def publish_to(self, peer: Peer, payload) -> None:
         self.sent.append((peer, payload))
+
+    async def publish(self, payload) -> None:
+        self.sent.append((None, payload))
+
+
+class ServiceFailure(Exception):
+    """A service's error reply, as a generated service module raises it: a
+    failure kind and a message."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
 
 
 class Subscription:
@@ -152,9 +166,9 @@ class _AttachHandle:
         return None
 
 
-async def _no_readiness_request(_runner, _handler) -> None:
-    """The readiness service of an engine nobody asks: it waits for a request
-    that never comes."""
+async def _no_request(_runner, _handler) -> None:
+    """A service of an engine nobody asks: it waits for a request that never
+    comes."""
     await asyncio.Event().wait()
 
 
@@ -239,11 +253,31 @@ def _install() -> None:
     attach.GoalDecision = _GoalDecision
     is_ready = types.ModuleType("peppygen.exposed_services.robots.is_ready")
     is_ready.Response = _ReadyResponse
-    is_ready.handle_requests = _no_readiness_request
+    is_ready.handle_requests = _no_request
     actions_robots = types.ModuleType("peppygen.exposed_actions.robots")
     actions_robots.attach = attach
     services_robots = types.ModuleType("peppygen.exposed_services.robots")
     services_robots.is_ready = is_ready
+
+    object_states = types.ModuleType("peppygen.emitted_topics.objects.object_states")
+    object_states.TOPIC_NAME = "object_states"
+    object_states.publisher = Publisher()
+    object_states.build_message = _payload
+    object_states.MessageRobotsItem = lambda **fields: fields
+
+    async def declare_object_states_publisher(_runner) -> Publisher:
+        return object_states.publisher
+
+    object_states.declare_publisher = declare_object_states_publisher
+    emitted_objects = types.ModuleType("peppygen.emitted_topics.objects")
+    emitted_objects.object_states = object_states
+    get_object_states = types.ModuleType("peppygen.exposed_services.objects.get_object_states")
+    get_object_states.Response = lambda **fields: types.SimpleNamespace(**fields)
+    get_object_states.ResponseRobotsItem = lambda **fields: fields
+    get_object_states.Failure = ServiceFailure
+    get_object_states.handle_requests = _no_request
+    services_objects = types.ModuleType("peppygen.exposed_services.objects")
+    services_objects.get_object_states = get_object_states
 
     paired = types.ModuleType("peppygen.paired_topics")
     modules = {
@@ -256,6 +290,11 @@ def _install() -> None:
         "peppygen.exposed_actions.robots": actions_robots,
         "peppygen.exposed_services": types.ModuleType("peppygen.exposed_services"),
         "peppygen.exposed_services.robots": services_robots,
+        "peppygen.exposed_services.objects": services_objects,
+        "peppygen.exposed_services.objects.get_object_states": get_object_states,
+        "peppygen.emitted_topics": types.ModuleType("peppygen.emitted_topics"),
+        "peppygen.emitted_topics.objects": emitted_objects,
+        "peppygen.emitted_topics.objects.object_states": object_states,
         "peppygen.paired_topics": paired,
     }
     for slot, topics in SLOT_TOPICS.items():
@@ -294,3 +333,4 @@ def reset() -> None:
             module = topic(slot, name)
             module.arrivals = []
             module.publisher = Publisher()
+    sys.modules["peppygen.emitted_topics.objects.object_states"].publisher = Publisher()

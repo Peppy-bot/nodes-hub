@@ -13,7 +13,6 @@ one model of the base."""
 from __future__ import annotations
 
 import math
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 import mujoco
@@ -57,9 +56,9 @@ def release_fixture():
 
 @dataclass(frozen=True)
 class Wheels:
-    """The base's wheels as its URDF gives them: their radius and track (m),
-    and the width of their tires (m), each tire its link's one collision
-    cylinder."""
+    """The base's wheels as its description gives them: their radius and
+    track (m), and the width of their tires (m), each tire its link's one
+    collision cylinder."""
 
     radius_m: float
     separation_m: float
@@ -67,19 +66,14 @@ class Wheels:
 
     @staticmethod
     def described() -> Wheels:
-        description = robot_description_py.model(MODEL).description()
-        base = description.differential_base()
-        assert base.left.radius_m == base.right.radius_m, "the base's two wheels are alike"
-        urdf = ET.fromstring(description.urdf)
-        child = {joint.get("name"): joint.find("child").get("link") for joint in urdf.iter("joint")}
-        links = {link.get("name"): link for link in urdf.iter("link")}
-        widths = {
-            float(links[child[wheel.joint]].find("collision/geometry/cylinder").get("length"))
-            for wheel in (base.left, base.right)
-        }
-        assert len(widths) == 1, "the base's two tires are alike"
+        base = robot_description_py.model(MODEL).description().differential_base()
+        assert (base.left.radius_m, base.left.width_m) == (base.right.radius_m, base.right.width_m), (
+            "the base's two wheels are alike"
+        )
         return Wheels(
-            radius_m=base.left.radius_m, separation_m=base.separation_m, tire_width_m=widths.pop()
+            radius_m=base.left.radius_m,
+            separation_m=base.separation_m,
+            tire_width_m=base.left.width_m,
         )
 
 
@@ -130,6 +124,9 @@ class _Driver:
 
     def take_base_release(self, _robot) -> bool:
         return False
+
+    def publish_object_states(self, _robots) -> None:
+        return None
 
     def latest_arm_command(self, _robot, _arm):
         return None

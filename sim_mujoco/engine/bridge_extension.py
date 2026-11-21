@@ -4,8 +4,9 @@
 applies the latest setpoint of every limb and base of every robot standing,
 clamps the integral of each wheel's rate loop, advances physics, and
 (throttled to state_rate_hz) publishes MuJoCo's own clock followed by the
-measured joint, gripper and wheel state it stamps, and records where each
-robot that rolls stands.
+measured joint, gripper and wheel state it stamps and each robot's record on
+object_state under the same stamp, and records where each robot that rolls
+stands.
 
 Every robot is driven through its own limb and base pairs and publishes its
 state back on them. A base's wheels run at the rates of its pair's latest
@@ -22,8 +23,9 @@ from __future__ import annotations
 import logging
 import time
 
-from control_core_py.geometry import xyzw_of_wxyz
+from control_core_py.geometry import normalized, rotate, xyzw_of_wxyz
 from sim_robot_core.cameras import FramePacer
+from sim_robot_core.object_state import RobotRecord
 from sim_robot_core.setpoints import MAX_VALUE
 from sim_robot_core.world import rolled_placement
 from robot_description_py import FingerSpan
@@ -82,8 +84,10 @@ class _RobotLimbs:
         # for a robot without a base.
         wheels = [self.scene_name(joint) for joint in self.entry.wheel_joints()]
         self.wheels = MujocoWheelDrive(model, data, wheels) if wheels else None
-        # Where the free joint a robot that rolls hangs on sits in qpos.
+        # Where the free joint a robot that rolls hangs on sits in qpos and
+        # in qvel.
         self.free_qpos: int | None = None
+        self.free_dof: int | None = None
 
     def scene_name(self, joint: str) -> str:
         return self.robot.scene_name(joint)
@@ -145,6 +149,7 @@ class _RobotLimbs:
 
             free = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_JOINT, self.robot.instance)
             self.free_qpos = int(self._model.jnt_qposadr[free])
+            self.free_dof = int(self._model.jnt_dofadr[free])
 
     def fits(self, arm: str, controls: dict[int, float]) -> bool:
         """Whether the controls a setpoint of `arm` gives its actuators, with
@@ -176,6 +181,34 @@ class _RobotLimbs:
         positions, velocities = states
         indices = [self.joint_index[joint] for joint in joints]
         return [positions[index] for index in indices], [velocities[index] for index in indices]
+
+    def robot_record(self) -> RobotRecord:
+        """This robot's record on object_state as the scene stands now: a
+        robot that rolls where its free joint stands, its robot frame, with
+        the free joint's velocities in world axes (MuJoCo gives its angular
+        velocity in the body's own axes), and any other at its placement, at
+        rest."""
+        robot = self.robot
+        if self.free_qpos is None:
+            placement = robot.placement
+            return RobotRecord.fixed(
+                robot.instance,
+                robot.model,
+                placement.position.position,
+                placement.orientation.quaternion,
+            )
+        at, dof = self.free_qpos, self.free_dof
+        qpos, qvel = self._data.qpos, self._data.qvel
+        orientation = normalized(xyzw_of_wxyz([float(q) for q in qpos[at + 3 : at + 7]]))
+        own_axes = tuple(float(w) for w in qvel[dof + 3 : dof + 6])
+        return RobotRecord(
+            robot=robot.instance,
+            model=robot.model,
+            position=tuple(float(p) for p in qpos[at : at + 3]),
+            orientation=orientation,
+            linear_velocity=tuple(float(v) for v in qvel[dof : dof + 3]),
+            angular_velocity=rotate(orientation, own_axes),
+        )
 
     def rolled_placement(self):
         """Where the wheels of a robot that rolls carried it: the origin of
@@ -366,7 +399,9 @@ class MujocoBridgeExtension:
             robot = limbs.robot.instance
             if states is not None:
                 for arm in limbs.entry.arms:
-                    self._io.publish_arm_states(robot, arm.name, *limbs.measured(states, arm.joints))
+                    self._io.publish_arm_states(
+                        robot, arm.name, *limbs.measured(states, arm.joints)
+                    )
                 if limbs.wheels is not None:
                     self._io.publish_base_states(
                         robot, *limbs.measured(states, limbs.entry.wheel_joints())
@@ -386,6 +421,7 @@ class MujocoBridgeExtension:
 
             if limbs.free_qpos is not None:
                 self._world.follow(robot, limbs.rolled_placement())
+        self._io.publish_object_states([limbs.robot_record() for limbs in self._limbs.values()])
 
     def shutdown(self) -> dict:
         """Stops every view this scene reads the model through, and says what

@@ -22,6 +22,12 @@ finished frames to the same loop and dropping a frame whose stream's
 previous publish is still in flight. Every hop is a generated peppygen
 pairing topic.
 
+Beside the pairings, the engine implements object_state: the bridge captures
+one record per standing robot on each telemetry tick, stamped as that tick's
+states are, the object_states topic publishes each capture, and
+get_object_states answers the latest one. Its scene spawns no object, so a
+capture lists none.
+
 When the deployment names this instance the publisher of a clock domain, the
 physics thread records its engine clock each step (`record_engine_time`, ahead
 of every stamp of that step) and this node publishes it on each telemetry tick
@@ -38,11 +44,14 @@ import logging
 import math
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 import peppylib
 from control_core_py.geometry import Pose
 from peppygen import clock
+from peppygen.emitted_topics.objects import object_states
+from peppygen.exposed_services.objects import get_object_states
 from peppylib.clock import ClockPublisher
 from peppygen.paired_topics.arms import joint_setpoints as arm_setpoints
 from peppygen.paired_topics.arms import joint_states as arm_states
@@ -58,6 +67,7 @@ from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
 from sim_robot_core.cameras import DISTORTION_MODEL
+from sim_robot_core.object_state import RobotRecord
 from sim_robot_core.pairs import (
     ARMS,
     BASE_NAME,
@@ -69,6 +79,7 @@ from sim_robot_core.pairs import (
     PairTable,
 )
 from sim_robot_core.setpoints import BaseSetpoints, JointSetpoint
+from sim_robot_core.world import WORLD
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +101,23 @@ _INFO_SURFACE = "info"
 # Geometry goes out on the same tick as the stream info, so it takes a guard
 # of its own: sharing the info one would drop whichever was scheduled second.
 _GEOMETRY_SURFACE = "geometry"
+
+
+# What get_object_states answers until the first capture: not an empty scene.
+_NOT_CAPTURED = (
+    "MuJoCo has not captured its object state yet; it captures on each state tick once "
+    "the scene steps"
+)
+_PRECONDITION_FAILED = "precondition_failed"
+
+
+@dataclass(frozen=True)
+class ObjectStateSnapshot:
+    """One capture of object_state: the simulated instant it was taken at,
+    and every robot standing then. The scene spawns no object."""
+
+    timestamp_s: float
+    robots: tuple[RobotRecord, ...]
 
 
 class _LatestSlot:
@@ -202,6 +230,14 @@ class SimTopicIO:
         # camera paired on it, so the guard is per robot and camera.
         self._camera_pubs: dict[tuple[str, str], peppylib.PeerPublisher] = {}
         self._camera_guards: dict[tuple[str, str, str], _PublishGuard] = {}
+        # The object_states publisher and its in-flight guard, and the latest
+        # capture, which get_object_states answers: written on the physics
+        # thread, read on the loop.
+        self._object_states_pub: Optional[peppylib.TopicPublisher] = None
+        self._object_states_guard = _PublishGuard()
+        self._snapshot: Optional[ObjectStateSnapshot] = None
+        self._snapshot_lock = threading.Lock()
+        self._consumers: list[asyncio.Task] = []
         self._tasks: list[asyncio.Task] = []
         # Set in start() when the deployment names this instance the
         # publisher of a clock domain.
@@ -231,6 +267,7 @@ class SimTopicIO:
         self._arm_pub = await arm_states.declare_publisher(self._node_runner)
         self._gripper_pub = await gripper_states.declare_publisher(self._node_runner)
         self._base_pub = await base_states.declare_publisher(self._node_runner)
+        self._object_states_pub = await object_states.declare_publisher(self._node_runner)
         await self._declare_camera_publishers(
             RGB_CAMERAS,
             [(_VIDEO_STREAM, rgb_video), (_STREAM_INFO, rgb_info), (_GEOMETRY, rgb_geometry)],
@@ -244,16 +281,19 @@ class SimTopicIO:
                 (_GEOMETRY, rgbd_geometry),
             ],
         )
-        self._tasks = [
+        # The consume tasks end with their subscriptions; the service runs
+        # for the life of the node.
+        self._consumers = [
             asyncio.create_task(self._consume(arm_setpoints, ARMS, self._take_arm)),
             asyncio.create_task(self._consume(gripper_setpoints, GRIPPERS, self._take_gripper)),
             asyncio.create_task(self._consume(base_setpoints, BASES, self._take_base)),
         ]
+        self._tasks = [*self._consumers, asyncio.create_task(self._serve_object_states())]
 
     async def stop(self) -> None:
         for task in self._tasks:
             task.cancel()
-        # Let the cancellations land so the consume loops exit before teardown.
+        # Let the cancellations land so the loops exit before teardown.
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def _consume(self, setpoints, slot: str, take) -> None:
@@ -308,7 +348,9 @@ class SimTopicIO:
         if setpoint is not None and self._base_cmd.put(robot, peer, setpoint):
             logger.info(f"first setpoint for '{robot}' {base}")
 
-    def _setpoint(self, robot: str, slot: str, part: str, joints: str, msg) -> Optional[JointSetpoint]:
+    def _setpoint(
+        self, robot: str, slot: str, part: str, joints: str, msg
+    ) -> Optional[JointSetpoint]:
         """The setpoint `msg` gives the arm or the base `part` of `robot` on
         `slot`, whose joints a refusal calls `joints` (joints, wheels), or
         None: for a robot the scene does not hold or a part its model lacks,
@@ -334,6 +376,41 @@ class SimTopicIO:
     def _command_slot(self, slots: dict, limb: str, robot: str) -> "_LatestSlot":
         with self._cmd_lock:
             return slots.setdefault((limb, robot), _LatestSlot())
+
+    async def _serve_object_states(self) -> None:
+        """Answers get_object_states for the life of the node. When the
+        service stops, its request stream ended or it could not listen, the
+        log says why and it listens again a second later."""
+        while True:
+            try:
+                await get_object_states.handle_requests(
+                    self._node_runner, self._answer_object_states
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pylint: disable=W0718
+                logger.exception("get_object_states service failed")
+            else:
+                logger.warning("get_object_states service: its request stream ended")
+            await asyncio.sleep(1.0)
+
+    def _answer_object_states(self, _request) -> get_object_states.Response:
+        """The latest capture, in world. No capture yet is not an empty
+        scene: it gives an error reply with `precondition_failed`, as
+        object_state:v1 says of an implementer that is not ready."""
+        with self._snapshot_lock:
+            snapshot = self._snapshot
+        if snapshot is None:
+            raise get_object_states.Failure(_PRECONDITION_FAILED, _NOT_CAPTURED)
+        return get_object_states.Response(
+            frame=WORLD,
+            timestamp=snapshot.timestamp_s,
+            objects=[],
+            robots=[
+                get_object_states.ResponseRobotsItem(**record.fields())
+                for record in snapshot.robots
+            ],
+        )
 
     def held_by(self, robot: str) -> Held:
         """What `robot` holds on the five slots: the limbs and the base its
@@ -475,6 +552,28 @@ class SimTopicIO:
         # torques.
         payload = base_states.build_message(self.timestamp_s(), positions, velocities, [])
         self._schedule_publish(self._base_pub, BASES, robot, BASE_NAME, payload)
+
+    def publish_object_states(self, robots: list[RobotRecord]) -> None:
+        """Captures object_state as the robots stand now, stamped as this
+        tick's states are: the capture get_object_states answers from here
+        on, published on the object_states stream unless the previous one is
+        still in flight. Called on the physics thread."""
+        snapshot = ObjectStateSnapshot(timestamp_s=self.timestamp_s(), robots=tuple(robots))
+        with self._snapshot_lock:
+            self._snapshot = snapshot
+        if self._object_states_pub is None:
+            return
+        payload = object_states.build_message(
+            WORLD,
+            snapshot.timestamp_s,
+            [],
+            [object_states.MessageRobotsItem(**record.fields()) for record in snapshot.robots],
+        )
+        self._publish_batch(
+            self._object_states_guard,
+            object_states.TOPIC_NAME,
+            [(self._object_states_pub, payload)],
+        )
 
     def publish_gripper_states(
         self, robot: str, gripper: str, opening: float, force: float = 0.0

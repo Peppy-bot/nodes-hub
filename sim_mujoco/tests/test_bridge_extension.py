@@ -128,6 +128,8 @@ class FakeIO:
         self.arm_states: list[tuple] = []
         self.gripper_states: list[tuple] = []
         self.base_states: list[tuple] = []
+        # Each capture of object_state: the robots' records.
+        self.object_states: list[list] = []
 
     def latest_arm_command(self, robot, arm):
         return self.arm_commands.get((robot, arm))
@@ -142,6 +144,9 @@ class FakeIO:
 
     def publish_base_states(self, robot, positions, velocities):
         self.base_states.append((robot, positions, velocities))
+
+    def publish_object_states(self, robots):
+        self.object_states.append(robots)
 
     def latest_gripper_command(self, robot, gripper):
         return self.gripper_commands.get((robot, gripper))
@@ -833,3 +838,85 @@ class TestTheWheelsOfABase:
         broken = WHEELED.replace(old, new, 1) if "left" in old else WHEELED.replace(old, new)
         with pytest.raises(RuntimeError, match=rf"wheel '{ROBOT}/left_wheel'.*{refusal}"):
             _wheeled(xml=broken)
+
+
+class TestTheRecordsOnObjectState:
+    """Each telemetry tick captures one record per standing robot, under the
+    stamp of that tick's states: a robot fixed to the world at its placement,
+    at rest, and a robot that rolls where its free joint stands, its
+    velocities in world axes."""
+
+    def test_a_robot_fixed_to_the_world_stands_at_its_placement_at_rest(self, clock):
+        io = FakeIO()
+        world = World(renders=False)
+        world.add(ROBOT, _known("jaw_arm", _JAW_ARM_ENTRY, _JAW_ARM), placement_at(1.5, yaw=0.5))
+        model = world.compose().compile()
+        data = mujoco.MjData(model)
+        bridge = MujocoBridgeExtension(model, data, io, world, _STATE_RATE_HZ, renders=False, time_base_s=0.0)
+        bridge.startup(posture_for=world.robots())
+
+        bridge.step()
+
+        ((record,),) = io.object_states
+        placement = placement_at(1.5, yaw=0.5)
+        assert (record.robot, record.model) == (ROBOT, "jaw_arm")
+        assert record.position == placement.position.position
+        assert record.orientation == placement.orientation.quaternion
+        assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
+
+    def test_a_robot_that_rolls_is_where_its_free_joint_stands_moving_in_world_axes(self, clock):
+        io = FakeIO()
+        model, data, _, bridge = _wheeled(io)
+        free = model.joint(ROBOT)
+        at, dof = free.qposadr[0], free.dofadr[0]
+        # Facing +y, turned a quarter about +z, and rolling about its own +x,
+        # which is the world's +y.
+        data.qpos[at : at + 7] = [0.5, 0.25, 0.0, math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)]
+        data.qvel[dof : dof + 6] = [0.2, -0.1, 0.0, 0.3, 0.0, 0.4]
+        io.object_states.clear()
+        captured = {}
+
+        def capture(robots):
+            # The state the step left, which is the one the record is stamped with.
+            captured["qpos"] = list(data.qpos[at : at + 7])
+            captured["qvel"] = list(data.qvel[dof : dof + 6])
+            io.object_states.append(robots)
+
+        io.publish_object_states = capture
+        bridge.step()
+
+        ((record,),) = io.object_states
+        assert record.position == pytest.approx(captured["qpos"][:3])
+        w, x, y, z = captured["qpos"][3:]
+        norm = math.sqrt(w * w + x * x + y * y + z * z)
+        assert record.orientation == pytest.approx((x / norm, y / norm, z / norm, w / norm))
+        assert record.linear_velocity == pytest.approx(captured["qvel"][:3])
+        # About a quarter turn about +z, which carries the body's +x onto the
+        # world's +y: MuJoCo's own rotation of the body's axes into the world's.
+        in_world = np.zeros(3)
+        mujoco.mju_rotVecQuat(in_world, np.array(captured["qvel"][3:]), np.array(captured["qpos"][3:]) / norm)
+        assert record.angular_velocity == pytest.approx(tuple(in_world), abs=1e-9)
+        assert record.angular_velocity == pytest.approx((0.0, 0.3, 0.4), abs=1e-3)
+
+    def test_an_empty_scene_captures_no_robot(self, clock):
+        io = FakeIO()
+        world = World(renders=False)
+        model = world.compose().compile()
+        bridge = MujocoBridgeExtension(
+            model, mujoco.MjData(model), io, world, _STATE_RATE_HZ, renders=False, time_base_s=0.0
+        )
+        bridge.startup()
+
+        bridge.step()
+
+        assert io.object_states == [[]]
+
+    def test_a_capture_rides_the_state_rate(self, clock):
+        io = FakeIO()
+        _, _, _, bridge = _jaw_arm(io)
+        for _ in range(5):
+            bridge.step()
+        assert len(io.object_states) == 1
+        clock.set(1.0 / _STATE_RATE_HZ)
+        bridge.step()
+        assert len(io.object_states) == 2

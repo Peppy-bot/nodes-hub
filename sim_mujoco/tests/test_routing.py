@@ -19,6 +19,7 @@ import pytest
 from robot_description_py import model as bundled
 from sim_robot_core.cameras import DEPTH_TO_COLOR, pinhole
 from sim_robot_core.models import shipped_entry
+from sim_robot_core.object_state import RobotRecord
 from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 from sim_robot_core.setpoints import MAX_VALUE, JointSetpoint
@@ -82,15 +83,16 @@ async def _drain(loop_turns: int = 10) -> None:
 
 def _serve(scene, arms=(), grippers=(), bases=()) -> None:
     """Starts the transport with these setpoints queued on the two limb
-    slots and the base slot, and runs each consume task to the end of its
-    subscription."""
+    slots and the base slot, runs each consume task to the end of its
+    subscription, and stops the service that runs for the node's life."""
     topic("arms", "joint_setpoints").arrivals = list(arms)
     topic("grippers", "gripper_setpoints").arrivals = list(grippers)
     topic("bases", "joint_setpoints").arrivals = list(bases)
 
     async def serve() -> None:
         await scene.io.start()
-        await asyncio.gather(*scene.io._tasks)  # pylint: disable=W0212
+        await asyncio.gather(*scene.io._consumers)  # pylint: disable=W0212
+        await scene.io.stop()
 
     scene.loop.run_until_complete(serve())
 
@@ -569,3 +571,36 @@ class TestTheBase:
         _publishes(scene)
 
         assert _sent("bases", "joint_states") == [(INDIA_BASE.info, (0.0, [0.1, 0.2], [1.0, 1.5], []))]
+
+
+class TestObjectState:
+    """The robots' records, as the bridge captures them on each telemetry
+    tick: the stream publishes each capture in world, and get_object_states
+    answers the latest one."""
+
+    RECORD = RobotRecord.fixed("alpha", "openarm_v2", (0.0, -1.5, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def test_a_capture_is_published_in_world_under_its_stamp_with_no_object(self, scene):
+        _serve(scene)
+
+        scene.io.publish_object_states([self.RECORD])
+        _publishes(scene)
+
+        stream = sys.modules["peppygen.emitted_topics.objects.object_states"]
+        assert stream.publisher.sent == [(None, ("world", 0.0, [], [self.RECORD.fields()]))]
+
+    def test_get_object_states_answers_the_latest_capture(self, scene):
+        _serve(scene)
+        scene.io.publish_object_states([])
+        scene.io.publish_object_states([self.RECORD])
+
+        answer = scene.io._answer_object_states(None)  # pylint: disable=W0212
+
+        assert (answer.frame, answer.timestamp, answer.objects) == ("world", 0.0, [])
+        assert answer.robots == [self.RECORD.fields()]
+
+    def test_no_capture_yet_is_an_error_reply_and_not_an_empty_scene(self, scene):
+        with pytest.raises(runtime_fakes.ServiceFailure) as refusal:
+            scene.io._answer_object_states(None)  # pylint: disable=W0212
+        assert refusal.value.kind == "precondition_failed"
+        assert "MuJoCo has not captured its object state yet" in refusal.value.message

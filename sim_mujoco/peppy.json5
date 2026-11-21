@@ -6,6 +6,7 @@
     description: [
       "The MuJoCo simulation: it stands any number of robots, of any model it has an entry for, in one composed scene, and serves a viser viewer to a browser. It needs no GPU, but it renders the robot cameras much faster on an NVIDIA GPU.",
       "Each robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine composes its scene from the models standing in it and steps them for as long as they stay. The engine plays the follower role of every limb pairing and every base pairing of every robot: a robot's backbone leads each limb's pair, its base node leads its base's, and the simulation's measured state streams back on each. Whether a robot stands with a pair for every limb and the base of its model is its readiness, answered on the same contract.",
+      "It implements object_state, streamed and on demand: one record per robot standing, the world pose of its robot frame and its velocities there, and no objects, since nothing is spawned in its scene.",
     ],
     implements: [
       // How a robot joins this scene: it attaches with the copy it runs as,
@@ -14,6 +15,10 @@
       // engine's own. Whether it stands with every limb and its base paired
       // is its readiness.
       { name: "simulation_robot", tag: "v1", link_id: "robots" },
+      // The ground truth of the robots standing: where each robot frame is
+      // and how fast it moves, captured on the state rate. Its scene spawns
+      // no object, so every snapshot lists none.
+      { name: "object_state", tag: "v1", link_id: "objects" },
     ],
     depends_on: {
       pairings: [
@@ -48,6 +53,7 @@
     services: {
       exposes: [
         { link_id: "robots", name: "is_ready" },
+        { link_id: "objects", name: "get_object_states" },
       ],
     },
     actions: {
@@ -67,6 +73,7 @@
         { link_id: "rgbd_cameras", name: "depth_stream" },
         { link_id: "rgbd_cameras", name: "stream_info" },
         { link_id: "rgbd_cameras", name: "geometry" },
+        { link_id: "objects", name: "object_states" },
       ],
       consumes: [
         { link_id: "arms", name: "joint_setpoints" },
