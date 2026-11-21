@@ -7,7 +7,8 @@
 //! setpoint, when a value is not finite, when the tree cannot place it, and
 //! when, placed, its linear_velocity's z or its angular_velocity's x or y lies
 //! farther than 1e-9 from 0. A setpoint's y reaches the limiter, whose range
-//! along y on a differential base is 0 alone.
+//! along y on a differential base is 0 alone. Each stream logs at most one
+//! dropped message per [`LOG_WINDOW`].
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use control_core::geometry::{Stamped, Twist};
 use control_core::receiving::receive;
 use control_core::robot_tree::Placer;
+use control_core::throttle::{LOG_WINDOW, Throttle};
 use control_core::twist::PlanarTwist;
 use peppygen::NodeRunner;
 use peppygen::paired_topics::base::joint_states;
@@ -32,6 +34,7 @@ pub async fn run_wheel_listener(runner: Arc<NodeRunner>, events: mpsc::Sender<Ev
         Ok(subscription) => subscription,
         Err(e) => return error!("wheel joint_states subscribe: {e}"),
     };
+    let mut drop_log = Throttle::new(LOG_WINDOW);
     receive(
         "wheel joint_states",
         runner.cancellation_token().cancelled(),
@@ -40,7 +43,9 @@ pub async fn run_wheel_listener(runner: Arc<NodeRunner>, events: mpsc::Sender<Ev
             let finite = message.positions.iter().all(|angle| angle.is_finite());
             let Some(timestamp_ns) = clock::ns_from_wire(message.timestamp).filter(|_| finite)
             else {
-                warn!("wheel joint_states: dropping a measurement that is not finite");
+                if drop_log.admit() {
+                    warn!("wheel joint_states: dropping a measurement that is not finite");
+                }
                 return ControlFlow::Continue(());
             };
             let state = WheelState {
@@ -69,6 +74,7 @@ pub async fn run_setpoint_listener(
         Ok(subscription) => subscription,
         Err(e) => return error!("drive_setpoints subscribe: {e}"),
     };
+    let mut drop_log = Throttle::new(LOG_WINDOW);
     receive(
         "drive_setpoints",
         runner.cancellation_token().cancelled(),
@@ -77,8 +83,14 @@ pub async fn run_setpoint_listener(
             let Some(received_ns) = clock::now_ns() else {
                 return ControlFlow::Continue(());
             };
-            let Some(velocity) = placed_setpoint(&placer, message).await else {
-                return ControlFlow::Continue(());
+            let velocity = match placed_setpoint(&placer, message).await {
+                Ok(velocity) => velocity,
+                Err(reason) => {
+                    if drop_log.admit() {
+                        warn!("drive_setpoints: dropping a setpoint: {reason}");
+                    }
+                    return ControlFlow::Continue(());
+                }
             };
             let event = Event::Setpoint {
                 velocity,
@@ -94,12 +106,11 @@ pub async fn run_setpoint_listener(
 }
 
 /// The velocity of `message` placed in the robot frame on the floor plane, or
-/// `None`, the log naming why, for a setpoint drive_link counts as no
-/// setpoint.
+/// why drive_link counts the setpoint as no setpoint.
 async fn placed_setpoint(
     placer: &Placer,
     message: drive_setpoints::Message,
-) -> Option<PlanarTwist> {
+) -> Result<PlanarTwist, String> {
     let stamped = Twist::parse(message.linear_velocity, message.angular_velocity)
         .and_then(|twist| {
             Stamped::parse(
@@ -108,20 +119,12 @@ async fn placed_setpoint(
                 twist,
             )
         })
-        .inspect_err(|e| warn!("drive_setpoints: dropping a setpoint: {e}"))
-        .ok()?;
+        .map_err(|e| e.to_string())?;
     let placed = placer
         .place_velocity(&stamped)
         .await
-        .inspect_err(|e| warn!("drive_setpoints: dropping a setpoint its tree cannot place: {e}"))
-        .ok()?;
+        .map_err(|e| format!("the robot's tree cannot place it: {e}"))?;
     placed
         .planar()
-        .inspect_err(|e| {
-            warn!(
-                "drive_setpoints: dropping a setpoint: {}",
-                velocity_off_the_floor(e)
-            )
-        })
-        .ok()
+        .map_err(|refusal| velocity_off_the_floor(&refusal))
 }

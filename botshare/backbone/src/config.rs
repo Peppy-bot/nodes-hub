@@ -8,7 +8,7 @@
 //! refused at setup, by parameter name.
 
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use control_core::footprint::Footprint;
 use control_core::limiter::{AxisLimits, AxisLimitsParams, Limiter, LimiterError, LimiterParams};
@@ -45,8 +45,6 @@ pub enum ConfigError {
         #[source]
         source: LimiterError,
     },
-    #[error("parameter {name}: a differential base moves along it, so its range is not 0 to 0")]
-    StillAxis { name: &'static str },
     #[error("parameter x: move_base drives the base ahead, so give x a max_velocity above 0")]
     NoForward,
     #[error(
@@ -87,19 +85,9 @@ impl AxisSpec {
         rest: 0.0,
     };
 
-    /// The axis `name` that the base moves along, as base_state's limiter
-    /// takes it: control_core's limiter checks the range, the acceleration,
-    /// the deceleration and the deadband, and the range of an axis a
-    /// differential base moves along is other than 0 to 0.
-    fn moving(&self, name: &'static str) -> Result<AxisLimits, ConfigError> {
-        let limits = self.limits(name)?;
-        if self.min_velocity == 0.0 && self.max_velocity == 0.0 {
-            return Err(ConfigError::StillAxis { name });
-        }
-        Ok(limits)
-    }
-
-    /// The axis `name` as base_state's limiter takes it.
+    /// The axis `name` as base_state's limiter takes it: control_core's
+    /// limiter checks the range, the acceleration, the deceleration and the
+    /// deadband.
     fn limits(&self, name: &'static str) -> Result<AxisLimits, ConfigError> {
         let non_negative = |limit, value| {
             NonNegativeFinite::parse(value).map_err(|source| ConfigError::NotNonNegative {
@@ -153,9 +141,9 @@ impl BaseAxes {
         let velocity_timeout_s = NonNegativeFinite::parse(seconds(LEADER_STREAMING_WINDOW_NS))
             .expect("drive_link's stream gap is a finite time of at least 0");
         LimiterSettings::parse(LimiterParams {
-            linear_x: self.x.moving("x")?,
+            linear_x: self.x.limits("x")?,
             linear_y: AxisLimits::STILL,
-            angular_z: self.yaw.moving("angular")?,
+            angular_z: self.yaw.limits("angular")?,
             smoothing_frequency_hz,
             velocity_timeout_s,
         })
@@ -218,7 +206,8 @@ pub struct BaseConfig {
     pub limiter: LimiterSettings,
     /// The outline's corners, counterclockwise from the front right one.
     pub footprint: Footprint,
-    /// The wheel joints, whose transforms the node publishes.
+    /// The wheel joints, whose transforms the node publishes, each started
+    /// when the node started.
     pub joint_transforms: JointTransforms,
     /// One step of base_state's limiter on the node's clock (ns).
     pub step_ns: i64,
@@ -277,13 +266,16 @@ impl BaseParameters {
                 rest: positive("angular.rest_rate", angular.rest_rate)?,
             },
         };
-        let limiter = axes.limiter_settings(params.smoothing_frequency_hz)?;
+        // What move_base asks of the axes comes first, so an axis of range 0
+        // to 0 is told what range to give before the limiter judges its other
+        // limits.
         if axes.x.max_velocity <= 0.0 {
             return Err(ConfigError::NoForward);
         }
         if axes.yaw.min_velocity >= 0.0 || axes.yaw.max_velocity <= 0.0 {
             return Err(ConfigError::OneWayTurn);
         }
+        let limiter = axes.limiter_settings(params.smoothing_frequency_hz)?;
         let step_ns = limiter.period_ns;
         let odometry_window = NonZeroUsize::new(params.odometry_velocity_window as usize)
             .ok_or(ConfigError::EmptyWindow)?;
@@ -307,9 +299,10 @@ impl BaseParameters {
         })
     }
 
-    /// The node's configuration for a robot of `model`: these parameters
-    /// with the model's base ([`BaseModel::of`]).
-    pub fn configure(&self, model: &str) -> Result<BaseConfig, ModelError> {
+    /// The node's configuration for a robot of `model`, the node started at
+    /// `started` on the wall clock: these parameters with the model's base
+    /// ([`BaseModel::of`]).
+    pub fn configure(&self, model: &str, started: SystemTime) -> Result<BaseConfig, ModelError> {
         let BundledBase {
             model: bundled,
             base,
@@ -326,7 +319,7 @@ impl BaseParameters {
             odometry,
             limiter: self.limiter.clone(),
             footprint: base.footprint,
-            joint_transforms: base.joint_transforms,
+            joint_transforms: JointTransforms::new(base.description, base.wheel_joints, started),
             step_ns: self.step_ns,
             fastest_wheel_rate,
             rotate_to_heading_min_angle_rad: self.rotate_to_heading_min_angle_rad,

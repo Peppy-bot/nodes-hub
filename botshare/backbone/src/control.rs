@@ -27,7 +27,7 @@ use control_core::stop_reason::stop_reason;
 use control_core::throttle::{LOG_WINDOW, Throttle};
 use control_core::time::{nanoseconds, seconds};
 use control_core::twist::PlanarTwist;
-use frame_tree::arithmetic::{normalize_angle, quaternion_of_yaw};
+use frame_tree::arithmetic::normalize_angle;
 use frame_tree::{MovingMessage, Publisher as TreePublisher};
 use peppygen::emitted_topics::base_state::base_states;
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
@@ -56,11 +56,11 @@ pub const BASE_NAME: &str = joint_setpoints::LINK_ID;
 
 /// How old the wheels' newest measurement may be before they are silent
 /// (ns): base_state's 0.5 s.
-pub const SILENT_AFTER_NS: i64 = 500_000_000;
+const SILENT_AFTER_NS: i64 = 500_000_000;
 
 /// The longest the base goes without a base_states while the wheels report
 /// (ns): base_state's 0.1 s.
-pub const REPORT_PERIOD_NS: i64 = 100_000_000;
+const REPORT_PERIOD_NS: i64 = 100_000_000;
 
 /// A measurement of both wheels, [left, right]: their angles (rad), when the
 /// wheels measured them on the node's clock (ns), and the instance of the
@@ -298,11 +298,12 @@ struct Located {
 macro_rules! end_goal {
     ($ctx:expr, $outcome:expr, $located:expr, $action_time:expr, $action:ident::$final_pose:ident) => {{
         let Located { pose, timestamp } = $located;
+        let (position, orientation) = transforms::position_and_orientation(pose);
         let final_pose = $action::$final_pose {
             frame: transforms::ODOMETRY_FRAME.to_owned(),
             timestamp,
-            position: [pose.x(), pose.y(), 0.0],
-            orientation: quaternion_of_yaw(pose.yaw()),
+            position,
+            orientation,
         };
         match $outcome {
             Outcome::Ending(Ending::Completed) => $ctx.complete(final_pose, $action_time).await,
@@ -665,8 +666,10 @@ pub struct Base {
     limits: Limiter,
     follower: Follower,
     odometry: Odometry,
-    /// The odometry epoch: `None` before the first measurement, and once the
-    /// base's clock went back to before the epoch's last measurement.
+    /// The odometry epoch: `None` before the first measurement. An epoch
+    /// whose last measurement lies after a time the base's clock went back
+    /// to stays here closed ([`Epoch`]) until the next measurement starts
+    /// one.
     epoch: Option<Epoch>,
     /// Whether the last step found the wheels silent, with no measurement
     /// taken since.
@@ -685,9 +688,6 @@ pub struct Base {
     publishers: Publishers,
     /// The odometry_start_timestamp of the newest epoch.
     last_odometry_start: Option<SystemTime>,
-    /// When the node started, on the wall clock: the start of the wheel
-    /// joints' transforms.
-    started: SystemTime,
 }
 
 impl Base {
@@ -696,7 +696,6 @@ impl Base {
         status: BaseStatus,
         slot: MoveSlot,
         publishers: Publishers,
-        started: SystemTime,
     ) -> Self {
         Self {
             limits: config.limiter.start(),
@@ -714,7 +713,6 @@ impl Base {
             rest: RestWindow::default(),
             publishers,
             last_odometry_start: None,
-            started,
         }
     }
 
@@ -840,11 +838,10 @@ impl Base {
         } else if !self.continue_epoch(&state) {
             return;
         }
-        let wheels = self.config.joint_transforms.message_at(
-            wire_from_ns(state.timestamp_ns),
-            state.positions,
-            self.started,
-        );
+        let wheels = self
+            .config
+            .joint_transforms
+            .message_at(wire_from_ns(state.timestamp_ns), state.positions);
         self.publish_transforms(wheels).await;
         let judged_ns = self.last_step_ns.unwrap_or(state.timestamp_ns);
         if self.wheels_report_at(judged_ns) {
@@ -994,7 +991,7 @@ impl Base {
     /// Run every step due on the node's clock, then publish the due report
     /// once the clock reads its stamp. A clock that reads earlier than the
     /// last step starts the base's timing over first.
-    pub async fn advance(&mut self) {
+    async fn advance(&mut self) {
         let Some(now_ns) = clock::now_ns() else {
             return;
         };
@@ -1206,7 +1203,7 @@ impl Base {
             angular,
         } = report;
         let timestamp = wire_from_ns(timestamp_ns);
-        let (position, orientation) = ([pose.x(), pose.y(), 0.0], quaternion_of_yaw(pose.yaw()));
+        let (position, orientation) = transforms::position_and_orientation(pose);
         let (linear_velocity, angular_velocity) = ([linear, 0.0, 0.0], [0.0, 0.0, angular]);
         let mode = match self.rest.rests(self.config.axes.rest_bounds()) {
             true => "standing",

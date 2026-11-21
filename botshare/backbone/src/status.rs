@@ -1,6 +1,6 @@
 //! What the goal handlers admit a goal on: whether the wheels report, when
 //! the leader's newest setpoint arrived and whether the base comes to rest
-//! from a failed goal, all written by the control loop, and the base's move
+//! from an earlier goal, all written by the control loop, and the base's move
 //! slot. A goal handler claims the slot when it admits a goal, at the time the
 //! admission read; the goal releases it when it ends.
 
@@ -26,8 +26,9 @@ struct BaseStatusState {
     setpoint_ns: Option<i64>,
     /// The odometry_start_timestamp of the odometry the base reports.
     odometry_start: Option<SystemTime>,
-    /// Whether the base comes to rest from a goal that failed: from the
-    /// failure until the limiter's command reaches 0.
+    /// Whether the base comes to rest from an earlier goal: from the end of a
+    /// goal that ended while the limiter's command was not 0, completed,
+    /// cancelled or failed, until the command reaches 0.
     resting: bool,
 }
 
@@ -40,8 +41,8 @@ impl BaseStatus {
     /// claim `slot` for it from then, or the refusal, in base_motion's order:
     /// the wheels are silent (`resource_unavailable`), the leader streams, as
     /// drive_link defines it (`leader_streaming`), the base comes to rest from
-    /// a goal that failed, or another goal holds the slot, running or coming
-    /// to rest (`precondition_failed`).
+    /// an earlier goal, or another goal holds the slot, running or coming to
+    /// rest (`precondition_failed`).
     pub fn admit(&self, now_ns: Option<i64>, slot: &MoveSlot) -> Result<Admitted, Failure> {
         let state = lock_ignoring_poison(&self.0);
         let Some(now_ns) = now_ns.filter(|_| state.wheels_report) else {
@@ -85,7 +86,7 @@ impl BaseStatus {
         state.setpoint_ns = state.setpoint_ns.map(|received_ns| received_ns.min(now_ns));
     }
 
-    /// Whether the base comes to rest from a goal that failed.
+    /// Whether the base comes to rest from an earlier goal.
     pub fn set_resting(&self, resting: bool) {
         lock_ignoring_poison(&self.0).resting = resting;
     }
@@ -178,7 +179,7 @@ mod tests {
     }
 
     #[test]
-    fn a_base_coming_to_rest_from_a_failed_goal_refuses_a_goal() {
+    fn a_base_coming_to_rest_from_an_earlier_goal_refuses_a_goal() {
         let (status, slot) = (BaseStatus::default(), MoveSlot::default());
         status.set_wheels_report(true);
         status.set_resting(true);

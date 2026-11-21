@@ -1,7 +1,5 @@
 use super::*;
 
-use peppygen::parameters::x::X;
-
 use crate::test_rig::params as parameters;
 use control_core::odometry::WheelGeometry;
 
@@ -26,7 +24,7 @@ fn assert_refused(spoiled: &[(&str, Spoil)], refused: fn(&ConfigError, &str) -> 
 fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
     let parameters = BaseParameters::parse(&parameters()).expect("the parameters are taken");
     let config = parameters
-        .configure("botshare_base")
+        .configure("botshare_base", SystemTime::UNIX_EPOCH)
         .expect("the bundled base");
     assert_eq!(config.step_ns, 50_000_000);
     assert_eq!(config.axes.x.profile().positive_speed, 0.5);
@@ -36,7 +34,9 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
         WheelGeometry::parse(0.4, 0.1, 0.1).expect("a wheel geometry")
     );
     assert_eq!(config.footprint.points().len(), 4);
-    let refused = parameters.configure("so101").expect_err("an arm");
+    let refused = parameters
+        .configure("so101", SystemTime::UNIX_EPOCH)
+        .expect_err("an arm");
     assert!(
         refused
             .to_string()
@@ -102,31 +102,26 @@ fn an_axis_that_describe_base_does_not_allow_is_refused_by_name() {
                 if format!("{axis}.{limit}") == field)
         },
     );
-    assert_refused(
-        &[("x", |p| {
-            p.x = X {
-                min_velocity: 0.0,
-                max_velocity: 0.0,
-                max_acceleration: 0.0,
-                max_deceleration: 0.0,
-                deadband: 0.0,
-                rest_velocity: p.x.rest_velocity,
-            }
-        })],
-        |error, field| matches!(error, ConfigError::StillAxis { name } if *name == field),
-    );
 }
 
 // move_base drives a base ahead and turns it the shorter way: a base that
-// cannot drive ahead, or turns one way alone, is refused; a base that
-// cannot drive backward is taken, its profile's backward speed 0.
+// cannot drive ahead, or turns one way alone, is refused, a range of 0 to 0
+// with the rig's other limits among them, before the limiter judges those
+// limits; a base that cannot drive backward is taken, its profile's backward
+// speed 0.
 #[test]
 fn a_base_that_cannot_drive_ahead_or_turn_both_ways_is_refused() {
     assert_refused(
-        &[("x", |p| {
-            p.x.min_velocity = -0.5;
-            p.x.max_velocity = 0.0;
-        })],
+        &[
+            ("x", |p| {
+                p.x.min_velocity = -0.5;
+                p.x.max_velocity = 0.0;
+            }),
+            ("x", |p| {
+                p.x.min_velocity = 0.0;
+                p.x.max_velocity = 0.0;
+            }),
+        ],
         |error, _| matches!(error, ConfigError::NoForward),
     );
     assert_refused(
@@ -134,6 +129,10 @@ fn a_base_that_cannot_drive_ahead_or_turn_both_ways_is_refused() {
             ("angular", |p| p.angular.min_rate = 0.0),
             ("angular", |p| {
                 p.angular.min_rate = -1.5;
+                p.angular.max_rate = 0.0;
+            }),
+            ("angular", |p| {
+                p.angular.min_rate = 0.0;
                 p.angular.max_rate = 0.0;
             }),
         ],

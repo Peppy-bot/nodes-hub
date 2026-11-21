@@ -85,6 +85,7 @@ mod tests {
         let before = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
         assert_eq!(ns_from_wire(before), None);
     }
+
     #[tokio::test]
     async fn the_end_of_the_simulation_clocks_ticks_raises_the_fault_and_stops_the_node() {
         let fault = Fault::default();

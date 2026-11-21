@@ -15,34 +15,33 @@ model's URDF in robot_description gives the base (`model.rs`), and the node
 holds the served digest to the one of the bundled description it was built
 with. It answers `describe_base` from then, and runs its goals, its streams
 and the robot stop once the initializer reports the robot ready on
-robot_ready's `is_ready` (`startup.rs`). The URDF's root link is the robot frame, base_footprint.
-The wheels are the URDF's two continuous joints, each on a link that fixed
-joints alone join to its root link, each turning about +y, so a positive turn
-rolls the base forward; the wheel separation is the distance between the two
-joints' origins, on one axle whose midpoint stands at the root link's origin,
-and a wheel's radius is the radius of its link's one collision cylinder about
-the joint's axis. The outline is the rectangle on the floor that holds every
-collision element of every link. A model whose URDF gives no such base, or
-whose root link is not base_footprint, ends the node naming why, and so does
-another description of the model than the bundled one. The node senses no
-state of the base's drives, so its mode is standing or moving whenever the
-wheels report, both modes that take velocity.
+robot_ready's `is_ready` (`startup.rs`). The URDF's root link is the robot
+frame, base_footprint. The wheels are the URDF's two continuous joints, each
+on a link that fixed joints alone join to its root link, each turning about
++y, so a positive turn rolls the base forward; the wheel separation is the
+distance between the two joints' origins, on one axle whose midpoint stands at
+the root link's origin, and a wheel's radius is the radius of its link's one
+collision cylinder about the joint's axis. The outline is the rectangle on the
+floor that holds every collision element of every link. A model whose URDF
+gives no such base, or whose root link is not base_footprint, ends the node
+naming why, and so does another description of the model than the bundled one.
+The node senses no state of the base's drives, so its mode is standing or
+moving whenever the wheels report, both modes that take velocity.
 
 ## The robot's tree
 
 The node holds the robot's tree (control_core's `RobotTree`, `cache_window_s`
 long): the messages of the publishers bound to its `other_transforms` link,
 the robot's initializer with the model's fixed joints, and the transforms it
-publishes itself, odom to base_footprint and its wheel joints, each taken
-into the tree as it publishes them (`follow.rs` follows the others, and
-`control.rs` takes its own). Each goal and each
-setpoint is placed by the tree, waiting up to `lookup_timeout_s` on the
-node's clock for it (control_core's `Placer`): a move_base target in odom and in the
-robot frame, where its frame stands at the latest time or, at a timestamp,
-where it stood then, through the root of its frame's chain; a drive_base
-velocity and each drive_link setpoint in the robot frame, by the place of
-their frame there at their own time, so a velocity in the robot frame stands
-in it at any time.
+publishes itself, odom to base_footprint and its wheel joints, each taken into
+the tree as it publishes them (`follow.rs` follows the others, and
+`control.rs` takes its own). Each goal and each setpoint is placed by the
+tree, waiting up to `lookup_timeout_s` on the node's clock for it
+(control_core's `Placer`): a move_base target in odom and in the robot frame,
+where its frame stands at the latest time or, at a timestamp, where it stood
+then, through the root of its frame's chain; a drive_base velocity and each
+drive_link setpoint in the robot frame, by the place of their frame there at
+their own time, so a velocity in the robot frame stands in it at any time.
 
 ```text
    drive (drive_link, follower, one leader)               base_motion: drive_base, move_base
@@ -141,42 +140,42 @@ such a setpoint as no setpoint (`streams.rs`).
 ## The robot stop
 
 robot_stop's `stop` is the robot stop. It cancels the goal in flight with the
-reason `stopped: <reason>` (`stopped` for an empty reason), holds the base against the leader, and brings the
-base to rest. The robot stop answers `["base"]` when it changed how a goal
-ends or the leader streamed, and an empty list otherwise; a goal that a cancel
-ended before keeps that cancel's reason. A goal admitted but not yet in the
-loop when the robot stop arrives ends cancelled for it as it arrives. A robot
-stop that the loop does not take and answer within `stop_answer_timeout_s`, or
-that finds the loop gone, gives an error reply with `attempt_failed`.
+reason `stopped: <reason>` (`stopped` for an empty reason), holds the base
+against the leader, and brings the base to rest. The robot stop answers
+`["base"]` when it changed how a goal ends or the leader streamed, and an
+empty list otherwise; a goal that a cancel ended before keeps that cancel's
+reason. A goal admitted but not yet in the loop when the robot stop arrives
+ends cancelled for it as it arrives. A robot stop that the loop does not take
+and answer within `stop_answer_timeout_s`, or that finds the loop gone, gives
+an error reply with `attempt_failed`.
 
 ## The odometry and the reports
 
 The odometry is control_core's `Odometry` over the measured wheel angles,
-integrated over the time between the wheels' own stamps, a silence included:
-a measurement after a silence takes in the motion the wheels measured across
-it. The odometry runs in epochs. The first measurement starts one, and so does
-a measurement of another wheel follower than the epoch's, one stamped before
-the epoch's last, or one with a wheel farther from its last angle than a wheel
+integrated over the time between the wheels' own stamps, a silence included: a
+measurement after a silence takes in the motion the wheels measured across it.
+The odometry runs in epochs. The first measurement starts one, and so does a
+measurement of another wheel follower than the epoch's, one stamped before the
+epoch's last, or one with a wheel farther from its last angle than a wheel
 turns in the time between them at the fastest wheel rate the base's limits
 allow, with the anchor bound and one limiter step of travel of lag on top
-(`BaseConfig::wheel_reach_rad`):
-the odometry starts at the origin,
+(`BaseConfig::wheel_reach_rad`): the odometry starts at the origin,
 `odometry_start_timestamp` takes the wall clock's time then, raised 1 ns past
 the last epoch's when the wall clock reads no later, so each epoch's value is
 new, and a goal in flight fails with `resource_unavailable`, its message `the
-base's odometry started over`. A measurement stamped less than a microsecond after the last one is
-dropped.
+base's odometry started over`. A measurement stamped less than a microsecond
+after the last one is dropped.
 
 `base_states`, and `drive_states` to the leader with its `follow_state`,
 report each measurement as an odometry record, stamped with it: the pose of
 base_footprint in odom and its twist in base_footprint, once the node's clock
-reads its stamp; a measurement a newer one replaces before
-then is not reported. A report's `mode` is `standing` while the
-base rests by the rule below as of the report, and `moving` otherwise; its
-`parts_within_footprint` is true, since the base carries no limb. While the wheels report and no newer measurement waits
-for the clock, a step that would leave 0.1 s without a report publishes the
-newest again, its stamp included. While they are silent, the node publishes
-neither.
+reads its stamp; a measurement a newer one replaces before then is not
+reported. A report's `mode` is `standing` while the base rests by the rule
+below as of the report, and `moving` otherwise; its `parts_within_footprint`
+is true, since the base carries no limb. While the wheels report and no newer
+measurement waits for the clock, a step that would leave 0.1 s without a
+report publishes the newest again, its stamp included. While they are silent,
+the node publishes neither.
 
 The base rests while the wheels report and each axis of every `base_states`
 whose stamp lies within 0.2 s of the newest lies within its rest bound,
@@ -216,11 +215,11 @@ comes from this node, whose mode is one of the two while the wheels report.
 `drive_base` takes a velocity whose linear_velocity, placed in the robot
 frame, lies within the x range, 0 along y, and whose angular_velocity's z lies
 within the `angular` range, a hold_duration_s above 0 and at most 60 s, and a
-settle timeout from 0 to 60 s. The base ramps to the velocity,
-holds it for the hold duration from the step at which the command reached it,
-and comes to rest. The drive completes once the base rests, and
-fails with `timeout` when it does not by the settle timeout after the command
-reached 0, its message giving the base's velocity then.
+settle timeout from 0 to 60 s. The base ramps to the velocity, holds it for
+the hold duration from the step at which the command reached it, and comes to
+rest. The drive completes once the base rests, and fails with `timeout` when
+it does not by the settle timeout after the command reached 0, its message
+giving the base's velocity then.
 
 `move_base` takes a target, which it places in odom at acceptance and steers
 to there, settle tolerances above 0, and a duration and a settle timeout from
@@ -230,13 +229,13 @@ to the target's heading, each turn the shorter way, as the fastest moves
 describe_base's limits allow at the speed of the way each leg goes, and scales
 each leg's speed to take the requested duration. The node takes a base that
 drives ahead and turns both ways: x's max_velocity above 0, and angular's
-min_rate below 0 and max_rate above 0. A move whose plan takes longer
-than 60 s, as the fastest move to a far target does on a slow base, is
-refused, the refusal giving its time. Each step steers on the odometry: a turn
-as Nav2's Spin turns, a drive as Nav2's DriveOnHeading drives, each braking at
-the speed from which the limiter's steps stop the base on the end of its leg.
-The drive turns toward the target again once the target's bearing leaves the
-orientation tolerance, or the node's `rotate_to_heading_min_angle_rad`, as Nav2's
+min_rate below 0 and max_rate above 0. A move whose plan takes longer than 60
+s, as the fastest move to a far target does on a slow base, is refused, the
+refusal giving its time. Each step steers on the odometry: a turn as Nav2's
+Spin turns, a drive as Nav2's DriveOnHeading drives, each braking at the speed
+from which the limiter's steps stop the base on the end of its leg. The drive
+turns toward the target again once the target's bearing leaves the orientation
+tolerance, or the node's `rotate_to_heading_min_angle_rad`, as Nav2's
 regulated pure pursuit's rotate_to_heading_min_angle, when the tolerance is
 wider. A turn ends once what remains of it falls below one limiter step at the
 angular deadband. A drive past its target backs up to it on a base that drives
@@ -249,13 +248,15 @@ the target.
 
 Each result gives `final_pose`, the robot frame's pose in odom at the time of
 the newest wheel measurement when the goal ended. A goal that a robot stop or
-its caller's cancel ends comes to rest and ends cancelled with its result, the reason the robot stop's or the cancel's. When
-the base has not come to rest by the goal's settle timeout after the first
-step that found the robot stop or the cancel, as on a slope or with a measurement noisier than the rest
-velocity, the goal ends cancelled then, where the base stands. A robot stop and a
-cancel each turn a goal that runs, or a drive that completed and still comes
-to rest, into a cancelled one, and leave a goal already cancelled as it was. The goal's move slot is freed before the outcome
-goes out, so a client that sends its next goal on the result is admitted.
+its caller's cancel ends comes to rest and ends cancelled with its result, the
+reason the robot stop's or the cancel's. When the base has not come to rest by
+the goal's settle timeout after the first step that found the robot stop or
+the cancel, as on a slope or with a measurement noisier than the rest
+velocity, the goal ends cancelled then, where the base stands. A robot stop
+and a cancel each turn a goal that runs, or a drive that completed and still
+comes to rest, into a cancelled one, and leave a goal already cancelled as it
+was. The goal's move slot is freed before the outcome goes out, so a client
+that sends its next goal on the result is admitted.
 
 `describe_base` answers the base's name, `base`, the name of its wheels'
 pairing slot, its odometry source, `measured`, its linear_limits along x and

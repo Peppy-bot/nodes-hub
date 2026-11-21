@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use control_core::planar_pose::PlanarPose;
-use frame_tree::arithmetic::quaternion_of_yaw;
 use frame_tree::{FrameName, FrameTransform, MessageError, MovingMessage};
 use peppygen::NodeRunner;
 use peppygen::emitted_topics::transforms::transforms;
@@ -39,7 +38,7 @@ pub fn robot_frame() -> FrameName {
 #[derive(Debug, thiserror::Error)]
 pub enum TransformsError {
     #[error(transparent)]
-    Wheel(#[from] LinkTransformError),
+    Transform(#[from] LinkTransformError),
     #[error(transparent)]
     Message(#[from] MessageError),
 }
@@ -50,25 +49,30 @@ pub enum TransformsError {
 pub struct JointTransforms {
     description: RobotDescription,
     joints: [String; 2],
+    /// When the node started, on the wall clock: the start of every
+    /// transform of the wheel joints.
+    start: SystemTime,
 }
 
 impl JointTransforms {
-    pub fn new(description: RobotDescription, joints: [String; 2]) -> Self {
+    /// The wheel joints `joints`, [left, right], of the model `description`
+    /// describes, every transform of them started at `start`.
+    pub fn new(description: RobotDescription, joints: [String; 2], start: SystemTime) -> Self {
         Self {
             description,
             joints,
+            start,
         }
     }
 
     /// The message of the wheel joints' transforms at `angles` (rad), [left,
-    /// right], measured at `timestamp` and started at `start`: each wheel's
-    /// link at its joint's origin, turned about its axle by its angle, in the
-    /// URDF's order of joints.
+    /// right], measured at `timestamp`: each wheel's link at its joint's
+    /// origin, turned about its axle by its angle, in the URDF's order of
+    /// joints.
     pub fn message_at(
         &self,
         timestamp: SystemTime,
         angles: [f64; 2],
-        start: SystemTime,
     ) -> Result<MovingMessage, TransformsError> {
         let positions: HashMap<&str, f64> =
             self.joints.iter().map(String::as_str).zip(angles).collect();
@@ -81,26 +85,30 @@ impl JointTransforms {
         Ok(MovingMessage::from_transforms(
             timestamp,
             &transforms,
-            start,
+            self.start,
         )?)
     }
 }
 
+/// `pose` in space, as the messages of the base carry a pose: its position
+/// on the floor at height 0 and its heading's unit quaternion, [x, y, z, w]
+/// ([`PlanarPose::to_transform`]).
+pub fn position_and_orientation(pose: PlanarPose) -> ([f64; 3], [f64; 4]) {
+    let transform = pose.to_transform();
+    (transform.origin(), transform.orientation())
+}
+
 /// The message of the transform odom to base_footprint at `pose`, measured at
 /// `timestamp` and started at `odometry_start`: the pose on the floor, its
-/// heading a turn about +z as tf2's `setRPY(0, 0, yaw)` makes it.
+/// heading a turn about +z ([`position_and_orientation`]).
 pub fn odometry_message(
     timestamp: SystemTime,
     pose: PlanarPose,
     odometry_start: SystemTime,
 ) -> Result<MovingMessage, TransformsError> {
-    let transform = FrameTransform::parse(
-        ODOMETRY_FRAME,
-        ROBOT_FRAME,
-        [pose.x(), pose.y(), 0.0],
-        quaternion_of_yaw(pose.yaw()),
-    )
-    .expect("a planar pose is finite, its quaternion a unit one");
+    let (position, orientation) = position_and_orientation(pose);
+    let transform = FrameTransform::parse(ODOMETRY_FRAME, ROBOT_FRAME, position, orientation)
+        .expect("a planar pose is finite, its quaternion a unit one");
     Ok(MovingMessage::from_transforms(
         timestamp,
         &[transform],
@@ -153,6 +161,7 @@ mod tests {
                 "left_wheel_joint".to_owned(),
                 "right_wheel_joint".to_owned(),
             ],
+            started(),
         )
     }
 
@@ -191,7 +200,7 @@ mod tests {
     #[test]
     fn the_wheel_angles_turn_each_wheel_link_about_its_axle() {
         let message = botshare_wheels()
-            .message_at(MEASURED, [std::f64::consts::PI, 0.0], started())
+            .message_at(MEASURED, [std::f64::consts::PI, 0.0])
             .expect("a message");
         let [left, right] = message.transforms.as_slice() else {
             panic!("two transforms: {:?}", message.transforms);

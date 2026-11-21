@@ -8,7 +8,7 @@
 //! answers.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use control_core::asking;
 use peppygen::NodeRunner;
@@ -30,12 +30,13 @@ struct Answer {
 }
 
 /// The base of the bundled model the robot's initializer names, configured by
-/// `parameters`, or `None` once the node is cancelled before the initializer answers:
-/// refused when the model's URDF gives no differential base, or when the initializer
-/// serves another description of the model.
+/// `parameters` for a node started at `started` on the wall clock, or `None` once the
+/// node is cancelled before the initializer answers: refused when the model's URDF gives
+/// no differential base, or when the initializer serves another description of the model.
 pub async fn identify(
     runner: &Arc<NodeRunner>,
     parameters: &BaseParameters,
+    started: SystemTime,
 ) -> Option<Result<BaseConfig, NodeError>> {
     let asker = runner.clone();
     let answer = asking::ask(
@@ -44,7 +45,7 @@ pub async fn identify(
         async move || ask(&asker).await,
     )
     .await?;
-    Some(driven_by(answer, parameters))
+    Some(driven_by(answer, parameters, started))
 }
 
 /// One ask of the robot's model and of the digest of its description.
@@ -65,9 +66,13 @@ async fn ask(runner: &NodeRunner) -> peppygen::Result<Answer> {
 }
 
 /// The base of the bundled model `answer` names, held to the description `answer`
-/// describes.
-fn driven_by(answer: Answer, parameters: &BaseParameters) -> Result<BaseConfig, NodeError> {
-    let config = parameters.configure(&answer.model)?;
+/// describes, for a node started at `started`.
+fn driven_by(
+    answer: Answer,
+    parameters: &BaseParameters,
+    started: SystemTime,
+) -> Result<BaseConfig, NodeError> {
+    let config = parameters.configure(&answer.model, started)?;
     config.model.hold_digest(&answer.digest)?;
     Ok(config)
 }
@@ -80,6 +85,12 @@ mod tests {
 
     fn parameters() -> BaseParameters {
         BaseParameters::parse(&params()).expect("the rig's parameters")
+    }
+
+    /// The base of the bundled model `answer` names, for a node started at
+    /// the epoch.
+    fn base_of(answer: Answer) -> Result<BaseConfig, NodeError> {
+        driven_by(answer, &parameters(), SystemTime::UNIX_EPOCH)
     }
 
     /// The answer of the initializer of `model`, built with this node's libraries.
@@ -95,14 +106,14 @@ mod tests {
 
     #[test]
     fn the_botshare_base_the_initializer_names_drives_the_node() {
-        let config = driven_by(answer_of("botshare_base"), &parameters()).expect("the base");
+        let config = base_of(answer_of("botshare_base")).expect("the base");
         assert_eq!(config.model.id(), "botshare_base");
     }
 
     // A model whose URDF gives no differential base is refused naming why.
     #[test]
     fn a_model_of_no_base_is_refused() {
-        let refused = driven_by(answer_of("so101"), &parameters()).expect_err("an SO-101 arm");
+        let refused = base_of(answer_of("so101")).expect_err("an SO-101 arm");
         assert_eq!(
             refused.to_string(),
             "the model the robot's initializer serves"
@@ -125,7 +136,7 @@ mod tests {
             model: "botshare_base".to_owned(),
             digest: other.clone(),
         };
-        let refused = driven_by(answer, &parameters()).expect_err("another description");
+        let refused = base_of(answer).expect_err("another description");
         let built = robot_description::model("botshare_base")
             .expect("the bundled base")
             .digest();

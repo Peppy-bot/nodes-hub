@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use control_core::move_slot::MoveSlot;
 use control_core::robot_tree::{Placer, Unplaced};
+use control_core::sync::lock_ignoring_poison;
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 use peppygen::{NodeRunner, Result};
 use tokio::sync::mpsc;
@@ -108,7 +109,7 @@ macro_rules! goal_runner {
                         Ok(
                             match admit(parse(&request.data, &config, &placer), &status, &slot) {
                                 Ok(goal) => {
-                                    *admitted.lock().expect("one decider at a time") = Some(goal);
+                                    *lock_ignoring_poison(&admitted) = Some(goal);
                                     $action::GoalDecision::accept()
                                 }
                                 Err(refusal) => {
@@ -121,10 +122,9 @@ macro_rules! goal_runner {
                     })
                     .await?;
                 let Some(ctx) = accepted else { return Ok(()) };
-                let (request, claim) = admitted
-                    .into_inner()
-                    .expect("one decider at a time")
-                    .expect("an accepted goal was admitted");
+                let (request, claim) = lock_ignoring_poison(&admitted)
+                    .take()
+                    .expect("the decider keeps the goal it accepts");
                 let goal = AcceptedGoal::$variant {
                     request,
                     ctx: Box::new(ctx),

@@ -9,14 +9,13 @@
 //! URDF in robot_description gives the base's wheels and outline.
 //!
 //! One velocity path carries every motion: the leader's setpoint that the
-//! base follows,
-//! or the setpoint a goal plans each step, passes control_core's limiter,
-//! stepped once per `1 / smoothing_frequency_hz` on the node's clock, and the
-//! limited body velocity is mixed into the two wheel rates. Each step the
-//! limiter gives a velocity streams one wheel setpoint by control_core's
-//! `WheelSetpoint::next`, its anchor bound one step of travel at the fastest
-//! wheel rate the base's limits allow. The measured wheel angles feed
-//! control_core's wheel odometry.
+//! base follows, or the setpoint a goal plans each step, passes
+//! control_core's limiter, stepped once per `1 / smoothing_frequency_hz` on
+//! the node's clock, and the limited body velocity is mixed into the two
+//! wheel rates. Each step the limiter gives a velocity streams one wheel
+//! setpoint by control_core's `WheelSetpoint::next`, its anchor bound one step
+//! of travel at the fastest wheel rate the base's limits allow. The measured
+//! wheel angles feed control_core's wheel odometry.
 //!
 //! The library crate exists so the harness tests boot the node in-process:
 //! [`setup`] is the node's whole entry point, and `src/main.rs` only hands it

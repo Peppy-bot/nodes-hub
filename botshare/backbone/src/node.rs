@@ -124,7 +124,7 @@ async fn run_once_identified(
     started: SystemTime,
 ) {
     let token = runner.cancellation_token().clone();
-    let Some(identified) = identity::identify(&runner, &parameters).await else {
+    let Some(identified) = identity::identify(&runner, &parameters, started).await else {
         return;
     };
     let config = match identified {
@@ -149,7 +149,7 @@ async fn run_once_identified(
     if !startup::wait_until_ready(&runner).await {
         return;
     }
-    run(runner, config, placer, publishers, started).await;
+    run(runner, config, placer, publishers).await;
 }
 
 /// The control loop, the stream listeners, the action handlers and the robot stop of the
@@ -160,7 +160,6 @@ async fn run(
     config: Arc<BaseConfig>,
     placer: Arc<Placer>,
     publishers: Publishers,
-    started: SystemTime,
 ) {
     let token = runner.cancellation_token().clone();
     let status = BaseStatus::default();
@@ -168,13 +167,7 @@ async fn run(
     // One event waits for the control loop at a time: each source waits for
     // the loop to take its last event before it hands it the next.
     let (events_tx, events_rx) = mpsc::channel(1);
-    let base = Base::new(
-        config.clone(),
-        status.clone(),
-        slot.clone(),
-        publishers,
-        started,
-    );
+    let base = Base::new(config.clone(), status.clone(), slot.clone(), publishers);
 
     let mut set = JoinSet::new();
     {
@@ -223,7 +216,10 @@ async fn run(
         match joined {
             Ok(Ok(())) => error!("base task exited; shutting node down"),
             Ok(Err(e)) => error!(error = %e, "base task failed; shutting node down"),
-            Err(e) => error!(error = %e, "base task ended abnormally; shutting node down"),
+            Err(e) if e.is_panic() => {
+                error!(error = %e, "base task panicked; shutting node down")
+            }
+            Err(e) => error!(error = %e, "base task join failed; shutting node down"),
         }
     }
     token.cancel();

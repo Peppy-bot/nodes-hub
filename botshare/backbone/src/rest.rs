@@ -2,19 +2,17 @@
 //! and each axis of the velocity of every base_states whose timestamp lies
 //! within [`REST_WINDOW_NS`] of the newest lies within that axis's rest bound
 //! of describe_base, rest_velocity along x and y and rest_rate for yaw, the
-//! bound included. The window holds the base_states of
-//! one odometry epoch, in the order of their timestamps; the control loop
-//! judges the silence.
+//! bound included. The window holds the base_states of one odometry epoch, in
+//! the order of their timestamps; the control loop judges the silence.
 
 use std::collections::VecDeque;
 
 /// How far back from the newest base_states the rest looks (ns): base_state's
 /// 0.2 s.
-pub const REST_WINDOW_NS: i64 = 200_000_000;
+const REST_WINDOW_NS: i64 = 200_000_000;
 
 /// The velocities along x, y and yaw (m/s, m/s, rad/s) of the base_states
-/// within
-/// [`REST_WINDOW_NS`] of the newest, by timestamp (ns).
+/// within [`REST_WINDOW_NS`] of the newest, by timestamp (ns).
 #[derive(Debug, Default)]
 pub struct RestWindow {
     velocities: VecDeque<(i64, [f64; 3])>,

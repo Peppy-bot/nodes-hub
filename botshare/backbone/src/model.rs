@@ -15,7 +15,7 @@ use control_core::footprint::{Footprint, FootprintError};
 use control_core::odometry::{WheelGeometry, WheelGeometryError};
 use robot_description::{Model, NoDifferentialBase, NoOutline, RobotDescription};
 
-use crate::transforms::{JointTransforms, ROBOT_FRAME};
+use crate::transforms::ROBOT_FRAME;
 
 /// What a model's description gives the base.
 #[derive(Debug)]
@@ -24,7 +24,9 @@ pub struct BaseModel {
     /// The outline's corners, counterclockwise from the front right one.
     pub footprint: Footprint,
     /// The wheel joints, [left, right], whose transforms the node publishes.
-    pub joint_transforms: JointTransforms,
+    pub wheel_joints: [String; 2],
+    /// The description, which places the wheel joints' links.
+    pub description: RobotDescription,
 }
 
 /// The base of a bundled model, with the model it is built from.
@@ -92,10 +94,8 @@ impl BaseModel {
                 base.right.radius_m,
             )?,
             footprint: Footprint::parse(&outline.corners()).map_err(BaseError::Footprint)?,
-            joint_transforms: JointTransforms::new(
-                description,
-                [base.left.joint, base.right.joint],
-            ),
+            wheel_joints: [base.left.joint, base.right.joint],
+            description,
         })
     }
 }
