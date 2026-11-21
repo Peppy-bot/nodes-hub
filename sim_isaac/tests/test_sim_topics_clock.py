@@ -202,7 +202,10 @@ def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight
     publisher = _GatedPublisher()
     io._object_states_pub = publisher
 
-    robot = object_state.RobotRecord.fixed("alpha", "openarm_v2", (0.0, -1.5, 0.0), (0.0, 0.0, 0.0, 1.0))
+    robot = object_state.RobotRecord(
+        robot="alpha", model="openarm_v2", position=(0.0, -1.5, 0.0), orientation=(0.0, 0.0, 0.0, 1.0),
+        linear_velocity=object_state.AT_REST, angular_velocity=object_state.AT_REST,
+    )
 
     def snapshot(timestamp_s, *object_ids, robots=()):
         return object_state.ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(

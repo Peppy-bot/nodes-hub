@@ -1,0 +1,28 @@
+// What this engine alone knows about the botshare base. Its base, its wheels
+// and its camera come from the robot's description, through sim_robot_core's
+// entry of the same name.
+{
+  // The robot's USD, under PEPPY_ROBOT_ASSETS_DIR, which
+  // scripts/build_botshare_base.py writes from the description. The engine
+  // references it under a prim of the robot's own name, so the stage's
+  // default prim is the robot's prim.
+  stage: "botshare_base/botshare_base.usd",
+
+  // The stage's default prim carries the articulation root, with no joint to
+  // the world: the base rolls on its wheels. Every link is a prim named after
+  // its URDF link under it, which is where the camera hanging from
+  // base_camera_link is defined.
+  articulation_root: ".",
+
+  // Each wheel runs as its driver, the ZLAC8015D, runs it in profile
+  // velocity mode: a loop on its rate of proportional gain kp (N*m*s/rad)
+  // and integral gain ki (N*m/rad), capped together at the hub motor's peak
+  // torque, max_torque (N*m, the ZLLG80ASM250-L-B2 V1.01 drawing). The gains
+  // are the ones Waldo measured on this base as its node drives it
+  // (tools/botshare_base/mjcf.py of private-nodes-hub).
+  wheel_rate_loop: {
+    kp: 128.0,
+    ki: 128.0,
+    max_torque: 16.0,
+  },
+}

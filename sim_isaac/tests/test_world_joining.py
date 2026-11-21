@@ -58,7 +58,7 @@ def _model_starting_in(posture: dict, joints=("slide", "hinge")):
     """A model whose one arm moves `joints` and starts in `posture`."""
     rig = entry("rig", arms={"arm": list(joints)}, start_posture=posture)
     return isaac_models.stood(
-        "rig", rig, isaac_models.parse("rig", {"stage": "rig/rig.usd", "articulation_root": "."}), {}, {}
+        "rig", rig, isaac_models.parse("rig", {"stage": "rig/rig.usd", "articulation_root": "."}), {}, {}, "base_link"
     )
 
 
@@ -200,7 +200,7 @@ def _rig_of_followers(*pairs):
         start_posture={joint: 0.0 for joint in joints},
     )
     raw = {"stage": "rig/rig.usd", "articulation_root": "."}
-    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {})
+    return isaac_models.stood("rig", rig, isaac_models.parse("rig", raw), {}, {}, "base_link")
 
 
 class TestFollowers:
@@ -394,4 +394,70 @@ class TestStageHeldToTheDescription:
         stage.RemovePrim("/World/charlo/joints/wrist_roll")
 
         with pytest.raises(RuntimeError, match=r"'wrist_roll' is no revolute or prismatic joint of it"):
+            world.World._hold_to_description(root, model_known)
+
+
+_WHEELS = {"left_wheel_joint": "left_wheel_link", "right_wheel_joint": "right_wheel_link"}
+
+
+def _rolling_stage():
+    """A botshare base as its entry expects it on the stage: its robot frame,
+    base_footprint, a rigid body no joint moves, and each wheel a rigid body
+    on a revolute joint without limits, kept under a scope."""
+    stage = Usd.Stage.CreateInMemory()
+    root = stage.DefinePrim("/World/delta", "Xform")
+    for link in ("base_footprint", *_WHEELS.values()):
+        UsdPhysics.RigidBodyAPI.Apply(UsdGeom.Xform.Define(stage, f"/World/delta/{link}").GetPrim())
+    for joint, wheel in _WHEELS.items():
+        revolute = UsdPhysics.RevoluteJoint.Define(stage, f"/World/delta/joints/{joint}")
+        revolute.CreateBody0Rel().SetTargets(["/World/delta/base_footprint"])
+        revolute.CreateBody1Rel().SetTargets([f"/World/delta/{wheel}"])
+    return stage, root, known("botshare_base")
+
+
+class TestARollingStage:
+    def test_a_base_standing_free_on_wheels_that_turn_without_end_is_held(self):
+        world = world_module()
+        _, root, model_known = _rolling_stage()
+
+        world.World._hold_to_description(root, model_known)
+
+    def test_a_wheel_with_limits_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        wheel = UsdPhysics.RevoluteJoint(stage.GetPrimAtPath("/World/delta/joints/left_wheel_joint"))
+        wheel.CreateLowerLimitAttr(-180.0)
+        wheel.CreateUpperLimitAttr(180.0)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"'left_wheel_joint' moves over \[-3\.14159, 3\.14159\] where the description gives \[-inf, inf\]",
+        ):
+            world.World._hold_to_description(root, model_known)
+
+    def test_a_base_held_to_the_world_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/delta/root_joint")
+        fixed.CreateBody1Rel().SetTargets(["/World/delta/base_footprint"])
+
+        with pytest.raises(RuntimeError, match=r"'root_joint' holds it to the world, and a robot that rolls stands free"):
+            world.World._hold_to_description(root, model_known)
+
+    def test_a_robot_frame_that_is_no_rigid_body_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        stage.GetPrimAtPath("/World/delta/base_footprint").RemoveAPI(UsdPhysics.RigidBodyAPI)
+
+        with pytest.raises(RuntimeError, match=r"its robot frame 'base_footprint' is no rigid body of it"):
+            world.World._hold_to_description(root, model_known)
+
+    def test_a_robot_frame_hung_from_another_body_is_refused(self):
+        world = world_module()
+        stage, root, model_known = _rolling_stage()
+        hung = UsdPhysics.FixedJoint.Define(stage, "/World/delta/joints/hang")
+        hung.CreateBody0Rel().SetTargets(["/World/delta/left_wheel_link"])
+        hung.CreateBody1Rel().SetTargets(["/World/delta/base_footprint"])
+
+        with pytest.raises(RuntimeError, match=r"'hang' hangs its robot frame 'base_footprint' from another body"):
             world.World._hold_to_description(root, model_known)

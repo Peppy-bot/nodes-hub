@@ -8,7 +8,7 @@
     tag: "v1",
     description: [
       "The Isaac Sim simulation: it stands any number of robots, of any model it has an entry for, on one stage, and streams its view over WebRTC. It needs an NVIDIA GPU with the proprietary driver on its machine.",
-      "A robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine references that model's stage and drives it for as long as the robot stays. The engine plays the follower role of every one of the robot's limb pairings: the robot's backbone leads each pair and the simulation's measured state streams back on it. Whether a robot stands with a pair for every limb of its model is its readiness, answered on the same contract.",
+      "A robot joins by attaching over the simulation_robot contract, naming the copy it runs as, the model it is and where it stands; the engine references that model's stage and drives it for as long as the robot stays. The engine plays the follower role of every one of the robot's limb pairings and of its base's: the robot's backbone or base node leads each pair and the simulation's measured state streams back on it. Whether a robot stands with a pair for every limb and the base of its model is its readiness, answered on the same contract.",
       "The node also implements scene_manipulation, the runtime scene and object services and actions that tools such as scene_commander consume, and object_state, which reports what those tools spawned, streamed and on demand. These interfaces use stable asset_id and object_id identifiers rather than Isaac USD paths.",
     ],
 
@@ -40,6 +40,12 @@
         // limbs and cameras of its model does not stay.
         { name: "joint_link", tag: "v1", role: "follower", link_id: "arms", cardinality: "zero_or_more" },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "grippers", cardinality: "zero_or_more" },
+        // A rolling robot's base: each wheel runs at the velocity its base
+        // node streams for it, as the base's driver runs it in profile
+        // velocity mode, and its measured angle and rate stream back on the
+        // same pair. A pair's base is the link it comes from on the robot's
+        // side, `base`, the one name a robot answers to for its base.
+        { name: "joint_link", tag: "v1", role: "follower", link_id: "bases", cardinality: "zero_or_more" },
         // Robot-mounted cameras rendered from the live scene, one slot per
         // kind of camera: the engine plays the camera role and a per-camera
         // relay presents the rgb/rgbd contract. A pair's camera is its
@@ -106,6 +112,7 @@
       emits: [
         { link_id: "arms", name: "joint_states" },
         { link_id: "grippers", name: "gripper_states" },
+        { link_id: "bases", name: "joint_states" },
         { link_id: "rgb_cameras", name: "video_stream" },
         { link_id: "rgb_cameras", name: "stream_info" },
         { link_id: "rgb_cameras", name: "geometry" },
@@ -119,6 +126,7 @@
       consumes: [
         { link_id: "arms", name: "joint_setpoints" },
         { link_id: "grippers", name: "gripper_setpoints" },
+        { link_id: "bases", name: "joint_setpoints" },
       ],
     },
   },

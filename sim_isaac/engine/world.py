@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """The stage the engine simulates, and the robots standing in it.
 
-The stage opens empty and each robot is referenced under /World as a prim of
-its own name, so two robots of the same model keep separate articulations,
-and taking one out is removing that prim. What is referenced, and what is
-authored on it as the robot joins, is its model's own entry.
+The stage opens empty but for its floor, and each robot is referenced under
+/World as a prim of its own name, so two robots of the same model keep
+separate articulations, and taking one out is removing that prim. What is
+referenced, and what is authored on it as the robot joins, is its model's
+own entry. A robot that rolls stands free on the floor, and its record
+follows where its wheels carry it.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuat
 
 import head_camera
 from isaac_models import IsaacModel
+from object_state import AT_REST
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,10 @@ _MAX_RINGS = 64
 # What stands between a robot's name and the stage path it is a prim of:
 # `/World/alpha` is alpha's.
 PRIM_SEPARATOR = "/"
+
+# The floor every robot stands on: a plane collider at z 0 of world, which
+# a robot that rolls rests its wheels on.
+GROUND_PRIM = f"{WORLD_PRIM}/ground"
 
 # How brightly an empty stage is lit, in the units UsdLux reads: enough to
 # read a robot's shape without washing out its materials.
@@ -129,6 +136,38 @@ def _stage_limits(prim) -> tuple[float, float]:
     return float(joint.GetLowerLimitAttr().Get()), float(joint.GetUpperLimitAttr().Get())
 
 
+def _same_limit(stage: float, described: float) -> bool:
+    """Whether a stage's joint limit is the description's, within
+    LIMIT_TOLERANCE: the same infinity on a joint that turns without end."""
+    return stage == described or abs(stage - described) <= LIMIT_TOLERANCE
+
+
+def _rolling_differences(root, known: IsaacModel) -> list[str]:
+    """How the stage of a robot that rolls is not one: its robot frame, the
+    description's root link, is the rigid body no joint moves, which the
+    articulation is rooted at and the robot is read at, and no joint holds it
+    to the world."""
+    from pxr import Usd, UsdPhysics  # pylint: disable=C0415
+
+    joints = [UsdPhysics.Joint(prim) for prim in Usd.PrimRange(root) if prim.IsA(UsdPhysics.Joint)]
+    frame = known.prim_of(known.root_link)
+    differences = [
+        f"'{joint.GetPrim().GetName()}' holds it to the world, and a robot that rolls stands free"
+        for joint in joints
+        if not joint.GetBody0Rel().GetTargets()
+    ]
+    body = next((prim for prim in Usd.PrimRange(root) if prim.GetName() == frame), None)
+    if body is None or not body.HasAPI(UsdPhysics.RigidBodyAPI):
+        differences.append(f"its robot frame '{known.root_link}' is no rigid body of it")
+    differences.extend(
+        f"'{joint.GetPrim().GetName()}' hangs its robot frame '{known.root_link}' from another body, "
+        "and the robot is read at the root of its articulation"
+        for joint in joints
+        if any(target.name == frame for target in joint.GetBody1Rel().GetTargets())
+    )
+    return differences
+
+
 def name_in_the_stage(instance: str) -> str:
     """The name a robot stands under. Every robot is a prim of the stage
     under this name, so a name carrying the separator nests one robot inside
@@ -156,12 +195,15 @@ def within_one_spot(one: Pose, other: Pose) -> bool:
 @dataclass(frozen=True)
 class Robot:
     """One robot in the stage: the name it stands under, the model it is,
-    and where: the pose of its base in world, whose orientation turns about
-    +z alone."""
+    where: the pose of its base in world, whose orientation turns about +z
+    alone, and how fast its robot frame moves in world at its origin, at rest
+    for a robot fixed to the world."""
 
     instance: str
     known: IsaacModel
     placement: Pose
+    linear_velocity: tuple[float, float, float] = AT_REST
+    angular_velocity: tuple[float, float, float] = AT_REST
 
     @property
     def model(self) -> str:
@@ -187,6 +229,9 @@ class World:
         # or None when no model of this engine draws it.
         self._head_camera_pack = head_camera_pack
         self._robots: dict[str, Robot] = {}
+        # The robots that roll and were moved since the thread that steps the
+        # scene last set them down at rest.
+        self._set_down: set[str] = set()
         # Robots are stood and taken out on the thread that steps the scene,
         # and listed on the one serving the contracts, so the two of them do
         # not read this while the other is changing it. Reentrant, because
@@ -270,11 +315,25 @@ class World:
         UsdGeom.SetStageMetersPerUnit(stage, 1.0)
         UsdGeom.Xform.Define(stage, WORLD_PRIM)
         World._physics_scene(stage)
+        World._floor(stage)
         # An empty stage carries no light of its own, and renders black
         # however many robots join it.
         if not any(prim.IsA(UsdLux.DomeLight) for prim in stage.Traverse()):
             dome = UsdLux.DomeLight.Define(stage, f"{WORLD_PRIM}/dome_light")
             dome.CreateIntensityAttr(DOME_LIGHT_INTENSITY)
+
+    @staticmethod
+    def _floor(stage):
+        """The floor of the stage: a plane collider at z 0 of world, facing
+        +z, which a robot that rolls rests its wheels on. Hydra draws no
+        plane, and it stands as a guide."""
+        from pxr import UsdGeom, UsdPhysics  # pylint: disable=C0415
+
+        ground = UsdGeom.Plane.Define(stage, GROUND_PRIM)
+        ground.CreateAxisAttr(UsdGeom.Tokens.z)
+        ground.CreatePurposeAttr(UsdGeom.Tokens.guide)
+        UsdPhysics.CollisionAPI.Apply(ground.GetPrim())
+        return ground.GetPrim()
 
     @staticmethod
     def _physics_scene(stage):
@@ -349,6 +408,8 @@ class World:
 
         with self._lock:
             self._robots[moved.instance] = moved
+            if moved.known.rolls:
+                self._set_down.add(moved.instance)
         logger.info(
             "robot '%s' moves to %s turned to %s",
             name,
@@ -357,10 +418,55 @@ class World:
         )
         return moved
 
+    def roll(
+        self,
+        instance: str,
+        placement: Pose,
+        linear_velocity: tuple[float, float, float],
+        angular_velocity: tuple[float, float, float],
+    ) -> None:
+        """Records where the wheels of a robot that rolls carried it, and how
+        fast it moves there: what the scene reports of it, and where the next
+        robot is given room from. A robot that left is not recorded again."""
+        with self._lock:
+            robot = self._robots.get(instance)
+            if robot is None:
+                return
+            self._robots[instance] = Robot(
+                instance=instance,
+                known=robot.known,
+                placement=placement,
+                linear_velocity=linear_velocity,
+                angular_velocity=angular_velocity,
+            )
+
+    def take_set_down(self) -> set[str]:
+        """The robots that roll and were moved since the last call: each
+        starts at rest where its move stood it."""
+        with self._lock:
+            moved, self._set_down = self._set_down, set()
+        return moved
+
+    def stand_where_rolled(self) -> None:
+        """Stands the prim of every robot that rolls where its wheels carried
+        it. A timeline that stops sets every body back on its prim, so a robot
+        that rolled stays where it went when the stage is edited."""
+        import omni.usd  # pylint: disable=C0415
+
+        stage = omni.usd.get_context().get_stage()
+        for robot in self.robots():
+            if robot.known.rolls:
+                World.place(
+                    stage.GetPrimAtPath(robot.prim()),
+                    robot.placement.position.position,
+                    robot.placement.orientation.quaternion,
+                )
+
     def remove(self, instance: str) -> None:
         """Takes a robot out of the stage."""
         with self._lock:
             robot = self._robots.pop(instance, None)
+            self._set_down.discard(instance)
         if robot is None:
             return
         World._unreference(robot)
@@ -421,12 +527,14 @@ class World:
     @staticmethod
     def _hold_to_description(root, known: IsaacModel) -> None:
         """Refuses a stage whose joints are not the description's: each joint
-        a limb of the robot moves is a revolute or prismatic joint of the
-        stage with the description's limits, within LIMIT_TOLERANCE; a finger
-        that follows another holds the description's limits within its own,
-        the joint it follows placing it; and every other revolute or
-        prismatic joint of the stage is locked, its two limits one, as a
-        joint the description fixes."""
+        a limb or the base of the robot moves is a revolute or prismatic
+        joint of the stage with the description's limits, within
+        LIMIT_TOLERANCE, none on a wheel that turns without end; a finger that
+        follows another holds the description's limits within its own, the
+        joint it follows placing it; every other revolute or prismatic joint
+        of the stage is locked, its two limits one, as a joint the
+        description fixes; and a robot that rolls stands free, rooted at its
+        robot frame."""
         moving = _moving_joints(root)
         followers = {
             joint for gripper in known.entry.grippers for joint, _ in gripper.followers()
@@ -441,7 +549,7 @@ class World:
             if name in followers:
                 held = low <= lower + LIMIT_TOLERANCE and high >= upper - LIMIT_TOLERANCE
             else:
-                held = abs(low - lower) <= LIMIT_TOLERANCE and abs(high - upper) <= LIMIT_TOLERANCE
+                held = _same_limit(low, lower) and _same_limit(high, upper)
             if not held:
                 differences.append(
                     f"'{name}' moves over [{low:.6g}, {high:.6g}] where the description "
@@ -456,6 +564,8 @@ class World:
                     f"'{name}' moves over [{low:.6g}, {high:.6g}], and the description moves no joint "
                     "of that name"
                 )
+        if known.rolls:
+            differences.extend(_rolling_differences(root, known))
         if differences:
             raise RuntimeError(
                 f"{known.stage} is not the {known.model} its description describes: "

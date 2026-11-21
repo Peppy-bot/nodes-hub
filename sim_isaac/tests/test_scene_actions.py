@@ -77,7 +77,7 @@ _QUARTER_TURN = [0.0, 0.0, 2 ** -0.5, 2 ** -0.5]
 
 class _Robot(SimpleNamespace):
     """A robot as world.py reports it: the name it stands under, its model,
-    and where."""
+    where, and how fast its robot frame moves there."""
 
     def prim(self):
         return f"/World/{self.instance}"
@@ -111,14 +111,18 @@ class _Registry:
 
 def _world(*robots):
     """The stage's robots, each as (instance, model, position, orientation),
-    the pose of its base in world."""
+    the pose of its base in world, at rest, or with its linear and angular
+    velocities after them."""
+    at_rest = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
     return _World(
         _Robot(
             instance=instance,
             model=model,
             placement=Pose.parse(position, orientation),
+            linear_velocity=(moving or [at_rest])[0][0],
+            angular_velocity=(moving or [at_rest])[0][1],
         )
-        for instance, model, position, orientation in robots
+        for instance, model, position, orientation, *moving in robots
     )
 
 
@@ -571,6 +575,25 @@ def test_the_object_states_give_each_standing_robot_at_its_placement_at_rest(pro
             "linear_velocity": [0.0, 0.0, 0.0], "angular_velocity": [0.0, 0.0, 0.0],
         },
     ]
+
+
+def test_a_robot_that_rolls_is_recorded_where_its_wheels_carried_it_moving_as_they_move_it(provider):
+    """The record is the robot's placement and velocities as the stage last
+    read them, the step the snapshot is stamped with."""
+    provider.io._world = _world(
+        ("delta", "botshare_base", (2.0, 1.0, 0.0), _QUARTER_TURN, ((0.0, 0.3, 0.0), (0.0, 0.0, 0.5))),
+    )
+    provider.io._robots = _Registry("delta")
+    provider.io.capture_object_states()
+
+    (robot,) = provider.io._handle_get_object_states(None).robots
+
+    half = math.sqrt(0.5)
+    assert vars(robot) == {
+        "robot": "delta", "model": "botshare_base", "position": [2.0, 1.0, 0.0],
+        "orientation": [0.0, 0.0, pytest.approx(half), pytest.approx(half)],
+        "linear_velocity": [0.0, 0.3, 0.0], "angular_velocity": [0.0, 0.0, 0.5],
+    }
 
 
 def test_the_object_states_give_a_robot_from_when_the_engine_has_stood_it(provider):

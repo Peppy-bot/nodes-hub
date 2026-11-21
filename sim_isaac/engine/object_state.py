@@ -5,9 +5,10 @@ robots standing in the scene, read on Isaac's main thread.
 A snapshot is one capture of every spawned object and every standing robot,
 stamped on the timeline the joint states use: the object_states stream
 publishes it on the state tick and get_object_states answers it until the
-next capture. A robot of this engine stands fixed to the world at its
-placement, the pose of its robot frame, so its record is that placement and
-zero velocities.
+next capture. A robot's record is its placement, the pose of its robot frame,
+with its velocities there: a robot fixed to the world at rest, and a robot
+that rolls where its wheels carried it as of the capture's step, moving as
+they move it.
 
 Engine reads live in three small functions below. A dynamic object's pose
 and velocities come from PhysX through a tensor rigid-body view: the USD
@@ -27,7 +28,8 @@ from control_core_py.geometry import rotate, xyzw_of_wxyz
 # reader reads it from.
 RUNTIME_OBJECTS_PATH = "/World/RuntimeObjects"
 
-_AT_REST = (0.0, 0.0, 0.0)
+# The velocities of a body at rest (m/s, rad/s).
+AT_REST = (0.0, 0.0, 0.0)
 
 
 @dataclass(frozen=True)
@@ -76,25 +78,6 @@ class RobotRecord:
     orientation: tuple[float, float, float, float]
     linear_velocity: tuple[float, float, float]
     angular_velocity: tuple[float, float, float]
-
-    @staticmethod
-    def fixed(
-        robot: str,
-        model: str,
-        position: tuple[float, float, float],
-        orientation: tuple[float, float, float, float],
-    ) -> RobotRecord:
-        """The record of a robot whose robot frame is fixed to the world at
-        `position` and `orientation`: zero velocities, as object_state:v1
-        states for such a robot."""
-        return RobotRecord(
-            robot=robot,
-            model=model,
-            position=position,
-            orientation=orientation,
-            linear_velocity=_AT_REST,
-            angular_velocity=_AT_REST,
-        )
 
     def fields(self) -> dict:
         """The record as the generated object_state item types take it."""
@@ -166,7 +149,7 @@ class IsaacObjectReader:
                 position, orientation, linear_velocity, angular_velocity = bodies[path]
             else:
                 position, orientation = _authored_world_pose(path)
-                linear_velocity = angular_velocity = _AT_REST
+                linear_velocity = angular_velocity = AT_REST
             records.append(
                 ObjectRecord(
                     object_id=obj["object_id"],

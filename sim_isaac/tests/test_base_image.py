@@ -92,7 +92,7 @@ def test_base_image_bakes_one_directory_per_robot_where_the_node_looks_stages_up
 
 
 def test_base_image_installs_the_packages_the_engines_share():
-    # The registry, the four slots, the model entries, the camera
+    # The registry, the five slots, the model entries, the camera
     # configuration and world come from sim_robot_core, the robots'
     # descriptions from robot_description_py, and the geometry types from
     # control_core_py, each pinned to the commit these suites run the engine

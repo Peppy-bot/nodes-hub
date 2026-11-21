@@ -26,7 +26,7 @@ from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
 from _world import known, placement_at
-import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
+import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
@@ -372,14 +372,14 @@ PAIR_GRACE = "2.0s, the pair grace time this scene gives"
 # What each model's side of a mismatch names.
 OPENARM_V2_HAS = (
     "the model openarm_v2 has arms ['left_arm', 'right_arm'], "
-    "grippers ['left_gripper', 'right_gripper'], rgb_cameras ['wrist_left', 'wrist_right'], "
+    "grippers ['left_gripper', 'right_gripper'], bases [], rgb_cameras ['wrist_left', 'wrist_right'], "
     "rgbd_cameras ['chest']"
 )
-SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], rgb_cameras ['wrist'], rgbd_cameras []"
+SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], bases [], rgb_cameras ['wrist'], rgbd_cameras []"
 
 
 class _Pairs:
-    """What each robot holds on the four slots, as the engine reads its
+    """What each robot holds on the five slots, as the engine reads its
     pairs."""
 
     def __init__(self, held: dict) -> None:
@@ -404,7 +404,7 @@ def _fleet_io_at(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) ->
     for name, (model, _held) in fleet.items():
         io._robots.admit(name, known(model).entry, _caller(name))
         if reached_s is not None:
-            io._robots.note_limbs_reached(name, reached_s)
+            io._robots.note_driven_part_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs({name: held for name, (_model, held) in fleet.items()})
     io._pair_grace_s = PAIR_GRACE_S
@@ -645,7 +645,7 @@ class TestPairGrace:
 
         assert io._lapse(io._robots.of_name("alpha")) == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
-            "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], rgb_cameras [], "
+            "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], bases [], rgb_cameras [], "
             f"rgbd_cameras [], and {OPENARM_V2_HAS}"
         )
 
@@ -657,12 +657,12 @@ class TestPairGrace:
 
         assert io._lapse(io._robots.of_name("charlo")) == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
-            "arms ['arm'], grippers ['gripper'], rgb_cameras [], rgbd_cameras ['chest'], "
+            "arms ['arm'], grippers ['gripper'], bases [], rgb_cameras [], rgbd_cameras ['chest'], "
             f"and {SO101_HAS}"
         )
 
     def test_each_robot_of_a_fleet_is_held_to_its_own_model(self):
-        """An SO-101 stands beside an OpenArm on the same four slots. Each
+        """An SO-101 stands beside an OpenArm on the same five slots. Each
         holds its own model's limbs, and neither is asked for the other's."""
         io = _fleet_io_at(
             now_s=10.0,
@@ -692,7 +692,7 @@ class TestPairGrace:
         assert why == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
             "arms ['left_arm', 'right_arm'], grippers ['left_gripper', 'right_gripper'], "
-            f"rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
+            f"bases [], rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
         )
         assert io._robots.of_name("charlo").last_paired_s == 0.0
         assert io._lapse(io._robots.of_name("alpha")) is None
@@ -853,7 +853,7 @@ class TestAdmission:
 
         assert decision.refusal.kind is FailureKind.REJECTED
         assert decision.refusal.message == (
-            "unknown model 'openarm_v9': this engine stands openarm_v1, openarm_v2, so101"
+            "unknown model 'openarm_v9': this engine stands botshare_base, openarm_v1, openarm_v2, so101"
         )
         assert io._robots.robots() == []
         assert io._promises == {}

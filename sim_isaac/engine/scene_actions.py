@@ -987,11 +987,13 @@ class SceneActionIO:
             timestamp_s=timestamp_s,
             objects=tuple(records),
             robots=tuple(
-                RobotRecord.fixed(
-                    robot.instance,
-                    robot.model,
-                    robot.placement.position.position,
-                    robot.placement.orientation.quaternion,
+                RobotRecord(
+                    robot=robot.instance,
+                    model=robot.model,
+                    position=robot.placement.position.position,
+                    orientation=robot.placement.orientation.quaternion,
+                    linear_velocity=robot.linear_velocity,
+                    angular_velocity=robot.angular_velocity,
                 )
                 for robot in self._world.robots()
                 if robot.instance in standing

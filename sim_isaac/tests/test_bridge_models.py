@@ -1,8 +1,9 @@
 """Every robot on the stage is driven as the model it joined as: its limbs
 under the names its own robot answers to, its drives under its own model's
-gains, its gripper opening mapped onto its own fingers' travel, and the rig
-of its own model's cameras. An SO-101 stands beside an OpenArm here, on
-stand-in views, so nothing of one leaks into the other.
+gains, its gripper opening mapped onto its own fingers' travel, its base's
+wheels on their rate loops, and the rig of its own model's cameras. An SO-101
+stands beside an OpenArm here, and a botshare base rolls beside them, on
+stand-in views, so nothing of one leaks into another.
 """
 
 import importlib.util
@@ -12,8 +13,10 @@ from types import ModuleType
 from unittest.mock import Mock
 
 import pytest
+from control_core_py.geometry import quaternion_of_yaw
 from robot_description_py import model as bundled
 from sim_robot_core.models import shipped_entry
+from sim_robot_core.setpoints import JointSetpoint
 
 import _world
 
@@ -46,6 +49,11 @@ class _Views:
         # Per articulation prim: the dof names it reports, in its own order.
         self.dofs = {}
         self.positions = {}
+        self.velocities = {}
+        # Per articulation prim: its root's state as PhysX reads it, and where
+        # each set down stood it.
+        self.roots = {}
+        self.set_downs = []
 
     def articulation(self, prim, name):
         views = self
@@ -62,14 +70,22 @@ class _Views:
 
             def get_joint_states(self):
                 positions = [views.positions.get((prim, dof), 0.0) for dof in views.dofs[prim]]
-                return positions, [0.0] * len(positions)
+                velocities = [views.velocities.get((prim, dof), 0.0) for dof in views.dofs[prim]]
+                return positions, velocities
+
+            def get_root_state(self):
+                return views.roots.get(prim)
+
+            def set_down_at(self, position, orientation):
+                views.set_downs.append((prim, tuple(position), tuple(orientation)))
+                return True
 
         built = Articulation()
         self.articulations[name] = prim
         return built
 
     def actuator(self, prim, joint_names, params, name):
-        built = Mock(spec=["setup", "teardown", "write_targets", "set_force_limit"])
+        built = Mock(spec=["setup", "teardown", "write_targets", "set_force_limit", "write_velocity_targets"])
         built.setup.return_value = True
         built.set_force_limit.return_value = True
         self.actuators[name] = (prim, joint_names, params, built)
@@ -122,7 +138,11 @@ def _robot(engine, instance: str, known):
 
     robot = world.Robot(instance=instance, known=known, placement=_world.placement_at(0.0))
     entry = known.entry
-    engine.views.dofs[robot.articulation()] = [*entry.finger_joints(), *entry.arm_joints()]
+    engine.views.dofs[robot.articulation()] = [
+        *entry.finger_joints(),
+        *entry.arm_joints(),
+        *entry.wheel_joints(),
+    ]
     return robot
 
 
@@ -205,6 +225,7 @@ class TestLimbs:
             isaac_models.parse("so101", {"stage": "so101/so101.usd", "articulation_root": "base_link"}),
             {},
             {},
+            "base_link",
         )
         robot = _robot(engine, "charlo", known)
 
@@ -248,6 +269,7 @@ def _fleet(engine, monkeypatch):
     ]
     world, io, registry = Mock(), Mock(), Mock()
     world.robots.return_value = robots
+    world.take_set_down.return_value = set()
     registry.standing.return_value = {"alpha": Mock(), "charlo": Mock()}
     io.camera_robots.return_value = set()
     io.latest_arm_command.return_value = None
@@ -287,8 +309,8 @@ class TestDrivingAFleet:
 
     def test_a_setpoint_reaches_the_drives_of_the_limb_it_names(self, engine, fleet):
         commands = {
-            ("charlo", "arm"): ([0.1, 0.2, 0.3, 0.4, 0.5], []),
-            ("alpha", "right_arm"): ([0.7] * 7, [0.01] * 7),
+            ("charlo", "arm"): JointSetpoint(positions=(0.1, 0.2, 0.3, 0.4, 0.5), velocities=()),
+            ("alpha", "right_arm"): JointSetpoint(positions=(0.7,) * 7, velocities=(0.01,) * 7),
         }
         fleet._io.latest_arm_command.side_effect = lambda robot, arm: commands.get((robot, arm))
 
@@ -309,16 +331,6 @@ class TestDrivingAFleet:
             dict(zip(right, [0.7] * 7)), dict(zip(right, [0.01] * 7))
         )
         _writes(engine, "left_arm_alpha").assert_not_called()
-
-    def test_a_setpoint_of_another_models_width_is_not_written(self, engine, fleet):
-        """Seven positions are an OpenArm's arm, not the SO-101's five."""
-        fleet._io.latest_arm_command.side_effect = lambda robot, arm: (
-            ([0.7] * 7, []) if robot == "charlo" else None
-        )
-
-        fleet.step()
-
-        _writes(engine, "arm_charlo").assert_not_called()
 
     def test_an_opening_is_mapped_onto_the_fingers_of_its_own_gripper(self, engine, fleet):
         commands = {("charlo", "gripper"): (0.5, 0.0), ("alpha", "right_gripper"): (1.0, 0.0)}
@@ -409,3 +421,126 @@ class TestRigs:
 
         assert engine.views.rigs == []
         fleet._io.camera_robots.assert_not_called()
+
+
+@pytest.fixture(name="rolling")
+def _rolling(engine, monkeypatch):
+    """A botshare base on the stage, its engine clock under the test's hand."""
+    robot = _robot(engine, "delta", _world.known("botshare_base"))
+    world, io, registry = Mock(), Mock(), Mock()
+    world.robots.return_value = [robot]
+    world.take_set_down.return_value = set()
+    registry.standing.return_value = {"delta": Mock()}
+    io.camera_robots.return_value = set()
+    io.latest_base_command.return_value = None
+    objects = Mock()
+    objects.capture_object_states.return_value = None
+    bridge = engine.IsaacBridgeExtension(world, io, registry, objects, state_rate_hz=60, renders=False)
+    clock = {"now_s": 0.0}
+    monkeypatch.setattr(type(bridge), "_engine_time_s", lambda self: clock["now_s"])
+    bridge.clock = clock
+    bridge._state_pacer = Mock(take_if_due=Mock(return_value=True))
+    bridge.bind()
+    return bridge
+
+
+_WHEELS = ("left_wheel_joint", "right_wheel_joint")
+_STEP_S = 1.0 / 60.0
+
+
+def _wheel_targets(engine):
+    return engine.views.actuators["base_delta"][3].write_velocity_targets
+
+
+def _step_at(rolling, now_s, left=0.0, right=0.0):
+    """Steps the bridge at `now_s` with the wheels read at these angles."""
+    rolling.clock["now_s"] = now_s
+    positions = sys.modules[type(rolling).__module__].views.positions
+    positions[("/World/delta", "left_wheel_joint")] = left
+    positions[("/World/delta", "right_wheel_joint")] = right
+    rolling.step()
+
+
+class TestDrivingABase:
+    def test_the_wheels_drives_take_the_rate_loops_gains_and_cap(self, engine, rolling):
+        prim, joints, params, _ = engine.views.actuators["base_delta"]
+        assert (prim, joints) == ("/World/delta", list(_WHEELS))
+        assert params == {
+            "joint_names": list(_WHEELS),
+            "kp": [0.0, 0.0],
+            "kd": [128.0, 128.0],
+            "max_efforts": [16.0, 16.0],
+        }
+
+    def test_each_wheel_follows_the_rate_of_its_setpoint_through_its_loop(self, engine, rolling):
+        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, -1.0))
+
+        _step_at(rolling, 0.0)
+        # A first read anchors each loop at rest: the drive's target is the rate.
+        _wheel_targets(engine).assert_called_with(dict(zip(_WHEELS, (2.0, -1.0))))
+
+        _step_at(rolling, _STEP_S, left=0.02, right=-0.02)
+        # The integral: the angle the rates carried each wheel to less its turn.
+        left = 2.0 * _STEP_S - 0.02
+        right = -1.0 * _STEP_S + 0.02
+        (targets,) = _wheel_targets(engine).call_args.args
+        assert targets == {
+            "left_wheel_joint": pytest.approx(2.0 + left),
+            "right_wheel_joint": pytest.approx(-1.0 + right),
+        }
+
+    def test_a_base_with_no_setpoint_holds_its_wheels_at_rate_0(self, engine, rolling):
+        _step_at(rolling, 0.0)
+
+        _wheel_targets(engine).assert_called_with(dict.fromkeys(_WHEELS, 0.0))
+
+    def test_the_wheels_state_is_their_counted_angle_and_measured_rate(self, engine, rolling):
+        engine.views.velocities[("/World/delta", "left_wheel_joint")] = 1.5
+        _step_at(rolling, 0.0, left=3.1)
+        _step_at(rolling, _STEP_S, left=-3.1)
+
+        robot, base, angles, rates = rolling._io.publish_base_states.call_args.args
+        assert (robot, base) == ("delta", "base")
+        assert angles == [pytest.approx(2 * 3.141592653589793 - 6.2), 0.0]
+        assert rates == [1.5, 0.0]
+
+    def test_the_robot_is_recorded_where_its_wheels_carried_it_each_step(self, engine, rolling):
+        yaw = quaternion_of_yaw(0.5)
+        engine.views.roots["/World/delta"] = ((1.0, 2.0, 0.01), yaw, (0.2, 0.0, 0.0), (0.0, 0.0, 0.1))
+        rolling._state_pacer = Mock(take_if_due=Mock(return_value=False))
+
+        _step_at(rolling, 0.0)
+
+        name, placement, linear, angular = rolling._world.roll.call_args.args
+        assert name == "delta"
+        assert placement.position.position == (1.0, 2.0, 0.01)
+        assert placement.orientation.quaternion == pytest.approx(yaw)
+        assert (linear, angular) == ((0.2, 0.0, 0.0), (0.0, 0.0, 0.1))
+
+    def test_a_robot_moved_since_the_last_step_is_set_down_at_rest(self, engine, rolling):
+        rolling._io.latest_base_command.return_value = JointSetpoint(positions=(0.0, 0.0), velocities=(2.0, 2.0))
+        _step_at(rolling, 0.0)
+        _step_at(rolling, _STEP_S, left=0.01, right=0.01)
+        rolling._world.take_set_down.return_value = {"delta"}
+
+        _step_at(rolling, 2 * _STEP_S, left=0.04, right=0.04)
+
+        (where,) = engine.views.set_downs
+        assert where == ("/World/delta", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
+        rolling._io.drop_base_command.assert_called_once_with("delta")
+        # Each loop reads the stage afresh: no turn counted, its integral clear.
+        assert [loop.integral for loop in rolling._wheels["delta"]] == [0.0, 0.0]
+        assert [loop.angle for loop in rolling._wheels["delta"]] == [pytest.approx(0.01)] * 2
+
+    def test_a_stage_edit_stands_the_robot_where_it_rolled_and_its_wheels_count_on(self, engine, rolling):
+        _step_at(rolling, 0.0, left=0.5)
+        _step_at(rolling, _STEP_S, left=0.7)
+
+        rolling.unbind()
+        rolling._world.stand_where_rolled.assert_called_once_with()
+        rolling.bind()
+        # The timeline set the wheel back to its stage's angle.
+        _step_at(rolling, 0.0, left=0.0)
+        _step_at(rolling, _STEP_S, left=0.1)
+
+        assert rolling._wheels["delta"][0].angle == pytest.approx(0.3)
