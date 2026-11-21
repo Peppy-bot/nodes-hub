@@ -185,10 +185,11 @@ gripper's **grasp point** (midway between the pads on the jaw closing axis,
 `+z` out of the gripper), not the wrist flange they mount on: the description
 names it as each arm's grasp link, and each arm's model mounts its tool there,
 so the pose solved for, the pose reported, and the point the EE speed cap
-applies to are one frame. One move per arm at a time (a
-single-flight move slot, control_core's `MoveSlot`, whose claim gives the release, a drop
-guard that the goal carries from its admission and the move that runs it then, so every
-terminal frees it, an end before the move starts included). `move_arm` plans a straight line (`srs_model::plan_line`): a
+applies to are one frame. One move per arm at a time (a single-flight
+move slot, control_core's `MoveSlot`, whose claim gives the release, a
+drop guard that the goal carries from its admission and the move that
+runs it then, so every terminal frees it, an end before the move starts
+included). `move_arm` plans a straight line (`srs_model::plan_line`): a
 walk along it in MoveIt's steps and within its Cartesian precision of 1 mm and 0.01 rad,
 each step one descent of the KDL search from the state before. The walk plays as a joint
 trajectory, timed from rest to rest within the joint velocity and acceleration

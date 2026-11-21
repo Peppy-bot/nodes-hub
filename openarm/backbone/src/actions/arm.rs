@@ -66,14 +66,15 @@ fn settle_tolerance_from_wire(
 }
 
 /// Parse the per-joint settle tolerances off the wire, one per joint in the
-/// arm's joint order: each a positive finite number, or the refusal.
+/// arm's joint order: each a positive finite number, or the refusal of the
+/// first that is not, in the words of [`PositiveFinite::parse_field`].
 pub(super) fn joint_tolerances_from_wire(
     tolerances: JointVec,
 ) -> std::result::Result<JointVec, String> {
-    if tolerances.iter().all(|&v| PositiveFinite::parse(v).is_ok()) {
-        return Ok(tolerances);
-    }
-    Err("each settle_tolerances_rad entry must be a positive number".to_string())
+    tolerances.iter().try_for_each(|&tolerance| {
+        PositiveFinite::parse_field("each settle_tolerances_rad entry", tolerance).map(|_| ())
+    })?;
+    Ok(tolerances)
 }
 
 /// The target of a `move_arm` goal or a `check_arm_move` request, field for
@@ -407,21 +408,25 @@ mod tests {
     use hegel::generators as gs;
 
     // Per-joint tolerances are accepted exactly when every entry is a
-    // positive finite value, kept in order.
+    // positive finite value, kept in order; a refusal names the first entry
+    // that is not, as the goal's other tolerances are named.
     #[hegel::test]
     fn joint_tolerances_need_a_positive_value_per_joint(tc: TestCase) {
         let values: JointVec = tc.draw(gs::arrays(gs::floats()));
-        let admitted = values.iter().all(|v| v.is_finite() && *v > 0.0);
+        let first_refused = values.iter().find(|v| !(v.is_finite() && **v > 0.0));
         match joint_tolerances_from_wire(values) {
             Ok(parsed) => {
-                assert!(admitted, "{values:?} was accepted");
+                assert!(first_refused.is_none(), "{values:?} was accepted");
                 assert_eq!(parsed, values);
             }
             Err(refusal) => {
-                assert!(!admitted, "{values:?} was refused");
+                let first = first_refused.unwrap_or_else(|| panic!("{values:?} was refused"));
                 assert_eq!(
                     refusal,
-                    "each settle_tolerances_rad entry must be a positive number"
+                    format!(
+                        "each settle_tolerances_rad entry must be a positive finite number, got \
+                         {first}"
+                    )
                 );
             }
         }

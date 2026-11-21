@@ -569,7 +569,7 @@ mod tests {
         zero_tolerance.arms[1].settle_tolerances_rad[2] = 0.0;
         assert_eq!(
             refusal(zero_tolerance),
-            "right_arm: each settle_tolerances_rad entry must be a positive number"
+            "right_arm: each settle_tolerances_rad entry must be a positive finite number, got 0"
         );
         let mut slow = goal(&both, &waypoints, None);
         slow.duration_s = 61.0;
