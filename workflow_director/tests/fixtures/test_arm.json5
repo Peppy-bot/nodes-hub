@@ -125,7 +125,7 @@
     actions: [
       {
         name: "grab",
-        description: "Grab an item, by its id or at a target.",
+        description: "Grab an item, by its id or at a target. The feedback gives each stage, with its sentence in activity.",
         goal_service: { request_message_format: {
           item_id: { $type: "string", $marks: ["item_id"] },
           target: {
@@ -137,6 +137,15 @@
           },
           speed: "u32",
         } },
+        feedback_topic: {
+          qos_profile: "reliable",
+          message_format: {
+            stage: { $type: "string", $enum: ["reach", "look", "close"] },
+            activity: { $type: "string", $marks: ["activity"] },
+            number: "u32",
+            maximum: "u32",
+          },
+        },
         result_service: { response_message_format: { success: "bool", item_id: { $type: "string", $marks: ["item_id"] } } },
         failure_kinds: ["unreachable"],
         marks: ["moves_robot", "reaches_for_item"],
@@ -164,8 +173,9 @@
       },
       {
         name: "home",
-        description: "Move the arm home.",
+        description: "Move the arm home. The feedback gives how far the move went, with a note that has no mark.",
         goal_service: { request_message_format: { duration_s: "f64" } },
+        feedback_topic: { qos_profile: "reliable", message_format: { progress: "f64", note: "string" } },
         result_service: { response_message_format: { at_home: "bool" } },
         marks: ["moves_robot"],
       },

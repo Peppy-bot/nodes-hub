@@ -18,7 +18,7 @@ use crate::config::AllowedContracts;
 use crate::contract::ContractShape;
 use crate::contract::tests::TEST_ARM;
 use crate::engine::failure::Failure;
-use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
+use crate::engine::host::{CallEnd, Event, Feedback, Host, Join, Joining};
 use crate::engine::plan::{Plan, Target};
 use crate::fleet::{Fleet, Instance, Robot, RobotContract, RobotLinks, Snapshot};
 
@@ -301,13 +301,15 @@ pub fn validation(parameters: Json, envelope: Json) -> Validation {
     .unwrap()
 }
 
-/// The answer of a scripted call: after how long, how it ends, and how
-/// it ends when the director cancels it first (`None`: cancelled).
+/// The answer of a scripted call: after how long, how it ends, how it ends
+/// when the director cancels it first (`None`: cancelled), and the feedback
+/// messages of a goal, each with how long after the call it comes.
 #[derive(Clone, Debug)]
 pub struct Answer {
     pub after: Duration,
     pub end: CallEnd,
     pub on_cancel: Option<CallEnd>,
+    pub feedback: Vec<(Duration, Json)>,
 }
 
 impl Answer {
@@ -316,6 +318,7 @@ impl Answer {
             after: Duration::ZERO,
             end: CallEnd::Completed(result),
             on_cancel: None,
+            feedback: Vec::new(),
         }
     }
 
@@ -324,6 +327,7 @@ impl Answer {
             after: Duration::from_secs(seconds),
             end: CallEnd::Completed(result),
             on_cancel: None,
+            feedback: Vec::new(),
         }
     }
 
@@ -333,6 +337,19 @@ impl Answer {
             after: Duration::ZERO,
             end: CallEnd::Failed(failure),
             on_cancel: None,
+            feedback: Vec::new(),
+        }
+    }
+
+    /// This answer, with each message of `feedback` given `seconds` after
+    /// the call.
+    pub fn with_feedback(self, feedback: Vec<(u64, Json)>) -> Answer {
+        Answer {
+            feedback: feedback
+                .into_iter()
+                .map(|(seconds, message)| (Duration::from_secs(seconds), message))
+                .collect(),
+            ..self
         }
     }
 
@@ -342,6 +359,7 @@ impl Answer {
             after: Duration::from_secs(1_000_000),
             end: CallEnd::Completed(Json::Null),
             on_cancel: None,
+            feedback: Vec::new(),
         }
     }
 
@@ -555,7 +573,14 @@ impl Host for ScriptedHost {
             .await
     }
 
-    async fn call(&self, target: &Target, request: Json, cancel: CancellationToken) -> CallEnd {
+    async fn call(
+        &self,
+        target: &Target,
+        request: Json,
+        cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
+    ) -> CallEnd {
+        let called = tokio::time::Instant::now();
         let index = {
             let mut sent = self.sent.lock().unwrap();
             sent.push(Sent {
@@ -568,8 +593,17 @@ impl Host for ScriptedHost {
             sent.len() - 1
         };
         let answer = self.next_answer(target.member.as_str());
+        let answered = async {
+            for (after, message) in &answer.feedback {
+                tokio::time::sleep_until(called + *after).await;
+                if let Some(feedback) = feedback {
+                    feedback(message.clone());
+                }
+            }
+            tokio::time::sleep_until(called + answer.after).await;
+        };
         tokio::select! {
-            _ = tokio::time::sleep(answer.after) => answer.end,
+            () = answered => answer.end,
             _ = cancel.cancelled() => {
                 self.sent.lock().unwrap()[index].cancelled = true;
                 answer.on_cancel.unwrap_or(CallEnd::Cancelled { asked: true, reason: "cancelled".to_owned() })

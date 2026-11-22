@@ -10,6 +10,7 @@ use peppy_codec::contract::{InterfaceKind, MessageFormat, PeppyContract, PeppyCo
 use peppy_codec::value;
 use serde_json::Value as Json;
 use workflow_documents::expression::{FieldType, Type};
+use workflow_documents::marks::ACTIVITY;
 
 use crate::engine::plan::MemberKind;
 
@@ -52,6 +53,10 @@ pub struct Member {
     /// The response of a service, the result of an action.
     pub output: Format,
     pub marks: BTreeSet<String>,
+    /// The string field at the top of the feedback message of an action
+    /// with the mark `activity`, the sentence of what the robot does now;
+    /// `None` for a service, and for an action with no such field.
+    pub activity: Option<String>,
 }
 
 /// A pinned contract document.
@@ -89,6 +94,7 @@ impl ContractShape {
                     input: format(service.request_message_format.as_ref())?,
                     output: format(service.response_message_format.as_ref())?,
                     marks: marks_of(&parsed, InterfaceKind::Service, &service.name),
+                    activity: None,
                 },
             );
         }
@@ -101,6 +107,10 @@ impl ContractShape {
                 .result_service
                 .as_ref()
                 .and_then(|result| result.response_message_format.as_ref());
+            let feedback = action
+                .feedback_topic
+                .as_ref()
+                .map(|feedback| &feedback.message_format);
             members.insert(
                 action.name.clone(),
                 Member {
@@ -108,6 +118,7 @@ impl ContractShape {
                     input: format(input)?,
                     output: format(output)?,
                     marks: marks_of(&parsed, InterfaceKind::Action, &action.name),
+                    activity: activity_of(&format(feedback)?),
                 },
             );
         }
@@ -139,6 +150,15 @@ fn marks_of(contract: &PeppyContract, kind: InterfaceKind, name: &str) -> BTreeS
         .unwrap_or_default()
         .into_iter()
         .collect()
+}
+
+/// The string field at the top of `feedback` with the mark `activity`.
+fn activity_of(feedback: &Format) -> Option<String> {
+    feedback
+        .0
+        .iter()
+        .find(|(_, field)| field.kind == FieldKind::String && field.marks.contains(ACTIVITY))
+        .map(|(name, _)| name.clone())
 }
 
 /// A format from its serde form: an object from field names to fields.
@@ -336,6 +356,9 @@ pub(crate) mod tests {
         let grab = &shape.members["grab"];
         assert_eq!(grab.kind, MemberKind::Action);
         assert!(grab.marks.contains("moves_robot") && grab.marks.contains("reaches_for_item"));
+        assert_eq!(grab.activity.as_deref(), Some("activity"));
+        assert_eq!(shape.members["home"].activity, None);
+        assert_eq!(shape.members["find"].activity, None);
         assert!(grab.input.0["item_id"].marks.contains("item_id"));
         let find = &shape.members["find"].output;
         assert_eq!(find.0["count"].kind, FieldKind::Int { wide: true });

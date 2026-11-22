@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{
-    ARM_INSTANCE, ARM_PIN, FOUND_AT, Home, Lease, ROBOT, ROBOT_FRAME, Rig, SETTLE, WIRE,
-    feedback_of, home_workflow, listed_robots, on_alpha,
+    ARM_INSTANCE, ARM_PIN, FOUND_AT, GRAB_REPORTS, Home, Lease, ROBOT, ROBOT_FRAME, Rig, SETTLE,
+    WIRE, feedback_messages_of, feedback_of, grab_report, home_workflow, listed_robots, on_alpha,
 };
 
 /// The goal of a run of `home_workflow` on `alpha`, once the director lists `alpha`.
@@ -976,6 +976,7 @@ async fn a_point_read_before_a_move_reaches_the_grab_after_it_with_its_time() ->
     let rig = Rig::start(Home::AtOnce).await?;
     // The reach assumption reads `find` once, and the lane once.
     rig.arm.finds.add_permits(2);
+    rig.arm.grabs.add_permits(1);
     let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
     workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
     workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
@@ -1007,6 +1008,77 @@ async fn a_point_read_before_a_move_reaches_the_grab_after_it_with_its_time() ->
             .map(|goal| goal["target"].clone())
             .collect::<Vec<_>>(),
         [json!({ "frame": ROBOT_FRAME, "timestamp": FOUND_AT, "position": [0.3, 0.0, 0.1] })]
+    );
+    rig.harness.shutdown().await
+}
+
+/// A grab whose goal reports its stages gives, on the feedback of the run,
+/// one step_reports for each new sentence, between the start and the end of
+/// its step, each with the sentence as its message and the feedback message
+/// as its details. The grab completes only once the test read its reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reports_of_a_grab_reach_the_feedback_of_the_run() -> peppygen::Result<()> {
+    let rig = Rig::start(Home::AtOnce).await?;
+    // The reach assumption reads `find` once, and the lane once.
+    rig.arm.finds.add_permits(2);
+    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
+    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
+    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
+    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "grab", "timeout_s": 5, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
+        } },
+    ] });
+    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
+    let last_sentence = GRAB_REPORTS[2].1;
+    let mut feedback = Vec::new();
+    while !feedback
+        .iter()
+        .any(|event: &run::Feedback| event.message == last_sentence)
+    {
+        let next = tokio::time::timeout(WIRE, goal.on_next_feedback())
+            .await
+            .expect("the run gives the reports of the grab before the grab ends");
+        feedback.push(next?);
+    }
+    rig.arm.grabs.add_permits(1);
+    feedback.extend(feedback_messages_of(&mut goal).await);
+    let ended = goal.get_result(WIRE).await?;
+    assert!(
+        matches!(ended.outcome, run::ResultOutcome::Completed(_)),
+        "{:?}",
+        ended.outcome
+    );
+    let of_the_grab: Vec<(String, String, Value)> = feedback
+        .iter()
+        .filter(|event| event.step == "arm.grab" && event.event.starts_with("step_"))
+        .map(|event| {
+            let details = match event.details.as_str() {
+                "" => Value::Null,
+                text => serde_json::from_str(text).expect("the details are JSON"),
+            };
+            (event.event.clone(), event.message.clone(), details)
+        })
+        .collect();
+    let edge = |event: &str| (event.to_owned(), String::new(), Value::Null);
+    let reported = |report: (&str, &str)| {
+        (
+            "step_reports".to_owned(),
+            report.1.to_owned(),
+            grab_report(report),
+        )
+    };
+    assert_eq!(
+        of_the_grab,
+        [
+            edge("step_starts"),
+            reported(GRAB_REPORTS[0]),
+            reported(GRAB_REPORTS[2]),
+            edge("step_ends"),
+        ],
+        "the same sentence twice gives one report"
     );
     rig.harness.shutdown().await
 }

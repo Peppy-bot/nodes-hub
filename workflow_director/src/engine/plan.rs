@@ -43,6 +43,12 @@ pub struct Target {
     /// Whether the member has the mark moves_robot, so the director asks
     /// `fleet.check_move` before each call.
     pub moves_robot: bool,
+    /// The field of the feedback of an action that holds the sentence of
+    /// what the robot does now (the mark `activity`), so the call of a step
+    /// gives an event `step_reports` for each new sentence; `None` for a
+    /// service, an observation, the monitor, and an action with no such
+    /// field.
+    pub activity: Option<String>,
 }
 
 /// A topic of one producer: its instance, its contract and its name.

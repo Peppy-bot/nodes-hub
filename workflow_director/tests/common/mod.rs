@@ -35,6 +35,7 @@ use peppygen::fixtures::exposed_services::director::robots;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
 use peppygen::mock::deps::fleet;
 use peppylib::Payload;
+use peppylib::messaging::NonEmptyPayload;
 use peppylib::messaging::{Failure, FailureKindName};
 use peppylib::messaging::{SenderTarget, TopicMessenger};
 use peppylib::testing::{MockActionServerCore, MockServiceCore};
@@ -581,7 +582,8 @@ pub enum Home {
 
 /// The arm of `alpha` on the session of `harness`: it answers each `home` goal as `home` says, counts the goals, and
 /// tells `arrived` of each; it goes to each place a `go_to` goal names, and keeps the names in `visited`; it grabs
-/// at each `grab` goal, and keeps the goals in `grabbed`; it serves `locations:v1`, knowing the locations of `known`,
+/// at each `grab` goal, keeps the goals in `grabbed`, gives the feedback messages of `GRAB_REPORTS`, and completes
+/// once the test gives `grabs` a permit; it serves `locations:v1`, knowing the locations of `known`,
 /// which a teach replaces, each one taught with no frame in its robot frame, and keeps the locations of the last teach
 /// request as it came in `taught`; and it answers each `find` once the test
 /// gives `finds` a permit, with a block found in its robot frame at `FOUND_AT`.
@@ -590,6 +592,7 @@ pub struct ScriptedArm {
     pub arrived: Arc<tokio::sync::Notify>,
     pub visited: Arc<Mutex<Vec<String>>>,
     pub grabbed: Arc<Mutex<Vec<Value>>>,
+    pub grabs: Arc<tokio::sync::Semaphore>,
     /// The locations the arm knows, as `list` gives them.
     pub known: Arc<Mutex<Vec<Value>>>,
     /// The locations of the last teach request, as the director sent them.
@@ -797,13 +800,14 @@ impl ScriptedArm {
             });
         }
         let grabbed = Arc::new(Mutex::new(Vec::new()));
+        let grabs = Arc::new(tokio::sync::Semaphore::new(0));
         let mut grabbing = MockActionServerCore::expose(
             harness.session(),
             core_node,
             ARM_INSTANCE,
             target.clone(),
             "grab",
-            false,
+            true,
         )
         .await?;
         {
@@ -817,11 +821,18 @@ impl ScriptedArm {
                 .message_format(InterfaceKind::Action, "grab", MessageSide::Result)
                 .expect("grab gives a result")
                 .clone();
+            let feedback = arm
+                .message_format(InterfaceKind::Action, "grab", MessageSide::Feedback)
+                .expect("grab gives a feedback")
+                .clone();
             let grabbed = Arc::clone(&grabbed);
+            let grabs = Arc::clone(&grabs);
             tokio::spawn(async move {
                 let goal = MessageCodec::new("grab goal", &goal).expect("a codec of the goal");
                 let result =
                     MessageCodec::new("grab result", &result).expect("a codec of the result");
+                let feedback =
+                    MessageCodec::new("grab feedback", &feedback).expect("a codec of the feedback");
                 while let Ok(pending) = grabbing.next_goal(IDLE).await {
                     let asked = goal
                         .decode(pending.request_bytes())
@@ -831,6 +842,18 @@ impl ScriptedArm {
                     let Ok(goal) = pending.accept(Payload::new()).await else {
                         continue;
                     };
+                    for report in GRAB_REPORTS {
+                        let message = feedback
+                            .encode(&grab_report(report))
+                            .expect("a feedback of grab");
+                        let payload = NonEmptyPayload::try_new(Payload::from(message))
+                            .expect("a feedback of grab holds its fields");
+                        let _ = goal.publish_feedback(payload).await;
+                    }
+                    let Ok(permit) = grabs.acquire().await else {
+                        return;
+                    };
+                    permit.forget();
                     let done = result
                         .encode(&json!({ "success": true, "item_id": item_id }))
                         .expect("a result of grab");
@@ -844,7 +867,7 @@ impl ScriptedArm {
             ARM_INSTANCE,
             target,
             "home",
-            false,
+            true,
         )
         .await?;
         let contract =
@@ -903,6 +926,7 @@ impl ScriptedArm {
             arrived,
             visited,
             grabbed,
+            grabs,
             known,
             taught,
             finds,
@@ -1067,11 +1091,33 @@ pub async fn listed_robots(rig: &Rig) -> peppygen::Result<robots::Response> {
     }
 }
 
+/// The stage and the sentence of each feedback message of each `grab` of the
+/// arm, in order: the same sentence twice, then another.
+pub const GRAB_REPORTS: [(&str, &str); 3] = [
+    ("reach", "The robot moves its hand above the block"),
+    ("reach", "The robot moves its hand above the block"),
+    ("close", "The robot closes its hand on the block"),
+];
+
+/// The feedback message of `grab` of the arm for `(stage, sentence)`.
+pub fn grab_report((stage, activity): (&str, &str)) -> Value {
+    json!({ "stage": stage, "activity": activity, "number": 0, "maximum": 0 })
+}
+
+/// The feedback of the run `goal` up to the end of its stream.
+pub async fn feedback_messages_of(goal: &mut run::GoalHandle) -> Vec<run::Feedback> {
+    let mut messages = Vec::new();
+    while let Ok(feedback) = goal.on_next_feedback().await {
+        messages.push(feedback);
+    }
+    messages
+}
+
 /// The events of the feedback of the run `goal` up to the end of its stream.
 pub async fn feedback_of(goal: &mut run::GoalHandle) -> Vec<String> {
-    let mut events = Vec::new();
-    while let Ok(feedback) = goal.on_next_feedback().await {
-        events.push(feedback.event);
-    }
-    events
+    feedback_messages_of(goal)
+        .await
+        .into_iter()
+        .map(|feedback| feedback.event)
+        .collect()
 }

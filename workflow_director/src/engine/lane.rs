@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot};
@@ -27,7 +27,7 @@ use super::failure::{
     RESOURCE_UNAVAILABLE, TIMEOUT,
 };
 use super::hold::{BranchCommand, Hold, Met};
-use super::host::{CallEnd, Host};
+use super::host::{CallEnd, Feedback, Host};
 use super::plan::{BoundArg, BoundCall, CallSite, MemberKind, read_path, request};
 use super::state::LaneClock;
 use super::{Interrupt, LEADER_RETRY_NS, NoInterrupt, RunCtx};
@@ -159,6 +159,55 @@ pub(crate) struct Lane<'a, H: Host> {
     pub robot: RobotName,
     pub clock: LaneClock,
     pub hold: Hold,
+}
+
+/// The reports of the call of one step: each feedback message of its goal
+/// whose sentence, in the field with the mark `activity`, differs from the
+/// one before gives an event `step_reports`, the sentence as its message and
+/// the feedback message as its details. A message with no sentence, or an
+/// empty one, gives none, so a skill that publishes at a high rate gives one
+/// event for each new sentence.
+struct StepReports<'l, 'a, H: Host> {
+    lane: &'l Lane<'a, H>,
+    step: &'l str,
+    activity: &'l str,
+    last: Mutex<Option<String>>,
+}
+
+impl<'l, 'a, H: Host> StepReports<'l, 'a, H> {
+    fn new(lane: &'l Lane<'a, H>, step: &'l str, activity: &'l str) -> Self {
+        StepReports {
+            lane,
+            step,
+            activity,
+            last: Mutex::new(None),
+        }
+    }
+
+    fn take(&self, feedback: Json) {
+        let Some(sentence) = feedback.get(self.activity).and_then(Json::as_str) else {
+            return;
+        };
+        if sentence.is_empty() {
+            return;
+        }
+        {
+            let mut last = self.last.lock().expect("no report panics");
+            if last.as_deref() == Some(sentence) {
+                return;
+            }
+            *last = Some(sentence.to_owned());
+        }
+        let message = sentence.to_owned();
+        self.lane.ctx.event(
+            &self.lane.role,
+            EventKind::StepReports,
+            self.step.to_owned(),
+            "",
+            message,
+            feedback,
+        );
+    }
 }
 
 impl<'a, H: Host> Lane<'a, H> {
@@ -905,7 +954,7 @@ impl<'a, H: Host> Lane<'a, H> {
         let result = match self
             .leaf(
                 &within.cancel,
-                self.send(bound, &observed, &within.cancel),
+                self.send(bound, &observed, &within.cancel, Some(&name)),
                 settle,
             )
             .await
@@ -970,15 +1019,25 @@ impl<'a, H: Host> Lane<'a, H> {
 
     /// Sends a bound call until it ends, again every second of run time
     /// while a leader's stream refuses it, so a call of the safe state of a
-    /// park, whose lane time stands, goes again too.
+    /// park, whose lane time stands, goes again too. The call of the step
+    /// `step` gives its reports (`StepReports`); a call of the safe state
+    /// gives none.
     async fn send(
         &self,
         bound: &BoundCall,
         scope: &Scope,
         cancel: &CancellationToken,
+        step: Option<&str>,
     ) -> Result<Json, StepEnd> {
         let request = request(&bound.args, scope)
             .map_err(|unsent| StepEnd::Failed(Failure::new(unsent.kind(), unsent.to_string())))?;
+        let reports = step
+            .zip(bound.target.activity.as_deref())
+            .map(|(step, activity)| StepReports::new(self, step, activity));
+        let take = reports
+            .as_ref()
+            .map(|reports| move |feedback: Json| reports.take(feedback));
+        let feedback = take.as_ref().map(|take| take as Feedback<'_>);
         loop {
             // A step cancelled before a try sends nothing, as when the leaf
             // settles work that it never started.
@@ -987,13 +1046,13 @@ impl<'a, H: Host> Lane<'a, H> {
             }
             let end = match bound.target.kind {
                 MemberKind::Service => tokio::select! {
-                    end = self.ctx.host.call(&bound.target, request.clone(), cancel.clone()) => end,
+                    end = self.ctx.host.call(&bound.target, request.clone(), cancel.clone(), None) => end,
                     _ = cancel.cancelled() => return Err(StepEnd::Cancelled),
                 },
                 MemberKind::Action => {
                     self.ctx
                         .host
-                        .call(&bound.target, request.clone(), cancel.clone())
+                        .call(&bound.target, request.clone(), cancel.clone(), feedback)
                         .await
                 }
             };
@@ -1046,7 +1105,7 @@ impl<'a, H: Host> Lane<'a, H> {
             match self
                 .ctx
                 .host
-                .call(&monitor.target, request, cancel.clone())
+                .call(&monitor.target, request, cancel.clone(), None)
                 .await
             {
                 CallEnd::Completed(answer) => Ok(answer),
@@ -1360,7 +1419,7 @@ impl<'a, H: Host> Lane<'a, H> {
                 .expect("the checker binds each safe-state call");
             let cancel = CancellationToken::new();
             let deadline = self.ctx.host.now() + call.timeout.nanos();
-            let sent = self.send(bound, &literals, &cancel);
+            let sent = self.send(bound, &literals, &cancel, None);
             tokio::pin!(sent);
             let interrupted = tokio::select! {
                 end = &mut sent => Err(end),

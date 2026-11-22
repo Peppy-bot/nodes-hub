@@ -129,6 +129,20 @@ result. The journal, the run result and the suspension give the incident.
 `run`, `resume` and `abort` give each event of the run as feedback, and the
 status of the run every 5 s; `run_events` gives every event of every run.
 
+The call of a step whose action has a string field with the mark `activity` at
+the top of its feedback message, such as `grab_item` of `item_manipulation:v1`,
+gives the event `step_reports` between the `step_starts` and the `step_ends`
+of its step, each time the sentence of that field changes: the sentence is
+its message, and the feedback message its details. A feedback message with
+the same sentence as the one before, or with no sentence, gives no event, so
+a skill that publishes at a high rate gives one event for each new sentence.
+The director finds the field through the mark alone, and reads the feedback
+of no other call: a service, an action with no such field, a call of the
+safe state, an observation and the monitor give no report. Each report goes
+into the journal with its time, as each event does; it changes no decision
+of the run, and `replay` does not compare it, as it does not compare the
+status of the run.
+
 `locations` teaches each locations:v1 instance of a robot the locations
 given, or lists what each knows; a teach is refused on a robot with a lease,
 naming its holder. A location holds at every time and gives no timestamp, and

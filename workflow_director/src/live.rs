@@ -21,7 +21,7 @@ use workflow_documents::{Name, RobotName};
 
 use crate::contract::ContractShape;
 use crate::engine::failure::{Failure, RESOURCE_UNAVAILABLE};
-use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
+use crate::engine::host::{CallEnd, Event, Feedback, Host, Join, Joining};
 use crate::engine::plan::{MemberKind, ObservationRead, Plan, Target, TopicKey};
 use crate::leases::Leases;
 
@@ -204,6 +204,8 @@ impl LiveHost {
         }
     }
 
+    /// Sends a goal and follows it to its end: each feedback message goes to
+    /// `feedback` while the stream lasts, when the engine gives one.
     async fn goal(
         &self,
         client: &ActionClient,
@@ -211,6 +213,7 @@ impl LiveHost {
         target: &Target,
         request: Json,
         cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
     ) -> CallEnd {
         let messenger = self.runner.messenger();
         let producer = producer_of(target);
@@ -225,7 +228,7 @@ impl LiveHost {
                 ADMISSION,
             )
             .await;
-        let handle = match handle {
+        let mut handle = match handle {
             Ok(handle) => handle,
             Err(error) => return CallEnd::Refused(Self::failure_of(&error)),
         };
@@ -235,15 +238,31 @@ impl LiveHost {
                 refusal.message().to_owned(),
             ));
         }
-        let outcome = tokio::select! {
-            outcome = handle.result(messenger, RESULT_WAIT) => outcome,
-            _ = cancel.cancelled() => {
-                let settling = async {
-                    let _ = handle.cancel(messenger, self.cancel_timeout).await;
-                    handle.result(messenger, RESULT_WAIT).await
-                };
-                let settled = tokio::time::timeout(self.cancel_timeout, settling).await;
-                return end_after_cancel(settled.ok());
+        // The result is asked through the requests of the goal, which borrow
+        // nothing of the handle, so the handle reads the feedback meanwhile.
+        let requests = handle.requests();
+        let result = requests.result(messenger, RESULT_WAIT);
+        tokio::pin!(result);
+        // The cancel first, so a stream of feedback never holds it back; then
+        // each feedback message that came, so the reports of a goal come
+        // before its end.
+        let mut reading = feedback;
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let settling = async {
+                        let _ = handle.cancel(messenger, self.cancel_timeout).await;
+                        handle.result(messenger, RESULT_WAIT).await
+                    };
+                    let settled = tokio::time::timeout(self.cancel_timeout, settling).await;
+                    return end_after_cancel(settled.ok());
+                }
+                fed = handle.next_feedback(), if reading.is_some() => match (fed, reading) {
+                    (Ok(Some(message)), Some(feedback)) => feedback(message),
+                    _ => reading = None,
+                },
+                outcome = &mut result => break outcome,
             }
         };
         match outcome {
@@ -298,7 +317,13 @@ impl Host for LiveHost {
         self.clock.until(at).await
     }
 
-    async fn call(&self, target: &Target, request: Json, cancel: CancellationToken) -> CallEnd {
+    async fn call(
+        &self,
+        target: &Target,
+        request: Json,
+        cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
+    ) -> CallEnd {
         if target.moves_robot {
             match self.leases.check_move(&target.producer.instance).await {
                 Ok(None) => {}
@@ -337,8 +362,12 @@ impl Host for LiveHost {
                     Err(error) => CallEnd::Refused(Self::failure_of(&error)),
                 }
             }
+            // A goal follows its feedback, its result and its cancel, a large
+            // future: on the heap, so the future of each call, a call of a
+            // service too, stays small in the futures of the engine, whose
+            // polls nest on the stack of a worker.
             Some(Client::Action(client, binding)) => {
-                self.goal(client, binding, target, request, cancel).await
+                Box::pin(self.goal(client, binding, target, request, cancel, feedback)).await
             }
             None => CallEnd::Refused(Failure::new(
                 RESOURCE_UNAVAILABLE,

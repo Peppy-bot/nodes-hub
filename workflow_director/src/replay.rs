@@ -23,7 +23,7 @@ use crate::checker::{self, RunChoices};
 use crate::config::AllowedContracts;
 use crate::contract::ContractShape;
 use crate::engine::failure::Failure;
-use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
+use crate::engine::host::{CallEnd, Event, Feedback, Host, Join, Joining};
 use crate::engine::plan::{Target, TopicKey, Watch};
 use crate::engine::{self, ChecksJudged, Phase, ResultBase, RunCommand};
 use crate::fleet::{Fleet, RobotLinks, Snapshot};
@@ -260,7 +260,13 @@ impl<H: Host> Host for Recorded<'_, H> {
         self.inner.until(at).await
     }
 
-    async fn call(&self, target: &Target, request: Json, cancel: CancellationToken) -> CallEnd {
+    async fn call(
+        &self,
+        target: &Target,
+        request: Json,
+        cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
+    ) -> CallEnd {
         let index = {
             let mut sent = self.sent.lock().expect("no recorder panics");
             let count = sent.entry(target.role.to_string()).or_insert(0);
@@ -279,7 +285,7 @@ impl<H: Host> Host for Recorded<'_, H> {
                 end: None,
             }),
         };
-        let end = self.inner.call(target, request, cancel).await;
+        let end = self.inner.call(target, request, cancel, feedback).await;
         if let Some(record) = unanswered.record.take() {
             let answered = CallRecord {
                 end: Some(end.clone()),
@@ -403,11 +409,18 @@ impl std::fmt::Display for Decision {
     }
 }
 
-/// The run's own events: the director gives them, not its engine.
-fn of_the_engine(kind: EventKind) -> bool {
+/// Whether the replay compares the events of `kind`: the events of the
+/// engine, which its decisions give. The director gives the run's own events
+/// (its start, its differences, its end and its heartbeat), and a step gives
+/// its reports from the feedback of its goal, which decides nothing.
+fn compared(kind: EventKind) -> bool {
     !matches!(
         kind,
-        EventKind::RunStarts | EventKind::Differences | EventKind::RunEnds | EventKind::Progress
+        EventKind::RunStarts
+            | EventKind::Differences
+            | EventKind::RunEnds
+            | EventKind::Progress
+            | EventKind::StepReports
     )
 }
 
@@ -528,7 +541,7 @@ impl Recording {
                             record.seq
                         )
                     })?;
-                    if of_the_engine(kind) {
+                    if compared(kind) {
                         let role = record.body["role"].as_str().unwrap_or_default().to_owned();
                         recording
                             .decisions
@@ -610,7 +623,14 @@ impl Host for ReplayHost {
         tokio::time::sleep_until(self.instant_of(at)).await
     }
 
-    async fn call(&self, target: &Target, request: Json, _cancel: CancellationToken) -> CallEnd {
+    /// A replayed goal gives no feedback: its reports are not compared.
+    async fn call(
+        &self,
+        target: &Target,
+        request: Json,
+        _cancel: CancellationToken,
+        _feedback: Option<Feedback<'_>>,
+    ) -> CallEnd {
         let role = target.role.to_string();
         self.decide(
             &role,
@@ -717,7 +737,7 @@ impl Host for ReplayHost {
     }
 
     fn event(&self, event: Event) {
-        if of_the_engine(event.kind) {
+        if compared(event.kind) {
             self.decide(
                 &event.role,
                 Stream::Events,
@@ -1147,8 +1167,9 @@ mod tests {
             () = sender => unreachable!("the commands of a test never end"),
         };
         for event in host.inner.events.lock().unwrap().iter() {
-            let body = json!({ "role": event.role, "event": event.kind.name(), "step": event.step, "failure_kind": event.failure_kind });
-            journals.append(&run, 0, journal::EVENT, body).unwrap();
+            journals
+                .append(&run, 0, journal::EVENT, json!(event))
+                .unwrap();
         }
         journals
             .append(&run, 0, journal::END, json!({ "ending": ending }))
@@ -1682,6 +1703,59 @@ mod tests {
             journal_of_a_document(&value, scripted, document, Commands::default(), |_| false).await;
         assert!(text.contains("\"uncovered\""), "{text}");
         let outcome = replay(&text).unwrap();
+        assert!(outcome.same, "{}", outcome.difference);
+    }
+
+    /// The journal of a run whose grab reports its stages holds each report
+    /// with its sentence and its feedback message, and its replay, whose
+    /// goals give no feedback, finds no difference.
+    #[tokio::test(start_paused = true)]
+    async fn the_journal_keeps_each_report_with_its_time_and_its_replay_is_the_same() {
+        let reaching = json!({ "stage": "reach", "activity": "The robot moves its hand above the block", "number": 0, "maximum": 0 });
+        let looking = json!({ "stage": "look", "activity": "The robot looks at the block (1 of 5)", "number": 1, "maximum": 5 });
+        let scripted = ScriptedHost::new()
+            .answer("find", vec![Answer::now(found())])
+            .answer(
+                "grab",
+                vec![
+                    Answer::after(4, json!({ "success": true, "item_id": "b1" }))
+                        .with_feedback(vec![(1, reaching.clone()), (3, looking.clone())]),
+                ],
+            )
+            .answer("home", vec![Answer::now(json!({ "at_home": true }))]);
+        let journal = journal_of_a_run_of(
+            &picking(),
+            scripted,
+            Attendance::Attended,
+            Commands::default(),
+            |_| false,
+        )
+        .await;
+        let reports: Vec<Record> = journal
+            .lines()
+            .map(|line| serde_json::from_str::<Record>(line).unwrap())
+            .filter(|record| {
+                record.kind == journal::EVENT && record.body["event"] == "step_reports"
+            })
+            .collect();
+        let bodies: Vec<(Json, Json, Json)> = reports
+            .iter()
+            .map(|record| {
+                (
+                    record.body["step"].clone(),
+                    record.body["message"].clone(),
+                    record.body["details"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                (json!("alpha.grab"), reaching["activity"].clone(), reaching),
+                (json!("alpha.grab"), looking["activity"].clone(), looking),
+            ]
+        );
+        let outcome = replay(&journal).unwrap();
         assert!(outcome.same, "{}", outcome.difference);
     }
 
