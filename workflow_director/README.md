@@ -136,6 +136,8 @@ of its step, each time the sentence of that field changes: the sentence is
 its message, and the feedback message its details. A feedback message with
 the same sentence as the one before, or with no sentence, gives no event, so
 a skill that publishes at a high rate gives one event for each new sentence.
+A feedback message that does not convert gives no event, and the log says
+so; the reports go on with the next message.
 The director finds the field through the mark alone, and reads the feedback
 of no other call: a service, an action with no such field, a call of the
 safe state, an observation and the monitor give no report. Each report goes

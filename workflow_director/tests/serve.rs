@@ -12,8 +12,9 @@ use serde_json::{Value, json};
 
 mod common;
 use common::{
-    ARM_INSTANCE, ARM_PIN, FOUND_AT, GRAB_REPORTS, Home, Lease, ROBOT, ROBOT_FRAME, Rig, SETTLE,
-    WIRE, feedback_messages_of, feedback_of, grab_report, home_workflow, listed_robots, on_alpha,
+    ARM_INSTANCE, ARM_PIN, FOUND_AT, GRAB_REPORTS, Home, LATE_REPORT, Lease, ROBOT, ROBOT_FRAME,
+    Rig, SETTLE, WIRE, feedback_messages_of, feedback_of, grab_report, home_workflow,
+    listed_robots, on_alpha,
 };
 
 /// The goal of a run of `home_workflow` on `alpha`, once the director lists `alpha`.
@@ -1015,7 +1016,9 @@ async fn a_point_read_before_a_move_reaches_the_grab_after_it_with_its_time() ->
 /// A grab whose goal reports its stages gives, on the feedback of the run,
 /// one step_reports for each new sentence, between the start and the end of
 /// its step, each with the sentence as its message and the feedback message
-/// as its details. The grab completes only once the test read its reports.
+/// as its details. A message that does not decode, before the reports, gives
+/// none and stops none. The grab completes only once the test read its
+/// reports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reports_of_a_grab_reach_the_feedback_of_the_run() -> peppygen::Result<()> {
     let rig = Rig::start(Home::AtOnce).await?;
@@ -1079,6 +1082,41 @@ async fn the_reports_of_a_grab_reach_the_feedback_of_the_run() -> peppygen::Resu
             edge("step_ends"),
         ],
         "the same sentence twice gives one report"
+    );
+    rig.harness.shutdown().await
+}
+
+/// A grab that its step bound cancels gives no report after the cancel: the
+/// arm reports once more when the cancel comes, and the director, which sent
+/// the cancel, reads no more feedback of the goal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_grab_gives_no_report_after_its_cancel() -> peppygen::Result<()> {
+    let rig = Rig::start(Home::AtOnce).await?;
+    // The reach assumption reads `find` once, and the lane once.
+    rig.arm.finds.add_permits(2);
+    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
+    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
+    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
+    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
+        { "id": "grab", "timeout_s": 1, "call": {
+            "member": "arm.grab",
+            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
+        } },
+    ] });
+    // The grab gets no permit: only its bound ends it.
+    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
+    let feedback = feedback_messages_of(&mut goal).await;
+    let grab_ends = feedback
+        .iter()
+        .find(|event| event.step == "arm.grab" && event.event == "step_ends")
+        .expect("the step of the grab ends");
+    assert_eq!(grab_ends.failure_kind, "timeout", "{feedback:?}");
+    assert!(
+        !feedback
+            .iter()
+            .any(|event| event.event == "step_reports" && event.message == LATE_REPORT.1),
+        "{feedback:?}"
     );
     rig.harness.shutdown().await
 }

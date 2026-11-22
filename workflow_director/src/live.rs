@@ -258,8 +258,17 @@ impl LiveHost {
                     let settled = tokio::time::timeout(self.cancel_timeout, settling).await;
                     return end_after_cancel(settled.ok());
                 }
+                // A message that does not convert is skipped: a handle that
+                // reads the feedback once follows it, and cancels the goal
+                // when its unread messages pass the bound.
                 fed = handle.next_feedback(), if reading.is_some() => match (fed, reading) {
                     (Ok(Some(message)), Some(feedback)) => feedback(message),
+                    (Err(ConsumerError::Conversion(error)), _) => tracing::warn!(
+                        "a feedback message of {}.{} on {} does not convert, and gives no report: {error}",
+                        target.contract,
+                        target.member,
+                        target.producer.instance
+                    ),
                     (Err(error), _) => {
                         tracing::warn!(
                             "the feedback of {}.{} on {} stops: {error}; the step gives no more reports",

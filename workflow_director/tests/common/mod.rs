@@ -582,8 +582,9 @@ pub enum Home {
 
 /// The arm of `alpha` on the session of `harness`: it answers each `home` goal as `home` says, counts the goals, and
 /// tells `arrived` of each; it goes to each place a `go_to` goal names, and keeps the names in `visited`; it grabs
-/// at each `grab` goal, keeps the goals in `grabbed`, gives the feedback messages of `GRAB_REPORTS`, and completes
-/// once the test gives `grabs` a permit; it serves `locations:v1`, knowing the locations of `known`,
+/// at each `grab` goal, keeps the goals in `grabbed`, gives a feedback message that does not decode and then those of
+/// `GRAB_REPORTS`, and completes once the test gives `grabs` a permit, or, at a cancel, gives `LATE_REPORT` and ends
+/// cancelled; it serves `locations:v1`, knowing the locations of `known`,
 /// which a teach replaces, each one taught with no frame in its robot frame, and keeps the locations of the last teach
 /// request as it came in `taught`; and it answers each `find` once the test
 /// gives `finds` a permit, with a block found in its robot frame at `FOUND_AT`.
@@ -833,6 +834,10 @@ impl ScriptedArm {
                     MessageCodec::new("grab result", &result).expect("a codec of the result");
                 let feedback =
                     MessageCodec::new("grab feedback", &feedback).expect("a codec of the feedback");
+                assert!(
+                    feedback.decode(&UNREADABLE_FEEDBACK).is_err(),
+                    "the unreadable feedback of the arm does not decode"
+                );
                 while let Ok(pending) = grabbing.next_goal(IDLE).await {
                     let asked = goal
                         .decode(pending.request_bytes())
@@ -842,15 +847,35 @@ impl ScriptedArm {
                     let Ok(goal) = pending.accept(Payload::new()).await else {
                         continue;
                     };
+                    let publish = |message: Vec<u8>| {
+                        let goal = Arc::clone(&goal);
+                        async move {
+                            let payload = NonEmptyPayload::try_new(Payload::from(message))
+                                .expect("a feedback of grab holds bytes");
+                            let _ = goal.publish_feedback(payload).await;
+                        }
+                    };
+                    publish(UNREADABLE_FEEDBACK.to_vec()).await;
                     for report in GRAB_REPORTS {
-                        let message = feedback
-                            .encode(&grab_report(report))
-                            .expect("a feedback of grab");
-                        let payload = NonEmptyPayload::try_new(Payload::from(message))
-                            .expect("a feedback of grab holds its fields");
-                        let _ = goal.publish_feedback(payload).await;
+                        publish(
+                            feedback
+                                .encode(&grab_report(report))
+                                .expect("a feedback of grab"),
+                        )
+                        .await;
                     }
-                    let Ok(permit) = grabs.acquire().await else {
+                    let permit = tokio::select! {
+                        permit = grabs.acquire() => permit,
+                        () = goal.cancel_signal() => {
+                            publish(feedback.encode(&grab_report(LATE_REPORT)).expect("a feedback of grab")).await;
+                            let stopped = result
+                                .encode(&json!({ "success": false, "item_id": "" }))
+                                .expect("a result of grab");
+                            let _ = goal.complete_cancelled("cancelled", Payload::from(stopped)).await;
+                            continue;
+                        }
+                    };
+                    let Ok(permit) = permit else {
                         return;
                     };
                     permit.forget();
@@ -1098,6 +1123,13 @@ pub const GRAB_REPORTS: [(&str, &str); 3] = [
     ("reach", "The robot moves its hand above the block"),
     ("close", "The robot closes its hand on the block"),
 ];
+
+/// The bytes of a feedback message of `grab` that does not decode, which the
+/// arm gives before its reports.
+pub const UNREADABLE_FEEDBACK: [u8; 3] = [0xff, 0xff, 0xff];
+
+/// The report that the arm gives once the director cancelled its grab.
+pub const LATE_REPORT: (&str, &str) = ("close", "The robot closes its hand after the cancel");
 
 /// The feedback message of `grab` of the arm for `(stage, sentence)`.
 pub fn grab_report((stage, activity): (&str, &str)) -> Value {
