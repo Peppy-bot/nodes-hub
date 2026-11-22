@@ -35,6 +35,7 @@ from wire import (
     accepted_grip,
     answer_the_camera,
     failure_of,
+    feedback_of,
     grab_by_pose,
     land_move,
     limbs_of,
@@ -331,6 +332,15 @@ async def test_identify_then_a_scripted_grab_holds_the_item():
         done.set()
         await stream
         assert (result.success, result.gripper_name, result.item_id) == (True, "left_gripper", found.item_id), result.message
+        # The generated goal context publishes each stage on the feedback
+        # topic: a grab with no aligner plans, moves above the item, and
+        # grasps.
+        reported = [(fed.stage, fed.activity, fed.number, fed.maximum) for fed in await feedback_of(grab)]
+        assert reported == [
+            ("plan", "The robot opens its hand for the cup and finds a way to reach it", 0, 0),
+            ("move_above", "The robot moves its hand above the cup", 0, 0),
+            ("grasp", "The robot lowers its hand, closes it on the cup and lifts it", 0, 0),
+        ]
         state = await get_state_fx.poll(h, 5.0)
         assert (state.holding, state.held_item_ids) == ([True, False], [found.item_id, ""])
         # The last snapshot the backbone published: the left jaws on the cup.
