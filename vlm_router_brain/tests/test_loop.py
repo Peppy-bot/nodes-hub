@@ -68,12 +68,12 @@ class DoneTool:
 
 def observing(*states: str):
     """An observer that gives `states` in turn, each with one picture,
-    and counts its calls."""
-    calls = {"count": 0}
+    and keeps the number of the step of each call."""
+    calls = {"steps": []}
     remaining = list(states)
 
-    async def observe() -> Observation:
-        calls["count"] += 1
+    async def observe(step: int) -> Observation:
+        calls["steps"].append(step)
         state = remaining.pop(0) if remaining else "later"
         return Observation(state, (Picture("wrist", b"jpeg"),))
 
@@ -170,12 +170,13 @@ async def test_a_cancel_during_the_models_call_raises_cancelled_without_waiting_
     assert not model.release.is_set()
 
 
-async def test_the_observer_runs_once_per_step_before_the_model():
+async def test_the_observer_runs_once_per_step_before_the_model_given_the_number_of_the_step():
     observe = observing("a", "b", "c")
-    model = FakeStepModel('{"action": "step", "x": 1}', '{"action": "step", "x": 1}', '{"action": "done"}')
+    model = FakeStepModel('{"action": "step", "x": 1}', "junk", '{"action": "done"}')
     the_loop, _, _ = loop(model, observe=observe)
     await the_loop.run(CancelToken())
-    assert observe.calls["count"] == 3
+    # An answer the loop cannot read counts as a step too.
+    assert observe.calls["steps"] == [1, 2, 3]
     assert [turn.state for turn in model.turns] == ["a", "b", "c"]
 
 

@@ -57,6 +57,20 @@ Known limitation: an abort while the arm climbs back after a `place_item`
 released the item leaves the held flag set, though the jaws are open and the
 item is down; `get_state`'s gripper opening shows the open jaws.
 
+Each goal of `grab_item`, `drop_item`, `place_item`, `scan_items` and
+`identify_item` publishes one feedback message at the start of each of its
+stages, with one sentence for the person who looks at the robot; brain_core
+writes the stages and every sentence (its README, "The feedback of a goal").
+`scripted` has no aligner, so it publishes no `align_look` and no
+`align_move`: a grab gives `plan` ("The robot opens its hand for the apple
+and finds a way to reach it"), `move_above` ("The robot moves its hand above
+the apple") and `grasp` ("The robot lowers its hand, closes it on the apple
+and lifts it"); a place `plan`, `move_above` and `set_down`; a drop above a
+target item `plan`, `move_above` and `release`, and any other drop `release`
+alone; a search `look` ("The robot looks for the apple"). Each of these
+stages has `number` and `maximum` 0. A goal refused before it starts, and
+`abort`, publish nothing.
+
 Each role runs the model its parameter names for the node's whole life.
 `get_model` and `list_models` name it, and `switch_model` accepts it alone:
 any other is refused with `rejected`, "this brain runs only 'sam3_siglip'

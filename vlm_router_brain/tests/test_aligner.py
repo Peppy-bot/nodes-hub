@@ -19,6 +19,7 @@ from brain_core.manipulators.scripted.aligning import Aligned, AlignmentFailed, 
 from brain_core.manipulators.scripted.grasp import GraspDirection, approach, jaw_line_deg, lifted, orientation
 from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal, TargetItem
 from brain_core.robot import MoveEnd, MoveResult
+from brain_core.stages import CarryReports, GrabReports, Report
 from control_core_py.geometry import Placement
 
 from vlm_router_brain.manipulators.vlm.aligner import MIN_FRAME_WAIT_S, NOT_STARTED, ModelAligner
@@ -40,6 +41,14 @@ POSES = {WRIST_FRAME: Placement((0.2, 0.2, 0.5), LOOKING_DOWN), CHEST_FRAME: Pla
 
 def cube(position=SEEN) -> Item:
     return Item("cube_1-t0", "cube", position, None, 0.9, 1)
+
+
+async def not_followed(report: Report) -> None:
+    """The reporter of a test that does not read the feedback."""
+
+
+# The reports of an alignment that no test reads.
+QUIET = GrabReports(not_followed, "cube")
 
 
 # When the chest picture and the first wrist picture were taken.
@@ -163,7 +172,7 @@ def aligner(*answers, the_senses=None, **kwargs):
 async def test_ready_at_once_keeps_the_points_and_shows_the_model_the_state_and_two_pictures():
     a, model = aligner('{"action": "ready"}')
     moves = FakeMoves()
-    end = await a.align(request(), moves, CancelToken())
+    end = await a.align(request(), moves, CancelToken(), QUIET)
     assert end == Aligned(PRE, POINT, lifted(POINT, LIFT_M), DOWN_0, steps=1)
     assert moves.checks == [] and moves.moves == []
     (turn,) = model.turns
@@ -184,7 +193,7 @@ async def test_ready_at_once_keeps_the_points_and_shows_the_model_the_state_and_
 async def test_a_move_inside_the_limits_checks_the_three_points_turned_and_moves_at_the_same_height():
     a, model = aligner('{"action": "move", "dx": 1.0, "dy": -2.0, "roll_deg": 45}', '{"action": "ready"}')
     moves = FakeMoves()
-    end = await a.align(request(), moves, CancelToken())
+    end = await a.align(request(), moves, CancelToken(), QUIET)
     pre = (0.51, 0.08, PRE[2])
     point = (0.51, 0.08, POINT[2])
     assert [p for p, _ in moves.checks] == [pre, point, lifted(point, LIFT_M)]
@@ -211,7 +220,7 @@ async def test_a_move_inside_the_limits_checks_the_three_points_turned_and_moves
 async def test_a_step_over_a_limit_or_unreadable_moves_nothing_counts_and_is_fed_back(answer, said):
     a, model = aligner(answer, '{"action": "ready"}')
     moves = FakeMoves()
-    end = await a.align(request(), moves, CancelToken())
+    end = await a.align(request(), moves, CancelToken(), QUIET)
     assert moves.checks == [] and moves.moves == []
     assert end == Aligned(PRE, POINT, lifted(POINT, LIFT_M), DOWN_0, steps=2)
     (line,) = model.turns[1].history
@@ -224,7 +233,7 @@ async def test_a_step_that_ends_over_10_cm_from_the_item_moves_nothing():
     far = (SEEN[0], SEEN[1] + 0.09, PRE[2])
     far_request = AlignRequest(cube(), LEFT, far, (far[0], far[1], POINT[2]), DOWN_0, LIFT_M)
     moves = FakeMoves()
-    await a.align(far_request, moves, CancelToken())
+    await a.align(far_request, moves, CancelToken(), QUIET)
     assert moves.moves == []
     (line,) = model.turns[1].history
     assert line.endswith("moved nothing: the gripper stays within 10 cm of the item, this step ends 11.0 cm from it")
@@ -234,7 +243,7 @@ async def test_a_point_the_backbone_has_no_plan_for_moves_nothing_and_is_named()
     a, model = aligner('{"action": "move", "dx": 1, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
     moves.refusals["point"] = "no joint solution"
-    end = await a.align(request(), moves, CancelToken())
+    end = await a.align(request(), moves, CancelToken(), QUIET)
     assert len(moves.checks) == 2 and moves.moves == []
     (line,) = model.turns[1].history
     assert line.endswith("moved nothing: the backbone has no plan for the grasp point: no joint solution")
@@ -245,7 +254,7 @@ async def test_a_move_that_fails_keeps_the_points_and_tells_the_model_where_the_
     a, model = aligner('{"action": "move", "dx": 1, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
     moves.results.append(MoveResult(MoveEnd.FAILED, "the arm did not settle", "timeout"))
-    end = await a.align(request(), moves, CancelToken())
+    end = await a.align(request(), moves, CancelToken(), QUIET)
     (line,) = model.turns[1].history
     assert "-> the move failed: the arm did not settle; the grasp point is now" in line
     assert end == Aligned(PRE, POINT, lifted(POINT, LIFT_M), DOWN_0, steps=2)
@@ -255,16 +264,16 @@ async def test_a_move_a_stop_ended_ends_the_alignment_stopped():
     a, model = aligner('{"action": "move", "dx": 1, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
     moves.results.append(MoveResult(MoveEnd.CANCELLED, "stopped: operator"))
-    end = await a.align(request(), moves, CancelToken())
+    end = await a.align(request(), moves, CancelToken(), QUIET)
     assert end == Stopped("stopped: operator", steps=1)
     assert len(model.turns) == 1
 
 
 async def test_give_up_and_running_out_of_steps():
     a, _ = aligner('{"action": "give_up"}')
-    assert await a.align(request(), FakeMoves(), CancelToken()) == GaveUp(steps=1)
+    assert await a.align(request(), FakeMoves(), CancelToken(), QUIET) == GaveUp(steps=1)
     a, model = aligner(*['{"action": "move", "dx": 0.5, "dy": 0, "roll_deg": 10}'] * 5, max_steps=5)
-    assert await a.align(request(), FakeMoves(), CancelToken()) == OutOfSteps(5)
+    assert await a.align(request(), FakeMoves(), CancelToken(), QUIET) == OutOfSteps(5)
     assert len(model.turns) == 5
 
 
@@ -272,7 +281,7 @@ async def test_the_aligner_says_why_an_arm_cannot_be_aligned():
     a = ModelAligner(FakeStepModel())
     assert a.why_unavailable("left_arm") == NOT_STARTED
     with pytest.raises(AlignmentFailed, match=NOT_STARTED):
-        await a.align(request(), FakeMoves(), CancelToken())
+        await a.align(request(), FakeMoves(), CancelToken(), QUIET)
     a.start(senses(wrists=FakeWrists(camera=None)))
     assert a.why_unavailable("left_arm") == "no wrist camera for left_arm: the wrist_cameras parameter names none"
     a.start(senses(chest=FakeChest(unavailable="no perception source: no camera frame received")))
@@ -284,26 +293,26 @@ async def test_the_aligner_says_why_an_arm_cannot_be_aligned():
 async def test_a_step_with_no_wrist_frame_after_the_move_fails_the_alignment():
     a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=FakeWrists(frames=0)))
     with pytest.raises(AlignmentFailed, match="no frame from wrist camera 'wrist_left' after the move"):
-        await a.align(request(), FakeMoves(), CancelToken())
+        await a.align(request(), FakeMoves(), CancelToken(), QUIET)
 
 
 async def test_each_camera_is_placed_where_the_frame_its_picture_names_stood_when_the_picture_was_taken():
     PLACED.clear()
     a, _ = aligner('{"action": "ready"}', the_senses=senses())
-    await a.align(request(), FakeMoves(), CancelToken())
+    await a.align(request(), FakeMoves(), CancelToken(), QUIET)
     assert PLACED == [(WRIST_FRAME, WRIST_TAKEN_S + 1), (CHEST_FRAME, CHEST_TAKEN_S)]
 
 
 async def test_a_step_with_no_chest_frame_no_chest_pose_or_no_limbs_fails_the_alignment():
     a, _ = aligner('{"action": "ready"}', the_senses=senses(chest=FakeChest(frame=False)))
     with pytest.raises(AlignmentFailed, match="no camera frame received"):
-        await a.align(request(), FakeMoves(), CancelToken())
+        await a.align(request(), FakeMoves(), CancelToken(), QUIET)
     a, _ = aligner('{"action": "ready"}', the_senses=senses(pose=undescribed))
     with pytest.raises(AlignmentFailed, match="the robot's sensors have not been described yet"):
-        await a.align(request(), FakeMoves(), CancelToken())
+        await a.align(request(), FakeMoves(), CancelToken(), QUIET)
     a, _ = aligner('{"action": "ready"}', the_senses=senses(store=LimbStateStore()))
     with pytest.raises(AlignmentFailed, match=NO_SNAPSHOT):
-        await a.align(request(), FakeMoves(), CancelToken())
+        await a.align(request(), FakeMoves(), CancelToken(), QUIET)
 
 
 async def test_a_picture_whose_frame_the_robot_cannot_place_fails_the_alignment_with_its_words():
@@ -315,7 +324,7 @@ async def test_a_picture_whose_frame_the_robot_cannot_place_fails_the_alignment_
 
     a, _ = aligner('{"action": "ready"}', the_senses=senses(pose=no_pose))
     with pytest.raises(AlignmentFailed, match=f"^picture 1 dropped: unknown_frame: the frame '{WRIST_FRAME}'"):
-        await a.align(request(), FakeMoves(), CancelToken())
+        await a.align(request(), FakeMoves(), CancelToken(), QUIET)
 
 
 @pytest.mark.parametrize(
@@ -333,21 +342,21 @@ async def test_a_picture_whose_frame_the_robot_cannot_place_fails_the_alignment_
 async def test_a_step_waits_for_the_frame_periods_of_the_wrist_camera_and_the_least_wait(period_s, waited):
     wrists = FakeWrists(period_s=period_s)
     a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists), frame_wait_periods=2.5, min_frame_wait_s=0.5)
-    await a.align(request(), FakeMoves(), CancelToken())
+    await a.align(request(), FakeMoves(), CancelToken(), QUIET)
     assert wrists.waited == [pytest.approx(waited)]
 
 
 async def test_a_step_waits_at_least_the_least_wait_by_default():
     wrists = FakeWrists()
     a, _ = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists))
-    await a.align(request(), FakeMoves(), CancelToken())
+    await a.align(request(), FakeMoves(), CancelToken(), QUIET)
     assert wrists.waited == [MIN_FRAME_WAIT_S]
 
 
 async def test_a_cancel_during_the_models_call_raises_cancelled():
     a, model = aligner()
     cancel = CancelToken()
-    running = asyncio.ensure_future(a.align(request(), FakeMoves(), cancel))
+    running = asyncio.ensure_future(a.align(request(), FakeMoves(), cancel, QUIET))
     for _ in range(20):
         await asyncio.sleep(0)
     assert len(model.turns) == 1
@@ -388,7 +397,7 @@ def test_every_move_keeps_the_limits_and_the_alignment_ends_within_five_steps(an
         moves = FakeMoves()
         moves.refusals = refusals
         moves.results.extend(r for r in results if r is not None)
-        end = await a.align(request(), moves, CancelToken())
+        end = await a.align(request(), moves, CancelToken(), QUIET)
         assert len(model.turns) <= 5
         previous, previous_q = PRE, DOWN_0
         for point, q in moves.moves:
@@ -419,7 +428,7 @@ def place_request(pre=PRE, target=TARGET) -> AlignRequest:
 
 async def test_a_place_request_speaks_of_the_held_item_and_measures_from_the_target_point():
     a, model = aligner('{"action": "ready"}')
-    end = await a.align(place_request(), FakeMoves(), CancelToken())
+    end = await a.align(place_request(), FakeMoves(), CancelToken(), QUIET)
     assert end == Aligned(PRE, (PRE[0], PRE[1], TARGET[2]), lifted((PRE[0], PRE[1], TARGET[2]), LIFT_M), DOWN_0, steps=1)
     (turn,) = model.turns
     assert turn.goal.startswith("You guide a robot gripper that holds an item")
@@ -436,7 +445,7 @@ async def test_a_place_step_that_ends_over_10_cm_from_the_target_point_moves_not
     a, model = aligner('{"action": "move", "dx": 0, "dy": 2.0, "roll_deg": 0}', '{"action": "ready"}')
     far = (TARGET[0], TARGET[1] + 0.09, PRE[2])
     moves = FakeMoves()
-    await a.align(place_request(pre=far), moves, CancelToken())
+    await a.align(place_request(pre=far), moves, CancelToken(), QUIET)
     assert moves.moves == []
     (line,) = model.turns[1].history
     assert line.endswith("moved nothing: the gripper stays within 10 cm of the item, this step ends 11.0 cm from it")
@@ -445,7 +454,7 @@ async def test_a_place_step_that_ends_over_10_cm_from_the_target_point_moves_not
 async def test_a_place_move_keeps_the_release_height_and_the_history_measures_from_the_target():
     a, model = aligner('{"action": "move", "dx": 1.0, "dy": 0.0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
-    end = await a.align(place_request(), moves, CancelToken())
+    end = await a.align(place_request(), moves, CancelToken(), QUIET)
     (moved_to, _q) = moves.moves[0]
     assert moved_to == (0.51, 0.10, PRE[2])
     assert end.point == (0.51, 0.10, TARGET[2])
@@ -468,7 +477,7 @@ def into_request(target=BOWL, descends=True) -> AlignRequest:
 
 async def test_a_place_into_a_bowl_names_the_bowl_and_its_width_and_measures_from_its_centre():
     a, model = aligner('{"action": "ready"}')
-    end = await a.align(into_request(), FakeMoves(), CancelToken())
+    end = await a.align(into_request(), FakeMoves(), CancelToken(), QUIET)
     assert isinstance(end, Aligned) and end.point == BOWL_BOTTOM
     (turn,) = model.turns
     assert turn.goal.startswith("You guide a robot gripper that holds an item to a free spot of the wooden bowl, about 18 cm wide.")
@@ -486,7 +495,7 @@ async def test_a_step_that_ends_beyond_half_the_bowls_width_less_the_margin_move
     off_centre = (0.55, 0.10, PRE[2])
     moves = FakeMoves()
     request = AlignRequest(None, LEFT, off_centre, (0.55, 0.10, 0.65), DOWN_0, LIFT_M, target=(0.50, 0.10, 0.72), into=BOWL)
-    await a.align(request, moves, CancelToken())
+    await a.align(request, moves, CancelToken(), QUIET)
     assert moves.moves == []
     (line,) = model.turns[1].history
     assert line.endswith("moved nothing: the gripper stays within 7 cm of the item, this step ends 7.5 cm from it")
@@ -496,7 +505,7 @@ async def test_a_step_that_ends_beyond_half_the_bowls_width_less_the_margin_move
 async def test_the_limit_above_a_target_is_10_cm_at_most_and_never_below_0(width_m, radius_words):
     a, model = aligner('{"action": "ready"}')
     target = TargetItem("tray_1-t0", "tray", (0.50, 0.10), 0.72, 0.65, width_m)
-    await a.align(into_request(target), FakeMoves(), CancelToken())
+    await a.align(into_request(target), FakeMoves(), CancelToken(), QUIET)
     move = model.turns[0].tools[0]
     assert move.description.endswith(f"the gripper stays within {radius_words} of the centre of the tray.")
 
@@ -504,7 +513,7 @@ async def test_the_limit_above_a_target_is_10_cm_at_most_and_never_below_0(width
 async def test_a_drop_above_a_bowl_checks_the_pre_point_alone_and_says_the_jaws_open_at_this_height():
     a, model = aligner('{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
-    end = await a.align(into_request(descends=False), moves, CancelToken())
+    end = await a.align(into_request(descends=False), moves, CancelToken(), QUIET)
     assert moves.checks == [((0.51, 0.10, PRE[2]), DOWN_0)]
     assert end.pre == (0.51, 0.10, PRE[2])
     turn = model.turns[0]
@@ -518,7 +527,7 @@ async def test_a_drop_above_a_bowl_checks_the_pre_point_alone_and_says_the_jaws_
 
 async def test_a_place_has_two_answers_and_its_goal_asks_for_the_whole_move_in_the_first():
     a, model = aligner('{"action": "ready"}')
-    await a.align(place_request(), FakeMoves(), CancelToken())
+    await a.align(place_request(), FakeMoves(), CancelToken(), QUIET)
     (turn,) = model.turns
     assert turn.max_steps == 2
     assert "and opens. You have 2 answers: make the whole move in the first, then answer ready." in turn.goal
@@ -530,7 +539,7 @@ async def test_a_place_has_two_answers_and_its_goal_asks_for_the_whole_move_in_t
 async def test_one_move_of_a_place_goes_anywhere_inside_the_limit_beyond_3_cm():
     a, model = aligner('{"action": "move", "dx": 8.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
-    end = await a.align(place_request(), moves, CancelToken())
+    end = await a.align(place_request(), moves, CancelToken(), QUIET)
     assert moves.moves[0][0] == (0.58, 0.10, PRE[2]) and isinstance(end, Aligned) and end.steps == 2
 
 
@@ -540,19 +549,110 @@ async def test_a_place_whose_answers_run_out_after_a_move_that_completed_ends_al
         '{"action": "ready"}',
     )
     moves = FakeMoves()
-    end = await a.align(place_request(), moves, CancelToken())
+    end = await a.align(place_request(), moves, CancelToken(), QUIET)
     assert len(model.turns) == 2
     assert end == Aligned((0.52, 0.10, PRE[2]), (0.52, 0.10, TARGET[2]), lifted((0.52, 0.10, TARGET[2]), LIFT_M), DOWN_0, steps=2)
 
 
 async def test_a_place_whose_last_answer_moved_nothing_runs_out_of_steps():
     a, model = aligner('{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "move", "dx": 0, "dy": 20.0, "roll_deg": 0}')
-    end = await a.align(place_request(), FakeMoves(), CancelToken())
+    end = await a.align(place_request(), FakeMoves(), CancelToken(), QUIET)
     assert end == OutOfSteps(2)
 
 
 async def test_a_grab_keeps_five_steps_of_3_cm_at_most():
     a, model = aligner('{"action": "move", "dx": 4.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
     moves = FakeMoves()
-    await a.align(request(), moves, CancelToken())
+    await a.align(request(), moves, CancelToken(), QUIET)
     assert moves.moves == [] and model.turns[0].max_steps == 5
+
+
+# The reports of each step: the question at the start of the step, before
+# the wait for the wrist frame and the model's answer, and the correction
+# before its move, each with the number of the step and the steps of the
+# alignment.
+
+
+class Published:
+    """A reporter that keeps each report and, for each, its stage, number
+    and maximum, with how many wrist frames the alignment had waited for,
+    questions the model had got and moves the gripper had made when it was
+    published."""
+
+    def __init__(self, wrists: FakeWrists, model, moves: FakeMoves) -> None:
+        self.wrists = wrists
+        self.model = model
+        self.moves = moves
+        self.reports: list[Report] = []
+        self.seen: list[tuple] = []
+
+    async def __call__(self, report: Report) -> None:
+        self.reports.append(report)
+        self.seen.append(
+            (report.stage.value, report.number, report.maximum, len(self.wrists.waited), len(self.model.turns), len(self.moves.moves))
+        )
+
+
+def published_alignment(*answers):
+    wrists = FakeWrists()
+    a, model = aligner(*answers, the_senses=senses(wrists=wrists))
+    moves = FakeMoves()
+    return a, moves, Published(wrists, model, moves)
+
+
+async def test_each_step_reports_its_question_before_it_looks_and_each_correction_before_its_move():
+    a, moves, published = published_alignment(
+        '{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}',
+        # Over the limit of a step: it moves nothing, so it reports no correction.
+        '{"action": "move", "dx": 5.0, "dy": 0, "roll_deg": 0}',
+        '{"action": "ready"}',
+    )
+    end = await a.align(request(), moves, CancelToken(), GrabReports(published, "cube"))
+    assert isinstance(end, Aligned) and end.steps == 3
+    # (stage, number, maximum, wrist frames waited for, questions, moves)
+    assert published.seen == [
+        ("align_look", 1, 5, 0, 0, 0),
+        ("align_move", 1, 5, 1, 1, 0),
+        ("align_look", 2, 5, 1, 1, 1),
+        ("align_look", 3, 5, 2, 2, 1),
+    ]
+    assert [report.activity for report in published.reports] == [
+        "The robot looks at the cube and decides how to correct its hand (1 of 5)",
+        "The robot corrects the position of its hand above the cube (1 of 5)",
+        "The robot looks at the cube and decides how to correct its hand (2 of 5)",
+        "The robot looks at the cube and decides how to correct its hand (3 of 5)",
+    ]
+
+
+async def test_a_correction_the_backbone_has_no_plan_for_reports_no_move():
+    a, moves, published = published_alignment('{"action": "move", "dx": 1, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    moves.refusals["point"] = "no joint solution"
+    await a.align(request(), moves, CancelToken(), GrabReports(published, "cube"))
+    assert [stage for stage, *_ in published.seen] == ["align_look", "align_look"]
+
+
+async def test_a_place_reports_its_steps_out_of_the_answers_of_a_place():
+    a, moves, published = published_alignment('{"action": "move", "dx": 1.0, "dy": 0, "roll_deg": 0}', '{"action": "ready"}')
+    await a.align(place_request(), moves, CancelToken(), CarryReports(published, "cube"))
+    assert [(stage, number, maximum) for stage, number, maximum, *_ in published.seen] == [
+        ("align_look", 1, 2), ("align_move", 1, 2), ("align_look", 2, 2),
+    ]
+    assert published.reports[0].activity == "The robot looks down and decides where to put the cube (1 of 2)"
+
+
+async def test_a_drop_above_a_bowl_reports_its_steps_naming_the_bowl():
+    a, moves, published = published_alignment('{"action": "ready"}')
+    await a.align(into_request(descends=False), moves, CancelToken(), CarryReports(published, "cube", BOWL))
+    assert [report.activity for report in published.reports] == [
+        "The robot looks at the wooden bowl and decides where to put the cube (1 of 2)",
+    ]
+
+
+async def test_a_step_whose_wrist_frame_does_not_come_reported_its_question_and_fails():
+    wrists = FakeWrists(frames=0)
+    a, model = aligner('{"action": "ready"}', the_senses=senses(wrists=wrists))
+    moves = FakeMoves()
+    published = Published(wrists, model, moves)
+    with pytest.raises(AlignmentFailed, match="no frame from wrist camera"):
+        await a.align(request(), moves, CancelToken(), GrabReports(published, "cube"))
+    assert published.seen == [("align_look", 1, 5, 0, 0, 0)]

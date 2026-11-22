@@ -1,13 +1,15 @@
 """A loop that asks a model for one action per step, over a fixed set of
 tools, and knows nothing of what the tools do.
 
-Each step: `observe` gives the state as text and the pictures of the
-moment; the loop builds a `Turn` from the goal, the tools, the history of
-the earlier steps and that observation; the `StepModel` answers with the
-text of one JSON object; the loop reads its `action`, finds the tool of
-that name, lets the tool parse its own fields and runs it; one line goes
-into the history, the answer and what the tool observed. The loop ends
-when a tool's result ends it, or when `max_steps` steps have run.
+Each step: `observe`, given the number of the step from 1, which tells
+the caller the step its tools run in, gives the state as text and the
+pictures of the moment; the loop builds a `Turn` from the goal, the tools,
+the history of the earlier steps and that observation; the `StepModel`
+answers with the text of one JSON object; the loop reads its `action`,
+finds the tool of that name, lets the tool parse its own fields and runs
+it; one line goes into the history, the answer and what the tool observed.
+The loop ends when a tool's result ends it, or when `max_steps` steps have
+run.
 
 Every step counts, a bad one too: an answer that is not a JSON object, an
 action no tool has, or a field a tool refuses runs nothing, and its reason
@@ -128,7 +130,7 @@ class ToolLoop:
         tools: Sequence[Tool],
         goal: str,
         max_steps: int,
-        observe: Callable[[], Awaitable[Observation]],
+        observe: Callable[[int], Awaitable[Observation]],
     ) -> None:
         if max_steps < 1:
             raise ValueError("a loop runs at least one step")
@@ -144,7 +146,7 @@ class ToolLoop:
     async def run(self, cancel: CancelToken) -> LoopEnd:
         history: list[str] = []
         for step in range(1, self.max_steps + 1):
-            observation = await self.observe()
+            observation = await self.observe(step)
             cancel.check()
             turn = Turn(self.goal, self.tools, tuple(history), observation.state, observation.pictures, step, self.max_steps)
             text = await until(cancel.wait(), self.model.next_step(turn))

@@ -38,6 +38,14 @@ and its goal text says so and asks for the whole move in the first: one
 move may go anywhere inside the limit, with no limit of a step. A grab has
 `max_steps`, each step within `step_max_m`.
 
+Each step publishes its question through the reports of the goal
+(`brain_core.stages.AlignReports`): `align_look` at the start of the step,
+before it waits for the wrist frame and asks the model, and `align_move`
+before the move of a correction that passed its checks, each with the
+number of the step and the steps of the alignment (`max_steps` for a grab,
+`place_max_steps` for a place or a drop). A step that moves nothing
+publishes no `align_move`. The words of each report are brain_core's.
+
 The alignment ends `Aligned` with the new points and orientation, `GaveUp`,
 `OutOfSteps` after the last step, or `Stopped` when a stop ended a move; a
 place whose last step was a move that completed ends `Aligned` there, with
@@ -70,6 +78,7 @@ from brain_core.manipulators.scripted.aligning import (
 from brain_core.manipulators.scripted.grasp import jaw_line_deg, lifted, turned_about_z
 from brain_core.perception.wrist import jpeg_of
 from brain_core.ports import CancelToken, Refusal, Vec3
+from brain_core.stages import AlignReports
 
 from .directions import axes_in_picture
 from .loop import Observation, Picture, StepModel, ToolLoop, ToolResult
@@ -177,11 +186,11 @@ class ModelAligner:
             return NOT_STARTED
         return self._senses.wrists.why_unavailable(arm) or self._senses.chest.why_unavailable()
 
-    async def align(self, request: AlignRequest, moves: ArmMoves, cancel: CancelToken) -> Alignment:
+    async def align(self, request: AlignRequest, moves: ArmMoves, cancel: CancelToken, reports: AlignReports) -> Alignment:
         if self._senses is None:
             raise AlignmentFailed(NOT_STARTED)
-        run = _Run(self, self._senses, request, moves)
         steps = self.place_max_steps if request.is_place else self.max_steps
+        run = _Run(self, self._senses, request, moves, reports, steps)
         goal = _goal(request)
         if request.is_place:
             goal = goal.replace("\n\n", PLACE_ANSWERS.format(answers=steps) + "\n\n", 1)
@@ -218,14 +227,21 @@ def radius_of(aligner: ModelAligner, request: AlignRequest) -> float:
 
 
 class _Run:
-    """One alignment: the points as the steps move them, the tools over
-    them, and the observation of each step."""
+    """One alignment of `steps` steps at most: the points as the steps move
+    them, the tools over them, the observation of each step, and the step
+    that runs, which each report names."""
 
-    def __init__(self, aligner: ModelAligner, senses, request: AlignRequest, moves: ArmMoves) -> None:
+    def __init__(
+        self, aligner: ModelAligner, senses, request: AlignRequest, moves: ArmMoves, reports: AlignReports, steps: int
+    ) -> None:
         self.aligner = aligner
         self.senses = senses
         self.request = request
         self.moves = moves
+        self.reports = reports
+        self.steps = steps
+        # The number of the step that runs, from 1.
+        self.step = 0
         self.pre = request.pre
         self.point = request.point
         self.lift = lifted(request.point, request.lift_m)
@@ -240,8 +256,11 @@ class _Run:
     def arm(self) -> str:
         return self.request.gripper.arm
 
-    async def observe(self) -> Observation:
+    async def observe(self, step: int) -> Observation:
+        """The observation of step `step`, whose question starts here."""
+        self.step = step
         self.moved_in_step = False
+        await self.reports.align_look(step, self.steps)
         try:
             return await self._observe()
         except Refusal as refusal:
@@ -363,6 +382,7 @@ class _MoveTool:
             refusal = await run.moves.refusal_for(run.arm, (target,), orientation, cancel)
             if refusal:
                 return ToolResult(f"moved nothing: the backbone has no plan for {name}: {refusal}")
+        await run.reports.align_move(run.step, run.steps)
         moved = await run.moves.move_to(run.arm, pre, orientation)
         cancel.check()
         if moved.cancelled:
