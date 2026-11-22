@@ -260,6 +260,15 @@ impl LiveHost {
                 }
                 fed = handle.next_feedback(), if reading.is_some() => match (fed, reading) {
                     (Ok(Some(message)), Some(feedback)) => feedback(message),
+                    (Err(error), _) => {
+                        tracing::warn!(
+                            "the feedback of {}.{} on {} stops: {error}; the step gives no more reports",
+                            target.contract,
+                            target.member,
+                            target.producer.instance
+                        );
+                        reading = None;
+                    }
                     _ => reading = None,
                 },
                 outcome = &mut result => break outcome,

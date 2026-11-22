@@ -231,6 +231,35 @@ async fn a_service_call_and_an_action_whose_feedback_has_no_sentence_report_noth
     );
 }
 
+/// A call of the safe state is not a step: its goal gives no report, also
+/// when its action has a sentence in its feedback.
+#[tokio::test(start_paused = true)]
+async fn a_call_of_the_safe_state_reports_nothing() {
+    let safe_state = json!([{ "id": "open", "timeout_s": 10, "call": { "member": "arm.release", "args": { "speed": 1 } } }]);
+    let plan = plan(
+        &one_arm("alpha", rest("rest"), safe_state),
+        Attendance::Unattended,
+    );
+    let host = ScriptedHost::new()
+        .answer("find", vec![Answer::now(found())])
+        .answer("home", vec![Answer::failing("unreachable")])
+        .answer(
+            "release",
+            vec![
+                Answer::after(2, json!({ "released": true }))
+                    .with_feedback(vec![(1, json!({ "activity": "The robot opens its hand" }))]),
+            ],
+        );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    assert_eq!(host.members().last().map(String::as_str), Some("release"));
+    assert!(
+        host.event_details(EventKind::StepReports).is_empty(),
+        "{:?}",
+        host.event_kinds()
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_result_that_fails_done_when_takes_the_retries() {
     let plan = plan(

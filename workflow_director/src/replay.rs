@@ -1710,7 +1710,7 @@ mod tests {
     /// with its sentence and its feedback message, and its replay, whose
     /// goals give no feedback, finds no difference.
     #[tokio::test(start_paused = true)]
-    async fn the_journal_keeps_each_report_with_its_time_and_its_replay_is_the_same() {
+    async fn the_journal_keeps_each_report_and_its_replay_is_the_same() {
         let reaching = json!({ "stage": "reach", "activity": "The robot moves its hand above the block", "number": 0, "maximum": 0 });
         let looking = json!({ "stage": "look", "activity": "The robot looks at the block (1 of 5)", "number": 1, "maximum": 5 });
         let scripted = ScriptedHost::new()

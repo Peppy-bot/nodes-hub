@@ -180,6 +180,14 @@
         marks: ["moves_robot"],
       },
       {
+        name: "release",
+        description: "Open the jaws. The feedback gives the sentence of the release in activity.",
+        goal_service: { request_message_format: { speed: "u32" } },
+        feedback_topic: { qos_profile: "reliable", message_format: { activity: { $type: "string", $marks: ["activity"] } } },
+        result_service: { response_message_format: { released: "bool" } },
+        marks: ["moves_robot"],
+      },
+      {
         name: "go_to",
         description: "Move the arm to a location.",
         goal_service: { request_message_format: { place: { $type: "string", $marks: ["location"] } } },
