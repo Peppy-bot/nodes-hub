@@ -1786,6 +1786,60 @@ async fn describe_base_answers_the_limits_and_rest_bounds_of_its_parameters_and_
     rig.shutdown().await;
 }
 
+// A leader reads the base's limits from its pair: drive_states carries
+// linear_limits and angular_limits as describe_base answers them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_states_carry_the_limits_describe_base_answers() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    let base = describe_base::poll(&rig.harness, ANSWER_BUDGET)
+        .await
+        .expect("describe_base answers");
+    let drive = rig.drive_state_at(rig.now_ns).await;
+    let (described, carried) = (&base.linear_limits, &drive.linear_limits);
+    for (field, actual, expected) in [
+        ("min_velocity", carried.min_velocity, described.min_velocity),
+        ("max_velocity", carried.max_velocity, described.max_velocity),
+        (
+            "max_acceleration",
+            carried.max_acceleration,
+            described.max_acceleration,
+        ),
+        (
+            "max_deceleration",
+            carried.max_deceleration,
+            described.max_deceleration,
+        ),
+        ("deadband", carried.deadband, described.deadband),
+        (
+            "rest_velocity",
+            carried.rest_velocity,
+            described.rest_velocity,
+        ),
+    ] {
+        assert_eq!(actual, expected, "linear_limits' {field}");
+    }
+    let (described, carried) = (&base.angular_limits, &drive.angular_limits);
+    for (field, actual, expected) in [
+        ("min_rate", carried.min_rate, described.min_rate),
+        ("max_rate", carried.max_rate, described.max_rate),
+        (
+            "max_acceleration",
+            carried.max_acceleration,
+            described.max_acceleration,
+        ),
+        (
+            "max_deceleration",
+            carried.max_deceleration,
+            described.max_deceleration,
+        ),
+        ("deadband", carried.deadband, described.deadband),
+        ("rest_rate", carried.rest_rate, described.rest_rate),
+    ] {
+        assert_eq!(actual, expected, "angular_limits' {field}");
+    }
+    rig.shutdown().await;
+}
+
 // The base answers describe_base from its model before the robot's
 // initializer reports the robot ready, and runs once it does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

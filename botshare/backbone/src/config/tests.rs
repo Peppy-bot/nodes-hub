@@ -1,7 +1,8 @@
 use super::*;
 
-use crate::test_rig::params as parameters;
 use control_core::odometry::WheelGeometry;
+
+use crate::test_rig::{REST_LINEAR_M_S, params as parameters};
 
 /// What spoils one parameter of a base the node takes.
 type Spoil = fn(&mut Parameters);
@@ -28,7 +29,7 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
         .expect("the bundled base");
     assert_eq!(config.step_ns, 50_000_000);
     assert_eq!(config.axes.linear.profile().positive_speed, 0.5);
-    assert_eq!(config.rest.velocity, 0.005);
+    assert_eq!(config.rest.velocity, REST_LINEAR_M_S);
     assert_eq!(
         config.wheels,
         WheelGeometry::parse(0.4, 0.1, 0.1).expect("a wheel geometry")
