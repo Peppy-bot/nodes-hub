@@ -1,4 +1,8 @@
-"""The command streams, one task per hand per pairing slot.
+"""The command streams of the hands, one task per hand per pairing slot,
+and what every stream of a grip shares, the base's included (`base`): the
+loop that publishes a stream, the release burst and the grip's hold of its
+robot through it (`GripStream`), and the drain that keeps each paired
+follower's newest report.
 
 Each slot holds a pair per robot; a stream commands the chosen robot's pair
 and is silent toward the others. Silence is the deadman: a disengaged hand
@@ -14,6 +18,7 @@ and the new robot engages on the next squeeze. One task per stream.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Generic, TypeVar
 
 import peppygen.clock
 from control_core_py.geometry import Pose, Stamped
@@ -36,13 +41,11 @@ from xr_commander.devices import (
     fresh_sample,
     gripper_opening,
 )
-from xr_commander.drive import (
-    Driver,
-    HandState,
-    Refusal,
-    Withdrawn,
-)
+from xr_commander.drive import Driver, Grip, GripState
 from xr_commander.robots import PairedRobots
+
+# What a release burst holds: an arm's pose, or a base's velocity.
+Held = TypeVar("Held")
 
 
 class MeasuredPoses:
@@ -76,52 +79,131 @@ def _timestamp_seconds() -> float:
     return peppygen.clock.now_ns() / 1e9
 
 
-# How long the release freeze streams the measured pose after the clutch
-# disengages. The follower's motion authority may keep converging to the
-# last command it heard (openarm's backbone documents that choice), so the
-# release explicitly commands "stay where the robot is"; a burst rather
-# than a single message, so one dropped sample cannot lose the stop.
+# How long the release burst streams after a stream stops driving. An arm's
+# follower may keep converging to the last command it heard (openarm's
+# backbone documents that choice), so an arm's release commands "stay where
+# the robot is"; a base's commands zero velocity, which drive_link says
+# brings the base to rest sooner. A burst of several messages, so one
+# dropped sample cannot lose the stop.
 RELEASE_HOLD_S = 0.25
 # The burst's own floor in messages, so a slow command rate cannot reduce it
 # to the single sample the burst exists to avoid depending on.
 RELEASE_HOLD_MESSAGES = 3
 
 
-class ReleaseHold:
-    """The release freeze: when a driving hand disengages, the last fresh
-    measured pose becomes the streamed target for a short burst, stopping
-    the follower where the robot is instead of at the last hand pose."""
+class ReleaseHold(Generic[Held]):
+    """The release burst: when a stream stops driving, the value it holds at
+    that tick becomes the streamed value for a short burst. An arm holds its
+    last fresh measured pose, so the follower stops where the robot is; a
+    base holds zero velocity."""
 
     def __init__(self, tick_period_s: float, hold_s: float = RELEASE_HOLD_S):
         self._hold_s = max(hold_s, RELEASE_HOLD_MESSAGES * tick_period_s)
         self._driving = False
-        self._pose: Setpoint | None = None
+        self._held: Held | None = None
         self._until = 0.0
 
     def step(
-        self,
-        *,
-        target: Setpoint | None,
-        measured_ee: Stamped[Pose] | None,
-        now_s: float,
-    ) -> Setpoint | None:
-        """This tick's pose to stream, or None for silence: the clutch's
-        target while driving, then the latched measured pose for the burst
-        that follows release. One call per tick, so no caller can arm the
-        burst without also being able to void it. Without a fresh measured
-        pose at release there is nothing truthful to freeze on, so silence."""
+        self, *, target: Held | None, held: Held | None, now_s: float
+    ) -> Held | None:
+        """This tick's value to stream, or None for silence: `target` while
+        driving, then `held` as latched at the tick the driving stopped, for
+        the burst that follows. One call per tick, so no caller can arm the
+        burst without also being able to void it. With nothing to hold at
+        that tick, such as no fresh measured pose, silence."""
         if target is not None:
             self._driving = True
             self._until = 0.0
             return target
         if self._driving:
             self._driving = False
-            if measured_ee is not None:
-                self._pose = Setpoint(measured_ee.frame, measured_ee.value)
+            if held is not None:
+                self._held = held
                 self._until = now_s + self._hold_s
         if now_s < self._until:
-            return self._pose
+            return self._held
         return None
+
+
+def _held_pose(measured_ee: Stamped[Pose] | None) -> Setpoint | None:
+    """What an arm's release burst holds: the measured pose in its frame,
+    None without a fresh one."""
+    if measured_ee is None:
+        return None
+    return Setpoint(measured_ee.frame, measured_ee.value)
+
+
+class GripStream(Generic[Held]):
+    """What a stream that a grip drives sends at each tick, and the grip's
+    hold on its robot: every value goes to the pair the stream last drove,
+    the release burst included, whichever robot is chosen since, and the
+    grip keeps its robot until that burst ends."""
+
+    def __init__(self, driver: Driver, grip: Grip, tick_period_s: float) -> None:
+        self._driver = driver
+        self._grip = grip
+        self._state = driver.grip(grip)
+        self._burst: ReleaseHold[Held] = ReleaseHold(tick_period_s)
+        # The pair the stream last drove.
+        self._driven = None
+        # The grip was engaged at the last step.
+        self._was_engaged = False
+        # The grip keeps its robot until its release burst ends.
+        self._releasing = False
+
+    def step(
+        self,
+        peer,
+        target: Held | None,
+        held_for: Callable[[object], Held | None],
+        now_s: float,
+    ) -> tuple[object, Held] | None:
+        """This tick's pair and value, None for silence: `target` to `peer`
+        while the grip drives, then, for the release burst, what `held_for`
+        gives for the pair last driven. A grip that disengaged releases its
+        robot once its burst ends."""
+        engaged = self._state.engaged
+        if engaged:
+            self._releasing = False
+        elif self._was_engaged:
+            self._releasing = True
+        self._was_engaged = engaged
+        if target is not None:
+            self._driven = peer
+        streamed = self._burst.step(
+            target=target, held=held_for(self._driven), now_s=now_s
+        )
+        if self._releasing and streamed is None:
+            self._releasing = False
+            self._driver.drop(self._state.robot, self._grip)
+            self._state.robot = None
+        if streamed is None or self._driven is None:
+            return None
+        return self._driven, streamed
+
+
+async def drain(
+    node_runner,
+    topic_module,
+    label: str,
+    keep: Callable[[object, object], None],
+    token: CancellationToken,
+) -> None:
+    """Hand each (peer, message) of `topic_module` to `keep` until the token
+    cancels. A message that `keep` refuses by raising is logged once until
+    one is kept: a malformed message repeats at its stream's rate. With no
+    subscription, which is logged, nothing is kept, and the stream that
+    reads it never engages."""
+    subscription = await subscribe_or_log(node_runner, topic_module, label)
+    if subscription is None:
+        return
+    unusable = Latch()
+    async for peer, message in messages(subscription, token, label):
+        try:
+            keep(peer, message)
+            unusable.clear()
+        except Exception as e:
+            unusable.trip(f"{label} unusable: {e!r}")
 
 
 async def drain_pose_states(
@@ -132,24 +214,15 @@ async def drain_pose_states(
     token: CancellationToken,
 ) -> None:
     """Keep `holder` at every paired follower's newest measured pose."""
-    subscription = await subscribe_or_log(
-        node_runner, topic_module, f"{label} pose_states"
-    )
-    if subscription is None:
-        # Loud and fail-safe: with no measured pose the hand never engages.
-        return
-    # Latched: a malformed pose would repeat every tick.
-    unusable = Latch()
-    async for peer, message in messages(subscription, token, f"{label} pose_states"):
-        try:
-            pose = Pose.parse(message.position, message.orientation)
-            holder.set(peer, Stamped.parse(message.frame, message.timestamp, pose))
-            unusable.clear()
-        except Exception as e:
-            unusable.trip(f"{label} pose_states unusable: {e!r}")
+
+    def keep(peer, message) -> None:
+        pose = Pose.parse(message.position, message.orientation)
+        holder.set(peer, Stamped.parse(message.frame, message.timestamp, pose))
+
+    await drain(node_runner, topic_module, f"{label} pose_states", keep, token)
 
 
-async def _run_stream(
+async def run_stream(
     node_runner,
     topic_module,
     period: float,
@@ -194,7 +267,6 @@ async def stream_pose(
     topic_module,
     gripper_module,
     handedness: Hand,
-    hand: HandState,
     driver: Driver,
     clutch: HandClutch,
     session: FrameSource,
@@ -219,47 +291,34 @@ async def stream_pose(
     # The one refusal an operator cannot see coming: squeezing while the
     # follower's measured pose is absent or stale does nothing. Say so once.
     waiting = Latch()
-    hold = ReleaseHold(settings.tick_period_s)
-    # The pair the clutch last drove: every message goes to it, the release
-    # burst included, whichever robot is chosen since.
-    driven = None
+    hand = driver.hands[handedness]
+    stream = GripStream[Setpoint](driver, handedness, settings.tick_period_s)
     # This hand's pair last tick: a new pair (a robot change on this hand)
     # re-anchors the clutch.
     last_peer = None
-    # The hand was engaged at the end of the last tick.
-    was_engaged = False
-    # The hand keeps its robot until its release burst ends.
-    releasing = False
 
-    async def engage(robot: str) -> None:
-        def still_squeezing() -> bool:
+    def still_squeezing(robot: str) -> Callable[[], bool]:
+        def wanted() -> bool:
             """The take runs over ticks: the grip may be released, or
             another robot chosen, since the squeeze."""
             latest = fresh_sample(session, handedness, settings.stale_timeout_s, clock)
             return latest is not None and latest.squeezing and robots.chosen() == robot
 
-        match await driver.acquire(robot, handedness, still_squeezing):
-            case Refusal(cause=refused):
-                hand.note.set(f"squeeze refused: {refused}")
-                log(f"{handedness} squeeze on {robot} refused: {refused}")
-                hand.wait_release = True
-                return
-            case Withdrawn():
-                return
-        # A robot left behind in its release burst is released now.
-        if hand.robot not in (None, robot):
-            driver.drop(hand.robot, handedness)
-        hand.engaged, hand.robot = True, robot
+        return wanted
+
+    def held_pose(driven) -> Setpoint | None:
+        return _held_pose(measured.fresh(driven, settings.stale_timeout_s))
 
     async def build():
-        nonlocal driven, last_peer, was_engaged, releasing
+        nonlocal last_peer
         # Stamped first: a clock that cannot stamp must fail the tick before
         # the clutch mutates its engagement state.
         timestamp = _timestamp_seconds()
         sample = fresh_sample(session, handedness, settings.stale_timeout_s, clock)
-        squeezing = bool(sample and sample.squeezing)
+        grip = None if sample is None else sample.squeezing
+        squeezing = grip is True
         chosen = robots.chosen()
-        hand.observe(chosen, sample)
+        hand.observe(chosen, grip)
         peer = robots.peer_for(topic_module)
         if peer != last_peer:
             clutch.release()
@@ -274,31 +333,17 @@ async def stream_pose(
             )
         paired = peer is not None or robots.peer_for(gripper_module) is not None
         ready = paired and (peer is None or measured_ee is not None)
-        if ready and hand.may_engage(sample):
-            await engage(chosen)
-            if hand.engaged:
-                releasing = False
-        if was_engaged and not hand.engaged:
-            releasing = True
-        was_engaged = hand.engaged
+        if ready and hand.may_engage(grip):
+            await driver.engage(chosen, handedness, still_squeezing(chosen))
         target = clutch.step(
             squeezing=hand.engaged,
             hand=sample.pose if sample else None,
             measured_ee=measured_ee,
         )
-        if target is not None:
-            driven = peer
-        commanded = hold.step(
-            target=target,
-            measured_ee=measured.fresh(driven, settings.stale_timeout_s),
-            now_s=clock.monotonic(),
-        )
-        if releasing and commanded is None:
-            releasing = False
-            driver.drop(hand.robot, handedness)
-            hand.robot = None
-        if commanded is None or driven is None:
+        sent = stream.step(peer, target, held_pose, clock.monotonic())
+        if sent is None:
             return None
+        driven, commanded = sent
         pose = commanded.pose
         return driven, topic_module.build_message(
             commanded.frame,
@@ -307,7 +352,7 @@ async def stream_pose(
             list(pose.orientation.xyzw),
         )
 
-    await _run_stream(
+    await run_stream(
         node_runner,
         topic_module,
         settings.tick_period_s,
@@ -323,7 +368,7 @@ async def stream_gripper(
     *,
     topic_module,
     handedness: Hand,
-    hand: HandState,
+    hand: GripState,
     session: FrameSource,
     robots: PairedRobots,
     settings: Settings,
@@ -349,7 +394,7 @@ async def stream_gripper(
         # follower's ceiling applies.
         return peer, topic_module.build_message(_timestamp_seconds(), opening, 0.0)
 
-    await _run_stream(
+    await run_stream(
         node_runner,
         topic_module,
         settings.tick_period_s,

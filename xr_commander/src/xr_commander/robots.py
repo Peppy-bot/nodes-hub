@@ -49,12 +49,13 @@ class PairedRobots:
         node_runner,
         arms: Mapping[Hand, ModuleType],
         grippers: Mapping[Hand, ModuleType],
+        base: ModuleType,
     ) -> None:
         """`arms` and `grippers` are the pose and gripper slots' modules by
-        the hand that drives them."""
+        the hand that drives them, and `base` the base slot's module."""
         self._node_runner = node_runner
         self._arms = dict(arms)
-        self._slots = (*arms.values(), *grippers.values())
+        self._slots = (*arms.values(), *grippers.values(), base)
         self._lock = threading.Lock()
         self._choice: str | None = None
         # The robot the hands drove at the last read.

@@ -1,6 +1,7 @@
 // xr_commander serves the WebXR page with teleop_xr. One headset per stack:
 // the backbone of every robot it leads pairs into its slots. Carries no
-// kinematics: solving a pose into joints is the follower's business.
+// kinematics: solving a pose into joints, and limiting how fast a base's
+// velocity changes, are the follower's business.
 {
   peppy_schema: "node/v1",
   manifest: {
@@ -8,8 +9,8 @@
     tag: "v1",
     description: [
       "A teleoperation leader driven from a WebXR headset, for any robot. It needs a headset whose browser reaches its HTTPS page; it opens no device on its host.",
-      "It streams a Cartesian setpoint per hand on pose_link and an opening per hand on gripper_link to the robot it drives, relays bound cameras into the headset as WebRTC tracks, and publishes where its page is: the page's URLs. The robot card on its page chooses the robot the hands drive, else the robot they drive while it stays paired, else the first robot paired. The deadman is the grip button, per hand; released streams the measured pose for a quarter second, then nothing, and the follower holds.",
-      "The headset holds the robot lease of the robot a person drives: a squeeze takes it and stops the moves in flight on that robot, the headset releases it after the release burst of the last hand once no posture move of its own runs, and it drives only the robots of the fleet listing.",
+      "It streams a Cartesian setpoint per hand on pose_link and an opening per hand on gripper_link to the robot it drives, and the velocity of its thumbsticks on drive_link to that robot's base within the limits that the base's drive_states give, relays bound cameras into the headset as WebRTC tracks, and publishes where its page is: the page's URLs. The robot card on its page chooses the robot the hands drive, else the robot they drive while it stays paired, else the first robot paired. The deadman is the grip button, per hand for an arm and either grip for the base; released streams the measured pose, or zero velocity, for a quarter second, then nothing: the arm's follower holds, and the base comes to rest.",
+      "The headset holds the robot lease of the robot a person drives: a squeeze takes it and stops the moves in flight on that robot, the headset releases it after the release burst of the last hand or of the base once no posture move of its own runs, and it drives only the robots of the fleet listing.",
     ],
     labels: [
       "teleop",
@@ -60,6 +61,10 @@
         // The same hand's opening loop.
         { name: "gripper_link", tag: "v1", role: "leader", link_id: "left_gripper", cardinality: "zero_or_more" },
         { name: "gripper_link", tag: "v1", role: "leader", link_id: "right_gripper", cardinality: "zero_or_more" },
+        // The velocity loop of each robot's mobile base, driven by the
+        // thumbsticks while either grip is held, scaled to the limits that
+        // the base's drive_states give.
+        { name: "drive_link", tag: "v1", role: "leader", link_id: "base", cardinality: "zero_or_more" },
       ],
       // The robot leases and the halt of the stack: the fleet listing and
       // its changes, and the lease of the robot a person drives.
@@ -76,11 +81,15 @@
         { link_id: "right_arm", name: "pose_setpoints" },
         { link_id: "left_gripper", name: "gripper_setpoints" },
         { link_id: "right_gripper", name: "gripper_setpoints" },
+        { link_id: "base", name: "drive_setpoints" },
       ],
       consumes: [
         // Measured end-effector pose.
         { link_id: "left_arm", name: "pose_states" },
         { link_id: "right_arm", name: "pose_states" },
+        // The base's state, the limits of its motion, and whether it follows
+        // the headset.
+        { link_id: "base", name: "drive_states" },
         { link_id: "color_cameras", name: "video_stream" },
         { link_id: "rgbd_cameras", name: "video_stream" },
         { link_id: "alerts", name: "alerts" },
@@ -127,8 +136,8 @@
       page: { kind: "page", description: "The WebXR page, HTTPS with the node's self-signed certificate." },
     },
     parameters: {
-      // Rate (Hz, 1..=1000) the per-hand setpoint streams publish at while
-      // engaged.
+      // Rate (Hz, 1..=1000) the setpoint streams of each hand and of the
+      // base publish at while engaged.
       command_rate_hz: "u32",
       // Where the WebXR page is served (always TLS, self-generated cert).
       https_port: { $type: "u32", $default: 4443 },

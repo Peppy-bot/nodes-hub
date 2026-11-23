@@ -38,6 +38,23 @@ SQUEEZE_BUTTON = 1
 # left), upper is B on the right hand (Y on the left).
 PRIMARY_BUTTON = 4
 SECONDARY_BUTTON = 5
+# The thumbstick's axes (WebXR Gamepads Module, sec. 3.3 "xr-standard").
+THUMBSTICK_X_AXIS = 2
+THUMBSTICK_Y_AXIS = 3
+# A stick rests within this deflection of its center: joy's `deadzone`.
+STICK_REST_BAND = 0.05
+
+
+@dataclass(frozen=True)
+class Thumbstick:
+    """A thumbstick's deflection past its rest band, each in [-1, 1]: 0 at
+    rest, 1 at full deflection forward or leftward."""
+
+    forward: float = 0.0
+    left: float = 0.0
+
+
+RESTING = Thumbstick()
 
 
 @dataclass(frozen=True)
@@ -53,6 +70,8 @@ class HandSample:
     primary_button: bool = False
     # B/Y held this frame; released when the gamepad does not carry it.
     secondary_button: bool = False
+    # At rest when the gamepad does not carry it.
+    thumbstick: Thumbstick = RESTING
 
 
 @dataclass(frozen=True)
@@ -106,6 +125,14 @@ def fresh_sample(
     return frame.hand(handedness) if frame else None
 
 
+def gripping(frame: XrFrame | None) -> bool | None:
+    """Whether a grip of either hand is held in `frame`; None while no frame
+    is fresh or it tracks no hand, which says nothing about the grips."""
+    if frame is None or not frame.hands:
+        return None
+    return any(sample.squeezing for sample in frame.hands.values())
+
+
 def primary_pressed(sample: HandSample) -> bool:
     return sample.primary_button
 
@@ -147,6 +174,39 @@ def _pressed(buttons: list, index: int) -> bool:
     if len(buttons) <= index:
         return False
     return buttons[index].get("pressed") is True
+
+
+def past_rest_band(deflection: float) -> float:
+    """A stick's deflection in [-1, 1] as it commands: 0 within the rest
+    band, then the deflection beyond it, scaled so that a full deflection
+    gives 1, as joy scales it."""
+    beyond = abs(deflection) - STICK_REST_BAND
+    if beyond <= 0.0:
+        return 0.0
+    return math.copysign(beyond / (1.0 - STICK_REST_BAND), deflection)
+
+
+def _axis(axes: object, index: int) -> float:
+    """One axis of the gamepad, clamped to [-1, 1]; 0 when the gamepad does
+    not carry it or carries anything but a finite number. A stick must never
+    be conjured out of a malformed payload."""
+    if not isinstance(axes, list) or len(axes) <= index:
+        return 0.0
+    value = axes[index]
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return min(max(float(value), -1.0), 1.0)
+
+
+def _parse_thumbstick(axes: object) -> Thumbstick:
+    """The thumbstick, forward and leftward positive: the Gamepad API gives
+    -1 for forward and for left (sec. 4, `axes`)."""
+    return Thumbstick(
+        forward=past_rest_band(-_axis(axes, THUMBSTICK_Y_AXIS)),
+        left=past_rest_band(-_axis(axes, THUMBSTICK_X_AXIS)),
+    )
 
 
 def _parse_pose(pose_data: dict) -> Pose:
@@ -193,6 +253,7 @@ def parse_hands(devices: list[object]) -> dict[Hand, HandSample]:
             squeezing = _pressed(buttons, SQUEEZE_BUTTON)
             primary = _pressed(buttons, PRIMARY_BUTTON)
             secondary = _pressed(buttons, SECONDARY_BUTTON)
+            thumbstick = _parse_thumbstick(gamepad.get("axes"))
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
         if not math.isfinite(trigger):
@@ -203,5 +264,6 @@ def parse_hands(devices: list[object]) -> dict[Hand, HandSample]:
             trigger=min(max(trigger, 0.0), 1.0),
             primary_button=primary,
             secondary_button=secondary,
+            thumbstick=thumbstick,
         )
     return hands

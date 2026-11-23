@@ -2,10 +2,10 @@
 
 A headset has no console, so anything the node only logs is invisible to the
 operator wearing it. This carries the chosen robot and who holds it, the
-state that decides whether a hand can drive at all, the alerts the robot is
-raising about itself, and each motor's health. teleop_xr renders every
-declared view as a floating panel, so nothing in the web stack needs to know
-this one is not a camera.
+state that decides whether a hand can drive at all, why the robot's base
+does not follow, the alerts the robot is raising about itself, and each
+motor's health. teleop_xr renders every declared view as a floating panel,
+so nothing in the web stack needs to know this one is not a camera.
 """
 
 from __future__ import annotations
@@ -19,11 +19,19 @@ import numpy as np
 
 from xr_commander import motor_health
 from xr_commander.alerts import ActiveAlerts, Alert
+from xr_commander.base import BaseReport, BaseReports, FollowState
 from xr_commander.bus import REAL_CLOCK, CancellationToken, Clock, Latch, ticks
 from xr_commander.clutch import HandClutch
 from xr_commander.config import Settings
-from xr_commander.devices import POSTURE_HAND, FrameSource, Hand, fresh_frame
-from xr_commander.drive import HandState, RobotLine
+from xr_commander.devices import (
+    POSTURE_HAND,
+    FrameSource,
+    Hand,
+    XrFrame,
+    fresh_frame,
+    gripping,
+)
+from xr_commander.drive import BaseGripState, GripState, RobotLine
 from xr_commander.motor_health import Level
 from xr_commander.postures import PostureStatus
 from xr_commander.publish import MeasuredPoses
@@ -50,9 +58,10 @@ _LINK_BASELINE = 92
 _FIRST_ROW_BASELINE = 148
 _ROW_STEP = 40
 
-# The robot's row, one row per hand, and the recorder's. The alert section
-# sits below the space they can occupy, so it does not shift when the
-# recorder binds mid-session.
+# The status rows: the robot's, one per hand, the base's and the recorder's,
+# four at most, as the snapshot asserts. The alert section sits below the
+# space they can occupy, so it does not shift when the recorder binds
+# mid-session.
 _MAX_STATUS_ROWS = 4
 _RULE_Y = _FIRST_ROW_BASELINE + _MAX_STATUS_ROWS * _ROW_STEP - 20
 _RULE_HEIGHT = 2
@@ -126,7 +135,7 @@ class HandSource:
     clutch: HandClutch
     # The hand's hold on its robot, shared with its streams: whether a
     # squeeze must be released first, and the cause of a refused squeeze.
-    state: HandState
+    state: GripState
     measured: MeasuredPoses
     arm_peer: Callable[[], object | None]
     gripper_peer: Callable[[], object | None]
@@ -136,6 +145,17 @@ class HandSource:
         carried, because the peer callables go live to the daemon and a
         second read could describe a row the filter would not have admitted."""
         return HandBinding(hand=self, arm=self.arm_peer(), gripper=self.gripper_peer())
+
+
+@dataclass(frozen=True)
+class BaseSource:
+    """Everything the panel reads for the base: the grips' hold on it, shared
+    with its stream, the bases' reports, and the chosen robot's pair on the
+    base slot, read live each snapshot."""
+
+    state: BaseGripState
+    reports: BaseReports
+    peer: Callable[[], object | None]
 
 
 @dataclass(frozen=True)
@@ -186,6 +206,8 @@ class PanelState:
     hands: tuple[Row, ...]
     # The chosen robot and who holds it; None draws no robot row.
     robot: Row | None = None
+    # The base's row; None while the chosen robot pairs no base.
+    base: Row | None = None
     # Worst first, capped at what the canvas holds.
     alerts: tuple[PanelLine, ...] = ()
     # Whether anything is wired to the alert slot at all.
@@ -272,6 +294,91 @@ def hand_line(
     return Row(label, "driving", _DRIVING)
 
 
+_BASE_LABEL = "BASE"
+
+# Why the base does not follow, by each follow_state other than following,
+# and what to do, as both leaders of drive_link say it: the stream sends
+# nothing until every stick rests.
+_HOLD_TEXTS = {
+    FollowState.BASE_MODE: (
+        "base {mode}, no velocity: release its hold, such as its e-stop;"
+        " let the sticks rest, then drive again"
+    ),
+    FollowState.BASE_SILENCE: (
+        "the base's motion sensing is silent, it rests until that reports:"
+        " let the sticks rest, then drive again"
+    ),
+    FollowState.ROBOT_STOP: (
+        "a robot stop holds the base: let the sticks rest, then drive again"
+    ),
+    FollowState.FOLLOWER_GOAL: (
+        "a goal of the base's node holds it: cancel it or let it end,"
+        " let the sticks rest, then drive again"
+    ),
+}
+_NOT_REPORTING = "the base does not report: check its base node"
+_DROPPED = "drive_states unreadable ({reason}): check its base node"
+
+
+def base_line(
+    *,
+    dropped: str | None,
+    report: BaseReport | None,
+    tracked: bool,
+    squeezing: bool,
+    wait_release: bool,
+    engaged: bool,
+    followed: bool,
+    wait_rest: bool,
+    note: str | None = None,
+) -> Row:
+    """The base's row: why the base does not follow, by its newest report,
+    then the conditions its stream gates on in the order the operator hits
+    them: a controller, a grip, a grip released since a refusal, a let-go or
+    a change of robot, the base following since the take, sticks that
+    rested since a hold. `dropped` is why the base's newest drive_states
+    was dropped, and `report` is None while the base does not report.
+    `note`, why a squeeze was refused, takes the row while it stands."""
+    if note:
+        return Row(_BASE_LABEL, note, _WAITING)
+    if dropped is not None:
+        text = _DROPPED.format(reason=dropped)
+        return Row(_BASE_LABEL, text, _NOT_REPORTING_MAGENTA)
+    if report is None:
+        return Row(_BASE_LABEL, _NOT_REPORTING, _NOT_REPORTING_MAGENTA)
+    if report.follow_state is not FollowState.FOLLOWING:
+        text = _HOLD_TEXTS[report.follow_state].format(mode=report.mode)
+        return Row(_BASE_LABEL, text, _WAITING)
+    if not tracked:
+        return Row(_BASE_LABEL, "no controller", _RESTING)
+    if not squeezing:
+        return Row(_BASE_LABEL, "grip released", _RESTING)
+    if wait_release:
+        return Row(_BASE_LABEL, "release the grip, then squeeze again", _WAITING)
+    if not (engaged and followed):
+        return Row(_BASE_LABEL, "waiting for the base", _WAITING)
+    if wait_rest:
+        return Row(_BASE_LABEL, "let the sticks rest", _WAITING)
+    return Row(_BASE_LABEL, "driving", _DRIVING)
+
+
+def _row_of_base(base: BaseSource, peer, frame: XrFrame | None) -> Row:
+    """The base's row as `base` and `frame` give it."""
+    grip = gripping(frame)
+    state = base.state
+    return base_line(
+        dropped=base.reports.dropped(peer),
+        report=base.reports.fresh(peer),
+        tracked=grip is not None,
+        squeezing=grip is True,
+        wait_release=state.wait_release,
+        engaged=state.engaged,
+        followed=state.followed,
+        wait_rest=state.wait_rest,
+        note=state.note.text(),
+    )
+
+
 _ROBOT_COLOURS = {"driving": _DRIVING, "waiting": _WAITING, "resting": _RESTING}
 
 
@@ -322,18 +429,21 @@ def snapshot(
     task: str | None = None,
     posture: PostureStatus | None = None,
     robot: RobotLine | None = None,
+    base: BaseSource | None = None,
     clock: Clock = REAL_CLOCK,
 ) -> PanelState:
     """This tick's panel content, read from the sources the streams read.
     The posture buttons are the right controller's, so their state goes on
     the right hand's row, or on the only row when the right hand has none.
-    A hand's own note, why its squeeze was refused, comes first."""
+    A hand's own note, why its squeeze was refused, comes first. The base
+    gets a row while the chosen robot pairs one."""
     frame = fresh_frame(session, stale_timeout_s, clock)
+    base_peer = base.peer() if base is not None else None
     # Only hands something listens to get a row; with nothing wired at all,
     # every hand shows so a misconfigured stack says why nothing drives.
     bound = [hand.bound() for hand in hands]
     wired = [binding for binding in bound if binding.wired]
-    shown = wired if wired else bound
+    shown = wired if wired or base_peer is not None else bound
     has_posture_hand = any(b.hand.handedness == POSTURE_HAND for b in shown)
     noted = (
         POSTURE_HAND
@@ -365,14 +475,14 @@ def snapshot(
         )
     recorder_line = recorder_row(recorder)
     robot_line = robot_row(robot) if robot is not None else None
-    assert (
-        len(rows) + (1 if recorder_line else 0) + (1 if robot_line else 0)
-        <= _MAX_STATUS_ROWS
-    )
+    base_row = _row_of_base(base, base_peer, frame) if base_peer is not None else None
+    extra_rows = (recorder_line, robot_line, base_row)
+    assert len(rows) + sum(row is not None for row in extra_rows) <= _MAX_STATUS_ROWS
     return PanelState(
         headset_live=frame is not None,
         hands=tuple(rows),
         robot=robot_line,
+        base=base_row,
         alerts=alert_lines(alerts.active()),
         alerts_bound=alerts.producers_bound,
         health=health_lines(motor_health.health_rows(health.by_instance())),
@@ -467,6 +577,7 @@ def render(state: PanelState) -> np.ndarray:
     rows = (
         ((state.robot,) if state.robot else ())
         + state.hands
+        + ((state.base,) if state.base else ())
         + ((state.recorder,) if state.recorder else ())
     )
     for index, row in enumerate(rows):
@@ -555,6 +666,7 @@ async def stream_status(
     read_task: Callable[[], str | None],
     posture: PostureStatus,
     robot: Callable[[], RobotLine],
+    base: BaseSource,
     clock: Clock = REAL_CLOCK,
 ) -> None:
     """Publish the panel until shutdown, re-drawing only on a change.
@@ -581,6 +693,7 @@ async def stream_status(
                 read_task(),
                 posture=posture,
                 robot=robot(),
+                base=base,
                 clock=clock,
             )
             if state != drawn or frame is None:

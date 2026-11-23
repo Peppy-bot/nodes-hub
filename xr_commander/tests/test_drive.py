@@ -18,6 +18,7 @@ from tests.helpers import (
 )
 from xr_commander.bus import Answered, Failed, Unanswered
 from xr_commander.drive import (
+    BASE,
     GOALS_ENDED,
     GRIP_HELD,
     GRIP_JUST_RELEASED,
@@ -70,8 +71,8 @@ class Driving:
     changes: list
     cancelled: list = field(default_factory=list)
 
-    def squeeze(self, robot="alpha", hand="right", wanted=held):
-        return self.driver.acquire(robot, hand, wanted)
+    def squeeze(self, robot="alpha", grip="right", wanted=held):
+        return self.driver.acquire(robot, grip, wanted)
 
     async def press(self, robot="alpha", start=None):
         """A posture press whose start returns `GOAL` and tells the driver
@@ -84,16 +85,16 @@ class Driving:
 
         return await self.driver.start_posture_move(robot, start or started)
 
-    def engage(self, hand="right", robot="alpha"):
-        """The hand engages on `robot`, as its pose stream does once the
-        driver holds the robot for it."""
-        state = self.driver.hands[hand]
+    def engage(self, grip="right", robot="alpha"):
+        """The grip, a hand's or the base's, engages on `robot`, as its
+        stream does once the driver holds the robot for it."""
+        state = self.driver.grip(grip)
         state.engaged, state.robot = True, robot
 
-    def release_grip(self, hand="right"):
-        """The hand's grip is released, as its pose stream sees it: its
-        release burst starts."""
-        self.driver.hands[hand].engaged = False
+    def release_grip(self, grip="right"):
+        """The grip is released, as its stream sees it: its release burst
+        starts."""
+        self.driver.grip(grip).engaged = False
 
     def hold_stops(self) -> asyncio.Event:
         """From now on each stop answers only once the returned event is
@@ -189,9 +190,9 @@ async def test_a_squeeze_released_during_the_stop_releases_the_lease():
 
 async def test_the_lease_is_released_after_the_last_reason_only():
     r = driving("alpha")
-    await r.squeeze(hand="right")
+    await r.squeeze(grip="right")
     r.engage("right")
-    await r.squeeze(hand="left")
+    await r.squeeze(grip="left")
     # The second hand joins the hold: no take and no stop.
     assert r.log == [("take", "alpha"), ("stop", "alpha")]
     r.driver.drop("alpha", "right")
@@ -202,6 +203,21 @@ async def test_the_lease_is_released_after_the_last_reason_only():
     assert r.log[-1] == ("release", "alpha")
     assert not r.driver.holds("alpha")
     assert len(r.changes) == 2
+
+
+async def test_the_base_holds_the_robot_beside_a_hand_until_the_last_of_them():
+    r = driving("alpha")
+    await r.squeeze(grip=BASE)
+    r.engage(BASE)
+    await r.squeeze(grip="left")
+    # The hand joins the base's hold: no take and no stop.
+    assert r.log == [("take", "alpha"), ("stop", "alpha")]
+    r.driver.drop("alpha", "left")
+    await r.settled()
+    assert r.releases() == 0
+    r.driver.drop("alpha", BASE)
+    await r.settled()
+    assert r.log[-1] == ("release", "alpha")
 
 
 async def test_a_squeeze_in_the_hands_own_burst_engages_with_no_take_and_no_stop():
@@ -215,7 +231,7 @@ async def test_a_squeeze_in_the_hands_own_burst_engages_with_no_take_and_no_stop
 
 async def test_two_hands_that_squeeze_at_once_take_the_robot_once():
     r = driving("alpha")
-    left, right = await asyncio.gather(r.squeeze(hand="left"), r.squeeze())
+    left, right = await asyncio.gather(r.squeeze(grip="left"), r.squeeze())
     assert (left, right) == (None, None)
     assert r.log == [("take", "alpha"), ("stop", "alpha")]
 
@@ -348,7 +364,7 @@ async def test_a_posture_start_that_a_let_go_overtakes_is_refused_and_its_move_c
     assert not r.driver.holds("alpha")
 
 
-async def test_a_press_on_a_robot_a_hand_holds_is_refused():
+async def test_a_press_on_a_robot_a_grip_holds_is_refused():
     r = driving("alpha")
     await r.squeeze()
     r.engage("right")
@@ -356,6 +372,16 @@ async def test_a_press_on_a_robot_a_hand_holds_is_refused():
     r.release_grip()
     assert await r.press() == Refusal(GRIP_JUST_RELEASED)
     assert r.log == [("take", "alpha"), ("stop", "alpha")]
+    assert not r.driver.holds_for("alpha", POSTURE)
+
+
+async def test_a_press_on_a_robot_whose_base_a_grip_holds_is_refused():
+    r = driving("alpha")
+    await r.squeeze(grip=BASE)
+    r.engage(BASE)
+    assert await r.press() == Refusal(GRIP_HELD)
+    r.release_grip(BASE)
+    assert await r.press() == Refusal(GRIP_JUST_RELEASED)
     assert not r.driver.holds_for("alpha", POSTURE)
 
 
@@ -474,11 +500,20 @@ async def test_the_headset_lets_go_at_a_halt():
     assert r.releases() == 0
 
 
+async def test_a_let_go_disengages_the_base_on_that_robot_and_waits_for_a_release():
+    r = driving("alpha")
+    await r.squeeze(grip=BASE)
+    r.engage(BASE)
+    r.driver.fleet_changed(fleet_view(["alpha"], halted_by="peppy-cli"))
+    assert not r.driver.base.engaged and r.driver.base.wait_release
+    assert not r.driver.holds("alpha")
+
+
 async def test_a_let_go_disengages_only_the_hands_on_that_robot():
     r = driving("alpha", "bravo")
-    await r.squeeze("alpha", hand="right")
+    await r.squeeze("alpha", grip="right")
     r.engage("right", "alpha")
-    await r.squeeze("bravo", hand="left")
+    await r.squeeze("bravo", grip="left")
     r.engage("left", "bravo")
     r.driver.let_go("alpha", "a test let go", release=True)
     assert not r.driver.hands["right"].engaged
@@ -647,18 +682,18 @@ async def test_under_an_open_lease_the_headset_drives_with_a_move_check_and_no_t
 
 async def test_under_an_open_lease_a_squeeze_in_a_burst_asks_again_and_stops():
     r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", hand="right")
+    await r.squeeze("alpha", grip="right")
     # The right hand's burst runs, and a program moves the other arm under
     # the open lease: the left squeeze asks the daemon and stops it.
-    assert await r.squeeze("alpha", hand="left") is None
+    assert await r.squeeze("alpha", grip="left") is None
     assert r.log == [("check_move", "alpha"), ("stop", "alpha")] * 2
 
 
 async def test_under_an_open_lease_a_squeeze_beside_the_other_hand_engages_at_once():
     r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", hand="right")
+    await r.squeeze("alpha", grip="right")
     r.engage("right")
-    assert await r.squeeze("alpha", hand="left") is None
+    assert await r.squeeze("alpha", grip="left") is None
     assert r.log == [("check_move", "alpha"), ("stop", "alpha")]
 
 
@@ -746,9 +781,9 @@ async def test_under_an_open_lease_a_refused_move_check_takes_nothing_and_says_w
 
 async def test_under_an_open_lease_a_refused_check_in_a_burst_stops_nothing():
     r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", hand="right")
+    await r.squeeze("alpha", grip="right")
     r.calls.check_outcome = Failed("the stack is halted (by peppy-cli)")
-    assert await r.squeeze("alpha", hand="left") == Refusal(
+    assert await r.squeeze("alpha", grip="left") == Refusal(
         "the stack is halted (by peppy-cli)"
     )
     assert r.log == [
@@ -762,7 +797,7 @@ async def test_under_an_open_lease_a_refused_check_in_a_burst_stops_nothing():
 
 async def test_under_an_open_lease_a_close_during_the_check_of_a_burst_stops_nothing():
     r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", hand="right")
+    await r.squeeze("alpha", grip="right")
     check = r.calls.check_move
 
     async def closes_while_checking(**target):
@@ -772,7 +807,7 @@ async def test_under_an_open_lease_a_close_during_the_check_of_a_burst_stops_not
         return answer
 
     r.calls.check_move = closes_while_checking
-    assert await r.squeeze("alpha", hand="left") == Refusal(
+    assert await r.squeeze("alpha", grip="left") == Refusal(
         "the headset let go of alpha"
     )
     assert r.log == [

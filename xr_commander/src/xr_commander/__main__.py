@@ -48,6 +48,8 @@ from peppygen.consumed_topics.rgbd_cameras import (
     video_stream as rgbd_cameras_video_stream,
 )
 from peppygen.emitted_topics.headset import page as headset_page_topic
+from peppygen.paired_topics.base import drive_setpoints as base_drive_setpoints
+from peppygen.paired_topics.base import drive_states as base_drive_states
 from peppygen.paired_topics.left_arm import pose_setpoints as left_arm_pose_setpoints
 from peppygen.paired_topics.left_arm import pose_states as left_arm_pose_states
 from peppygen.paired_topics.left_gripper import (
@@ -64,6 +66,7 @@ from teleop_xr.video_stream import ExternalVideoSource
 from xr_commander import (
     addresses,
     alerts,
+    base,
     config,
     drive,
     fleet,
@@ -176,12 +179,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         video_sources=video_sources,
     )
 
-    # Every robot's backbone pairs into the four slots; the hands drive the
-    # chosen one.
+    # Every robot's backbone pairs into the slots of its arms, grippers and
+    # base; the hands drive the chosen one.
     robots = PairedRobots(
         node_runner,
         arms={hand: wiring.pose_setpoints for hand, wiring in _HANDS.items()},
         grippers={hand: wiring.gripper_setpoints for hand, wiring in _HANDS.items()},
+        base=base_drive_setpoints,
     )
     # The robot leases: the headset holds the lease of the robot a person
     # drives, and follows the fleet listing.
@@ -194,6 +198,13 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     robot_states = robot_choice.RobotStates(
         robots, state_of=lambda name: driver.state_of(name)
     )
+    # Shared by the drive_states listener, the base stream and the panel.
+    base_reports = base.BaseReports()
+    # Each stop of a robot, noted where it stands among the bases' reports.
+    stops = base.NotedStops(
+        drive.RobotStops(node_runner, robots, robot_stop_stop, fleet_timing),
+        base_reports,
+    )
     driver = drive.Driver(
         the_fleet,
         fleet.FleetCalls(
@@ -203,7 +214,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             check_move_module=fleet_check_move,
             timing=fleet_timing,
         ),
-        drive.RobotStops(node_runner, robots, robot_stop_stop, fleet_timing),
+        stops,
         timing=fleet_timing,
         on_change=robot_states.refresh,
     )
@@ -402,6 +413,11 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     def slot_peer(topic_module):
         return lambda: robots.peer_for(topic_module)
 
+    base_source = panel.BaseSource(
+        state=driver.base,
+        reports=base_reports,
+        peer=slot_peer(base_drive_setpoints),
+    )
     hands = tuple(
         panel.HandSource(
             handedness=handedness,
@@ -428,6 +444,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     read_task=task_label.current,
                     posture=posture_status,
                     robot=lambda: driver.robot_line(robots.chosen()),
+                    base=base_source,
                 )
             )
         )
@@ -452,7 +469,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     topic_module=wiring.pose_setpoints,
                     gripper_module=wiring.gripper_setpoints,
                     handedness=hand.handedness,
-                    hand=hand.state,
                     driver=driver,
                     clutch=hand.clutch,
                     session=session,
@@ -477,6 +493,33 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                 )
             )
         )
+
+    tasks.append(
+        asyncio.create_task(
+            publish.drain(
+                node_runner,
+                base_drive_states,
+                "base drive_states",
+                base_reports.record,
+                token,
+            )
+        )
+    )
+    tasks.append(
+        asyncio.create_task(
+            base.stream_base(
+                node_runner,
+                topic_module=base_drive_setpoints,
+                driver=driver,
+                stops=stops,
+                reports=base_reports,
+                session=session,
+                robots=robots,
+                settings=settings,
+                token=token,
+            )
+        )
+    )
 
     return tasks
 

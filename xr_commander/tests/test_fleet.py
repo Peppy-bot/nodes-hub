@@ -22,6 +22,7 @@ from tests.helpers import (
     fleet_view,
     lease_event,
     listing,
+    robots_of,
     running,
 )
 from xr_commander import fleet
@@ -47,7 +48,6 @@ from xr_commander.fleet import (
     state_text,
     status_text,
 )
-from xr_commander.robots import PairedRobots
 
 # The bound of a call that the test leaves unanswered.
 SILENT_CALL_S = 0.2
@@ -503,8 +503,9 @@ async def test_each_call_the_daemon_does_not_answer_ends_unanswered():
 
 
 def stops_of(h, call_timeout_s=CALL_S) -> RobotStops:
-    robots = PairedRobots(h.node_runner, arms={}, grippers={})
-    return RobotStops(h.node_runner, robots, stop, Timing(call_timeout_s=call_timeout_s))
+    return RobotStops(
+        h.node_runner, robots_of(h), stop, Timing(call_timeout_s=call_timeout_s)
+    )
 
 
 ROBOT_AND_BRAVO = {

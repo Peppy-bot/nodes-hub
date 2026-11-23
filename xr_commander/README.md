@@ -3,50 +3,60 @@
 A robot-agnostic teleoperation leader driven from a WebXR headset.
 
 It serves a WebXR page the headset's browser opens, reads the operator's
-controller poses and buttons off that session, and streams a Cartesian setpoint
-per hand plus a gripper opening per hand. Any bound camera is relayed back into
-the headset as a named WebRTC track.
+controller poses, buttons and thumbsticks off that session, and streams a
+Cartesian setpoint per hand plus a gripper opening per hand, and a velocity to
+the robot's mobile base. Any bound camera is relayed back into the headset as a
+named WebRTC track.
 
 The node carries no kinematics and names no robot. It reads where each
 end-effector is and writes where it should be; solving that pose into joints, and
-bounding what the joints may do to reach it, are the follower's business.
+bounding what the joints may do to reach it, are the follower's business. The
+base's follower limits how fast the base's velocity changes.
 
 ## Making a robot drivable from a headset
 
 One headset serves the whole stack. Every robot that should be drivable from
-it pairs into the headset's four slots. The controllers drive one robot at a
-time: the one chosen on the headset's page. Implement these on the robot's
+it pairs into the headset's slots: an arm and a gripper per hand, and a base.
+The controllers drive one robot at a time: the one chosen on the headset's
+page. Implement these on the robot's
 side and bind them in a launcher. No code here changes.
 
 | Interface | Kind | Your robot's side | Slots on this node |
 |---|---|---|---|
 | `pose_link/v1` | pairing | `follower` | `left_arm`, `right_arm` (any number of robots) |
 | `gripper_link/v1` | pairing | `follower` | `left_gripper`, `right_gripper` (any number of robots) |
+| `drive_link/v1` | pairing | `follower` | `base` (any number of robots) |
 | `rgb_camera/v1` | contract | implementer | `color_cameras` (any number) |
 | `rgbd_camera/v1` | contract | implementer | `rgbd_cameras` (any number, colour half only) |
 | `postures/v1` | contract | implementer | `postures` (any number; the chosen robot's takes the face buttons) |
 | `robot_stop/v1` | contract | implementer | `robot_stop` (any number; a squeeze stops the moves in flight on the robot it takes) |
 | `episode_recording/v1` | contract | implementer | `recorder` (any number; the chosen robot's takes the left face buttons) |
 
-Both pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
-`robot/gripper_link.json5`). On the wire: positions are metres, orientations
-are unit quaternions `[x, y, z, w]` (scalar last), each `pose_states` message
-names the follower's robot frame in `frame`, and each setpoint names the frame
+The pairings are defined in `pairings-hub` (`robot/pose_link.json5`,
+`robot/gripper_link.json5`, `robot/drive_link.json5`). On the wire:
+positions are metres, orientations are unit quaternions `[x, y, z, w]`
+(scalar last), each `pose_states` message names the follower's robot frame
+in `frame`, and each setpoint of an arm names the frame
 of the measured pose its hand anchored on, and in `timestamp` the time of its
 tick on the instance's clock, the clock of transforms, so a follower drops by
 its age a setpoint that a stall held back.
 A measured pose in another frame than that anchor re-anchors the hand on the
 arm where it is measured, as a measured pose that jumps does. A gripper opening
 is a fraction of full travel, 0 closed to 1 fully open; `max_effort` 0 means
-the follower's configured ceiling.
+the follower's configured ceiling. A base's setpoint is in the robot frame at
+the latest time, with no `frame` and no `timestamp`: `linear_velocity` is
+`[x, y, 0]` (m/s) and `angular_velocity` `[0, 0, turn]` (rad/s), each within
+the limits that the base's newest `drive_states` gives, as base_state's
+`describe_base` gives them.
 
 Every slot is optional. A robot is named by the copy its backbone runs in,
 or, outside any copy, by its backbone's instance id. The headset drives only
 the robots of the fleet listing, the copies of the stack: a robot that a
 launcher deploys outside any copy shows on the page, and a squeeze on it
-does nothing. A robot pairs only the sides it has: a single-arm robot pairs
-the right side, and a robot without grippers leaves the gripper slots alone.
-The robot declares the pairs from its own side, naming this node's slots:
+does nothing. A robot pairs only the parts it has: a single-arm robot pairs
+the right side, a robot without grippers leaves the gripper slots alone, and
+only a robot with a mobile base pairs `base`. The robot declares the pairs
+from its own side, naming this node's slots:
 
 ```json5
 {
@@ -67,7 +77,9 @@ and the launcher adds the robot's postures, robot_stop, recorder and cameras
 to the headset under the option that selects the robot, so a robot that
 joins later brings them with it: `add_links: { postures: ["backbone_inst"],
 robot_stop: ["backbone_inst"], rgbd_cameras: ["chest"] }` on
-`headset_inst`. The page's **Robot** card
+`headset_inst`. A mobile base's backbone pairs `leader_base:
+"headset_inst/base"` alone, and the launcher adds its robot_stop for the
+squeeze: `add_links: { robot_stop: ["backbone_inst"] }`. The page's **Robot** card
 lists the paired robots in name order and picks the one to drive; it works from a laptop's
 browser as well as the headset's. Until a robot is chosen, or while the
 chosen one is away, the controllers keep the robot they are driving; if that
@@ -103,8 +115,9 @@ outside any copy:
   not drive yet takes the robot's lease under the name `driven from the
   headset`, stops the planned moves in flight on the robot (`stop` of
   `robot_stop`, with that name as the reason), and only then streams. The
-  headset releases the lease once no hand drives the robot, after the
-  release burst of the last hand, and no posture move of its own runs.
+  headset releases the lease once no hand drives the robot's arms or its
+  base, after the release burst of the last of them, and no posture move of
+  its own runs.
 - **A held robot.** While another client holds the lease, a squeeze does
   nothing and the hand's row names the holder and the lease name. The other
   clients see the lease in the fleet listing under the holder
@@ -138,7 +151,11 @@ outside any copy:
 After the headset releases a lease, a program that takes it at once can see
 the backbone refuse its first goals with `leader_streaming` for up to 250
 ms. After a let-go at once, the refusals can last until the headset sees the
-change, then for the release burst, and for 250 ms more.
+change, then for the release burst, and for 250 ms more. A base's leader
+streams until 0.5 s pass with no setpoint, counted on the base's clock: after
+the base's release burst, a program can see `leader_streaming` for up to 0.5 s
+of that clock, which is longer in wall time under a simulation that runs
+slower than real time.
 
 ## Operating it
 
@@ -184,7 +201,25 @@ whatever camera you bind.
   during an episode, the episode keeps its row and X still stops it. With no
   episode in flight, the buttons do nothing while the chosen robot has no
   recorder.
-- **Changing the robot**: choosing another robot releases both hands. The previous robot stops where it is, and the next squeeze engages the new one. A grip held through the change drives nothing until it is released; the status panel says so.
+- **Thumbsticks**: the base, while either grip is held on a robot that pairs
+  one. The squeeze takes the robot as it does for an arm, and the base drives
+  once a `drive_states` that reports that the base follows arrives more than
+  0.5 s after the stop's answer, counted on the instance's clock. The left
+  thumbstick drives forward and back, and sideways on a base whose limits give
+  a y range other than 0 to 0; the right thumbstick's left and right turn the
+  base. A full deflection drives at the limit in that direction that the
+  base's newest `drive_states` gives, a partial one at that fraction, so a
+  `drive_states` with other limits scales the next setpoint. A stick rests
+  when the velocity it commands on this base is zero: a sideways deflection on
+  a base whose y range is 0 to 0 rests, and so does any deflection within 0.05
+  of rest, as joy's `deadzone` does. The headset streams only while the sticks
+  command a velocity other than zero. When every stick rests, or the grip is
+  released, the base gets zero velocity for a quarter second, then nothing,
+  and the base's follower brings it to rest. While the base reports that it
+  does not follow (its mode, a silence of its sensing, a robot stop or a goal
+  of the base's node holds it), the headset sends nothing, and once it follows
+  again a stick drives only after every stick rested.
+- **Changing the robot**: choosing another robot releases both hands and the base. The previous robot stops where it is, and the next squeeze engages the new one. A grip held through the change drives nothing until it is released; the status panel says so.
 
 The mapping assumes you share the robot's facing (natural once your view is
 the robot's camera). Motion is relative to the squeeze, so standing elsewhere
@@ -195,7 +230,11 @@ mostly costs intuition, not correctness.
 A headset has no console, so a floating `status` panel carries the state
 that decides whether a hand can drive: whether the headset link is live, the
 chosen robot and who holds it, and per hand whether it has a controller, a
-held grip, a fresh measurement from its follower, and an engagement. The
+held grip, a fresh measurement from its follower, and an engagement. While
+the chosen robot pairs a base, the `BASE` row says why the base does not
+follow, by its newest `drive_states`, with what to do, or that the base does
+not report once 0.5 s of the instance's clock pass with none; else whether a
+grip drives it. The
 `ROBOT` row gives the chosen robot's state with the Robot card's words, why
 the headset let go of it for three seconds, or why the headset cannot ask
 the fleet: the daemon is lost, or refused the fleet. It answers "why is
@@ -209,7 +248,10 @@ reports the posture buttons: "moving to home..." while the move runs, then
 does nothing says why for three seconds: "move to home ignored: release the
 grip first", "move to home ignored: still moving to ready", "move to home:
 bravo has no postures". A refused squeeze says why on its hand's row for
-three seconds: "squeeze refused: <cause>".
+three seconds: "squeeze refused: <cause>", and on the `BASE` row when it
+asked for the base. A `drive_states` whose `follow_state` or limits
+`drive_link` does not allow is dropped and logged once, and the `BASE` row
+names the value until the base sends one the headset keeps.
 
 While the chosen robot has a recorder it also carries the task line: what
 the next episode records as, so the label is visible without taking the
@@ -308,9 +350,9 @@ full list and defaults.
 
 ## Development
 
-`__main__`, `publish` and `page` import the generated modules, `panel`
-imports them through `publish`, and `sensor_hold` imports peppylib; every
-other module is pure of peppy. The tests drive the generated modules through
+`__main__`, `publish`, `base` and `page` import the generated modules, `panel`
+imports them through `publish` and `base`, and `sensor_hold` imports peppylib;
+every other module is pure of peppy. The tests drive the generated modules through
 the peppygen harness, so the full suite needs the synced environment (and
 nothing served):
 

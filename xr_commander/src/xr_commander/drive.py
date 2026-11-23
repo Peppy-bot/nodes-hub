@@ -6,13 +6,14 @@ take-over, asks the daemon whether it may move it. It then stops the planned
 moves in flight on the robot, and only then streams. A press of a posture
 button takes the robot the same way for the time of its move.
 
-The headset holds a robot while a hand drives it, through the release burst
-of the last hand, and while a posture move of its own runs; then it releases
-the lease. It lets go at once, as at a grip release, when its lease ends, at
-a halt, when the open lease it drives under closes or ends, and when a goal
-of the fleet ends. The lease feedback names the robot of each lease that
-ends: the headset asks the daemon whether it may still move that robot, and
-lets go unless a fleet listing as recent as a yes names it as the holder.
+The headset holds a robot while a hand drives its arm or its base, through
+the release burst of the last of them, and while a posture move of its own
+runs; then it releases the lease. It lets go at once, as at a grip release,
+when its lease ends, at a halt, when the open lease it drives under closes
+or ends, and when a goal of the fleet ends. The lease feedback names the
+robot of each lease that ends: the headset asks the daemon whether it may
+still move that robot, and lets go unless a fleet listing as recent as a yes
+names it as the holder.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from xr_commander.bus import (
     refusal_of,
     spawn,
 )
-from xr_commander.devices import Hand, HandSample
+from xr_commander.devices import Hand
 from xr_commander.fleet import (
     DAEMON_SILENT,
     LEASE_NAME,
@@ -53,10 +54,13 @@ from xr_commander.fleet import (
 )
 from xr_commander.robots import JOIN_COMMAND, PairedRobots
 
-# Why the headset holds a robot: a hand that drives it, or a posture move.
-Reason = Hand | Literal["posture"]
+# What a grip drives: a hand's arm, or the base, which either grip drives.
+Grip = Hand | Literal["base"]
+BASE: Grip = "base"
+# Why the headset holds a robot: a grip that drives it, or a posture move.
+Reason = Grip | Literal["posture"]
 POSTURE: Reason = "posture"
-_HANDS: tuple[Hand, ...] = tuple(Hand)
+_GRIPS: tuple[Grip, ...] = (*Hand, BASE)
 
 # Why a press does nothing while a hand holds the chosen robot.
 GRIP_HELD = "release the grip first"
@@ -71,45 +75,69 @@ Started = TypeVar("Started")
 
 
 @dataclass
-class HandState:
-    """One hand's hold on a robot, shared by its two streams and the panel.
-    The hand's pose stream writes it at each tick, and a let-go of its robot
-    disengages it."""
+class GripState:
+    """One grip's hold on a robot, shared by its streams and the panel: a
+    hand's, for its arm and gripper, or the base's. The pose stream of the
+    hand, or the base stream, writes it at each tick, and a let-go of its
+    robot disengages it."""
 
     note: FlashNote
-    # The hand's streams command `robot`.
+    # The grip's streams command `robot`.
     engaged: bool = False
-    # The robot the hand holds, from its squeeze to the end of its release
+    # The robot the grip holds, from its squeeze to the end of its release
     # burst.
     robot: str | None = None
     # A grip held through a refusal, a let-go or a change of robot drives
     # nothing until it is released.
     wait_release: bool = False
-    # The robot chosen at the hand's last tick, and whether one ever was.
+    # The robot chosen at the grip's last tick, and whether one ever was.
     chosen: str | None = None
     had_chosen: bool = False
 
-    def observe(self, chosen: str | None, sample: HandSample | None) -> None:
-        """This tick's chosen robot and grip. A squeeze held across a change
-        of robot waits for a release, once a robot was chosen at all: the
-        first robot chosen engages a squeeze already held. Only a fresh
-        frame showing the grip released clears the wait; a stale tick says
-        nothing about the grip, though it disengages the hand."""
-        squeezing = sample is not None and sample.squeezing
+    def observe(self, chosen: str | None, grip: bool | None) -> None:
+        """This tick's chosen robot and grip, None while no fresh frame
+        tracks it. A squeeze held across a change of robot waits for a
+        release, once a robot was chosen at all: the first robot chosen
+        engages a squeeze already held. Only a fresh frame showing the grip
+        released clears the wait; a stale tick says nothing about the grip,
+        though it disengages it."""
+        squeezing = grip is True
         if chosen != self.chosen:
             self.wait_release = self.wait_release or (squeezing and self.had_chosen)
             self.engaged = False
             self.chosen = chosen
             self.had_chosen = self.had_chosen or chosen is not None
-        if sample is not None and not sample.squeezing:
+        if grip is False:
             self.wait_release = False
         if not squeezing:
             self.engaged = False
 
-    def may_engage(self, sample: HandSample | None) -> bool:
-        """Whether this tick's squeeze asks to engage the hand."""
-        squeezing = sample is not None and sample.squeezing
-        return squeezing and not self.engaged and not self.wait_release
+    def may_engage(self, grip: bool | None) -> bool:
+        """Whether this tick's squeeze asks to engage the grip."""
+        return grip is True and not self.engaged and not self.wait_release
+
+    def engage_on(self, robot: str) -> None:
+        """The headset holds `robot` for the grip: its streams command it."""
+        self.engaged, self.robot = True, robot
+
+
+@dataclass
+class BaseGripState(GripState):
+    """The grips' hold on the base of a robot, shared by the base stream and
+    the panel."""
+
+    # The base reported that it follows since the headset took the robot:
+    # the stream may command it.
+    followed: bool = False
+    # The base reported a hold: the stream sends nothing until every stick
+    # rests.
+    wait_rest: bool = False
+
+    def engage_on(self, robot: str) -> None:
+        """The headset holds `robot` for the base: the base follows from the
+        reports after the take."""
+        super().engage_on(robot)
+        self.followed = self.wait_rest = False
 
 
 @dataclass(frozen=True)
@@ -247,7 +275,8 @@ class Driver:
         self._timing = timing
         self._on_change = on_change
         self._clock = clock
-        self.hands = {hand: HandState(FlashNote(clock)) for hand in _HANDS}
+        self.hands = {hand: GripState(FlashNote(clock)) for hand in Hand}
+        self.base = BaseGripState(FlashNote(clock))
         # Why the headset let go last, for the panel.
         self.note = FlashNote(clock)
         self._holds: dict[str, Hold] = {}
@@ -262,36 +291,64 @@ class Driver:
         hold = self._holds.get(robot)
         return hold is not None and reason in hold.reasons
 
-    def hand_holds(self, robot: str | None) -> bool:
-        """Whether a hand holds `robot`, driving it or in its release
-        burst."""
-        return any(self.holds_for(robot, hand) for hand in _HANDS)
+    def grip_holds(self, robot: str | None) -> bool:
+        """Whether a grip holds `robot`: a hand's, for its arm, or the
+        base's, while it drives or in its release burst."""
+        return any(self.holds_for(robot, grip) for grip in _GRIPS)
 
     def driven_under_open(self, robot: str) -> bool:
         hold = self._holds.get(robot)
         return hold is not None and isinstance(hold.mode, UnderOpen)
 
     def press_refusal(self, robot: str | None) -> str | None:
-        """Why a press on `robot` does nothing for a hand: a hand drives it,
-        or a hand's release burst holds it. None while no hand holds it."""
-        if self._driven_by_a_hand(robot):
+        """Why a press on `robot` does nothing for a hand: a hand drives its
+        arm or its base, or their release burst holds it. None while no hand
+        holds it."""
+        if self._driven_by_a_grip(robot):
             return GRIP_HELD
-        if self.hand_holds(robot):
+        if self.grip_holds(robot):
             return GRIP_JUST_RELEASED
         return None
 
-    def _driven_by_a_hand(self, robot: str | None) -> bool:
-        return any(hand.engaged and hand.robot == robot for hand in self.hands.values())
+    def _driven_by_a_grip(self, robot: str | None) -> bool:
+        return any(grip.engaged and grip.robot == robot for grip in self._grip_states())
+
+    def _grip_states(self) -> tuple[GripState, ...]:
+        return (*self.hands.values(), self.base)
+
+    def grip(self, grip: Grip) -> GripState:
+        """`grip`'s hold on a robot: the hand's, or the base's."""
+        return self.base if grip == BASE else self.hands[grip]
+
+    async def engage(self, robot: str, grip: Grip, wanted: Callable[[], bool]) -> None:
+        """A squeeze that drives `grip` asks for `robot`: take it, then
+        engage the grip on it, releasing a robot the grip left in its release
+        burst. A refused take says why on the grip's row, and the grip drives
+        nothing until it is released; a withdrawn one changes nothing.
+        `wanted` is `acquire`'s."""
+        state = self.grip(grip)
+        match await self.acquire(robot, grip, wanted):
+            case Refusal(cause=refused):
+                state.note.set(f"squeeze refused: {refused}")
+                log(f"{grip} squeeze on {robot} refused: {refused}")
+                state.wait_release = True
+                return
+            case Withdrawn():
+                return
+        # A robot left behind in its release burst is released now.
+        if state.robot not in (None, robot):
+            self.drop(state.robot, grip)
+        state.engage_on(robot)
 
     async def acquire(
-        self, robot: str, hand: Hand, wanted: Callable[[], bool]
+        self, robot: str, grip: Grip, wanted: Callable[[], bool]
     ) -> Refusal | Withdrawn | None:
-        """Take `robot` for a squeeze of `hand`: None once the headset holds
-        it for the hand, else why not. `wanted` says whether the squeeze
-        still asks for the robot, before the headset stops the moves in
-        flight on it and once they stopped."""
+        """Take `robot` for a squeeze that drives `grip`: None once the
+        headset holds it for the grip, else why not. `wanted` says whether
+        the squeeze still asks for the robot, before the headset stops the
+        moves in flight on it and once they stopped."""
         async with self._locks[robot]:
-            held = await self._hold(robot, hand, wanted)
+            held = await self._hold(robot, grip, wanted)
         return None if isinstance(held, Hold) else held
 
     async def start_posture_move(
@@ -366,7 +423,7 @@ class Driver:
                 self.press_refusal(robot) or f"a posture move runs on {robot}"
             )
         posture_runs = POSTURE in hold.reasons
-        engages_at_once = isinstance(hold.mode, Taken) or self._driven_by_a_hand(robot)
+        engages_at_once = isinstance(hold.mode, Taken) or self._driven_by_a_grip(robot)
         joined = reason not in hold.reasons
         hold.reasons.add(reason)
         if engages_at_once and not posture_runs:
@@ -447,7 +504,7 @@ class Driver:
         return None
 
     def drop(self, robot: str | None, reason: Reason) -> None:
-        """`reason` no longer holds `robot`: a hand's release burst ended, or
+        """`reason` no longer holds `robot`: a grip's release burst ended, or
         a posture move ended. The last reason releases the lease."""
         hold = self._holds.get(robot)
         if hold is None or reason not in hold.reasons:
@@ -472,15 +529,15 @@ class Driver:
         hold.cancel_posture = cancel
 
     def let_go(self, robot: str, why: str, *, release: bool) -> None:
-        """Let go of `robot` at once, as at a grip release: each hand on it
-        disengages and waits for its grip to be released, the posture move
-        of the headset is cancelled, and, when `release`, the lease is
-        released."""
+        """Let go of `robot` at once, as at a grip release: each hand and the
+        base on it disengage and wait for their grip to be released, the
+        posture move of the headset is cancelled, and, when `release`, the
+        lease is released."""
         hold = self._holds.pop(robot, None)
-        for hand in self.hands.values():
-            if hand.robot == robot and hand.engaged:
-                hand.engaged = False
-                hand.wait_release = True
+        for grip in self._grip_states():
+            if grip.robot == robot and grip.engaged:
+                grip.engaged = False
+                grip.wait_release = True
         if hold is None:
             return
         if hold.cancel_posture is not None:

@@ -46,7 +46,7 @@ from xr_commander.devices import (
     HandSample,
     XrFrame,
 )
-from xr_commander.drive import Driver, HandState
+from xr_commander.drive import Driver, GripState
 from xr_commander.fleet import Timing
 
 
@@ -78,7 +78,7 @@ def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
 
     async def run():
         await asyncio.wait_for(
-            publish._run_stream(
+            publish.run_stream(
                 None,
                 NoPublisherTopic(),
                 0.001,
@@ -96,7 +96,7 @@ def test_a_failed_publisher_declaration_ends_the_stream_loudly(capsys):
 
 async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
     async with boot_clocked(**ONE_ROBOT) as h:
-        hand = HandState(FlashNote())
+        hand = GripState(FlashNote())
         session = ScriptedHeadset()
         session.press(right=(False, False, False))
         async with running(
@@ -119,7 +119,7 @@ async def test_the_gripper_stream_is_silent_without_the_squeeze_deadman():
 
 async def test_the_gripper_stream_publishes_openings_while_the_hand_is_engaged():
     async with boot_clocked(**ONE_ROBOT) as h:
-        hand = HandState(FlashNote(), engaged=True, robot="backbone_inst")
+        hand = GripState(FlashNote(), engaged=True, robot="backbone_inst")
         session = ScriptedHeadset()
         session.press(right=(False, False, True))
         async with running(
@@ -153,7 +153,6 @@ async def test_the_pose_stream_refuses_to_engage_without_a_fresh_measured_pose()
                 topic_module=right_arm_pose_setpoints,
                 gripper_module=right_gripper_setpoints,
                 handedness="right",
-                hand=driver.hands["right"],
                 driver=driver,
                 clutch=HandClutch(1.0),
                 session=session,
@@ -182,7 +181,6 @@ async def test_the_pose_stream_engages_once_the_follower_reports():
                 topic_module=right_arm_pose_setpoints,
                 gripper_module=right_gripper_setpoints,
                 handedness="right",
-                hand=driver.hands["right"],
                 driver=driver,
                 clutch=HandClutch(1.0),
                 session=session,
@@ -255,7 +253,6 @@ async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone()
                 topic_module=right_arm_pose_setpoints,
                 gripper_module=right_gripper_setpoints,
                 handedness="right",
-                hand=driver.hands["right"],
                 driver=driver,
                 clutch=HandClutch(1.0),
                 session=session,
@@ -307,7 +304,6 @@ async def test_a_grip_held_across_a_robot_change_leaves_the_new_gripper_alone():
                     topic_module=right_arm_pose_setpoints,
                     gripper_module=right_gripper_setpoints,
                     handedness="right",
-                    hand=driver.hands["right"],
                     driver=driver,
                     clutch=HandClutch(1.0),
                     session=session,
@@ -380,7 +376,6 @@ async def test_the_pose_stream_goes_silent_when_frames_stop_mid_squeeze():
                 topic_module=right_arm_pose_setpoints,
                 gripper_module=right_gripper_setpoints,
                 handedness="right",
-                hand=driver.hands["right"],
                 driver=driver,
                 clutch=HandClutch(1.0),
                 session=session,
@@ -460,7 +455,6 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
                 topic_module=right_arm_pose_setpoints,
                 gripper_module=right_gripper_setpoints,
                 handedness="right",
-                hand=driver.hands["right"],
                 driver=driver,
                 clutch=HandClutch(1.0),
                 session=session,
@@ -628,17 +622,15 @@ FAST_TICK_S = 0.001
 
 
 class TestReleaseHold:
-    # Where the clutch drives the arm, and where the follower measures it.
+    # Where the clutch drives the arm, and the measured pose the burst holds.
     TARGET = Setpoint(ROBOT_FRAME, pose_at((0.1, 0.2, 0.3)))
-    MEASURED = reported(pose_at((0.4, 0.5, 0.6)))
-    # The burst's setpoint: the measured pose in its frame.
     HELD = Setpoint(ROBOT_FRAME, pose_at((0.4, 0.5, 0.6)))
 
     def drive(self, hold, target, now_s):
-        return hold.step(target=target, measured_ee=None, now_s=now_s)
+        return hold.step(target=target, held=None, now_s=now_s)
 
-    def release(self, hold, measured, now_s):
-        return hold.step(target=None, measured_ee=measured, now_s=now_s)
+    def release(self, hold, held, now_s):
+        return hold.step(target=None, held=held, now_s=now_s)
 
     def test_a_driving_tick_streams_the_clutch_target_itself(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
@@ -647,13 +639,13 @@ class TestReleaseHold:
     def test_release_after_driving_streams_the_measured_pose_for_the_hold(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
         self.drive(hold, self.TARGET, 9.9)
-        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
-        assert self.release(hold, self.MEASURED, 10.2) == self.HELD
-        assert self.release(hold, self.MEASURED, 10.26) is None
+        assert self.release(hold, self.HELD, 10.0) == self.HELD
+        assert self.release(hold, self.HELD, 10.2) == self.HELD
+        assert self.release(hold, self.HELD, 10.26) is None
 
     def test_release_without_prior_driving_stays_silent(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
-        assert self.release(hold, self.MEASURED, 10.0) is None
+        assert self.release(hold, self.HELD, 10.0) is None
 
     def test_release_with_stale_measured_stays_silent(self):
         # Nothing truthful to freeze on: the follower's pose is unknown.
@@ -661,21 +653,21 @@ class TestReleaseHold:
         self.drive(hold, self.TARGET, 9.9)
         assert self.release(hold, None, 10.0) is None
         # And the edge is consumed: a pose arriving later does not revive it.
-        assert self.release(hold, self.MEASURED, 10.1) is None
+        assert self.release(hold, self.HELD, 10.1) is None
 
     def test_redriving_voids_the_pending_burst(self):
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
         self.drive(hold, self.TARGET, 9.9)
-        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
+        assert self.release(hold, self.HELD, 10.0) == self.HELD
         self.drive(hold, self.TARGET, 10.05)
-        assert self.release(hold, self.MEASURED, 10.1) == self.HELD, (
+        assert self.release(hold, self.HELD, 10.1) == self.HELD, (
             "a fresh edge re-arms"
         )
         # Mid-burst re-engage then release again: the burst restarts from now.
         self.drive(hold, self.TARGET, 10.15)
-        assert self.release(hold, self.MEASURED, 10.2) == self.HELD
-        assert self.release(hold, self.MEASURED, 10.44) == self.HELD
-        assert self.release(hold, self.MEASURED, 10.46) is None
+        assert self.release(hold, self.HELD, 10.2) == self.HELD
+        assert self.release(hold, self.HELD, 10.44) == self.HELD
+        assert self.release(hold, self.HELD, 10.46) is None
 
     def test_a_voided_burst_cannot_resume_from_the_stale_pose(self):
         # Re-engaging must void the pending burst, not just re-arm it. If the
@@ -684,7 +676,7 @@ class TestReleaseHold:
         # earlier burst's now-stale pose.
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
         self.drive(hold, self.TARGET, 9.9)
-        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
+        assert self.release(hold, self.HELD, 10.0) == self.HELD
         self.drive(hold, self.TARGET, 10.05)
         assert self.release(hold, None, 10.1) is None, (
             "the voided burst resumed streaming a pose the robot may have left"
@@ -695,8 +687,8 @@ class TestReleaseHold:
         # tick landing exactly on it cannot double the burst's stated length.
         hold = publish.ReleaseHold(FAST_TICK_S, hold_s=0.25)
         self.drive(hold, self.TARGET, 9.9)
-        assert self.release(hold, self.MEASURED, 10.0) == self.HELD
-        assert self.release(hold, self.MEASURED, 10.25) is None
+        assert self.release(hold, self.HELD, 10.0) == self.HELD
+        assert self.release(hold, self.HELD, 10.25) is None
 
     def test_a_slow_command_rate_still_gets_a_burst_not_one_message(self):
         # At 4 Hz the 0.25 s window would carry a single sample, which is the
@@ -705,7 +697,7 @@ class TestReleaseHold:
         hold = publish.ReleaseHold(slow_tick_s, hold_s=0.25)
         self.drive(hold, self.TARGET, 9.9)
         held = [
-            self.release(hold, self.MEASURED, 10.0 + tick * slow_tick_s) == self.HELD
+            self.release(hold, self.HELD, 10.0 + tick * slow_tick_s) == self.HELD
             for tick in range(publish.RELEASE_HOLD_MESSAGES)
         ]
         assert all(held), "the burst shrank to fewer messages than its floor"
@@ -721,18 +713,19 @@ def frame_of(squeezing: bool) -> HandSample:
     )
 
 
-def gate_engages(hand: HandState, chosen, sample) -> bool:
+def gate_engages(hand: GripState, chosen, sample) -> bool:
     """One tick of the hand's gate: whether its squeeze asks to engage."""
-    hand.observe(chosen, sample)
-    return hand.may_engage(sample)
+    grip = None if sample is None else sample.squeezing
+    hand.observe(chosen, grip)
+    return hand.may_engage(grip)
 
 
 def test_the_first_robot_engages_a_squeeze_already_held():
-    assert gate_engages(HandState(FlashNote()), "alpha", frame_of(True))
+    assert gate_engages(GripState(FlashNote()), "alpha", frame_of(True))
 
 
 def test_a_squeeze_held_across_any_change_of_robot_waits_for_a_fresh_release():
-    hand = HandState(FlashNote())
+    hand = GripState(FlashNote())
     assert gate_engages(hand, "charlie", frame_of(True))
     assert gate_engages(hand, "charlie", frame_of(True))
     # Charlie pairs no left arm: the gate follows the robot, not the pair.
@@ -773,7 +766,6 @@ def pose_stream(h, clock, driver, session, measured, robots, handedness="right")
         topic_module=arm,
         gripper_module=gripper,
         handedness=handedness,
-        hand=driver.hands[handedness],
         driver=driver,
         clutch=HandClutch(1.0),
         session=session,
@@ -815,7 +807,7 @@ async def test_the_gripper_is_silent_while_its_hand_is_in_its_release_burst():
         session = ScriptedHeadset(clock)
         session.press(right=(False, False, True))
         # The hand holds the robot through its burst, no longer engaged.
-        hand = HandState(FlashNote(clock), robot="backbone_inst")
+        hand = GripState(FlashNote(clock), robot="backbone_inst")
         gripper = h.mocks.pairings.right_gripper[0].gripper_setpoints
 
         def stream(token):
@@ -862,7 +854,7 @@ async def test_a_change_of_robot_in_the_release_burst_releases_the_robot_left_be
                 await step()
 
             await report()
-            assert driver.hand_holds("alpha")
+            assert driver.grip_holds("alpha")
             # Release, choose bravo and squeeze again inside alpha's burst.
             session.press(right=(False, False, False))
             await report()
@@ -870,7 +862,7 @@ async def test_a_change_of_robot_in_the_release_burst_releases_the_robot_left_be
             await report()
             session.press(right=(False, False, True))
             await report()
-            assert driver.hand_holds("bravo")
+            assert driver.grip_holds("bravo")
             assert not driver.holds("alpha")
             assert ("release", "alpha") in log
 

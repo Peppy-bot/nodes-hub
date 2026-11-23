@@ -12,6 +12,8 @@ from control_core_py.geometry import Pose, Quaternion, Stamped
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from peppygen.consumed_actions.fleet import changes, lease
+from peppygen.consumed_services.fleet import check_move, release, take
+from peppygen.consumed_services.robot_stop import stop
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
@@ -20,8 +22,16 @@ from xr_commander import config
 from xr_commander.bus import REAL_CLOCK, Answered, Clock, FlashNote, Outcome
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
-from xr_commander.drive import Driver, HandState
-from xr_commander.fleet import Fleet, FleetView, Following, Holder, Timing
+from xr_commander.drive import Driver, GripState, RobotStops, Stops
+from xr_commander.fleet import (
+    LEASE_NAME,
+    Fleet,
+    FleetCalls,
+    FleetView,
+    Following,
+    Holder,
+    Timing,
+)
 from xr_commander.panel import HandSource
 from xr_commander.publish import MeasuredPoses
 from xr_commander.robots import PairedRobots
@@ -91,6 +101,47 @@ def posture_done(module):
     )
 
 
+def controller(
+    handedness,
+    *,
+    position=(0.0, 0.0, 0.0),
+    squeezing=False,
+    trigger=0.0,
+    primary=False,
+    secondary=False,
+    axes=(0.0, 0.0, 0.0, 0.0),
+):
+    """A controller as the page sends it in an `xr_state` frame."""
+    buttons = [
+        {"pressed": trigger >= 1.0, "touched": True, "value": trigger},
+        {
+            "pressed": squeezing,
+            "touched": True,
+            "value": 1.0 if squeezing else 0.0,
+        },
+    ]
+    if primary or secondary:
+        buttons += [
+            {"pressed": False, "touched": False, "value": 0.0},
+            {"pressed": False, "touched": False, "value": 0.0},
+            {"pressed": primary, "touched": primary, "value": 0.0},
+        ]
+    if secondary:
+        buttons.append({"pressed": True, "touched": True, "value": 0.0})
+    return {
+        "role": "controller",
+        "handedness": handedness,
+        "gripPose": {
+            "position": dict(zip("xyz", position, strict=True)),
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+        "gamepad": {
+            "buttons": buttons,
+            "axes": list(axes),
+        },
+    }
+
+
 def squeezing_hand():
     return HandSample(pose=POSE, squeezing=True, trigger=0.0)
 
@@ -104,7 +155,8 @@ class ScriptedHeadset:
         self, clock: Clock = REAL_CLOCK, *, hands=None, age_s: float = 0.0
     ) -> None:
         self._clock = clock
-        self._age_s = age_s
+        # How old each frame is when the stream reads it (s).
+        self.age_s = age_s
         self.hands = hands or {}
         # The trigger of every hand that `press` sets.
         self.trigger = 0.0
@@ -125,7 +177,7 @@ class ScriptedHeadset:
 
     def latest(self):
         return XrFrame(
-            received_monotonic_s=self._clock.monotonic() - self._age_s,
+            received_monotonic_s=self._clock.monotonic() - self.age_s,
             hands=self.hands,
         )
 
@@ -153,7 +205,7 @@ def source(
     return HandSource(
         handedness=handedness,
         clutch=clutch,
-        state=HandState(FlashNote()),
+        state=GripState(FlashNote()),
         measured=measured,
         arm_peer=lambda: PEER if arm_bound else None,
         gripper_peer=lambda: PEER if gripper else None,
@@ -426,6 +478,7 @@ class FakeToken:
 
 def robots_of(h):
     """The paired robots over the harness's real runner and slot modules."""
+    from peppygen.paired_topics.base import drive_setpoints as base
     from peppygen.paired_topics.left_arm import pose_setpoints as left_arm
     from peppygen.paired_topics.left_gripper import gripper_setpoints as left_gripper
     from peppygen.paired_topics.right_arm import pose_setpoints as right_arm
@@ -435,6 +488,7 @@ def robots_of(h):
         h.node_runner,
         arms={"left": left_arm, "right": right_arm},
         grippers={"left": left_gripper, "right": right_gripper},
+        base=base,
     )
 
 
@@ -639,6 +693,106 @@ def scripted_driver(*robots, clock=REAL_CLOCK, log=None) -> Driver:
         on_change=lambda: None,
         clock=clock,
     )
+
+
+# The bound of each call to a mock that the test answers, and the retry.
+WIRE_TIMING = Timing(call_timeout_s=CALL_S, retry_s=RETRY_S)
+
+# The robot of a wire rig, outside any copy: its backbone's instance id.
+ROBOT = "backbone_inst"
+SETTINGS = config.from_parameters(
+    default_parameters(command_rate_hz=100, stale_timeout_s=0.25)
+)
+TICK_S = SETTINGS.tick_period_s
+# The most ticks a test waits for a state, and the ticks a held grip gets to
+# stream where it must stream nothing.
+WIRE_TICKS = 50
+HELD_TICKS = 5
+
+
+class TickedRig:
+    """A rig whose loops run on `clock`: a tick is one step of each loop of
+    `loops`."""
+
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+        # The loops that each tick waits for.
+        self.loops: list[asyncio.Task] = []
+
+    async def tick(self, count=1):
+        for _ in range(count):
+            await self.clock.advance(TICK_S, parked=self.loops)
+
+    async def ticks_until(self, predicate, limit=WIRE_TICKS):
+        """Tick until `predicate()`."""
+        for _ in range(limit):
+            if predicate():
+                return
+            await self.tick()
+        raise AssertionError("the condition was never met")
+
+
+def wire_stops(h, robots: PairedRobots) -> RobotStops:
+    """The stops of the robots through the harness's mocks of `robot_stop`."""
+    return RobotStops(h.node_runner, robots, stop, WIRE_TIMING)
+
+
+def driver_on_the_wire(h, fleet: Fleet, stops: Stops, clock: Clock) -> Driver:
+    """A driver whose daemon is the harness's mock of the target `fleet` and
+    whose backbones stop through `stops`."""
+    return Driver(
+        fleet,
+        FleetCalls(
+            h.node_runner,
+            take_module=take,
+            release_module=release,
+            check_move_module=check_move,
+            timing=WIRE_TIMING,
+        ),
+        stops,
+        timing=WIRE_TIMING,
+        on_change=lambda: None,
+        clock=clock,
+    )
+
+
+async def daemon_answers_take(daemon, robot: str, refusal: str | None = None):
+    """The mock daemon's answer to the next take, of `robot` under the
+    headset's lease name: a yes, or `refusal`."""
+    request, responder = await daemon.take.next_request(CALL_S)
+    assert (request.robot, request.name) == (robot, LEASE_NAME)
+    if refusal is None:
+        await responder.respond()
+    else:
+        await responder.respond_failure(take.FailureKind.LEASED, refusal)
+
+
+async def backbone_answers_stop(stops, stopped: list[str]) -> None:
+    """A mock backbone's answer to the next stop, whose reason is the
+    headset's lease name: the parts it stopped."""
+    request, responder = await stops.next_request(CALL_S)
+    assert request.reason == LEASE_NAME
+    await responder.respond(stop.ResponseData(stopped=stopped))
+
+
+async def daemon_answers_check_move(daemon, instance: str, refusal=None) -> None:
+    """The mock daemon's answer to the next check whether the headset may
+    call a member that moves the robot of `instance`: a yes, or `refusal`."""
+    request, responder = await daemon.check_move.next_request(CALL_S)
+    assert (request.instance, request.robot) == (instance, None)
+    denied = (
+        None
+        if refusal is None
+        else check_move.ResponseDataRefusal(failure_kind="leased", message=refusal)
+    )
+    await responder.respond(check_move.ResponseData(refusal=denied, revision=1))
+
+
+async def daemon_answers_release(daemon, robot: str) -> None:
+    """The mock daemon's yes to the next release, of `robot`."""
+    request, responder = await daemon.release.next_request(CALL_S)
+    assert request.robot == robot
+    await responder.respond()
 
 
 # The fleet listing and the lease events as the daemon sends them.

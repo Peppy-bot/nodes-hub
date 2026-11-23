@@ -3,52 +3,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.helpers import ScriptedHeadset, squeezing_hand
+from tests.helpers import ScriptedHeadset, controller, squeezing_hand
 from xr_commander.devices import (
+    RESTING,
     RisingEdge,
+    Thumbstick,
+    XrFrame,
     fresh_sample,
     gripper_opening,
+    gripping,
     parse_hands,
+    past_rest_band,
 )
-
-
-def controller(
-    handedness,
-    *,
-    position=(0.0, 0.0, 0.0),
-    squeezing=False,
-    trigger=0.0,
-    primary=False,
-    secondary=False,
-):
-    buttons = [
-        {"pressed": trigger >= 1.0, "touched": True, "value": trigger},
-        {
-            "pressed": squeezing,
-            "touched": True,
-            "value": 1.0 if squeezing else 0.0,
-        },
-    ]
-    if primary or secondary:
-        buttons += [
-            {"pressed": False, "touched": False, "value": 0.0},
-            {"pressed": False, "touched": False, "value": 0.0},
-            {"pressed": primary, "touched": primary, "value": 0.0},
-        ]
-    if secondary:
-        buttons.append({"pressed": True, "touched": True, "value": 0.0})
-    return {
-        "role": "controller",
-        "handedness": handedness,
-        "gripPose": {
-            "position": dict(zip("xyz", position, strict=True)),
-            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-        },
-        "gamepad": {
-            "buttons": buttons,
-            "axes": [0.0, 0.0, 0.0, 0.0],
-        },
-    }
 
 
 def test_both_controllers_are_parsed_and_the_head_is_ignored():
@@ -220,3 +186,61 @@ def test_a_stale_frame_is_discarded_rather_than_held():
     # age, not content, decides.
     source = ScriptedHeadset(hands={"left": squeezing_hand()}, age_s=1.0)
     assert fresh_sample(source, "left", 0.25) is None
+
+
+def stick_of(axes) -> Thumbstick:
+    """The right thumbstick of a squeezing controller whose gamepad carries
+    `axes`."""
+    (sample,) = parse_hands([controller("right", squeezing=True, axes=axes)]).values()
+    return sample.thumbstick
+
+
+def test_the_thumbstick_is_read_from_the_xr_standard_axes_forward_and_left_positive():
+    # The thumbstick is at axes 2 and 3; the Gamepad API gives -1 forward and
+    # left. The touchpad's axes 0 and 1 drive nothing.
+    assert stick_of([0.9, 0.9, 0.0, -1.0]) == Thumbstick(forward=1.0, left=0.0)
+    assert stick_of([0.0, 0.0, -1.0, 0.0]) == Thumbstick(forward=0.0, left=1.0)
+    assert stick_of([0.0, 0.0, 1.0, 1.0]) == Thumbstick(forward=-1.0, left=-1.0)
+
+
+def test_a_deflection_within_the_rest_band_rests_and_one_past_it_is_rescaled():
+    assert past_rest_band(0.05) == 0.0
+    assert past_rest_band(-0.05) == 0.0
+    # Half a deflection past the band: 0.05 + 0.5 * 0.95.
+    assert past_rest_band(0.525) == pytest.approx(0.5)
+    assert past_rest_band(-0.525) == pytest.approx(-0.5)
+    assert past_rest_band(1.0) == pytest.approx(1.0)
+    assert stick_of([0.0, 0.0, 0.05, -0.04]) == RESTING
+
+
+@pytest.mark.parametrize(
+    "axes",
+    [
+        None,
+        "forward",
+        {"3": -1.0},
+        [0.0, 0.0],
+        [0.0, 0.0, True, False],
+        [0.0, 0.0, "-1", None],
+        [0.0, 0.0, math.nan, -math.inf],
+    ],
+)
+def test_a_missing_or_malformed_axis_reads_as_rest_and_keeps_the_hand(axes):
+    device = controller("right", squeezing=True)
+    device["gamepad"]["axes"] = axes
+    (parsed,) = parse_hands([device]).values()
+    assert parsed.squeezing
+    assert parsed.thumbstick == RESTING
+
+
+def test_an_axis_past_full_deflection_reads_as_full_deflection():
+    assert stick_of([0.0, 0.0, -7.0, 3.0]) == Thumbstick(forward=-1.0, left=1.0)
+
+
+def test_either_grip_holds_and_a_frame_with_no_hand_says_nothing():
+    held = squeezing_hand()
+    released = parse_hands([controller("left")])["left"]
+    assert gripping(None) is None
+    assert gripping(XrFrame(0.0, {})) is None
+    assert gripping(XrFrame(0.0, {"left": released, "right": held})) is True
+    assert gripping(XrFrame(0.0, {"left": released})) is False

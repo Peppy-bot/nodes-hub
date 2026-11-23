@@ -34,7 +34,7 @@ def live_slot(peers):
 
 def one_slot(*peers):
     """The robots of one right-arm slot holding `peers`."""
-    return PairedRobots(None, arms={"right": slot(*peers)}, grippers={})
+    return PairedRobots(None, arms={"right": slot(*peers)}, grippers={}, base=slot())
 
 
 def test_a_pair_is_named_by_its_copy_else_its_instance():
@@ -61,7 +61,10 @@ def test_the_robots_are_listed_once_in_name_order_and_the_first_that_paired_is_d
     # An SO-101 pairs on the right side alone, and pairs first.
     right = [peer("charlie_backbone_inst", "charlie")]
     robots = PairedRobots(
-        None, arms={"left": live_slot(left), "right": live_slot(right)}, grippers={}
+        None,
+        arms={"left": live_slot(left), "right": live_slot(right)},
+        grippers={},
+        base=slot(),
     )
     assert robots.names() == ["charlie"]
     # An OpenArm joins on both sides: the list is in name order, and
@@ -84,7 +87,9 @@ def test_the_first_robot_is_driven_until_one_is_chosen_and_while_it_stands():
         peer("alpha_backbone_inst", "alpha"),
         peer("bravo_backbone_inst", "bravo"),
     ]
-    robots = PairedRobots(None, arms={"right": live_slot(paired)}, grippers={})
+    robots = PairedRobots(
+        None, arms={"right": live_slot(paired)}, grippers={}, base=slot()
+    )
     assert robots.chosen() == "alpha"
     assert robots.choose("bravo")
     assert robots.chosen() == "bravo"
@@ -97,7 +102,9 @@ def test_the_first_robot_is_driven_until_one_is_chosen_and_while_it_stands():
 
 def test_a_choice_of_a_robot_not_paired_is_refused_and_changes_nothing():
     paired = [peer("alpha_backbone_inst", "alpha")]
-    robots = PairedRobots(None, arms={"right": live_slot(paired)}, grippers={})
+    robots = PairedRobots(
+        None, arms={"right": live_slot(paired)}, grippers={}, base=slot()
+    )
     assert not robots.choose("delta")
     assert not robots.choose("")
     assert robots.chosen() == "alpha"
@@ -111,7 +118,9 @@ def test_the_chosen_robots_pair_is_found_per_slot_and_absent_where_it_has_none()
     right = slot(
         peer("charlie_backbone_inst", "charlie"), peer("alpha_backbone_inst", "alpha")
     )
-    robots = PairedRobots(None, arms={"left": left, "right": right}, grippers={})
+    robots = PairedRobots(
+        None, arms={"left": left, "right": right}, grippers={}, base=slot()
+    )
     assert robots.peer_for(right).producer.instance_id == "alpha_backbone_inst"
     robots.choose("charlie")
     assert robots.peer_for(left) is None
@@ -132,7 +141,9 @@ def test_the_chosen_robots_producer_is_found_on_a_contract_slot():
 def test_a_robot_has_its_own_producers_only():
     # The robot outside any copy pairs first, so the hands drive it.
     paired = [peer("backbone_inst")]
-    robots = PairedRobots(None, arms={"right": live_slot(paired)}, grippers={})
+    robots = PairedRobots(
+        None, arms={"right": live_slot(paired)}, grippers={}, base=slot()
+    )
     assert robots.chosen() == "backbone_inst"
     paired.append(peer("alpha_backbone_inst", "alpha"))
     recorder = SimpleNamespace(
@@ -160,7 +171,10 @@ def test_a_robot_drives_the_hands_whose_arm_slot_it_pairs():
     # A gripper pair names no hand an arm: the arm slots alone do.
     gripper = slot(peer("charlie_backbone_inst", "charlie"))
     robots = PairedRobots(
-        None, arms={"left": left, "right": right}, grippers={"left": gripper}
+        None,
+        arms={"left": left, "right": right},
+        grippers={"left": gripper},
+        base=slot(),
     )
     assert robots.arm_sides("alpha") == {"left", "right"}
     assert robots.arm_sides("bravo") == {"right"}
@@ -204,7 +218,9 @@ def test_a_robot_that_left_is_still_no_shared_producer():
     # A copy-less robot's backbone stays bound on postures while its pairs
     # are down; it serves no other robot's posture buttons.
     paired = [peer("backbone_inst")]
-    robots = PairedRobots(None, arms={"right": live_slot(paired)}, grippers={})
+    robots = PairedRobots(
+        None, arms={"right": live_slot(paired)}, grippers={}, base=slot()
+    )
     assert robots.names() == ["backbone_inst"]
     paired.append(peer("alpha_backbone_inst", "alpha"))
     assert robots.names() == ["alpha", "backbone_inst"]
@@ -215,3 +231,11 @@ def test_a_robot_that_left_is_still_no_shared_producer():
     robots.choose("alpha")
     paired.pop(0)
     assert robots.producer_for(postures) is None
+
+
+def test_a_robot_that_pairs_a_base_alone_is_listed_and_driven():
+    base = slot(peer("delta_backbone_inst", "delta"))
+    robots = PairedRobots(None, arms={"right": slot()}, grippers={}, base=base)
+    assert robots.names() == ["delta"]
+    assert robots.chosen() == "delta"
+    assert robots.arm_sides("delta") == frozenset()

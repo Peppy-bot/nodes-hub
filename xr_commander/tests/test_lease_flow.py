@@ -19,7 +19,7 @@ import peppygen.clock
 import pytest
 from peppygen.consumed_actions.fleet import changes, lease
 from peppygen.consumed_actions.postures import move_to_home
-from peppygen.consumed_services.fleet import check_move, release, take
+from peppygen.consumed_services.fleet import check_move
 from peppygen.consumed_services.robot_stop import stop
 from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
 from peppygen.paired_topics.right_gripper import (
@@ -30,19 +30,29 @@ from tests.helpers import (
     CALL_S,
     DIRECTOR,
     HALTED,
-    HEADSET,
+    HELD_TICKS,
     OTHER_FRAME,
     POSE,
     REPORTED_AT_S,
+    ROBOT,
     ROBOT_FRAME,
+    SETTINGS,
+    TICK_S,
+    WIRE_TICKS,
     ManualClock,
     ScriptedHeadset,
+    TickedRig,
     accept_both,
+    backbone_answers_stop,
     boot_clocked,
     change,
-    default_parameters,
+    daemon_answers_check_move,
+    daemon_answers_release,
+    daemon_answers_take,
+    driver_on_the_wire,
     eventually,
     fleet_view,
+    following_fleet,
     lease_event,
     pose_at,
     posture_done,
@@ -50,54 +60,29 @@ from tests.helpers import (
     robots_of,
     running,
     settle,
+    wire_stops,
 )
-from xr_commander import config, fleet, postures, publish
+from xr_commander import fleet, postures, publish
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import primary_pressed
-from xr_commander.drive import Driver, RobotStops
-from xr_commander.fleet import LEASE_NAME, Fleet, FleetCalls, Following, Timing
+from xr_commander.fleet import LEASE_NAME, Timing
 
-ROBOT = "backbone_inst"
-SETTINGS = config.from_parameters(
-    default_parameters(command_rate_hz=100, stale_timeout_s=0.25)
-)
-TICK_S = SETTINGS.tick_period_s
-# The most ticks a test waits for a state, and the most poses it reads.
-WIRE_TICKS = 50
-# Ticks a held grip gets to stream, where it must stream nothing.
-HELD_TICKS = 5
 ELSEWHERE = pose_at((0.4, 0.0, 0.0))
 # Where the hand drives the arm in the halt test: neither the arm's pose nor
 # the pose it moves to later.
 HAND_AWAY = pose_at((0.1, 0.0, 0.0))
 
 
-class Rig:
+class Rig(TickedRig):
     """The headset's right hand on one robot of the fleet listing, with the
     daemon, the robot's robot_stop and its postures played by the mocks."""
 
     def __init__(self, h, clock: ManualClock) -> None:
+        super().__init__(clock)
         self.h = h
-        self.clock = clock
-        self.fleet = Fleet(HEADSET)
-        self.fleet.view = fleet_view([ROBOT])
-        self.fleet.status = Following()
+        self.fleet = following_fleet(ROBOT)
         robots = robots_of(h)
-        timing = Timing(call_timeout_s=CALL_S, retry_s=1.0)
-        self.driver = Driver(
-            self.fleet,
-            FleetCalls(
-                h.node_runner,
-                take_module=take,
-                release_module=release,
-                check_move_module=check_move,
-                timing=timing,
-            ),
-            RobotStops(h.node_runner, robots, stop, timing),
-            timing=timing,
-            on_change=lambda: None,
-            clock=clock,
-        )
+        self.driver = driver_on_the_wire(h, self.fleet, wire_stops(h, robots), clock)
         self.hand = self.driver.hands["right"]
         self.robots = robots
         self.session = ScriptedHeadset(clock)
@@ -112,8 +97,6 @@ class Rig:
         self.postures = h.mocks.deps.postures[0].move_to_home
         self.wire = h.mocks.pairings.right_arm[0].pose_setpoints
         self.status = postures.PostureStatus(clock)
-        # The loops of the test, which each tick waits for.
-        self.loops: list[asyncio.Task] = []
 
     def pose_stream(self, token):
         return publish.stream_pose(
@@ -121,7 +104,6 @@ class Rig:
             topic_module=right_arm_pose_setpoints,
             gripper_module=right_gripper_setpoints,
             handedness="right",
-            hand=self.hand,
             driver=self.driver,
             clutch=HandClutch(1.0),
             session=self.session,
@@ -165,45 +147,22 @@ class Rig:
         self.session.press(pose=hand, right=(a, False, squeeze))
 
     async def tick(self, count=1):
+        """The follower reports the arm's pose at every tick."""
         for _ in range(count):
             self.measured.set(self.peer, reported(self.arm_at, self.arm_frame))
-            await self.clock.advance(TICK_S, parked=self.loops)
-
-    async def ticks_until(self, predicate, limit=WIRE_TICKS):
-        """Tick until `predicate()`; each tick is one step of the loops."""
-        for _ in range(limit):
-            if predicate():
-                return
-            await self.tick()
-        raise AssertionError("the condition was never met")
+            await super().tick()
 
     async def answer_take(self, refusal=None):
-        request, responder = await self.daemon.take.next_request(CALL_S)
-        assert (request.robot, request.name) == (ROBOT, LEASE_NAME)
-        if refusal is None:
-            await responder.respond()
-        else:
-            await responder.respond_failure(take.FailureKind.LEASED, refusal)
+        await daemon_answers_take(self.daemon, ROBOT, refusal)
 
     async def answer_stop(self):
-        request, responder = await self.stops.next_request(CALL_S)
-        assert request.reason == LEASE_NAME
-        await responder.respond(stop.ResponseData(stopped=["right_arm"]))
+        await backbone_answers_stop(self.stops, ["right_arm"])
 
     async def answer_release(self):
-        request, responder = await self.daemon.release.next_request(CALL_S)
-        assert request.robot == ROBOT
-        await responder.respond()
+        await daemon_answers_release(self.daemon, ROBOT)
 
     async def answer_check_move(self, refusal=None):
-        request, responder = await self.daemon.check_move.next_request(CALL_S)
-        assert (request.instance, request.robot) == (ROBOT, None)
-        denied = (
-            None
-            if refusal is None
-            else check_move.ResponseDataRefusal(failure_kind="leased", message=refusal)
-        )
-        await responder.respond(check_move.ResponseData(refusal=denied, revision=1))
+        await daemon_answers_check_move(self.daemon, ROBOT, refusal)
 
     async def press_a(self):
         """A press of A from rest: the posture button asks to take the
@@ -404,7 +363,7 @@ async def test_a_squeeze_in_the_release_burst_drives_on_and_keeps_the_lease():
         await r.next_streamed()
         r.hold(squeeze=False)
         await r.tick()
-        assert r.driver.hand_holds(ROBOT) and not r.hand.engaged
+        assert r.driver.grip_holds(ROBOT) and not r.hand.engaged
         r.hold(squeeze=True)
         await r.ticks_until(lambda: r.hand.engaged)
         # The burst stops: no take, no stop, and the lease stays past the
@@ -420,7 +379,7 @@ async def test_a_press_in_the_release_burst_does_nothing_and_says_why():
         await r.next_streamed()
         r.hold(squeeze=False)
         await r.tick()
-        assert r.driver.hand_holds(ROBOT)
+        assert r.driver.grip_holds(ROBOT)
         r.hold(a=True)
         await r.tick()
         assert r.status.state() == "move to home ignored: the grip was just released"
