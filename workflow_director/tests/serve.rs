@@ -70,6 +70,80 @@ fn home_workflow_to_confirm() -> String {
     workflow.to_string()
 }
 
+/// The longest bound of a step, in seconds: no step of a test reaches it.
+const A_DAY_S: u32 = 86_400;
+
+/// `home_workflow` whose lane looks for the block, which its reach assumption reads too, and then does the steps
+/// `after_the_look`, which read what the look found as `seen`. No bound of the look ends it: `find` answers once the
+/// test gives it a permit.
+fn look_then(after_the_look: &[Value]) -> String {
+    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
+    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
+    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
+    let look = json!({ "id": "look", "timeout_s": A_DAY_S, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } });
+    let sequence: Vec<Value> = std::iter::once(look)
+        .chain(after_the_look.iter().cloned())
+        .collect();
+    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": sequence });
+    workflow.to_string()
+}
+
+/// The step `grab` of the block that the look of `look_then` found. No bound of the step ends it: the grab ends
+/// once the test gives it a permit, or at a cancel.
+fn grab_of_the_seen_block() -> Value {
+    json!({ "id": "grab", "timeout_s": A_DAY_S, "call": {
+        "member": "arm.grab",
+        "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
+    } })
+}
+
+/// The events of `feedback` of the step `arm.grab`, each as its event, its message and its details.
+fn events_of_the_grab(feedback: &[run::Feedback]) -> Vec<(String, String, Value)> {
+    feedback
+        .iter()
+        .filter(|event| event.step == "arm.grab" && event.event.starts_with("step_"))
+        .map(|event| {
+            let details = match event.details.as_str() {
+                "" => Value::Null,
+                text => serde_json::from_str(text).expect("the details are JSON"),
+            };
+            (event.event.clone(), event.message.clone(), details)
+        })
+        .collect()
+}
+
+/// The start or the end of a step, as `events_of_the_grab` gives it.
+fn edge(event: &str) -> (String, String, Value) {
+    (event.to_owned(), String::new(), Value::Null)
+}
+
+/// The event `step_reports` of `report`, a stage and its sentence, as `events_of_the_grab` gives it.
+fn reported(report: (&str, &str)) -> (String, String, Value) {
+    (
+        "step_reports".to_owned(),
+        report.1.to_owned(),
+        grab_report(report),
+    )
+}
+
+/// The feedback of the run `goal` up to the event `step_reports` of `sentence`.
+async fn feedback_until_the_report(
+    goal: &mut run::GoalHandle,
+    sentence: &str,
+) -> peppygen::Result<Vec<run::Feedback>> {
+    let mut feedback = Vec::new();
+    while !feedback
+        .iter()
+        .any(|event: &run::Feedback| event.event == "step_reports" && event.message == sentence)
+    {
+        let next = tokio::time::timeout(WIRE, goal.on_next_feedback())
+            .await
+            .expect("the run gives the report while its step runs");
+        feedback.push(next?);
+    }
+    Ok(feedback)
+}
+
 /// The goal of a run of `workflow` on `alpha`, once the director lists `alpha`.
 async fn run_on_alpha(rig: &Rig, workflow: String) -> peppygen::Result<run::GoalHandle> {
     listed_robots(rig).await?;
@@ -978,18 +1052,8 @@ async fn a_point_read_before_a_move_reaches_the_grab_after_it_with_its_time() ->
     // The reach assumption reads `find` once, and the lane once.
     rig.arm.finds.add_permits(2);
     rig.arm.grabs.add_permits(1);
-    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
-    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
-    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
-    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": [
-        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
-        { "id": "move", "timeout_s": 5, "call": { "member": "arm.home", "args": { "duration_s": 0 } } },
-        { "id": "grab", "timeout_s": 5, "call": {
-            "member": "arm.grab",
-            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
-        } },
-    ] });
-    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
+    let move_home = json!({ "id": "move", "timeout_s": A_DAY_S, "call": { "member": "arm.home", "args": { "duration_s": 0 } } });
+    let mut goal = run_on_alpha(&rig, look_then(&[move_home, grab_of_the_seen_block()])).await?;
     feedback_of(&mut goal).await;
     let ended = goal.get_result(WIRE).await?;
     assert!(
@@ -1016,36 +1080,17 @@ async fn a_point_read_before_a_move_reaches_the_grab_after_it_with_its_time() ->
 /// A grab whose goal reports its stages gives, on the feedback of the run,
 /// one step_reports for each new sentence, between the start and the end of
 /// its step, each with the sentence as its message and the feedback message
-/// as its details. A message that does not decode, before the reports, gives
-/// none and stops none. The grab completes only once the test read its
-/// reports.
+/// as its details, while the grab runs: the grab completes only once the
+/// test read its reports. A message that does not decode, before the
+/// reports, gives none and stops none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_reports_of_a_grab_reach_the_feedback_of_the_run() -> peppygen::Result<()> {
+async fn the_reports_of_a_grab_reach_the_feedback_of_the_run_while_the_grab_runs()
+-> peppygen::Result<()> {
     let rig = Rig::start(Home::AtOnce).await?;
     // The reach assumption reads `find` once, and the lane once.
     rig.arm.finds.add_permits(2);
-    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
-    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
-    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
-    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": [
-        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
-        { "id": "grab", "timeout_s": 5, "call": {
-            "member": "arm.grab",
-            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
-        } },
-    ] });
-    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
-    let last_sentence = GRAB_REPORTS[2].1;
-    let mut feedback = Vec::new();
-    while !feedback
-        .iter()
-        .any(|event: &run::Feedback| event.message == last_sentence)
-    {
-        let next = tokio::time::timeout(WIRE, goal.on_next_feedback())
-            .await
-            .expect("the run gives the reports of the grab before the grab ends");
-        feedback.push(next?);
-    }
+    let mut goal = run_on_alpha(&rig, look_then(&[grab_of_the_seen_block()])).await?;
+    let mut feedback = feedback_until_the_report(&mut goal, GRAB_REPORTS[2].1).await?;
     rig.arm.grabs.add_permits(1);
     feedback.extend(feedback_messages_of(&mut goal).await);
     let ended = goal.get_result(WIRE).await?;
@@ -1054,27 +1099,8 @@ async fn the_reports_of_a_grab_reach_the_feedback_of_the_run() -> peppygen::Resu
         "{:?}",
         ended.outcome
     );
-    let of_the_grab: Vec<(String, String, Value)> = feedback
-        .iter()
-        .filter(|event| event.step == "arm.grab" && event.event.starts_with("step_"))
-        .map(|event| {
-            let details = match event.details.as_str() {
-                "" => Value::Null,
-                text => serde_json::from_str(text).expect("the details are JSON"),
-            };
-            (event.event.clone(), event.message.clone(), details)
-        })
-        .collect();
-    let edge = |event: &str| (event.to_owned(), String::new(), Value::Null);
-    let reported = |report: (&str, &str)| {
-        (
-            "step_reports".to_owned(),
-            report.1.to_owned(),
-            grab_report(report),
-        )
-    };
     assert_eq!(
-        of_the_grab,
+        events_of_the_grab(&feedback),
         [
             edge("step_starts"),
             reported(GRAB_REPORTS[0]),
@@ -1086,37 +1112,74 @@ async fn the_reports_of_a_grab_reach_the_feedback_of_the_run() -> peppygen::Resu
     rig.harness.shutdown().await
 }
 
-/// A grab that its step bound cancels gives no report after the cancel: the
-/// arm reports once more when the cancel comes, and the director, which sent
-/// the cancel, reads no more feedback of the goal.
+/// A grab that ends as soon as it gave its reports still gives each of them
+/// before the end of its step: the director reads the feedback of the goal
+/// to the end of its stream, also when the result of the goal comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reports_of_a_grab_that_ends_at_once_come_before_the_end_of_its_step()
+-> peppygen::Result<()> {
+    let rig = Rig::start(Home::AtOnce).await?;
+    // The reach assumption reads `find` once, and the lane once.
+    rig.arm.finds.add_permits(2);
+    rig.arm.grabs.add_permits(1);
+    let mut goal = run_on_alpha(&rig, look_then(&[grab_of_the_seen_block()])).await?;
+    let feedback = feedback_messages_of(&mut goal).await;
+    let ended = goal.get_result(WIRE).await?;
+    assert!(
+        matches!(ended.outcome, run::ResultOutcome::Completed(_)),
+        "{:?}",
+        ended.outcome
+    );
+    assert_eq!(
+        events_of_the_grab(&feedback),
+        [
+            edge("step_starts"),
+            reported(GRAB_REPORTS[0]),
+            reported(GRAB_REPORTS[2]),
+            edge("step_ends"),
+        ]
+    );
+    rig.harness.shutdown().await
+}
+
+/// A grab that the director cancels gives no report after the cancel: the
+/// test aborts the run once the grab gave its reports, the arm reports once
+/// more when the cancel comes, and the director, which sent the cancel, reads
+/// no more feedback of the goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_grab_gives_no_report_after_its_cancel() -> peppygen::Result<()> {
     let rig = Rig::start(Home::AtOnce).await?;
     // The reach assumption reads `find` once, and the lane once.
     rig.arm.finds.add_permits(2);
-    let mut workflow: Value = serde_json::from_str(&home_workflow()).expect("the workflow is JSON");
-    workflow["observations"] = json!({ "block": { "member": "arm.find", "role": "arm", "args": { "description": "block" } } });
-    workflow["assumptions"] = json!({ "in_reach": { "kind": "reach", "says": "The block is in reach", "check": "block.found" } });
-    workflow["actions"]["arm"]["tree"] = json!({ "id": "pick", "sequence": [
-        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" }, "as": "seen" } },
-        { "id": "grab", "timeout_s": 1, "call": {
-            "member": "arm.grab",
-            "args": { "item_id": { "$ref": "seen.item_id" }, "target": { "$ref": "seen.item_point" }, "speed": 1 },
-        } },
-    ] });
-    // The grab gets no permit: only its bound ends it.
-    let mut goal = run_on_alpha(&rig, workflow.to_string()).await?;
-    let feedback = feedback_messages_of(&mut goal).await;
-    let grab_ends = feedback
-        .iter()
-        .find(|event| event.step == "arm.grab" && event.event == "step_ends")
-        .expect("the step of the grab ends");
-    assert_eq!(grab_ends.failure_kind, "timeout", "{feedback:?}");
+    // The grab gets no permit: only the cancel ends it.
+    let mut goal = run_on_alpha(&rig, look_then(&[grab_of_the_seen_block()])).await?;
+    let mut feedback = feedback_until_the_report(&mut goal, GRAB_REPORTS[2].1).await?;
+    let request = abort::GoalRequestData {
+        run: "r1".to_owned(),
+    };
+    let aborting = abort::send_goal(&rig.harness, &request, DEFAULT_FEEDBACK_BOUND, WIRE).await?;
+    assert!(aborting.accepted, "{:?}", aborting.refusal);
+    let aborted = aborting.get_result(WIRE).await?;
     assert!(
-        !feedback
-            .iter()
-            .any(|event| event.event == "step_reports" && event.message == LATE_REPORT.1),
-        "{feedback:?}"
+        matches!(aborted.outcome, abort::ResultOutcome::Completed(_)),
+        "{:?}",
+        aborted.outcome
+    );
+    feedback.extend(feedback_messages_of(&mut goal).await);
+    assert_eq!(
+        *rig.arm.grabs_cancelled.lock().unwrap(),
+        1,
+        "the arm gave its late report and ended the grab cancelled"
+    );
+    assert_eq!(
+        events_of_the_grab(&feedback),
+        [
+            edge("step_starts"),
+            reported(GRAB_REPORTS[0]),
+            reported(GRAB_REPORTS[2]),
+        ],
+        "no report of `{}`, and no end of a step that the abort stopped",
+        LATE_REPORT.1
     );
     rig.harness.shutdown().await
 }

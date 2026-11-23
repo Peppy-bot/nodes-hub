@@ -583,8 +583,8 @@ pub enum Home {
 /// The arm of `alpha` on the session of `harness`: it answers each `home` goal as `home` says, counts the goals, and
 /// tells `arrived` of each; it goes to each place a `go_to` goal names, and keeps the names in `visited`; it grabs
 /// at each `grab` goal, keeps the goals in `grabbed`, gives a feedback message that does not decode and then those of
-/// `GRAB_REPORTS`, and completes once the test gives `grabs` a permit, or, at a cancel, gives `LATE_REPORT` and ends
-/// cancelled; it serves `locations:v1`, knowing the locations of `known`,
+/// `GRAB_REPORTS`, and completes once the test gives `grabs` a permit, or, at a cancel, gives `LATE_REPORT`, counts
+/// the grab in `grabs_cancelled` and ends cancelled; it serves `locations:v1`, knowing the locations of `known`,
 /// which a teach replaces, each one taught with no frame in its robot frame, and keeps the locations of the last teach
 /// request as it came in `taught`; and it answers each `find` once the test
 /// gives `finds` a permit, with a block found in its robot frame at `FOUND_AT`.
@@ -594,6 +594,8 @@ pub struct ScriptedArm {
     pub visited: Arc<Mutex<Vec<String>>>,
     pub grabbed: Arc<Mutex<Vec<Value>>>,
     pub grabs: Arc<tokio::sync::Semaphore>,
+    /// How many grabs got a cancel and gave their `LATE_REPORT`.
+    pub grabs_cancelled: Arc<Mutex<u32>>,
     /// The locations the arm knows, as `list` gives them.
     pub known: Arc<Mutex<Vec<Value>>>,
     /// The locations of the last teach request, as the director sent them.
@@ -802,6 +804,7 @@ impl ScriptedArm {
         }
         let grabbed = Arc::new(Mutex::new(Vec::new()));
         let grabs = Arc::new(tokio::sync::Semaphore::new(0));
+        let grabs_cancelled = Arc::new(Mutex::new(0));
         let mut grabbing = MockActionServerCore::expose(
             harness.session(),
             core_node,
@@ -828,6 +831,7 @@ impl ScriptedArm {
                 .clone();
             let grabbed = Arc::clone(&grabbed);
             let grabs = Arc::clone(&grabs);
+            let grabs_cancelled = Arc::clone(&grabs_cancelled);
             tokio::spawn(async move {
                 let goal = MessageCodec::new("grab goal", &goal).expect("a codec of the goal");
                 let result =
@@ -871,6 +875,9 @@ impl ScriptedArm {
                             let stopped = result
                                 .encode(&json!({ "success": false, "item_id": "" }))
                                 .expect("a result of grab");
+                            // Counted before the end of the goal, so a test that saw the end of the run reads
+                            // the count of each grab that the run cancelled.
+                            *grabs_cancelled.lock().unwrap() += 1;
                             let _ = goal.complete_cancelled("cancelled", Payload::from(stopped)).await;
                             continue;
                         }
@@ -952,6 +959,7 @@ impl ScriptedArm {
             visited,
             grabbed,
             grabs,
+            grabs_cancelled,
             known,
             taught,
             finds,

@@ -138,6 +138,10 @@ the same sentence as the one before, or with no sentence, gives no event, so
 a skill that publishes at a high rate gives one event for each new sentence.
 A feedback message that does not convert gives no event, and the log says
 so; the reports go on with the next message.
+The director reads the feedback of the goal in a task of its own, as it comes
+and up to the end of its stream: a sentence that a skill publishes just
+before its goal ends gives its event before the `step_ends`. A goal that the
+director cancels gives no event after the cancel.
 The director finds the field through the mark alone, and reads the feedback
 of no other call: a service, an action with no such field, a call of the
 safe state, an observation and the monitor give no report. Each report goes
