@@ -70,7 +70,7 @@ wheels = [
 [[package]]
 name = "brain-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=b62a25d1c9cc0ad1d4ef4a01fabd47360ec4c6bd#b62a25d1c9cc0ad1d4ef4a01fabd47360ec4c6bd" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cd01c2250adb5632e4562b0a9e03cb66ca201e94#cd01c2250adb5632e4562b0a9e03cb66ca201e94" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -197,7 +197,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=b62a25d1c9cc0ad1d4ef4a01fabd47360ec4c6bd#b62a25d1c9cc0ad1d4ef4a01fabd47360ec4c6bd" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=cd01c2250adb5632e4562b0a9e03cb66ca201e94#cd01c2250adb5632e4562b0a9e03cb66ca201e94" }
 
 [[package]]
 name = "cryptography"
@@ -1127,7 +1127,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "any-llm-sdk", extras = ["openrouter", "gemini"], specifier = "==1.41.0" },
-    { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=b62a25d1c9cc0ad1d4ef4a01fabd47360ec4c6bd" },
+    { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cd01c2250adb5632e4562b0a9e03cb66ca201e94" },
     { name = "control-core-py" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
