@@ -1,6 +1,7 @@
-"""The any-llm adapter: what each call sends, what it reads back, and how
-each of any-llm's failure classes comes out, retryable or not. any-llm's
-client is a fake: no network and no key."""
+"""The any-llm adapter: what each call sends, what it reads back, how each
+of any-llm's failure classes comes out, retryable or not, and the one
+client of an OpenAI-compatible API. any-llm's client is a fake: no network
+and no key."""
 
 import base64
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from conftest import BOTH_KEYS, TEST_CATALOG
 from brain_core.ports import ExpectedFailure, FailureKind
 
 from vlm_router_brain import provider as provider_module
+from vlm_router_brain.openai_compatible import CompatibleApi
 from vlm_router_brain.parsing import Answer
 from vlm_router_brain.provider import AnyLlmProvider, ProviderFailure, is_retryable
 
@@ -145,3 +147,48 @@ async def test_a_provider_with_no_key_fails_without_a_client(clients):
         await AnyLlmProvider({"OPENROUTER_API_KEY": "set"}).ask(FAST, [b"jpeg"], "q", Answer, 10.0)
     assert raised.value.message == "fast failed: MissingApiKeyError: GEMINI_API_KEY is not set"
     assert raised.value.retryable is False and list(clients) == []
+
+
+# --- with an OpenAI-compatible API
+
+API = CompatibleApi("http://127.0.0.1:8000/v1", "test-api-key")
+
+
+@pytest.fixture
+def compatible(monkeypatch, clients):
+    """Each AnyLLM.create_openai_compatible the adapter made, as (name,
+    options, client), beside `clients`, the fake of AnyLLM.create, which
+    records each provider client."""
+    made = Made()
+    made.outcome = response('{"boxes": []}')
+
+    def create_openai_compatible(name, **kwargs):
+        client = FakeClient(made.outcome)
+        made.append((name, kwargs, client))
+        return client
+
+    monkeypatch.setattr(provider_module.AnyLLM, "create_openai_compatible", staticmethod(create_openai_compatible))
+    return made
+
+
+@pytest.mark.parametrize("environ", [{}, BOTH_KEYS], ids=["no provider key", "both provider keys"])
+async def test_with_an_api_one_client_of_the_api_serves_every_route_and_no_provider_client_is_made(compatible, clients, environ):
+    provider = AnyLlmProvider(environ, api=API)
+    await provider.ask(FAST, [b"jpeg"], "Find the cup.", Answer, 12.5)
+    await provider.ask(CAREFUL, [b"jpeg"], "q", Answer, 10.0)
+    [(name, options, client)] = compatible
+    assert name == "openai_compatible"
+    assert options == dict(api_base="http://127.0.0.1:8000/v1", api_key="test-api-key", unified_exceptions=True, max_retries=0)
+    # Each call keeps its route's model and settings.
+    first, second = client.calls
+    assert (first["model"], first["timeout"], first["reasoning_effort"], first["response_format"]) == ("gemini-fast", 12.5, "medium", Answer)
+    assert second["model"] == "lab/careful"
+    assert list(clients) == []
+
+
+async def test_with_an_api_a_failure_masks_the_apis_key(compatible):
+    compatible.outcome = AuthenticationError("Incorrect API key provided: test-api-key.", status_code=401)
+    with pytest.raises(ProviderFailure) as raised:
+        await AnyLlmProvider({}, api=API).ask(FAST, [b"jpeg"], "q", Answer, 10.0)
+    assert raised.value.message == "fast failed: AuthenticationError: Incorrect API key provided: ***."
+    assert raised.value.retryable is False

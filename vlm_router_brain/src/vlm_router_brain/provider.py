@@ -8,21 +8,27 @@ before the question, in an OpenAI-style user message, with the route's
 reasoning effort and the schema the caller asks for as the structured
 output: a pydantic model (`parsing.Answer` for a search) or a JSON schema
 mapping in the `json_schema` form (the loop's flat schema for an alignment
-step), which any-llm passes to OpenRouter and converts for Gemini. It
-awaits any-llm's
-`acompletion`, so a call never blocks the event loop. Each provider's
-client is made once, with the key of its route from the node's environment
-passed explicitly (so gemini never falls back to another variable),
-`unified_exceptions=True` (so every provider raises any-llm's classes) and
-`max_retries=0` (so the detector's one retry is the only one).
+step), which any-llm passes to OpenRouter and to an OpenAI-compatible API
+as it is, and converts for Gemini. It awaits any-llm's `acompletion`, so a
+call never blocks the event loop.
+
+Each client is made once, with `unified_exceptions=True` (so every client
+raises any-llm's classes) and `max_retries=0` (so the detector's one retry
+is the only one). Without an OpenAI-compatible API, each provider has its
+own client, made with the key of its route from the node's environment
+passed explicitly (so gemini never falls back to another variable). With
+one (openai_compatible.py), one client of any-llm's OpenAI-compatible kind
+serves every route, made with the API's base and key passed explicitly:
+no provider key is read, and any-llm reads no variable for the key or the
+base.
 
 A failure is a `ProviderFailure`, an expected failure with the kind
 `attempt_failed`: "<model> failed: <class>: <message>", and whether the
 detector may ask again. It may for a
 429, a gateway timeout, or a provider or upstream error with a 5xx status,
 the failures that come back at once; any other, a lost connection among
-them, fails the search. The message never holds the route's key: each
-occurrence of the key in the provider's text becomes "***".
+them, fails the search. The message never holds the key the client was
+made with: each occurrence of it in the provider's text becomes "***".
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import base64
 import os
 import time
 from dataclasses import dataclass
-from typing import Mapping, Protocol, Sequence
+from typing import Mapping, Optional, Protocol, Sequence
 
 from any_llm import AnyLLM
 from any_llm.exceptions import (
@@ -46,6 +52,7 @@ from brain_core.ports import ExpectedFailure, FailureKind
 
 from .catalog import Route
 from .keys import KEY_VARIABLES, key_for
+from .openai_compatible import OPENAI_COMPATIBLE, CompatibleApi
 
 # The longest provider message a failure carries.
 DETAIL_CHARS = 300
@@ -99,9 +106,11 @@ def image_message(images: Sequence[bytes], prompt: str) -> list[dict]:
 
 
 class AnyLlmProvider:
-    def __init__(self, environ: Mapping[str, str] = os.environ) -> None:
+    def __init__(self, environ: Mapping[str, str] = os.environ, *, api: Optional[CompatibleApi] = None) -> None:
         self._environ = environ
-        # Each provider's client, and the key it was made with.
+        self._api = api
+        # Each client by the name of what it calls, a provider or the API,
+        # and the key it was made with.
         self._clients: dict[str, tuple[AnyLLM, str]] = {}
 
     async def ask(self, route: Route, images: Sequence[bytes], prompt: str, schema: object, timeout_s: float) -> Reply:
@@ -129,18 +138,33 @@ class AnyLlmProvider:
         )
 
     def _client(self, route: Route) -> tuple[AnyLLM, str]:
-        """The client of the route's provider and the key it was made with."""
-        made = self._clients.get(route.provider)
+        """The client that calls the route, the API's when the node has one,
+        else the provider's, and the key it was made with."""
+        name = OPENAI_COMPATIBLE if self._api is not None else route.provider
+        made = self._clients.get(name)
         if made is not None:
             return made
+        made = self._api_client(self._api) if self._api is not None else self._provider_client(route)
+        self._clients[name] = made
+        return made
+
+    @staticmethod
+    def _api_client(api: CompatibleApi) -> tuple[AnyLLM, str]:
+        """The client of the API, made with its base and its key."""
+        client = AnyLLM.create_openai_compatible(
+            OPENAI_COMPATIBLE, api_base=api.base, api_key=api.key, unified_exceptions=True, max_retries=0
+        )
+        return client, api.key
+
+    def _provider_client(self, route: Route) -> tuple[AnyLLM, str]:
+        """The client of the route's provider, made with the key of the
+        provider from the node's environment."""
         key = key_for(route.provider, self._environ)
         if not key:
             raise ProviderFailure(
                 route.model_name, "MissingApiKeyError", f"{KEY_VARIABLES[route.provider]} is not set", retryable=False
             )
-        made = (AnyLLM.create(route.provider, api_key=key, unified_exceptions=True, max_retries=0), key)
-        self._clients[route.provider] = made
-        return made
+        return AnyLLM.create(route.provider, api_key=key, unified_exceptions=True, max_retries=0), key
 
 
 def _detail(error: AnyLLMError, key: str) -> str:

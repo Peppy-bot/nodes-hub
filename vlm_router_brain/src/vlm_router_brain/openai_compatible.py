@@ -25,6 +25,9 @@ from urllib.parse import urlsplit
 
 API_BASE_VARIABLE = "OPENAI_COMPATIBLE_API_BASE"
 API_KEY_VARIABLE = "OPENAI_COMPATIBLE_API_KEY"
+# The name the node gives the API in any-llm, which any-llm's messages
+# carry ("[openai_compatible] Error code: 404 - ...").
+OPENAI_COMPATIBLE = "openai_compatible"
 # The schemes a base address may have.
 BASE_SCHEMES = ("http", "https")
 
