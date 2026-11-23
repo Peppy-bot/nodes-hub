@@ -16,7 +16,8 @@ dependencies = [
     # The geometry types of the contracts and their rotation arithmetic, from
     # the commit brain_core is pinned at, as brain_core's own source names it.
     "control_core_py",
-    # Every model call goes through any-llm, to Google's API or OpenRouter.
+    # Every model call goes through any-llm, to Google's API, OpenRouter or
+    # an OpenAI-compatible API.
     # Pinned exactly: the error classes the retry policy reads and the
     # reasoning settings of each route are any-llm's.
     "any-llm-sdk[openrouter,gemini]==1.41.0",

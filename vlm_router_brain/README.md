@@ -1,7 +1,8 @@
 # vlm_router_brain
 
 A brain whose models are hosted vision-language models, reached over the
-network through [any-llm](https://github.com/mozilla-ai/any-llm). It serves
+network through [any-llm](https://github.com/mozilla-ai/any-llm), at their
+providers or through one OpenAI-compatible API. It serves
 `item_perception:v1` and `item_manipulation:v1` as every brain does, and
 `brain_model:v1`, which names the model of each role, switches one while
 the brain runs, and makes the brain forget the world it knew. The contract rules, the robot, the camera geometry and the
@@ -9,7 +10,8 @@ goal loops are [brain_core](https://github.com/Peppy-bot/public-peppy-libs/tree/
 this node brings the catalog of models, the detector that asks them, and
 the keys.
 
-It needs the network and a key, and no GPU.
+It needs no GPU. It needs the key of a model provider, or the address and
+the key of an OpenAI-compatible API, a local model server among them.
 
 ## The catalog
 
@@ -33,6 +35,11 @@ ground truth, in 3.3 to 4.9 s. Adding a model is an entry in this file: a
 name, `"roles": ["perception"]`, `"coordinates": "yx_0_1000"` and its routes.
 A catalog the node cannot read stops it at its start, naming the entry and
 the field.
+
+Through an OpenAI-compatible API (see [Keys and the OpenAI-compatible
+API](#keys-and-the-openai-compatible-api)) the API is asked for each model
+by its catalog name, `gemini-4-argon` and never `google/gemini-4-argon`,
+with the settings of the model's first route.
 
 Both roles also accept `none`, the role's missing model: its goals are
 refused naming it, a search with `precondition_failed`. Manipulation runs
@@ -222,21 +229,55 @@ answer the loop cannot read, `ready`, `give_up`) publishes no `align_move`.
 The `ToolLoop` gives the aligner the number of each step through its
 `observe`, and knows nothing of the feedback.
 
-## Keys
+## Keys and the OpenAI-compatible API
 
-The node reads the key of a route from its own environment and from nowhere
-else: `GEMINI_API_KEY` for `gemini`, `OPENROUTER_API_KEY` for `openrouter`. A
-model runs on the first of its routes whose key is set. A starting model with
-no keyed route stops the node, and a switch to one fails with
-`resource_unavailable`, both naming the variables. No key is a parameter, and none is logged. A provider message
+The node reads its keys from its own environment and from nowhere else. No
+key is a parameter, and none is logged.
+
+Without an OpenAI-compatible API, the node calls each model at its provider,
+with the key of a route: `GEMINI_API_KEY` for `gemini`, `OPENROUTER_API_KEY`
+for `openrouter`. A model runs on the first of its routes whose key is set. A
+starting model with no keyed route stops the node, and a switch to one fails
+with `resource_unavailable`, both naming the variables. A provider message
 that holds the route's key shows `***` in its place.
 
+With an OpenAI-compatible API, every model call goes to it, and the node
+reads no provider key, even one that is set. Two variables name it:
+`OPENAI_COMPATIBLE_API_BASE`, the base address of an API in the chat
+completions form of OpenAI's, such as `http://localhost:11434/v1`, and
+`OPENAI_COMPATIBLE_API_KEY`, the key the node sends it; a server that needs
+no key takes any value. The API is asked for each model by its catalog name,
+so a local model server must serve its model under a catalog name: a model
+outside the catalog is not reached. A switch to a model the API does not
+serve fails with `attempt_failed` and the API's message, and the role keeps
+its model. One of the two variables alone, or a base that is not an
+`http://` or `https://` address with a host, stops the node at its start,
+naming the variables; a value of spaces counts as not set. Neither value is
+logged, and an API message that holds the key shows `***` in its place.
+
+Every call carries the route's `reasoning_effort` and a `json_schema`
+`response_format`. An API that refuses one fails the call with its message;
+an API that ignores the schema can answer in free text, which fails the
+search with `the model's answer could not be read`.
+
+The OpenAI SDK under any-llm also reads `OPENAI_ORG_ID`,
+`OPENAI_PROJECT_ID`, `OPENAI_CUSTOM_HEADERS`, `OPENAI_ADMIN_KEY` and
+`OPENAI_WEBHOOK_SECRET` from the node's environment, and sends the first
+three to the API as headers when they are set.
+
 `peppy stack launch` passes the launching shell's environment to the nodes it
-starts on that machine, so a local launch reads the key the shell exports:
+starts on that machine, so a local launch reads what the shell exports. A
+launcher that names a variable as a launch variable (`env_from_launch`)
+passes it to the brain alone, and refuses a launch without it:
 
 ```sh
 export GEMINI_API_KEY=...
 peppy stack launch simulation_mcp --join openarm_sim:alpha --with alpha.vlm_router_brain
+```
+
+```sh
+export OPENAI_COMPATIBLE_API_BASE=http://localhost:11434/v1 OPENAI_COMPATIBLE_API_KEY=...
+peppy stack launch simulation_mcp --join openarm_sim:alpha --with openai_compatible,alpha.vlm_router_brain
 ```
 
 ## What a search asks
@@ -276,8 +317,9 @@ its route, its tokens and its latency.
 `switch_model {role: "perception", model: "claude-opus-5.5"}` makes that
 model the perception model. The node asks the model once, a small grey
 picture and a question whose answer is `{"boxes": []}`, and the switch fails
-with `attempt_failed` and the provider's message when the model cannot be
-reached or its answer does not read; the role then keeps its model. A switch
+with `attempt_failed` and the message of the provider or of the API when the
+model cannot be reached or its answer does not read; the role then keeps its
+model. A switch
 is refused with `rejected` for a role or a model the brain does not have, and
 with `precondition_failed` while a goal of its role runs, naming it, and
 while another switch of its role runs. A goal never sees its model change.
@@ -327,11 +369,11 @@ sequenceDiagram
             M->>M: the role's model is the new backend
             M-->>H: the model's name
             H-->>B: role and model
-        else no route of the model has a key
+        else no OpenAI-compatible API, and no route of the model has a key
             RM-->>B: Refusal, resource_unavailable, naming every key variable, no call made
-        else a route has a key
+        else the route through the API, or else the first route with a key
             RM->>P: await ask(route, a small grey picture, the probe question, at least 30 s)
-            alt the provider fails, or the answer does not read
+            alt the provider or the API fails, or the answer does not read
                 P-->>B: ProviderFailure or UnreadableAnswer, attempt_failed, the role keeps its model
             else the model answers
                 RM-->>M: a VlmDetector on that route
@@ -388,11 +430,18 @@ sequenceDiagram
 
 ## Tests
 
-`uv run --locked --with pytest pytest` runs the suite with no network and no
-key: the catalog, the keys, the any-llm adapter against any-llm's own
-exception classes, the parser, the detector, the alignment (its loop, the
-aligner's guards, ends and reports, the picture directions, the step model
-and its probe), the switch against a scripted provider, and the whole node over the
-wire under the generated harness, its camera and backbone mocked: a search, a
-switch (a manipulation switch to a catalog model probes with the alignment's
-question), and the scripted grab from the identified item to the held flag.
+`uv run --locked --with pytest pytest` runs the suite with no network beyond
+127.0.0.1 and no real key: the catalog, the keys, the OpenAI-compatible API
+(both variables or neither, and each model under its catalog name), the
+any-llm adapter against any-llm's own exception classes, the parser, the
+detector, the alignment (its loop, the aligner's guards, ends and reports,
+the picture directions, the step model and its probe), the switch against a
+scripted provider, and the whole node over the wire under the generated
+harness, its camera and backbone mocked: a search, a switch (a manipulation
+switch to a catalog model probes with the alignment's question), and the
+scripted grab from the identified item to the held flag. `tests/fake_api.py`
+is an OpenAI-compatible API in the test process, on 127.0.0.1; against it
+the whole node runs with its real any-llm client, and a test with a recorder
+in place of `os.environ` proves that no provider key is read. No test of the
+API waits on the clock: the fake API answers at once, and the poll interval
+of its thread only bounds its stop.

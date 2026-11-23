@@ -7,16 +7,20 @@
 // a name of its own, the roles it serves, and the routes that reach it, a
 // provider and that provider's model id. The node reads the key of a route
 // from its own environment, OPENROUTER_API_KEY for openrouter and
-// GEMINI_API_KEY for gemini, and takes the first route whose key is set. No
-// key is a parameter, and no key is logged.
+// GEMINI_API_KEY for gemini, and takes the first route whose key is set.
+// With OPENAI_COMPATIBLE_API_BASE and OPENAI_COMPATIBLE_API_KEY set in its
+// environment, the base address of an OpenAI-compatible API and its key,
+// the node calls every model through that API instead, under the model's
+// catalog name, and reads no provider key; one of the two alone stops the
+// node at its start. No key is a parameter, and no key is logged.
 {
   peppy_schema: "node/v1",
   manifest: {
     name: "vlm_router_brain",
     tag: "v1",
     description: [
-      "A brain whose models are hosted vision-language models that it reaches over the network. It finds items by words in the images of the robot, then picks them up and puts them down. It needs no GPU, but it needs the network and the API key of a model provider.",
-      "It implements item_perception, item_manipulation and brain_model, which also switches the model of a role while the brain runs. It reads the API key from its environment: GEMINI_API_KEY for Google, OPENROUTER_API_KEY for OpenRouter. It finds items through one RGB-D camera, the geometry of that camera and its mount on the robot: without them, it refuses each search. The default perception model is Gemini Robotics-ER on the Google API. The default manipulation model grabs an item from above at the point where the brain saw it, and calls no model. A catalog model in the manipulation role also looks through the wrist camera of the arm and corrects the place and the turn of the gripper before the descent. With the robot's motion planner bound, the arm goes to the point above an item, and above the spot of a place, by a path planned around what the chest camera sees.",
+      "A brain whose models are hosted vision-language models that it reaches over the network. It finds items by words in the images of the robot, then picks them up and puts them down. It needs no GPU, but it needs the API key of a model provider, or the address and the key of an OpenAI-compatible API, a local model server among them.",
+      "It implements item_perception, item_manipulation and brain_model, which also switches the model of a role while the brain runs. It reads the API key from its environment: GEMINI_API_KEY for Google, OPENROUTER_API_KEY for OpenRouter. With OPENAI_COMPATIBLE_API_BASE and OPENAI_COMPATIBLE_API_KEY set, it calls every model through that OpenAI-compatible API, under the model's catalog name, and reads no provider key. It finds items through one RGB-D camera, the geometry of that camera and its mount on the robot: without them, it refuses each search. The default perception model is Gemini Robotics-ER on the Google API. The default manipulation model grabs an item from above at the point where the brain saw it, and calls no model. A catalog model in the manipulation role also looks through the wrist camera of the arm and corrects the place and the turn of the gripper before the descent. With the robot's motion planner bound, the arm goes to the point above an item, and above the spot of a place, by a path planned around what the chest camera sees.",
     ],
     implements: [
       { name: "item_perception", tag: "v1", link_id: "item_perception" },
@@ -141,7 +145,8 @@
       // perception (list_models names them), or "none", which refuses every
       // search naming the missing model. The default is Gemini Robotics-ER
       // on Google's API, the model the perception study measured, which
-      // needs GEMINI_API_KEY. switch_model changes it while the brain runs.
+      // needs GEMINI_API_KEY, or an OpenAI-compatible API that serves it.
+      // switch_model changes it while the brain runs.
       perception_model: { $type: "string", $default: "gemini-robotics-er-2-preview" },
       // The model manipulation starts on: "scripted", the default, grabs
       // from above at the item's seen point and needs no model call; a
