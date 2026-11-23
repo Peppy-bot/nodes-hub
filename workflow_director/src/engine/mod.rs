@@ -471,7 +471,7 @@ impl<H: Host> RunCtx<'_, H> {
                 };
                 match self
                     .host
-                    .call(&observation.target, request, CancellationToken::new())
+                    .call(&observation.target, request, CancellationToken::new(), None)
                     .await
                 {
                     CallEnd::Completed(json) => Ok(json),

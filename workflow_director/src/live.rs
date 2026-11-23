@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use control_core::node_clock::NodeClock;
+use futures::{Stream, StreamExt};
 use peppy_codec::consumer::{
-    ActionClient, ConsumerError, ConsumerIdentity, GoalOutcome, MemberBinding, ServiceClient,
-    TopicConsumer, contract_topic_codec,
+    ActionClient, ConsumerError, ConsumerIdentity, GoalHandle, GoalOutcome, MemberBinding,
+    ServiceClient, TopicConsumer, contract_topic_codec,
 };
 use peppygen::NodeRunner;
 use peppylib::messaging::ProducerRef;
@@ -21,7 +22,7 @@ use workflow_documents::{Name, RobotName};
 
 use crate::contract::ContractShape;
 use crate::engine::failure::{Failure, RESOURCE_UNAVAILABLE};
-use crate::engine::host::{CallEnd, Event, Host, Join, Joining};
+use crate::engine::host::{CallEnd, Event, Feedback, Host, Join, Joining};
 use crate::engine::plan::{MemberKind, ObservationRead, Plan, Target, TopicKey};
 use crate::leases::Leases;
 
@@ -31,6 +32,11 @@ const ADMISSION: Duration = Duration::from_secs(10);
 /// How long the host waits for the result of a goal: past every bound a
 /// workflow gives.
 const RESULT_WAIT: Duration = Duration::from_secs(86_400 + 60);
+
+/// How long the host waits, after the result of a goal, for the end of the
+/// feedback of the goal. The producer of a goal gives its result and then
+/// closes its feedback, so the end follows the result at once.
+const FEEDBACK_END: Duration = Duration::from_secs(5);
 
 /// A client of one member.
 enum Client {
@@ -71,6 +77,95 @@ fn producer_of(target: &Target) -> ProducerRef {
         target.producer.core_node.clone(),
         target.producer.instance.clone(),
     )
+}
+
+/// The feedback of `handle` as the codec decodes it, to the end of the stream
+/// of its goal.
+fn feedback_of(handle: GoalHandle) -> impl Stream<Item = Result<Json, ConsumerError>> + Send {
+    futures::stream::unfold(handle, |mut handle| async move {
+        let fed = handle.next_feedback().await.transpose()?;
+        Some((fed, handle))
+    })
+}
+
+/// The feedback of one goal, which a task of its own reads. A handle whose
+/// feedback is read once follows it, and cancels its goal when more messages
+/// than its bound are unread. The task takes each message as it comes, so
+/// the count of the unread messages does not depend on how often the engine
+/// polls the call, and the call takes the messages from the task each time
+/// the engine polls it.
+struct FeedbackReader {
+    /// The messages that the task read and the call did not take yet; closed
+    /// once the task read the end of the stream.
+    messages: mpsc::UnboundedReceiver<Json>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FeedbackReader {
+    /// Reads `feedback`, the feedback of a goal of `member`, to its end. A
+    /// message that does not convert is logged and skipped; any other
+    /// failure of the stream is logged and ends the read.
+    fn start(
+        feedback: impl Stream<Item = Result<Json, ConsumerError>> + Send + 'static,
+        member: String,
+    ) -> FeedbackReader {
+        let (read, messages) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut feedback = std::pin::pin!(feedback);
+            while let Some(fed) = feedback.next().await {
+                match fed {
+                    Ok(message) => {
+                        if read.send(message).is_err() {
+                            return;
+                        }
+                    }
+                    Err(ConsumerError::Conversion(error)) => tracing::warn!(
+                        "a feedback message of {member} does not convert, and gives no report: {error}"
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            "the feedback of {member} stops: {error}; the step gives no more reports"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+        FeedbackReader { messages, task }
+    }
+
+    /// The next message; `None` once the stream ended and the call took each
+    /// message before its end.
+    async fn next(&mut self) -> Option<Json> {
+        self.messages.recv().await
+    }
+
+    /// Hands `sink` each message that is left, up to the end of the stream:
+    /// the last messages of a goal can come after its result. The wait ends
+    /// at the cancel of `cancel` and after `FEEDBACK_END`, each after the
+    /// messages that came before it.
+    async fn rest(mut self, sink: Feedback<'_>, cancel: &CancellationToken, member: &str) {
+        let to_the_end = async {
+            while let Some(message) = self.next().await {
+                sink(message);
+            }
+        };
+        tokio::select! {
+            biased;
+            () = to_the_end => {}
+            () = cancel.cancelled() => {}
+            () = tokio::time::sleep(FEEDBACK_END) => tracing::warn!(
+                "the feedback of {member} did not end within {} s of the result of its goal",
+                FEEDBACK_END.as_secs()
+            ),
+        }
+    }
+}
+
+impl Drop for FeedbackReader {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl LiveHost {
@@ -204,6 +299,9 @@ impl LiveHost {
         }
     }
 
+    /// Sends a goal and follows it to its end. When the engine gives a
+    /// `feedback` sink, each feedback message of the goal goes to it, in
+    /// order, up to the end of the stream or the cancel of the goal.
     async fn goal(
         &self,
         client: &ActionClient,
@@ -211,6 +309,7 @@ impl LiveHost {
         target: &Target,
         request: Json,
         cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
     ) -> CallEnd {
         let messenger = self.runner.messenger();
         let producer = producer_of(target);
@@ -235,17 +334,50 @@ impl LiveHost {
                 refusal.message().to_owned(),
             ));
         }
-        let outcome = tokio::select! {
-            outcome = handle.result(messenger, RESULT_WAIT) => outcome,
-            _ = cancel.cancelled() => {
-                let settling = async {
-                    let _ = handle.cancel(messenger, self.cancel_timeout).await;
-                    handle.result(messenger, RESULT_WAIT).await
-                };
-                let settled = tokio::time::timeout(self.cancel_timeout, settling).await;
-                return end_after_cancel(settled.ok());
+        // The cancel and the result are asked through the requests of the
+        // goal, which borrow nothing of the handle: the reader of the
+        // feedback owns the handle. A goal with no sink keeps its handle
+        // unread, so the handle never follows the feedback.
+        let requests = handle.requests();
+        let member = format!(
+            "{}.{} on {}",
+            target.contract, target.member, target.producer.instance
+        );
+        let (mut reports, _unread) = match feedback {
+            Some(sink) => {
+                let reader = FeedbackReader::start(feedback_of(handle), member.clone());
+                (Some((sink, reader)), None)
+            }
+            None => (None, Some(handle)),
+        };
+        let result = requests.result(messenger, RESULT_WAIT);
+        tokio::pin!(result);
+        // The cancel first, so a stream of feedback never holds it back; then
+        // each feedback message that came, so the reports of a goal come as
+        // the goal gives them.
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let settling = async {
+                        let _ = requests.cancel(messenger, self.cancel_timeout).await;
+                        requests.result(messenger, RESULT_WAIT).await
+                    };
+                    let settled = tokio::time::timeout(self.cancel_timeout, settling).await;
+                    return end_after_cancel(settled.ok());
+                }
+                message = next_report(&mut reports), if reports.is_some() => {
+                    match (message, &reports) {
+                        (Some(message), Some((sink, _))) => sink(message),
+                        _ => reports = None,
+                    }
+                }
+                outcome = &mut result => break outcome,
             }
         };
+        if let Some((sink, reader)) = reports {
+            reader.rest(sink, &cancel, &member).await;
+        }
         match outcome {
             Ok(GoalOutcome::Completed(result)) => CallEnd::Completed(result),
             Ok(GoalOutcome::Cancelled { reason, .. }) => CallEnd::Cancelled {
@@ -285,6 +417,13 @@ fn end_after_cancel(settled: Option<Result<GoalOutcome, ConsumerError>>) -> Call
     }
 }
 
+/// The next feedback message of `reports`; `None` at the end of the stream,
+/// and with no reports.
+async fn next_report(reports: &mut Option<(Feedback<'_>, FeedbackReader)>) -> Option<Json> {
+    let (_, reader) = reports.as_mut()?;
+    reader.next().await
+}
+
 impl Host for LiveHost {
     fn now(&self) -> u64 {
         self.clock.now_ns()
@@ -298,7 +437,13 @@ impl Host for LiveHost {
         self.clock.until(at).await
     }
 
-    async fn call(&self, target: &Target, request: Json, cancel: CancellationToken) -> CallEnd {
+    async fn call(
+        &self,
+        target: &Target,
+        request: Json,
+        cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
+    ) -> CallEnd {
         if target.moves_robot {
             match self.leases.check_move(&target.producer.instance).await {
                 Ok(None) => {}
@@ -337,8 +482,12 @@ impl Host for LiveHost {
                     Err(error) => CallEnd::Refused(Self::failure_of(&error)),
                 }
             }
+            // A goal follows its feedback, its result and its cancel, a large
+            // future: on the heap, so the future of each call, a call of a
+            // service too, stays small in the futures of the engine, whose
+            // polls nest on the stack of a worker.
             Some(Client::Action(client, binding)) => {
-                self.goal(client, binding, target, request, cancel).await
+                Box::pin(self.goal(client, binding, target, request, cancel, feedback)).await
             }
             None => CallEnd::Refused(Failure::new(
                 RESOURCE_UNAVAILABLE,
@@ -389,9 +538,106 @@ impl Host for LiveHost {
 
 #[cfg(test)]
 mod tests {
+    use peppylib::PeppyError;
+    use peppylib::messaging::DEFAULT_FEEDBACK_BOUND;
     use serde_json::json;
 
     use super::*;
+
+    /// The member of the goals of these tests, as the log names it.
+    const MEMBER: &str = "test_arm.grab on alpha_arm";
+
+    /// A sink that keeps each message it takes in `taken`.
+    fn keeping(taken: &Mutex<Vec<Json>>) -> impl Fn(Json) + Send + Sync + '_ {
+        |message| taken.lock().expect("no sink panics").push(message)
+    }
+
+    /// The reader reads the feedback of a goal to its end with no call that
+    /// takes a message, so the handle of the goal never holds more unread
+    /// messages than its bound while the engine does not poll the call.
+    #[tokio::test]
+    async fn the_reader_reads_the_feedback_to_its_end_while_the_call_takes_no_message() {
+        let count = 4 * DEFAULT_FEEDBACK_BOUND.get();
+        let feedback = futures::stream::iter((0..count).map(|number| Ok(json!(number))));
+        let mut reader = FeedbackReader::start(feedback, MEMBER.to_owned());
+        (&mut reader.task)
+            .await
+            .expect("the reader reads to the end of the stream");
+        for number in 0..count {
+            assert_eq!(reader.next().await, Some(json!(number)));
+        }
+        assert_eq!(reader.next().await, None);
+    }
+
+    /// A message that does not convert gives nothing and the read goes on;
+    /// any other failure of the stream ends the read.
+    #[tokio::test]
+    async fn the_reader_skips_a_message_that_does_not_convert_and_stops_at_another_failure() {
+        let feedback = futures::stream::iter([
+            Ok(json!("first")),
+            Err(ConsumerError::Conversion(
+                "the message has no stage".to_owned().into(),
+            )),
+            Ok(json!("second")),
+            Err(ConsumerError::Messaging(
+                PeppyError::ActionFeedbackChannelClosed,
+            )),
+            Ok(json!("after the failure")),
+        ]);
+        let mut reader = FeedbackReader::start(feedback, MEMBER.to_owned());
+        assert_eq!(reader.next().await, Some(json!("first")));
+        assert_eq!(reader.next().await, Some(json!("second")));
+        assert_eq!(reader.next().await, None);
+    }
+
+    /// The feedback that comes after the result of its goal goes to the sink
+    /// up to the end of the stream: the last message of this stream comes
+    /// only once the call waits for the rest.
+    #[tokio::test]
+    async fn the_rest_of_the_feedback_goes_to_the_sink_up_to_the_end_of_the_stream() {
+        let (last, coming) = futures::channel::mpsc::unbounded();
+        let feedback = futures::stream::iter([Ok(json!("before the result"))]).chain(coming);
+        let reader = FeedbackReader::start(feedback, MEMBER.to_owned());
+        let taken = Mutex::new(Vec::new());
+        let sink = keeping(&taken);
+        let cancel = CancellationToken::new();
+        tokio::join!(reader.rest(&sink, &cancel, MEMBER), async {
+            last.unbounded_send(Ok(json!("after the result")))
+                .expect("the reader reads the stream");
+            drop(last);
+        });
+        assert_eq!(
+            *taken.lock().unwrap(),
+            [json!("before the result"), json!("after the result")]
+        );
+    }
+
+    /// A stream that does not end holds the end of its call no longer than
+    /// `FEEDBACK_END`, on the paused clock of tokio.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_for_the_end_of_the_feedback_ends_at_its_bound() {
+        let feedback = futures::stream::iter([Ok(json!("only"))]).chain(futures::stream::pending());
+        let reader = FeedbackReader::start(feedback, MEMBER.to_owned());
+        let taken = Mutex::new(Vec::new());
+        let sink = keeping(&taken);
+        let started = tokio::time::Instant::now();
+        reader.rest(&sink, &CancellationToken::new(), MEMBER).await;
+        assert_eq!(started.elapsed(), FEEDBACK_END);
+        assert_eq!(*taken.lock().unwrap(), [json!("only")]);
+    }
+
+    /// A cancel of the step ends the wait for the end of the feedback at
+    /// once, on the paused clock of tokio.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_ends_the_wait_for_the_end_of_the_feedback() {
+        let feedback = futures::stream::pending::<Result<Json, ConsumerError>>();
+        let reader = FeedbackReader::start(feedback, MEMBER.to_owned());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+        reader.rest(&|_| {}, &cancel, MEMBER).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
 
     /// A cancelled goal settled when it ended cancelled, completed or failed;
     /// a goal that its producer dropped, whose result expired, or that gave no

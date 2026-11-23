@@ -158,6 +158,17 @@ async def failure_of(fixture, h, request):
     return result.failure
 
 
+async def feedback_of(goal) -> list:
+    """Each feedback message of `goal`, in order, up to the end of its
+    stream, which the node closes when the goal ends."""
+    messages = []
+    while True:
+        try:
+            messages.append(await asyncio.wait_for(goal.on_next_feedback(), WAIT))
+        except RuntimeError:
+            return messages
+
+
 async def refusal_of(fixture, h, request):
     """The failure a goal the node refused carries."""
     goal = await fixture.send_goal(h, request, 5.0)

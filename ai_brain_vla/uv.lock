@@ -31,7 +31,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=afd4ea988216ece0f17ed13d9a58a4bab3e67922" },
+    { name = "brain-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cd01c2250adb5632e4562b0a9e03cb66ca201e94" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "peppygen", directory = ".peppy/libs/peppygen" },
     { name = "peppylib", directory = ".peppy/libs/peppylib" },
@@ -75,7 +75,7 @@ wheels = [
 [[package]]
 name = "brain-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=afd4ea988216ece0f17ed13d9a58a4bab3e67922#afd4ea988216ece0f17ed13d9a58a4bab3e67922" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=brain_core&rev=cd01c2250adb5632e4562b0a9e03cb66ca201e94#cd01c2250adb5632e4562b0a9e03cb66ca201e94" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },
@@ -103,7 +103,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=afd4ea988216ece0f17ed13d9a58a4bab3e67922#afd4ea988216ece0f17ed13d9a58a4bab3e67922" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=cd01c2250adb5632e4562b0a9e03cb66ca201e94#cd01c2250adb5632e4562b0a9e03cb66ca201e94" }
 
 [[package]]
 name = "cuda-bindings"

@@ -189,6 +189,39 @@ The limit is the smaller of 10 cm and half the target's width less 2 cm
 clear of the rim. A drop checks the plan of the pre-place point alone, since
 no descent follows.
 
+## The feedback of a goal
+
+Each goal of `grab_item`, `drop_item`, `place_item`, `scan_items` and
+`identify_item` publishes one feedback message at the start of each of its
+stages, with one sentence for the person who looks at the robot; brain_core
+writes the stages and every sentence (its README, "The feedback of a goal").
+A grab reports `plan`, `move_above` and `grasp`; a place `plan`,
+`move_above` and `set_down`; a drop above a target item `plan`,
+`move_above` and `release`, and any other drop `release` alone; a search
+`look`.
+
+With a catalog model as `manipulation_model`, the alignment step publishes
+its stages between `move_above` and the next stage: `align_look` at the
+start of each step, before the step waits for the wrist frame and asks the
+model, and `align_move` before each move of a correction that passed the
+limits and the backbone's plan checks. Each gives the number of the step
+and the steps of the alignment, 5 for a grab and 2 for a place or a drop,
+in its `number` and `maximum` and at the end of its sentence:
+
+| Stage | Sentence |
+|---|---|
+| `align_look`, a grab | The robot looks at the apple and decides how to correct its hand (2 of 5) |
+| `align_move`, a grab | The robot corrects the position of its hand above the apple (2 of 5) |
+| `align_look`, a place or a drop into the bowl | The robot looks at the bowl and decides where to put the apple (1 of 2) |
+| `align_move`, a place or a drop into the bowl | The robot corrects the position of the apple above the bowl (1 of 2) |
+| `align_look`, a place at a pose | The robot looks down and decides where to put the apple (1 of 2) |
+| `align_move`, a place at a pose | The robot corrects the position of the apple above the spot where it puts it down (1 of 2) |
+
+A step that moves nothing (an answer over a limit, a point with no plan, an
+answer the loop cannot read, `ready`, `give_up`) publishes no `align_move`.
+The `ToolLoop` gives the aligner the number of each step through its
+`observe`, and knows nothing of the feedback.
+
 ## Keys
 
 The node reads the key of a route from its own environment and from nowhere
@@ -358,8 +391,8 @@ sequenceDiagram
 `uv run --locked --with pytest pytest` runs the suite with no network and no
 key: the catalog, the keys, the any-llm adapter against any-llm's own
 exception classes, the parser, the detector, the alignment (its loop, the
-aligner's guards and ends, the picture directions, the step model and its
-probe), the switch against a scripted provider, and the whole node over the
+aligner's guards, ends and reports, the picture directions, the step model
+and its probe), the switch against a scripted provider, and the whole node over the
 wire under the generated harness, its camera and backbone mocked: a search, a
 switch (a manipulation switch to a catalog model probes with the alignment's
 question), and the scripted grab from the identified item to the held flag.

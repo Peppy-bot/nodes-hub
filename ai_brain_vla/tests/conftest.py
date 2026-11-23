@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from brain_core.ports import Box, CancelToken, Coverage, Deadline, Gripper, Item, Outcome, Pose, TargetItem
+from brain_core.stages import CarryReports, GrabReports
 from peppygen.parameters import Parameters
 
 from ai_brain_vla.perception import gallery, weights
@@ -112,8 +113,8 @@ PLACE_MEASURED_AT = 2.5
 
 
 class FakeManipulator:
-    """Succeeds at once unless told to wait for a stop. `begun` resolves when
-    a sequence has reached it."""
+    """Succeeds at once unless told to wait for a stop, and publishes no
+    report. `begun` resolves when a sequence has reached it."""
 
     name = "fake"
 
@@ -143,15 +144,17 @@ class FakeManipulator:
             cancel.check()
         return Outcome(True, "", final_position, PLACE_MEASURED_AT if final_position is not None else 0.0)
 
-    async def grab(self, item: Item, gripper: Gripper, max_effort: float, cancel: CancelToken) -> Outcome:
+    async def grab(self, item: Item, gripper: Gripper, max_effort: float, cancel: CancelToken, reports: GrabReports) -> Outcome:
         self.calls.append(("grab", item.item_id, gripper.name, max_effort))
         return await self._run(cancel)
 
-    async def drop(self, gripper: Gripper, cancel: CancelToken, above: Optional[TargetItem] = None) -> Outcome:
+    async def drop(
+        self, gripper: Gripper, cancel: CancelToken, reports: CarryReports, above: Optional[TargetItem] = None
+    ) -> Outcome:
         self.calls.append(("drop", gripper.name) if above is None else ("drop", gripper.name, above.item_id))
         return await self._run(cancel)
 
-    async def place(self, gripper: Gripper, to: Union[Pose, TargetItem], cancel: CancelToken) -> Outcome:
+    async def place(self, gripper: Gripper, to: Union[Pose, TargetItem], cancel: CancelToken, reports: CarryReports) -> Outcome:
         """A place at a pose reports the jaws opened 1 cm above it; a place
         into a target item, 1 cm above the item's top at its centre; each
         measured at PLACE_MEASURED_AT."""

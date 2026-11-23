@@ -32,6 +32,9 @@ pub enum CallEnd {
     MoveRefused { halted: bool, message: String },
 }
 
+/// What takes each feedback message of a goal, as the codec decodes it.
+pub type Feedback<'a> = &'a (dyn Fn(Json) + Send + Sync);
+
 /// An event of a run, which the host gives on the progress of the goal of the
 /// run, on `run_events` and in the journal, where it is written as it
 /// serializes.
@@ -87,12 +90,15 @@ pub trait Host: Send + Sync {
     /// Sends a call and gives how it ended. A goal that `cancel` cancels
     /// gets its cancel, and the host waits for its end up to the cancel
     /// timeout; a call of a member with the mark moves_robot asks
-    /// `fleet.check_move` first.
+    /// `fleet.check_move` first. Given a `feedback` sink, the host hands it
+    /// each feedback message of the goal, in order, until the goal ends or
+    /// its cancel is sent; with none, it reads no feedback.
     fn call(
         &self,
         target: &Target,
         request: Json,
         cancel: CancellationToken,
+        feedback: Option<Feedback<'_>>,
     ) -> impl Future<Output = CallEnd> + Send;
 
     /// The latest message of a topic and when it arrived on the run clock,

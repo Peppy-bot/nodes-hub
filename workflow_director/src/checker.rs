@@ -388,6 +388,7 @@ impl<'a> Checker<'a> {
                                 kind,
                                 producer,
                                 moves_robot: false,
+                                activity: None,
                             },
                             read,
                             ty: format.ty(),
@@ -1157,6 +1158,7 @@ impl<'a> Checker<'a> {
                             kind: found_member.kind,
                             producer: producer.clone(),
                             moves_robot: found_member.marks.contains(MOVES_ROBOT),
+                            activity: found_member.activity.clone(),
                         },
                         args,
                         result_type: found_member.output.ty(),
@@ -2071,6 +2073,7 @@ fn monitor_target(
             instance: instance.0.clone(),
         },
         moves_robot: false,
+        activity: None,
     })
 }
 

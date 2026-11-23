@@ -128,6 +128,138 @@ async fn a_run_calls_its_steps_in_order_and_completes() {
     );
 }
 
+/// A feedback message of `grab` of the test arm: its stage, its sentence,
+/// and the number of a stage that repeats, of 5, or 0 for none.
+fn grab_feedback(stage: &str, activity: &str, number: u32) -> Json {
+    let maximum = if number == 0 { 0 } else { 5 };
+    json!({ "stage": stage, "activity": activity, "number": number, "maximum": maximum })
+}
+
+/// The step events of the step `step` (its start, its reports and its end),
+/// each with its kind, its role and its message, in order.
+fn events_of_step(host: &ScriptedHost, step: &str) -> Vec<(EventKind, String, String)> {
+    let of_a_step = [
+        EventKind::StepStarts,
+        EventKind::StepReports,
+        EventKind::StepEnds,
+    ];
+    host.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.step == step && of_a_step.contains(&event.kind))
+        .map(|event| (event.kind, event.role.clone(), event.message.clone()))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_whose_feedback_gives_a_sentence_reports_each_new_one_between_its_start_and_end() {
+    let plan = plan(
+        &one_arm("alpha", find_then_grab(grab(0, "grabbed.success")), home()),
+        Attendance::Attended,
+    );
+    let above = grab_feedback("reach", "The robot moves its hand above the block", 0);
+    let first = grab_feedback("look", "The robot looks at the block (1 of 5)", 1);
+    let unnamed = grab_feedback("look", "", 1);
+    let second = grab_feedback("look", "The robot looks at the block (2 of 5)", 2);
+    let host = arm().answer(
+        "grab",
+        vec![
+            Answer::after(6, json!({ "success": true, "item_id": "b1" })).with_feedback(vec![
+                (1, above.clone()),
+                (2, first.clone()),
+                (3, first.clone()),
+                (4, unnamed),
+                (5, second.clone()),
+            ]),
+        ],
+    );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    let reports = |message: &Json| {
+        (
+            EventKind::StepReports,
+            "alpha".to_owned(),
+            message["activity"].as_str().unwrap().to_owned(),
+        )
+    };
+    let edge = |kind| (kind, "alpha".to_owned(), String::new());
+    assert_eq!(
+        events_of_step(&host, "alpha.grab"),
+        [
+            edge(EventKind::StepStarts),
+            reports(&above),
+            reports(&first),
+            reports(&second),
+            edge(EventKind::StepEnds),
+        ],
+        "a repeated sentence and an empty one give no event"
+    );
+    assert_eq!(
+        host.event_details(EventKind::StepReports),
+        [above, first, second],
+        "each report gives the feedback message as its details"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_service_call_and_an_action_whose_feedback_has_no_sentence_report_nothing() {
+    let tree = json!({ "id": "rest", "sequence": [
+        { "id": "look", "timeout_s": 5, "call": { "member": "arm.find", "args": { "description": "block" } } },
+        { "id": "go_home", "timeout_s": 5, "call": { "member": "arm.home", "args": { "duration_s": 1 } } },
+    ] });
+    let plan = plan(&one_arm("alpha", tree, home()), Attendance::Attended);
+    let host = ScriptedHost::new()
+        .answer(
+            "find",
+            vec![Answer::now(found()).with_feedback(vec![(0, json!({ "activity": "unread" }))])],
+        )
+        .answer(
+            "home",
+            vec![
+                Answer::after(2, json!({ "at_home": true }))
+                    .with_feedback(vec![(1, json!({ "progress": 0.5, "note": "half way" }))]),
+            ],
+        );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Completed, "{result:#?}");
+    assert_eq!(host.members(), ["find", "find", "home"]);
+    assert!(
+        host.event_details(EventKind::StepReports).is_empty(),
+        "{:?}",
+        host.event_kinds()
+    );
+}
+
+/// A call of the safe state is not a step: its goal gives no report, also
+/// when its action has a sentence in its feedback.
+#[tokio::test(start_paused = true)]
+async fn a_call_of_the_safe_state_reports_nothing() {
+    let safe_state = json!([{ "id": "open", "timeout_s": 10, "call": { "member": "arm.release", "args": { "speed": 1 } } }]);
+    let plan = plan(
+        &one_arm("alpha", rest("rest"), safe_state),
+        Attendance::Unattended,
+    );
+    let host = ScriptedHost::new()
+        .answer("find", vec![Answer::now(found())])
+        .answer("home", vec![Answer::failing("unreachable")])
+        .answer(
+            "release",
+            vec![
+                Answer::after(2, json!({ "released": true }))
+                    .with_feedback(vec![(1, json!({ "activity": "The robot opens its hand" }))]),
+            ],
+        );
+    let (result, _) = run(&plan, &host, Vec::new()).await;
+    assert_eq!(result.ending, Ending::Failed, "{result:#?}");
+    assert_eq!(host.members().last().map(String::as_str), Some("release"));
+    assert!(
+        host.event_details(EventKind::StepReports).is_empty(),
+        "{:?}",
+        host.event_kinds()
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_result_that_fails_done_when_takes_the_retries() {
     let plan = plan(
@@ -578,6 +710,7 @@ async fn a_leader_streaming_refusal_is_sent_again_each_second_within_the_bound()
         after: Duration::ZERO,
         end: CallEnd::Refused(Failure::new("leader_streaming", "a leader streams")),
         on_cancel: None,
+        feedback: Vec::new(),
     };
     let host = ScriptedHost::new()
         .answer("find", vec![Answer::now(found())])
@@ -1730,6 +1863,7 @@ fn leader_streams(after: Duration) -> Answer {
         after,
         end: CallEnd::Refused(Failure::new("leader_streaming", "a leader streams")),
         on_cancel: None,
+        feedback: Vec::new(),
     }
 }
 
