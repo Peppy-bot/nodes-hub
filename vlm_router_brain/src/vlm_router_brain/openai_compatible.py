@@ -11,6 +11,13 @@ spaces counts as not set, as a key does, and each value is read without
 the spaces around it. The base must be an http:// or https:// address with
 a host.
 
+Through the API a catalog model runs on one route (`route_of`): its
+catalog name is the model the API is asked for ("gemini-4-argon", never a
+provider's id such as "google/gemini-4-argon"), with the least deadline
+and the reasoning effort of its first route, the route the catalog lists
+first. So an API serves a model under its catalog name; a model outside
+the catalog is not reached.
+
 Neither value is ever logged or in a message: the base can carry a user
 and a password. What the node says about the API names the variables, and
 neither value is in the API's repr.
@@ -23,10 +30,13 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional
 from urllib.parse import urlsplit
 
+from .catalog import CatalogEntry, Route
+
 API_BASE_VARIABLE = "OPENAI_COMPATIBLE_API_BASE"
 API_KEY_VARIABLE = "OPENAI_COMPATIBLE_API_KEY"
-# The name the node gives the API in any-llm, which any-llm's messages
-# carry ("[openai_compatible] Error code: 404 - ...").
+# The provider of every route through the API, and the name the node gives
+# the API in any-llm, which any-llm's messages carry ("[openai_compatible]
+# Error code: 404 - ...").
 OPENAI_COMPATIBLE = "openai_compatible"
 # The schemes a base address may have.
 BASE_SCHEMES = ("http", "https")
@@ -55,6 +65,13 @@ def compatible_api(environ: Mapping[str, str] = os.environ) -> Optional[Compatib
     if not _is_http_address(base):
         raise ValueError(f"{API_BASE_VARIABLE} must be an http:// or https:// address with a host, such as http://localhost:11434/v1")
     return CompatibleApi(base, key)
+
+
+def route_of(model: CatalogEntry) -> Route:
+    """The route of `model` through the API: its catalog name sent as the
+    model, with the settings of its first route."""
+    first = model.routes[0]
+    return Route(model.name, OPENAI_COMPATIBLE, model.name, first.min_call_timeout_s, first.reasoning_effort)
 
 
 def _is_http_address(base: str) -> bool:

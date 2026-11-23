@@ -11,9 +11,12 @@ the item in the scripted grab and above the spot in the scripted place
 `rejected`,
 pointing to list_models. `offered` gives the entry of a name for a role, a
 `BuiltIn` or a `RouterEntry` for a catalog model, so the entry carries the
-role it was offered for. A catalog model runs on the first of its routes
-whose key is set in the node's environment, the route the log names and
-no result does, and becomes the backend `BUILDERS` makes for its role.
+role it was offered for. A catalog model runs on one route, the route the
+log names and no result does, and becomes the backend `BUILDERS` makes for
+its role. With an OpenAI-compatible API (openai_compatible.py) that route
+is the one through the API, under the model's catalog name, and a model
+always has it. Without one it is the first of the model's routes whose key
+is set in the node's environment, and a model may have none.
 
 A built-in model makes no call, so a start and a switch build it alike.
 At the node's start (`start`) a catalog model makes no call either: the
@@ -22,8 +25,9 @@ fails that goal alone. A switch to a catalog model (`prepare`) probes the
 route once, with the probe of the role (`PROBES`), before brain_core hands
 the role its new model, so a model that cannot be reached, or that does
 not answer the role's question, fails the switch and the role keeps its
-model: with `resource_unavailable` when no route of the model has its
-key, with `attempt_failed` when the probe fails.
+model: with `resource_unavailable` when the model has no route, with
+`attempt_failed` when the probe fails, an API that does not serve the
+model among them.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Mapping, Sequence, Union
+from typing import Awaitable, Callable, Mapping, Optional, Sequence, Union
 
 from brain_core.manipulators.none import NoneManipulator
 from brain_core.manipulators.scripted import CentreProposer, ScriptedManipulator
@@ -41,6 +45,7 @@ from brain_core.ports import FailureKind, Refusal, Role
 from .catalog import NONE, SCRIPTED, Catalog, CatalogEntry, Route
 from .keys import first_keyed, no_key_message
 from .manipulators.vlm import probe_alignment, vlm_manipulator
+from .openai_compatible import CompatibleApi, route_of
 from .provider import Provider
 from .vlm_detector import VlmDetector, probe
 
@@ -87,10 +92,13 @@ PROBES: Mapping[Role, Callable[[Provider, Route], Awaitable[None]]] = {
 
 
 class RouterModels:
-    def __init__(self, catalog: Catalog, provider: Provider, environ: Mapping[str, str] = os.environ) -> None:
+    def __init__(
+        self, catalog: Catalog, provider: Provider, environ: Mapping[str, str] = os.environ, *, api: Optional[CompatibleApi] = None
+    ) -> None:
         self._catalog = catalog
         self._provider = provider
         self._environ = environ
+        self._api = api
 
     def roles(self) -> Sequence[Role]:
         return (Role.PERCEPTION, Role.MANIPULATION)
@@ -110,7 +118,7 @@ class RouterModels:
         if isinstance(entry, BuiltIn):
             return _built_in(entry)
         model = entry.catalog_entry
-        route = first_keyed(model.routes, self._environ)
+        route = self._route(model)
         if route is None:
             raise ValueError(no_key_message(model.name, model.routes))
         return self._build(entry, route)
@@ -119,11 +127,18 @@ class RouterModels:
         if isinstance(entry, BuiltIn):
             return _built_in(entry)
         model = entry.catalog_entry
-        route = first_keyed(model.routes, self._environ)
+        route = self._route(model)
         if route is None:
             raise Refusal(FailureKind.RESOURCE_UNAVAILABLE, no_key_message(model.name, model.routes))
         await PROBES[entry.role](self._provider, route)
         return self._build(entry, route)
+
+    def _route(self, model: CatalogEntry) -> Optional[Route]:
+        """The route `model` runs on: the one through the API when the node
+        has one, else the first of its routes whose key is set, or none."""
+        if self._api is not None:
+            return route_of(model)
+        return first_keyed(model.routes, self._environ)
 
     def _build(self, entry: RouterEntry, route: Route):
         logger.info("%s runs through %s", entry.catalog_entry.name, route.spelled)
