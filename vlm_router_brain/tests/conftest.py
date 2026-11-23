@@ -1,6 +1,6 @@
 """Shared test pieces: a scripted provider, a catalog of the test's own,
-and the records of one logger, so the router's parts run with no network,
-no key and no model."""
+the records of one logger, and no OpenAI-compatible API from the shell, so
+the router's parts run with no network, no key and no model."""
 
 from __future__ import annotations
 
@@ -15,9 +15,18 @@ from typing import Iterator, Optional
 import pytest
 
 from vlm_router_brain.catalog import Catalog, Route, parse_catalog
+from vlm_router_brain.openai_compatible import API_BASE_VARIABLE, API_KEY_VARIABLE
 from vlm_router_brain.provider import Reply
 
 NOTHING = '{"boxes": []}'
+
+
+@pytest.fixture(autouse=True)
+def no_api_from_the_shell(monkeypatch):
+    """No test reads an OpenAI-compatible API from the shell that runs the
+    suite: a test that wants one sets it."""
+    monkeypatch.delenv(API_BASE_VARIABLE, raising=False)
+    monkeypatch.delenv(API_KEY_VARIABLE, raising=False)
 
 
 @dataclass(frozen=True)
