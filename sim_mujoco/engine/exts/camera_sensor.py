@@ -67,20 +67,29 @@ _HEARTBEAT_TIMEOUT_S = 5.0
 
 def add_cameras(spec, known, xml_path: Path) -> None:
     """Add to one model's spec a camera per camera of its entry, on the body
-    its entry hangs it from. The robot is attached into the scene under its
-    own prefix, so these are the cameras of that robot alone.
+    its entry hangs it from. A camera the model's MJCF defines under the
+    camera's name is that camera, where the file puts it, at the field of
+    view of its render: a model written from its description, such as the
+    botshare base, carries its cameras where the description puts them, on a
+    body that holds every link its fixed joints join. Such a camera projecting
+    through a sensor size of its own is refused, since its field of view is
+    then the file's. The robot is attached into the scene under its own
+    prefix, so these are the cameras of that robot alone.
 
-    The baked MJCF is never modified: the cameras go on an mjSpec parsed from
-    it, so a camera-less launch compiles the scene without them.
+    The baked MJCF is never modified: the cameras added here go on an mjSpec
+    parsed from it, so a camera-less launch compiles the scene without them.
     """
     cameras = list(known.entry.cameras)
-    taken = {camera.name for camera in spec.cameras}
     for camera in cameras:
-        if camera.name in taken:
+        defined = spec.camera(camera.name)
+        if defined is not None and any(defined.sensor_size):
             raise RuntimeError(
-                f"camera '{camera.name}' collides with a camera the scene "
-                f"{xml_path.name} already defines"
+                f"camera '{camera.name}' of {xml_path.name} projects through its sensorsize: give "
+                "it a fovy and no sensorsize, so it renders at its render's field of view"
             )
+        if defined is not None:
+            defined.fovy = camera.fovy_deg
+            continue
         mjcf_camera = _parent_body(spec, known, camera, xml_path).add_camera()
         mjcf_camera.name = camera.name
         mjcf_camera.pos = list(camera.pos)

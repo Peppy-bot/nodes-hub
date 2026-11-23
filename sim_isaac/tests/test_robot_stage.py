@@ -26,7 +26,7 @@ from sim_robot_core.pairs import Held
 from sim_robot_core.registry import Caller, Registry
 
 from _world import known, placement_at
-import runtime_fakes  # pylint: disable=W0611  (installs the runtime robots_io imports)
+import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime robots_io imports)
 from runtime_fakes import CANCEL_REASONS, FailureKind
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
@@ -46,7 +46,7 @@ def _robots_io(world):
     io = RobotsIO.__new__(RobotsIO)
     io._world = world
     io._robots = Mock(spec=["renew", "release"])
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._loop = Mock()
     io._loop.time.return_value = 0.0
     io._bind = Mock()
@@ -113,7 +113,7 @@ def test_taking_a_robot_out_is_all_the_stage_is_asked_for():
     io = _robots_io(world)
     order = []
     world.remove.side_effect = lambda *_: order.append("left the stage")
-    io._io.forget.side_effect = lambda *_: order.append("setpoints dropped")
+    io._io.setpoints.forget.side_effect = lambda *_: order.append("setpoints dropped")
 
     io._rebind = Mock(side_effect=lambda: order.append("scene resolved"))
 
@@ -183,6 +183,8 @@ def _joining_io(model: str = "openarm_v2"):
     io._handovers = {}
     io._robots = Mock(spec=["release", "stand"])
     io._models = MODELS
+    # What the robot commanded, which a stand that never happens drops.
+    io._io = Mock(spec=["setpoints"])
     io._loop = Mock()
     io._loop.time.return_value = 0.0
     return io
@@ -372,18 +374,19 @@ PAIR_GRACE = "2.0s, the pair grace time this scene gives"
 # What each model's side of a mismatch names.
 OPENARM_V2_HAS = (
     "the model openarm_v2 has arms ['left_arm', 'right_arm'], "
-    "grippers ['left_gripper', 'right_gripper'], rgb_cameras ['wrist_left', 'wrist_right'], "
+    "grippers ['left_gripper', 'right_gripper'], bases [], rgb_cameras ['wrist_left', 'wrist_right'], "
     "rgbd_cameras ['chest']"
 )
-SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], rgb_cameras ['wrist'], rgbd_cameras []"
+SO101_HAS = "the model so101 has arms ['arm'], grippers ['gripper'], bases [], rgb_cameras ['wrist'], rgbd_cameras []"
 
 
 class _Pairs:
-    """What each robot holds on the four slots, as the engine reads its
-    pairs."""
+    """What each robot holds on the five slots, as the engine reads its
+    pairs, and the setpoints of every robot."""
 
     def __init__(self, held: dict) -> None:
         self.held = dict(held)
+        self.setpoints = Mock(spec=["forget"])
 
     def held_by(self, robot: str) -> Held:
         return self.held.get(robot, Held())
@@ -404,7 +407,7 @@ def _fleet_io_at(now_s: float, fleet: dict, reached_s: Optional[float] = 0.0) ->
     for name, (model, _held) in fleet.items():
         io._robots.admit(name, known(model).entry, _caller(name))
         if reached_s is not None:
-            io._robots.note_limbs_reached(name, reached_s)
+            io._robots.note_driven_part_reached(name, reached_s)
     io._loop = SimpleNamespace(time=lambda: now_s)
     io._io = _Pairs({name: held for name, (_model, held) in fleet.items()})
     io._pair_grace_s = PAIR_GRACE_S
@@ -431,7 +434,7 @@ def test_a_robot_that_left_before_it_stood_gives_back_its_name_and_its_spot():
     """Its stand still waits for the thread that steps the scene, so the
     stand is withdrawn: nothing stood, and the next copy takes the name."""
     io = _joining_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
 
     stood = asyncio.run(io._stand(_Withdrawing(), "alpha", "openarm_v2"))
 
@@ -444,7 +447,7 @@ def test_a_robot_the_stage_refused_gives_back_its_name_and_its_spot():
     """The stage answered the stand with why it will not take the robot, so
     what the admission held goes back with the answer."""
     io = _joining_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["release", "stand", "renew"])
     io._unbind = lambda: None
     io._rebind = lambda: None
@@ -470,7 +473,7 @@ def test_a_robot_that_stood_is_recorded_as_standing():
     """What marks it standing is what tells a copy re-registering that its
     own robot is there to be handed over."""
     io = _joining_io()
-    io._io = Mock(spec=["forget"])
+    io._io = Mock(spec=["setpoints"])
     io._robots = Mock(spec=["release", "stand", "renew"])
     io._unbind = lambda: None
     io._rebind = lambda: None
@@ -627,7 +630,7 @@ class TestPairGrace:
         io = _fleet_io_at(now_s=10.0, fleet={"alpha": ("openarm_v2", Held())})
 
         assert io._lapse(io._robots.of_name("alpha")) == (
-            f"none of this robot's limbs were paired for {PAIR_GRACE}"
+            f"this robot held no pair for {PAIR_GRACE}"
         )
 
     def test_a_robot_has_the_pair_grace_time_to_pair_its_limbs(self):
@@ -645,7 +648,7 @@ class TestPairGrace:
 
         assert io._lapse(io._robots.of_name("alpha")) == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
-            "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], rgb_cameras [], "
+            "arms ['left_arm', 'right_arm'], grippers ['left_gripper'], bases [], rgb_cameras [], "
             f"rgbd_cameras [], and {OPENARM_V2_HAS}"
         )
 
@@ -657,12 +660,12 @@ class TestPairGrace:
 
         assert io._lapse(io._robots.of_name("charlo")) == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
-            "arms ['arm'], grippers ['gripper'], rgb_cameras [], rgbd_cameras ['chest'], "
+            "arms ['arm'], grippers ['gripper'], bases [], rgb_cameras [], rgbd_cameras ['chest'], "
             f"and {SO101_HAS}"
         )
 
     def test_each_robot_of_a_fleet_is_held_to_its_own_model(self):
-        """An SO-101 stands beside an OpenArm on the same four slots. Each
+        """An SO-101 stands beside an OpenArm on the same five slots. Each
         holds its own model's limbs, and neither is asked for the other's."""
         io = _fleet_io_at(
             now_s=10.0,
@@ -692,7 +695,7 @@ class TestPairGrace:
         assert why == (
             f"this robot's pairs were not its model's for {PAIR_GRACE}: its pairs name "
             "arms ['left_arm', 'right_arm'], grippers ['left_gripper', 'right_gripper'], "
-            f"rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
+            f"bases [], rgb_cameras [], rgbd_cameras [], and {SO101_HAS}"
         )
         assert io._robots.of_name("charlo").last_paired_s == 0.0
         assert io._lapse(io._robots.of_name("alpha")) is None
@@ -853,7 +856,7 @@ class TestAdmission:
 
         assert decision.refusal.kind is FailureKind.REJECTED
         assert decision.refusal.message == (
-            "unknown model 'openarm_v9': this engine stands openarm_v1, openarm_v2, so101"
+            "unknown model 'openarm_v9': this engine stands botshare_base, openarm_v1, openarm_v2, so101"
         )
         assert io._robots.robots() == []
         assert io._promises == {}

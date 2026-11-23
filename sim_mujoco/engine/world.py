@@ -7,7 +7,11 @@ actuators and cameras, and taking one out is composing the scene again
 without it. What is attached is the body of its model's MJCF that carries
 the whole robot, with its servos and weight compensation as the release of
 Waldo's catalogue gives them and the cameras of its description; where it
-stands is its placement.
+stands is its placement. A robot that rolls hangs from the world on a free
+joint of its own, named as the robot is: its placement is where it starts,
+it settles onto the floor the scene lays for it, its wheels carry it from
+there, and its placement follows it (`World.follow`), so the spacing rule
+and the scene composed next take where it stands.
 
 MuJoCo compiles a scene whole, so a robot joining or leaving makes a new
 model out of the robots standing then. The thread that steps the scene
@@ -23,6 +27,7 @@ it.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import threading
@@ -37,7 +42,8 @@ from mujoco_models import MujocoModel
 logger = logging.getLogger(__name__)
 
 # The empty scene robots join. A model that works against a floor asks for
-# one in its entry, and the scene lays it once for every robot that does.
+# one in its entry, a model that rolls needs one, and the scene lays it once
+# for every robot of either.
 _STAGE_XML = '<mujoco model="stage"><compiler angle="radian"/><worldbody/></mujoco>'
 
 # Side of the square the engine parks robots on when one asks for no
@@ -45,6 +51,9 @@ _STAGE_XML = '<mujoco model="stage"><compiler angle="radian"/><worldbody/></mujo
 # the models this engine stands can touch. Isaac Sim parks them on the same
 # lattice, so a fleet stands alike on both.
 SPOT_PITCH_M = 1.5
+
+# MuJoCo's name of the body every scene hangs from.
+_WORLD_BODY = "world"
 
 # What stands between a robot's name and the name of anything it carries,
 # in the composed scene: `alpha/left_joint1` is alpha's.
@@ -90,9 +99,15 @@ class Robot:
 def name_in_the_scene(instance: str) -> str:
     """The name a robot stands under. Every name it answers to in the scene
     is this name and the separator, so a name carrying the separator names
-    two robots at once."""
+    two robots at once, and a robot that rolls names its own body by it, so
+    the name of the scene's world body names no robot."""
     if not instance:
         raise ValueError("a robot stands under the name of the copy it runs as")
+    if instance == _WORLD_BODY:
+        raise ValueError(
+            f"'{_WORLD_BODY}' is the name of the scene's own body: join under another name, "
+            f"`peppy stack join LAUNCHER -i {_WORLD_BODY}_robot`"
+        )
     if PREFIX_SEPARATOR in instance:
         plain = instance.replace(PREFIX_SEPARATOR, "_")
         raise ValueError(
@@ -209,6 +224,14 @@ class World:
         )
         return robot
 
+    def follow(self, instance: str, placement: Pose) -> None:
+        """Records where a robot that rolls stands now: its wheels carried it
+        to `placement`. A name the scene holds no robot under is left out."""
+        with self._lock:
+            robot = self._robots.get(instance)
+            if robot is not None:
+                self._robots[instance] = dataclasses.replace(robot, placement=placement)
+
     def remove(self, instance: str) -> None:
         """Takes a robot out of the scene."""
         with self._lock:
@@ -229,15 +252,14 @@ class World:
         settings = _shared_settings(children)
         if settings is not None:
             stage.option, stage.stat = settings
-        if any(robot.known.floor for robot in robots):
+        if any(robot.known.floor or robot.known.rolls for robot in robots):
             _lay_floor(stage)
         if self._renders:
             self._fit_out_rendering(stage, robots)
         for robot, child in children:
-            frame = stage.worldbody.add_frame()
-            frame.pos = list(robot.placement.position.position)
-            frame.quat = list(wxyz_of_xyzw(robot.placement.orientation.quaternion))
-            frame.attach_body(child.body(robot.known.robot.mount_body), robot.prefix, "")
+            _stance(stage, robot).attach_body(
+                child.body(robot.known.robot.mount_body), robot.prefix, ""
+            )
         return stage
 
     def _fit_out_rendering(self, stage, robots: list[Robot]) -> None:
@@ -257,6 +279,22 @@ class World:
         if self._renders and known.entry.cameras:
             add_cameras(spec, known, known.scene_path())
         return spec
+
+
+def _stance(stage, robot: Robot):
+    """The frame a robot is attached on, at its placement: a frame of the
+    world for a robot that holds where it is placed, and, for a robot that
+    rolls, the frame of a body of its own hanging from the world on a free
+    joint, body and joint named as the robot is."""
+    position = list(robot.placement.position.position)
+    orientation = list(wxyz_of_xyzw(robot.placement.orientation.quaternion))
+    if not robot.known.rolls:
+        frame = stage.worldbody.add_frame()
+        frame.pos, frame.quat = position, orientation
+        return frame
+    body = stage.worldbody.add_body(name=robot.instance, pos=position, quat=orientation)
+    body.add_freejoint(name=robot.instance)
+    return body.add_frame()
 
 
 def within_one_spot(one: Pose, other: Pose) -> bool:

@@ -5,7 +5,8 @@ A view of a prim that is edited under it stops reading, so the bridge drops
 every view before the stage changes and builds them again after. These cover
 that the drop reaches every view of every robot, that what a view cached goes
 with it, that the camera's render products, which ride USD prims, are left
-alone, and that every state tick carries the spawned objects' snapshot.
+alone, that every state tick carries the spawned objects' snapshot, and that
+the engine clock runs on across the timeline's stops.
 """
 
 import importlib.util
@@ -35,7 +36,7 @@ def _limbs_of(module, instance):
     limbs.exts.return_value = views
     limbs.setup.return_value = True
     limbs.ready = True
-    limbs.robot = Mock(instance=instance)
+    limbs.robot = Mock(instance=instance, known=Mock(rolls=False))
     return limbs
 
 
@@ -58,6 +59,7 @@ def bridge(monkeypatch):
     extension = bridge_extension.IsaacBridgeExtension(
         Mock(), Mock(), Mock(), Mock(), state_rate_hz=60, renders=True
     )
+    extension._world.take_set_down.return_value = set()
     # Two robots on the stage, each with views of its own.
     extension._limbs = {
         "alpha": _limbs_of(bridge_extension, "alpha"),
@@ -219,3 +221,56 @@ def test_the_engine_clock_is_recorded_while_the_bridge_takes_the_stage_up_again(
     assert not bridge.is_ready
     bridge._io.record_engine_time.assert_called_once_with(4.5)
     bridge._objects.capture_object_states.assert_not_called()
+
+
+def _timeline_reading(monkeypatch, *reads):
+    """Isaac's timeline, reading `reads` in turn."""
+    timeline = Mock()
+    timeline.get_current_time.side_effect = iter(reads)
+    omni = ModuleType("omni")
+    omni.timeline = ModuleType("omni.timeline")
+    omni.timeline.get_timeline_interface = lambda: timeline
+    monkeypatch.setitem(sys.modules, "omni", omni)
+    monkeypatch.setitem(sys.modules, "omni.timeline", omni.timeline)
+
+
+def test_the_engine_clock_runs_on_where_the_timeline_goes_back_to_its_start(bridge, monkeypatch):
+    # A stop the engine did not make sends the timeline back to its start:
+    # each read earlier than the last one adds the last one to the time
+    # played before, so the clock never goes back.
+    _timeline_reading(monkeypatch, 0.5, 1.0, 0.0, 0.25, 0.0, 0.1)
+
+    clock = [bridge._engine_time_s() for _ in range(6)]
+
+    assert clock == [0.5, 1.0, 1.0, 1.25, 1.25, 1.35]
+
+
+@pytest.mark.parametrize(
+    ("reads", "stops", "clock"),
+    [((0.25, 0.25, 0.5, 0.75), 2, (0.25, 1.5)), ((0.5, 0.5, 0.3), 1, (0.5, 0.8))],
+    ids=["two-edits-read-past-the-last", "one-edit-read-short-of-the-last"],
+)
+def test_each_stop_the_engine_makes_adds_the_time_the_timeline_played(bridge, monkeypatch, reads, stops, clock):
+    # An edit stops the timeline and plays it again before the next step,
+    # so the read after it can lie past the read before it or short of it,
+    # and two edits can run between two steps: each stop adds the time
+    # played up to it, once.
+    _timeline_reading(monkeypatch, *reads)
+
+    before = bridge._engine_time_s()
+    for _ in range(stops):
+        bridge.hold_through_stop()
+    after = bridge._engine_time_s()
+
+    assert (before, after) == pytest.approx(clock)
+
+
+def test_a_step_with_no_robot_read_records_the_worlds_instant(bridge, monkeypatch):
+    # The records hold as the edit left them, so a capture now is of the
+    # instant it is stamped with.
+    monkeypatch.setattr(type(bridge), "_engine_time_s", lambda self: 4.5)
+    bridge.unbind()
+
+    bridge.step()
+
+    bridge._world.roll.assert_called_once_with(bridge._io.timestamp_s.return_value, {})

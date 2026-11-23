@@ -71,3 +71,21 @@ async fn a_robot_whose_model_carries_no_camera_answers_empty_arrays() -> peppyge
 
     harness.shutdown().await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_botshare_base_names_its_depth_camera_on_no_arm() -> peppygen::Result<()> {
+    let config = Config {
+        parameters: Some(parameters("botshare_base")),
+        ..on_its_own_hardware()
+    };
+    let (harness, _mocks) = Harness::start_with(config, robot_initializer::setup).await?;
+
+    let answer = describe_sensors::poll(&harness, WIRE).await?;
+    assert_eq!(answer.robot_frame, "base_footprint");
+    assert_eq!(answer.sensor_names, ["base_camera"]);
+    assert_eq!(answer.sensor_kinds, ["rgbd_camera"]);
+    assert_eq!(answer.sensor_frames, ["base_camera_optical_frame"]);
+    assert_eq!(answer.carried_by, [""]);
+
+    harness.shutdown().await
+}

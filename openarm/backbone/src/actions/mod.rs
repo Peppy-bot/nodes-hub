@@ -4,9 +4,11 @@
 //! shares of the limbs it moves and ends with their one result, and an
 //! execute_joint_path goal for the share of each of its arms
 //! ([`collect_ends`]); the stop and the plan check ask the coordinator and
-//! answer what it says. The times and the tolerances every move goal names,
-//! and the contact gap every arm goal names, are parsed here, and each
-//! action's own fields in its module.
+//! answer what it says. The contact gap every arm goal names is parsed here,
+//! the times and the tolerances every move goal names by control_core's
+//! parses ([`MoveSeconds`](control_core::move_seconds::MoveSeconds),
+//! [`PositiveFinite::parse_field`]), and each action's own fields in its
+//! module.
 
 pub mod arm;
 pub mod gripper;
@@ -18,48 +20,24 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use control_core::move_slot::{MoveSlot, SlotRelease};
 use control_core::positive_finite::PositiveFinite;
-use control_core::sync::wait_for;
 use robot_description::{ArmId, PerArm};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use crate::coordinator::CoordinatorRequest;
-use crate::failure::{Failure, FailureKind};
-use crate::move_slot::{ARM_BUSY, GRIPPER_BUSY, MoveSlot};
+use crate::failure::{ARM_BUSY, Failure, FailureKind, GRIPPER_BUSY};
 use crate::robot::{ARMS, LIMBS};
 use crate::settle::ContactGap;
 use crate::streams::LeaderActivity;
 
-/// How long a service waits for the coordinator's answer before it gives an
-/// error reply: many ticks of the slowest control rate, so only a loop that
-/// has stopped ticking runs it out.
+/// How long the plan check and the grasp measurement of a posture wait for
+/// the coordinator's answer before they give an error: many ticks of the
+/// slowest control rate, so only a loop that has stopped ticking runs it out.
 const COORDINATOR_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The longest a move may be asked to take, and the longest it may be given
-/// to settle after its planned end: the bound the limb_motion contract states
-/// for every duration and timeout. A plan walks the control ticks of the
-/// request, so the bound also bounds its work.
-pub(crate) const MAX_MOVE_DURATION_S: f64 = 60.0;
-
-/// Parse a tolerance off the wire: a positive finite number, or the refusal
-/// naming `field`.
-fn tolerance_from_wire(field: &str, value: f64) -> Result<f64, String> {
-    PositiveFinite::parse(value)
-        .map(PositiveFinite::get)
-        .map_err(|_| format!("{field} must be a positive number"))
-}
-
-/// Parse a number of seconds a move may be asked for off the wire, `field`
-/// being `duration_s` or `settle_timeout_s`: from 0 to
-/// [`MAX_MOVE_DURATION_S`], or the refusal naming the field.
-fn move_seconds_from_wire(field: &str, value: f64) -> Result<Duration, String> {
-    if value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value) {
-        return Ok(Duration::from_secs_f64(value));
-    }
-    Err(format!(
-        "{field} must be a number of seconds from 0 to {MAX_MOVE_DURATION_S:.0}"
-    ))
-}
+/// The name an ask of the coordinator gives it in its errors
+/// ([`ask_loop`](control_core::asking::ask_loop)).
+const COORDINATOR: &str = "coordinator";
 
 /// Parse the `contact_gap_m` of an arm goal off the wire: 0 for no contact
 /// check, a positive finite number of meters for a gap, or the refusal.
@@ -122,63 +100,32 @@ fn check_limb_free(fresh: bool, streaming: bool, words: &LimbWords) -> Result<()
 }
 
 /// Claim the move slot of the limb on each arm of `arms`, in their order,
-/// `move_slots` being the slots of the arms or of the grippers, or give the
-/// first arm whose slot another move holds. A refusal releases the slots it
-/// claimed before it, so it never leaves a slot held.
-fn claim_slots(arms: &[ArmId], move_slots: &PerArm<MoveSlot, ARMS>) -> Result<(), ArmId> {
-    for (k, &arm) in arms.iter().enumerate() {
-        if move_slots[arm].claim() {
-            continue;
-        }
-        for &claimed in &arms[..k] {
-            move_slots[claimed].release();
-        }
-        return Err(arm);
-    }
-    Ok(())
+/// `move_slots` being the slots of the arms or of the grippers: the release
+/// of each claim in that order, or the first arm whose slot another move
+/// holds. A refusal drops the releases of the claims before it, so it never
+/// leaves a slot held.
+fn claim_slots(
+    arms: &[ArmId],
+    move_slots: &PerArm<MoveSlot, ARMS>,
+) -> Result<Vec<SlotRelease>, ArmId> {
+    arms.iter()
+        .map(|&arm| move_slots[arm].claim().ok_or(arm))
+        .collect()
 }
 
 /// Admit a move on one limb: [`check_limb_free`], then claim the limb's
 /// move slot, or `precondition_failed` while the limb executes another move.
-/// The move that runs the goal releases the slot.
+/// The goal carries the release of the claim, and the move that runs it then.
 fn admit_limb(
     fresh: &AtomicBool,
     leader: &LeaderActivity,
     move_slot: &MoveSlot,
     words: &LimbWords,
-) -> Result<(), Failure> {
+) -> Result<SlotRelease, Failure> {
     check_limb_free(fresh.load(Ordering::Acquire), leader.streaming(), words)?;
-    if !move_slot.claim() {
-        return Err(Failure::new(FailureKind::PreconditionFailed, words.busy));
-    }
-    Ok(())
-}
-
-/// Hand `request` to the coordinator and wait for the answer it sends on
-/// `answer`, for at most [`COORDINATOR_REPLY_TIMEOUT`]. The error names
-/// what went wrong:
-/// - the coordinator is not running;
-/// - it has too many requests queued;
-/// - it dropped the request;
-/// - it did not answer in time.
-async fn ask_coordinator<T>(
-    requests: &mpsc::Sender<CoordinatorRequest>,
-    request: CoordinatorRequest,
-    answer: oneshot::Receiver<T>,
-) -> std::result::Result<T, String> {
-    requests.try_send(request).map_err(|e| match e {
-        mpsc::error::TrySendError::Full(_) => {
-            "the coordinator has too many requests queued".to_string()
-        }
-        mpsc::error::TrySendError::Closed(_) => "the coordinator is not running".to_string(),
-    })?;
-    match tokio::time::timeout(COORDINATOR_REPLY_TIMEOUT, answer).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) => Err("the coordinator dropped the request".to_string()),
-        Err(_) => Err(format!(
-            "the coordinator did not answer within {COORDINATOR_REPLY_TIMEOUT:?}"
-        )),
-    }
+    move_slot
+        .claim()
+        .ok_or_else(|| Failure::new(FailureKind::PreconditionFailed, words.busy))
 }
 
 /// The ends the shares of a goal report on `ends`, once `pending` have
@@ -208,19 +155,10 @@ async fn collect_ends<T>(
     received
 }
 
-/// [`ask_coordinator`] from inside a service handler, which the generated
-/// code calls synchronously: the wait blocks in place on the runtime.
-fn blocking_ask_coordinator<T>(
-    requests: &mpsc::Sender<CoordinatorRequest>,
-    request: CoordinatorRequest,
-    answer: oneshot::Receiver<T>,
-) -> std::result::Result<T, String> {
-    wait_for(ask_coordinator(requests, request, answer))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{LEFT, RIGHT};
 
     /// A limb with no fresh state is unavailable whatever its leader does;
     /// a fresh limb a leader streams is the leader's.
@@ -238,85 +176,52 @@ mod tests {
         assert_eq!(check_limb_free(true, false, &ARM_WORDS), Ok(()));
     }
 
-    /// A free limb is claimed; a second move on it is refused busy, and a
-    /// refused move claims nothing.
+    /// A free limb is claimed until the release its admission gives drops; a
+    /// second move on it is refused busy, and a refused move claims nothing.
     #[test]
     fn admitting_a_move_claims_the_limb_once() {
         let fresh = AtomicBool::new(true);
         let idle = LeaderActivity::default();
         let move_slot = MoveSlot::default();
-        assert_eq!(admit_limb(&fresh, &idle, &move_slot, &ARM_WORDS), Ok(()));
+        let release = admit_limb(&fresh, &idle, &move_slot, &ARM_WORDS).expect("a free limb");
         assert!(move_slot.is_claimed(), "the move holds the limb");
         assert_eq!(
-            admit_limb(&fresh, &idle, &move_slot, &ARM_WORDS),
-            Err(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY))
+            admit_limb(&fresh, &idle, &move_slot, &ARM_WORDS).err(),
+            Some(Failure::new(FailureKind::PreconditionFailed, ARM_BUSY))
         );
+        drop(release);
+        assert!(!move_slot.is_claimed(), "the release frees the limb");
 
         let stale = AtomicBool::new(false);
         let free = MoveSlot::default();
         assert_eq!(
-            admit_limb(&stale, &idle, &free, &ARM_WORDS).map_err(|f| f.kind),
-            Err(FailureKind::ResourceUnavailable)
+            admit_limb(&stale, &idle, &free, &ARM_WORDS)
+                .err()
+                .map(|f| f.kind),
+            Some(FailureKind::ResourceUnavailable)
         );
         assert!(!free.is_claimed(), "a refusal claims nothing");
     }
 
-    // --- Tolerances and times off the wire ---------------------------------
+    /// The claims of a goal on several limbs come back in their order; a busy
+    /// limb refuses the goal, naming it, and frees the limbs claimed before it.
+    #[test]
+    fn claiming_the_slots_of_a_goal_frees_them_all_on_a_busy_one() {
+        let move_slots = PerArm::<MoveSlot, ARMS>::from_fn(|_| MoveSlot::default());
+        let both = claim_slots(&[LEFT, RIGHT], &move_slots).expect("free slots");
+        assert_eq!(both.len(), 2);
+        assert!(move_slots.iter().all(MoveSlot::is_claimed));
+        drop(both);
+        let _busy = move_slots[RIGHT].claim().expect("a free slot");
+        assert_eq!(claim_slots(&[LEFT, RIGHT], &move_slots).err(), Some(RIGHT));
+        assert!(
+            !move_slots[LEFT].is_claimed(),
+            "the refusal frees the left arm"
+        );
+    }
 
     use hegel::TestCase;
     use hegel::generators as gs;
-
-    fn admitted_tolerance(value: f64) -> bool {
-        value.is_finite() && value > 0.0
-    }
-
-    // A tolerance off the wire is exactly a positive finite number, kept as it
-    // came; anything else is refused naming the field.
-    #[hegel::test]
-    fn a_tolerance_is_accepted_exactly_when_positive_and_finite(tc: TestCase) {
-        let value: f64 = tc.draw(gs::floats());
-        match tolerance_from_wire("settle_tolerance", value) {
-            Ok(parsed) => {
-                assert!(admitted_tolerance(value), "{value} was accepted");
-                assert_eq!(parsed, value);
-            }
-            Err(refusal) => {
-                assert!(!admitted_tolerance(value), "{value} was refused");
-                assert_eq!(refusal, "settle_tolerance must be a positive number");
-            }
-        }
-    }
-
-    #[test]
-    fn non_finite_zero_and_negative_tolerances_are_refused() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1e-9, -1.0] {
-            assert!(
-                tolerance_from_wire("settle_tolerance", bad).is_err(),
-                "tolerance {bad} must be refused"
-            );
-        }
-    }
-
-    // A number of seconds off the wire is exactly a finite value from 0 to the
-    // move ceiling, carried as a duration.
-    #[hegel::test]
-    fn move_seconds_are_accepted_exactly_within_the_ceiling(tc: TestCase) {
-        let value: f64 = tc.draw(gs::floats());
-        let admitted = value.is_finite() && (0.0..=MAX_MOVE_DURATION_S).contains(&value);
-        match move_seconds_from_wire("settle_timeout_s", value) {
-            Ok(duration) => {
-                assert!(admitted, "{value} s was accepted");
-                assert_eq!(duration, Duration::from_secs_f64(value));
-            }
-            Err(refusal) => {
-                assert!(!admitted, "{value} s was refused");
-                assert_eq!(
-                    refusal,
-                    "settle_timeout_s must be a number of seconds from 0 to 60"
-                );
-            }
-        }
-    }
 
     // A contact gap off the wire is exactly 0, for no contact check, or a
     // positive finite number of meters, carried as that gap.

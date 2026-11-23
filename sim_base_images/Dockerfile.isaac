@@ -73,5 +73,5 @@ RUN --mount=type=secret,id=rclone_key \
     WALDO_R2_SECRET_ACCESS_KEY="$(cat /run/secrets/rclone_secret)" \
     bash /tmp/download_assets.sh \
     && mkdir -p /opt/robot_assets \
-    && cp -r /tmp/.peppy_openarm_assets_isaac/. /opt/robot_assets/ \
-    && rm -rf /tmp/.peppy_openarm_assets_isaac
+    && cp -r /tmp/.peppy_isaac_bundles/. /opt/robot_assets/ \
+    && rm -rf /tmp/.peppy_isaac_bundles

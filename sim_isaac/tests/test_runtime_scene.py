@@ -19,6 +19,7 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 _RUNTIME_COMMAND = Path(__file__).resolve().parents[1] / "scripts" / "runtime_command.py"
 _SCENE = "/World/RuntimeScene"
 _OBJECTS = "/World/RuntimeObjects"
+_FLOOR = "/World/ground"
 _ASSET_ROOT = "https://assets.example/Isaac/6.2"
 _PROPS = {
     "props/blocks/red_block": {
@@ -144,6 +145,15 @@ def scene(monkeypatch):
     )
 
 
+def test_a_removal_takes_the_views_again_and_runs_no_update(scene):
+    scene.stage.DefinePrim(_FLOOR, "Xform")
+
+    assert scene.launcher._remove_prim(scene.stage, _FLOOR)
+
+    assert [name for name, _, _ in scene.bridge.mock_calls] == ["unbind", "bind"]
+    scene.launcher._sim_app.update.assert_not_called()
+
+
 def _load(scene, path, scale=None):
     command = {"path": path}
     if scale is not None:
@@ -174,6 +184,74 @@ def test_loading_another_scene_replaces_the_current_one_and_invalidates_the_view
     scene.bridge.unbind.assert_called_once_with()
     scene.bridge.bind.assert_called_once_with()
     assert f"Replacing runtime scene {_SCENE}" in caplog.text
+
+
+def test_a_load_keeps_the_stages_floor_until_the_floor_is_judged(scene):
+    _load(scene, "Isaac/Environments/Grid/default_environment.usd")
+
+    scene.world.lay_floor_until_judged.assert_called_once_with(scene.stage)
+    assert scene.stage.removed == []
+
+
+def test_a_clear_lays_the_stages_floor_again_and_has_the_floor_judged(scene):
+    _load(scene, "Isaac/Environments/Simple_Warehouse/warehouse.usd")
+    scene.world.reset_mock()
+
+    scene.launcher._runtime_clear_scene()
+
+    scene.world.lay_floor_until_judged.assert_called_once_with(scene.stage)
+
+
+def _judge(scene, monkeypatch, spots, heights):
+    """One judgment of the floor, due, under `spots`, the scene's floor at
+    `heights` there by a fake scene query."""
+    scene.world.take_floor_judgment.return_value = True
+    scene.world.floor_spots.return_value = spots
+    found = dict(zip(spots, heights))
+    monkeypatch.setattr(scene.launcher, "_floor_height", lambda x, y: found[(x, y)])
+    scene.launcher._judge_floor()
+
+
+def test_the_stages_floor_comes_up_once_the_scenes_holds_every_robot(scene, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    scene.stage.DefinePrim(_FLOOR, "Xform")
+
+    _judge(scene, monkeypatch, [(0.0, 0.0), (2.0, -1.0)], [0.0, 0.0002])
+
+    assert scene.stage.removed == [_FLOOR]
+    scene.bridge.unbind.assert_called_once_with()
+    scene.bridge.bind.assert_called_once_with()
+    assert "the stage's floor is taken up" in caplog.text
+
+
+@pytest.mark.parametrize("height", [-0.007, -0.1407, 0.0153, None], ids=["7-mm-under", "0.14-m-under", "above", "none"])
+def test_the_stages_floor_stays_while_the_scenes_misses_a_robot(scene, monkeypatch, height):
+    scene.stage.DefinePrim(_FLOOR, "Xform")
+
+    _judge(scene, monkeypatch, [(0.0, 0.0), (2.0, 0.0)], [0.0, height])
+
+    assert scene.stage.removed == []
+    scene.world.lay_floor.assert_not_called()
+
+
+def test_a_later_robot_over_no_floor_lays_the_stages_floor(scene, monkeypatch):
+    scene.stage.DefinePrim(_FLOOR, "Xform")
+    _judge(scene, monkeypatch, [(0.0, 0.0)], [0.0])
+    assert scene.stage.removed == [_FLOOR]
+
+    _judge(scene, monkeypatch, [(0.0, 0.0), (2.0, 0.0)], [0.0, None])
+
+    scene.world.lay_floor.assert_called_once_with(scene.stage)
+
+
+def test_no_judgment_is_made_until_an_edit_asks_for_one(scene, monkeypatch):
+    scene.world.take_floor_judgment.return_value = False
+    monkeypatch.setattr(scene.launcher, "_floor_height", Mock(side_effect=AssertionError("no query")))
+    scene.stage.DefinePrim(_FLOOR, "Xform")
+
+    scene.launcher._judge_floor()
+
+    assert _FLOOR in scene.stage.prims
 
 
 def test_scene_scale_needs_three_values(scene):
@@ -258,9 +336,16 @@ def scene_manipulation(scene, monkeypatch):
     """The real scene_manipulation provider as the launcher's, reading the fake stage."""
     module = scene_actions_module(monkeypatch, "_scene_manipulation_under_test")
 
-    world = Mock(spec=["robots"])
+    world = Mock(spec=["robots", "listing"])
     world.robots.return_value = []
-    io = module.SceneActionIO(object(), Mock(), SimpleNamespace(capture_timestamp_s=lambda: 10.0), world)
+    world.listing.return_value = (10.0, [])
+    robots = Mock(spec=["standing"])
+    robots.standing.return_value = {}
+    stamps = SimpleNamespace(
+        capture_timestamp_s=lambda: 10.0,
+        placement_timestamp_s=lambda recorded_s: 10.0 if recorded_s is None else recorded_s,
+    )
+    io = module.SceneActionIO(object(), Mock(), stamps, world, robots)
     io._object_reader = StageReader(scene.stage)
     io.set_assets(_PROPS)
     scene.launcher._scene_actions = io

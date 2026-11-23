@@ -12,6 +12,7 @@
 
 use std::time::{Duration, Instant};
 
+use control_core::move_slot::{MoveSlot, SlotRelease};
 use peppygen::exposed_actions::limb_motion::move_gripper;
 use robot_description::ArmId;
 use tokio::sync::mpsc;
@@ -19,7 +20,6 @@ use tracing::{error, warn};
 
 use crate::failure::{Failure, FailureKind, stale_failure};
 use crate::liveness::Admission;
-use crate::move_slot::{MoveSlot, SlotRelease};
 use crate::planner::{Outcome, POSTURE_SETTLE, PostureShare};
 use crate::robot::LIMBS;
 
@@ -66,7 +66,8 @@ impl EffortCap {
 /// An accepted gripper goal handed to the coordinator, which executes it
 /// through the same per-tick governing as everything else (the gripper analog of
 /// [`Goal`](crate::planner::Goal) for the arms). The opening is the validated
-/// goal fraction.
+/// goal fraction. The goal carries the release of the claim its admission made
+/// on the gripper's move slot, so dropping the goal frees the slot.
 pub struct GripperGoal {
     pub opening: f64,
     pub effort: EffortCap,
@@ -78,26 +79,28 @@ pub struct GripperGoal {
     /// makes it.
     pub travel_timeout: Option<Duration>,
     pub reply: GripperReply,
+    pub move_slot: SlotRelease,
 }
 
 impl GripperGoal {
     /// The close of the gripper of `arm` for a `move_to_home` goal, which
-    /// `share` reports to: to [`CLOSED_OPENING`] under the effort cap of the
-    /// last setpoint the gripper got, its travel ending within
+    /// `share` reports to, holding `move_slot`, the release of the goal's claim
+    /// on the gripper: to [`CLOSED_OPENING`] under the effort cap of the last
+    /// setpoint the gripper got, its travel ending within
     /// [`CLOSE_TRAVEL_TIMEOUT`] and its jaws settling within
     /// [`CLOSE_SETTLE_TIMEOUT`].
-    pub fn close(arm: ArmId, share: PostureShare) -> Self {
+    pub fn close(arm: ArmId, share: PostureShare, move_slot: SlotRelease) -> Self {
         Self {
             opening: CLOSED_OPENING,
             effort: EffortCap::Kept,
             settle_timeout: CLOSE_SETTLE_TIMEOUT,
             travel_timeout: Some(CLOSE_TRAVEL_TIMEOUT),
             reply: GripperReply::Close { arm, share },
+            move_slot,
         }
     }
 
-    /// Fail unstarted with `failure`, with no result. The move slot is the
-    /// caller's concern.
+    /// Fail unstarted with `failure`, with no result, freeing the move slot.
     pub async fn fail(self, failure: Failure) {
         self.reply.fail(failure).await;
     }
@@ -106,7 +109,7 @@ impl GripperGoal {
     /// `move_gripper` goal fails with the failure of a stale limb. The close
     /// of a `move_to_home` goal completes with no command sent: the goal
     /// leaves a gripper it cannot see as it stands, so a robot with a silent
-    /// gripper still parks its arms. The move slot is the caller's concern.
+    /// gripper still parks its arms. The move slot is freed.
     pub async fn end_on_stale_follower(self) {
         match self.reply {
             GripperReply::MoveGripper(ctx) => fail_gripper_goal(&ctx, stale_failure()).await,
@@ -118,9 +121,8 @@ impl GripperGoal {
         }
     }
 
-    /// End unstarted as cancelled by the stop service, for `reason`, which
-    /// names the stop, reporting `reported_frac`. The move slot is the
-    /// caller's concern.
+    /// End unstarted as cancelled by the robot stop, for `reason`, which
+    /// names the stop, reporting `reported_frac`, freeing the move slot.
     pub async fn stop(self, reason: &str, reported_frac: f64) {
         let stopped = GripperTerminal::Cancelled(reason.to_string());
         self.reply.finish(stopped, reported_frac, 0.0).await;
@@ -428,7 +430,7 @@ pub enum GripperTerminal {
     /// this long; the move fails with `timeout`.
     TravelTimedOut(Duration),
     /// The goal was cancelled, for this reason: by its caller, or by the
-    /// stop service, whose reason names the stop.
+    /// robot stop, whose reason names the stop.
     Cancelled(String),
 }
 
@@ -474,9 +476,10 @@ fn gripper_move_terminal(
     (since_end >= motion.settle_timeout).then_some(GripperTerminal::SettleTimedOut)
 }
 
-/// Admit a queued gripper goal into a free arm, and end an in-flight move
-/// on the terminal [`gripper_move_terminal`] decides. A queued goal does not
-/// start, and frees the move slot its admission claimed:
+/// Admit a queued gripper goal into a free arm, the move taking the release
+/// of the goal's claim, and end an in-flight move on the terminal
+/// [`gripper_move_terminal`] decides. A queued goal does not start, and frees
+/// the move slot its admission claimed:
 /// - after a stop that came since its admission ([`MoveSlot::take_stop`]):
 ///   it ends cancelled for the stop's reason;
 /// - while the follower is stale ([`GripperGoal::end_on_stale_follower`]).
@@ -498,10 +501,8 @@ pub async fn service_gripper_move(
     // Drain fully: every queued goal is answered, never left parked.
     while let Ok(goal) = goals.try_recv() {
         if let Some(reason) = move_slot.take_stop() {
-            let _release = move_slot.release_on_drop();
             goal.stop(&reason, measured.frac).await;
         } else if admission == Admission::Stale {
-            let _release = move_slot.release_on_drop();
             goal.end_on_stale_follower().await;
         } else if mv.is_none() {
             *mv = Some(GripperMove {
@@ -511,7 +512,7 @@ pub async fn service_gripper_move(
                 },
                 effort: goal.effort,
                 reply: goal.reply,
-                _move_slot: move_slot.release_on_drop(),
+                _move_slot: goal.move_slot,
             });
         } else {
             let failure = Failure::new(
@@ -935,16 +936,16 @@ mod tests {
     // The close of a gripper for a move_to_home goal: a goal that reports to
     // the share of its posture goal.
 
-    /// A close of the left gripper, where its share reports, and the cancel
-    /// flag of its posture goal.
-    fn left_close() -> (GripperGoal, mpsc::Receiver<Outcome>, Arc<AtomicBool>) {
+    /// A close of the left gripper holding `claim`, where its share reports,
+    /// and the cancel flag of its posture goal.
+    fn left_close(claim: SlotRelease) -> (GripperGoal, mpsc::Receiver<Outcome>, Arc<AtomicBool>) {
         let (done_tx, ends) = mpsc::channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let share = PostureShare {
             done_tx,
             cancelled: cancelled.clone(),
         };
-        (GripperGoal::close(LEFT, share), ends, cancelled)
+        (GripperGoal::close(LEFT, share, claim), ends, cancelled)
     }
 
     /// One tick of an arm that `goal` waits on, at `now`: the goal is
@@ -974,7 +975,8 @@ mod tests {
     /// 2 s for the jaws to stand still.
     #[test]
     fn a_close_goes_to_a_closed_gripper_and_keeps_its_effort_cap() {
-        let (goal, _ends, _cancelled) = left_close();
+        let (_move_slot, claim) = claimed_move_slot();
+        let (goal, _ends, _cancelled) = left_close(claim);
         assert_eq!((goal.opening, goal.effort), (0.0, EffortCap::Kept));
         assert_eq!(goal.settle_timeout, Duration::from_secs(2));
         assert_eq!(goal.travel_timeout, Some(Duration::from_secs(8)));
@@ -1087,9 +1089,9 @@ mod tests {
     /// it, and frees its gripper.
     #[tokio::test]
     async fn a_close_whose_jaws_stand_still_on_an_item_completes() {
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
-        let (goal, mut ends, _cancelled) = left_close();
+        let (goal, mut ends, _cancelled) = left_close(claim);
         queue.try_send(goal).expect("queue the close");
         let mut mv = None;
         let start = Instant::now();
@@ -1134,9 +1136,9 @@ mod tests {
     /// every share of a cancelled posture goal ends with.
     #[tokio::test]
     async fn the_cancel_of_its_posture_goal_ends_a_close_cancelled() {
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
-        let (goal, mut ends, cancelled) = left_close();
+        let (goal, mut ends, cancelled) = left_close(claim);
         queue.try_send(goal).expect("queue the close");
         let mut mv = None;
         let start = Instant::now();
@@ -1169,9 +1171,9 @@ mod tests {
     /// frees its gripper.
     #[tokio::test]
     async fn a_close_that_reaches_a_stale_follower_completes_with_no_move() {
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
-        let (goal, mut ends, _cancelled) = left_close();
+        let (goal, mut ends, _cancelled) = left_close(claim);
         queue.try_send(goal).expect("queue the close");
         let mut mv = None;
 
@@ -1194,9 +1196,9 @@ mod tests {
     /// gripper.
     #[tokio::test]
     async fn a_follower_gone_stale_during_a_close_fails_it_naming_its_gripper() {
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
-        let (goal, mut ends, _cancelled) = left_close();
+        let (goal, mut ends, _cancelled) = left_close(claim);
         queue.try_send(goal).expect("queue the close");
         let mut mv = None;
         let start = Instant::now();
@@ -1225,9 +1227,9 @@ mod tests {
     /// `timeout`, led by the name of its gripper, and frees its gripper.
     #[tokio::test]
     async fn a_close_whose_travel_runs_out_of_its_timeout_fails_naming_its_gripper() {
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
-        let (goal, mut ends, _cancelled) = left_close();
+        let (goal, mut ends, _cancelled) = left_close(claim);
         queue.try_send(goal).expect("queue the close");
         let mut mv = None;
         let start = Instant::now();
@@ -1256,10 +1258,10 @@ mod tests {
     /// no move starts, and the close frees its gripper.
     #[tokio::test]
     async fn a_stop_since_its_admission_ends_a_close_before_it_starts() {
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         move_slot.stop_unstarted("stopped: the operator asked");
         let (queue, mut goals) = mpsc::channel(1);
-        let (goal, mut ends, _cancelled) = left_close();
+        let (goal, mut ends, _cancelled) = left_close(claim);
         queue.try_send(goal).expect("queue the close");
         let mut mv = None;
 
@@ -1275,17 +1277,22 @@ mod tests {
         assert!(mv.is_none() && !move_slot.is_claimed());
     }
 
-    /// The stop service ends a close that waits on its queue cancelled, for
+    /// The robot stop ends a close that waits on its queue cancelled, for
     /// the stop's reason.
     #[tokio::test]
     async fn a_stop_ends_a_queued_close_cancelled_for_its_reason() {
-        let (goal, mut ends, _cancelled) = left_close();
+        let (move_slot, claim) = claimed_move_slot();
+        let (goal, mut ends, _cancelled) = left_close(claim);
         goal.stop("stopped: the operator asked", 1.0).await;
         assert_eq!(
             ends.try_recv(),
             Ok(Outcome::Cancelled(
                 "stopped: the operator asked".to_string()
             ))
+        );
+        assert!(
+            !move_slot.is_claimed(),
+            "the stopped close frees its gripper"
         );
     }
 
@@ -1329,6 +1336,7 @@ mod tests {
     async fn send_left_gripper_goal(
         harness: &Harness,
         accepted: &mut mpsc::Receiver<move_gripper::GoalContext>,
+        claim: SlotRelease,
     ) -> (fixture::GoalHandle, GripperGoal) {
         let request = move_gripper::GoalRequestData {
             gripper_name: "left_gripper".to_string(),
@@ -1351,6 +1359,7 @@ mod tests {
             settle_timeout: MOVE_TIMEOUT,
             travel_timeout: None,
             reply: GripperReply::MoveGripper(Box::new(ctx)),
+            move_slot: claim,
         };
         (handle, goal)
     }
@@ -1358,12 +1367,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_queued_goal_failed_on_a_stale_follower_frees_the_arm_for_the_next_goal() {
         let (harness, mut accepted) = accepting_gripper_goals().await;
-        let move_slot = claimed_move_slot();
+        let (move_slot, claim) = claimed_move_slot();
         let (queue, mut goals) = mpsc::channel(1);
         let mut mv = None;
         let start = Instant::now();
 
-        let (stale_goal, goal) = send_left_gripper_goal(&harness, &mut accepted).await;
+        let (stale_goal, goal) = send_left_gripper_goal(&harness, &mut accepted, claim).await;
         queue.try_send(goal).expect("queue the goal");
         service_gripper_move(
             &mut mv,
@@ -1394,8 +1403,8 @@ mod tests {
             "the failure releases the claim of its admission"
         );
 
-        assert!(move_slot.claim(), "the handler admits the next goal");
-        let (_next_goal, goal) = send_left_gripper_goal(&harness, &mut accepted).await;
+        let claim = move_slot.claim().expect("the handler admits the next goal");
+        let (_next_goal, goal) = send_left_gripper_goal(&harness, &mut accepted, claim).await;
         queue.try_send(goal).expect("queue the goal");
         service_gripper_move(
             &mut mv,

@@ -10,13 +10,13 @@ import sys
 from pathlib import Path
 
 import pytest
+from sim_robot_core.object_state import ObjectRecord, ObjectStateSnapshot, RobotRecord
 
-import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime sim_topics imports)
+import runtime_fakes  # installs the runtime sim_topics imports
 
 _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 sys.path.insert(0, str(_ENGINE_DIR))
 
-import object_state  # noqa: E402  (beside sim_topics on the engine path)
 import sim_topics  # noqa: E402  (needs the runtime fakes)
 
 
@@ -118,6 +118,19 @@ def test_publish_lands_the_recorded_instant_in_nanoseconds(io, loop):
     assert io._clock_publisher.published == [2_500_000_000]
 
 
+@pytest.mark.parametrize("engine_time_s, stamp_ns", [(2.01, 2_010_000_000), (4.1, 4_100_000_000)])
+def test_the_tick_carries_the_instant_of_the_stamps_of_its_step(io, loop, engine_time_s, stamp_ns):
+    """As a float, 4.1 s lies just under 4 100 000 000 ns: the wire carries a
+    stamp of it at the nearest nanosecond, and the tick carries that same
+    instant, so a consumer whose clock reads the tick has reached the stamp."""
+    io.record_engine_time(engine_time_s)
+    io.publish_clock_tick()
+    loop.run_until_complete(_drain())
+    stamp = runtime_fakes.convert_time(io.timestamp_s())
+    assert stamp.sec * runtime_fakes.NANOS_PER_SEC + stamp.nsec == stamp_ns
+    assert io._clock_publisher.published == [stamp_ns]
+
+
 def test_a_tick_arriving_mid_flight_is_latched_never_reordered(io, loop):
     publisher = io._clock_publisher
 
@@ -171,13 +184,15 @@ def test_the_placements_stand_at_the_start_of_the_timeline_until_the_first_step(
     # A publisher that has not recorded a step stamps the robots' placements
     # at the instant a timeline at zero carries, and at the engine clock once
     # it steps.
-    assert io.placement_timestamp_s() == sim_topics._MIN_ENGINE_TIME_S
+    assert io.placement_timestamp_s(None) == sim_topics._MIN_ENGINE_TIME_S
     io.record_engine_time(3.25)
-    assert io.placement_timestamp_s() == 3.25
+    assert io.placement_timestamp_s(None) == 3.25
+    # The world's records hold at the step that recorded them.
+    assert io.placement_timestamp_s(2.5) == 2.5
 
     follower = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=_Robots())
     monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 7_000_000_000)
-    assert follower.placement_timestamp_s() == 7.0
+    assert follower.placement_timestamp_s(None) == 7.0
 
 
 class _GatedPublisher:
@@ -195,24 +210,27 @@ class _GatedPublisher:
 def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight(io, loop, monkeypatch):
     topic = sim_topics.object_states
     monkeypatch.setattr(topic, "MessageObjectsItem", lambda **fields: fields, raising=False)
+    monkeypatch.setattr(topic, "MessageRobotsItem", lambda **fields: fields, raising=False)
     monkeypatch.setattr(
-        topic, "build_message", lambda frame, timestamp, objects: (frame, timestamp, objects), raising=False
+        topic, "build_message", lambda frame, timestamp, objects, robots: (frame, timestamp, objects, robots), raising=False
     )
     publisher = _GatedPublisher()
     io._object_states_pub = publisher
 
-    def snapshot(timestamp_s, *object_ids):
-        return object_state.ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
-            object_state.ObjectRecord(
+    robot = RobotRecord.fixed("alpha", "openarm_v2", (0.0, -1.5, 0.0), (0.0, 0.0, 0.0, 1.0))
+
+    def snapshot(timestamp_s, *object_ids, robots=()):
+        return ObjectStateSnapshot(timestamp_s=timestamp_s, objects=tuple(
+            ObjectRecord(
                 object_id=object_id, name=object_id, asset_id="props/blocks/red_block", physics="dynamic", mass=0.1,
                 scale=1.0,
                 position=(0.5, 0.0, 0.8), orientation=(0.0, 0.0, 0.0, 1.0),
                 linear_velocity=(0.0, 0.0, -0.2), angular_velocity=(0.0, 0.0, 0.0),
             )
             for object_id in object_ids
-        ))
+        ), robots=robots)
 
-    first, second, third = snapshot(1.5, "obj_a", "obj_b"), snapshot(1.6, "obj_a"), snapshot(1.7)
+    first, second, third = snapshot(1.5, "obj_a", "obj_b", robots=(robot,)), snapshot(1.6, "obj_a"), snapshot(1.7)
 
     async def scenario():
         publisher.gate = asyncio.Event()
@@ -226,6 +244,6 @@ def test_object_snapshots_publish_whole_in_world_and_drop_while_one_is_in_flight
 
     loop.run_until_complete(scenario())
     assert publisher.payloads == [
-        ("world", 1.5, [record.fields() for record in first.objects]),
-        ("world", 1.7, []),
+        ("world", 1.5, [record.fields() for record in first.objects], [robot.fields()]),
+        ("world", 1.7, [], []),
     ]

@@ -5,6 +5,8 @@ from typing import Optional
 
 import numpy as np
 
+from object_state import origin_velocity
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +94,51 @@ class IsaacArticulation:
         except Exception as exc:
             logger.warning(f"Could not read joint states: {exc}")
             return None
+
+    def get_root_state(self):
+        """The world pose of the articulation's root body, PhysX's first, and
+        its velocities at its origin, in world: (position, orientation (x, y,
+        z, w), linear, angular). PhysX gives the root's linear velocity at its
+        centre of mass, which is carried to the origin here. None when the
+        view cannot read."""
+        if self._view is None:
+            return None
+        try:
+            positions, orientations = self._view.get_world_poses()
+            velocities = self._view.get_velocities()
+            com_positions, _ = self._view.get_body_coms(body_indices=np.array([0]))
+            w, x, y, z = (float(value) for value in orientations[0])
+            orientation = (x, y, z, w)
+            angular = tuple(float(value) for value in velocities[0][3:6])
+            linear = origin_velocity(
+                [float(value) for value in velocities[0][0:3]],
+                angular,
+                orientation,
+                [float(value) for value in com_positions[0][0]],
+            )
+            return tuple(float(value) for value in positions[0]), orientation, linear, angular
+        except Exception as exc:
+            logger.warning(f"Could not read the root of '{self._prim_path}': {exc}")
+            return None
+
+    def set_down_at(self, position, orientation) -> bool:
+        """Stands the articulation's root at `position` turned to
+        `orientation` (x, y, z, w), at rest: no velocity of its root and none
+        of its joints. True once written."""
+        if self._view is None:
+            return False
+        x, y, z, w = orientation
+        try:
+            self._view.set_world_poses(
+                positions=np.array([position], dtype=np.float32),
+                orientations=np.array([(w, x, y, z)], dtype=np.float32),
+            )
+            self._view.set_velocities(np.zeros((1, 6), dtype=np.float32))
+            self._view.set_joint_velocities(np.zeros((1, self._num_dof), dtype=np.float32))
+            return True
+        except Exception as exc:
+            logger.warning(f"Could not set down '{self._prim_path}': {exc}")
+            return False
 
     @property
     def num_dof(self) -> int:

@@ -2,21 +2,28 @@
 
 Bridges the physics thread (sync, runs the engine step in an executor) to the
 node_runner's asyncio loop, where peppygen pairing pub/sub lives. The engine
-plays the follower role of every limb's joint_link / gripper_link pairing on
-two slots, `arms` and `grippers`, each holding any number of pairs: one
-consume task per slot holds a generated `subscribe()` subscription (gap-free,
-in-order) and keeps the latest governed setpoint per limb of the robot in
-thread-safe slots; the physics thread reads those and publishes the robot's
-stamped measured state back on the pair of the same limb. A pair carries the
-copy its robot attached under and the link it comes from on the robot's
-side, which is what tells one robot's limbs from another's and one limb from
-the next (sim_robot_core.pairs), and a pair of a robot the engine does not
-stand is left alone. The engine also plays the camera role of the
-sim_rgb_camera_link / sim_rgbd_camera_link pairings on `rgb_cameras` and
-`rgbd_cameras`, one pair per rendered camera named after its relay, handing
-finished frames to the same loop and dropping a frame whose stream's
-previous publish is still in flight. Every hop is a generated peppygen
-pairing topic.
+plays the follower role of every limb's joint_link / gripper_link pairing and
+of every base's joint_link pairing on three slots, `arms`, `grippers` and
+`bases`, each holding any number of pairs: one consume task per slot holds a
+generated `subscribe()` subscription (gap-free, in-order) and hands each
+setpoint to sim_robot_core's `Setpoints`, which keeps the latest of each
+limb and base of each robot; the physics thread reads those and publishes
+the robot's stamped measured state back on the pair of the same limb or
+base. A pair carries the copy its robot attached under and the link it comes
+from on the robot's side, which is what tells one robot's parts from
+another's and one part from the next (sim_robot_core.pairs), and a pair of a
+robot the engine does not stand is left alone. The engine also plays the
+camera role of the sim_rgb_camera_link / sim_rgbd_camera_link pairings on
+`rgb_cameras` and `rgbd_cameras`, one pair per rendered camera named after
+its relay, handing finished frames to the same loop and dropping a frame
+whose stream's previous publish is still in flight. Every hop is a generated
+peppygen pairing topic.
+
+Beside the pairings, the engine implements object_state: the bridge captures
+one record per standing robot on each telemetry tick, stamped as that tick's
+states are, the object_states topic publishes each capture, and
+get_object_states answers the latest one. Its scene spawns no object, so a
+capture lists none.
 
 When the deployment names this instance the publisher of a clock domain, the
 physics thread records its engine clock each step (`record_engine_time`, ahead
@@ -34,14 +41,19 @@ import logging
 import math
 import threading
 import time
+from functools import partial
 from typing import Optional
 
 import peppylib
 from control_core_py.geometry import Pose
 from peppygen import clock
+from peppygen.emitted_topics.objects import object_states
+from peppygen.exposed_services.objects import get_object_states
 from peppylib.clock import ClockPublisher
 from peppygen.paired_topics.arms import joint_setpoints as arm_setpoints
 from peppygen.paired_topics.arms import joint_states as arm_states
+from peppygen.paired_topics.bases import joint_setpoints as base_setpoints
+from peppygen.paired_topics.bases import joint_states as base_states
 from peppygen.paired_topics.grippers import gripper_setpoints
 from peppygen.paired_topics.grippers import gripper_states
 from peppygen.paired_topics.rgb_cameras import geometry as rgb_geometry
@@ -52,9 +64,28 @@ from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
 from sim_robot_core.cameras import DISTORTION_MODEL
-from sim_robot_core.pairs import ARMS, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held, PairTable
+from sim_robot_core.object_state import ObjectStateSnapshot, RobotRecord
+from sim_robot_core.pairs import (
+    ARMS,
+    BASE_NAME,
+    BASES,
+    GRIPPERS,
+    RGB_CAMERAS,
+    RGBD_CAMERAS,
+    Held,
+    PairTable,
+)
+from sim_robot_core.setpoints import Setpoints
+from sim_robot_core.world import WORLD
 
 logger = logging.getLogger(__name__)
+
+# The topic each driven slot's setpoints arrive on.
+_SETPOINT_TOPICS = (
+    (ARMS, arm_setpoints),
+    (GRIPPERS, gripper_setpoints),
+    (BASES, base_setpoints),
+)
 
 # The clock topic reserves zero for "no tick observed yet", so the smallest
 # instant an engine can carry is one nanosecond. A timeline still sitting at
@@ -76,21 +107,12 @@ _INFO_SURFACE = "info"
 _GEOMETRY_SURFACE = "geometry"
 
 
-class _LatestSlot:
-    """Thread-safe latest-wins single value, written on the loop and read on the
-    physics thread."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._value = None
-
-    def set(self, value) -> None:
-        with self._lock:
-            self._value = value
-
-    def get(self):
-        with self._lock:
-            return self._value
+# What get_object_states answers until the first capture: not an empty scene.
+_NOT_CAPTURED = (
+    "MuJoCo has not captured its object state yet; it captures on each state tick once "
+    "the scene steps"
+)
+_PRECONDITION_FAILED = "precondition_failed"
 
 
 # How long one publish batch may stay in flight before the surface holding it
@@ -143,7 +165,8 @@ class _PublishGuard:
 
 class SimTopicIO:
     """Owns the typed pairing publishers + setpoint-consume tasks on the node
-    loop, and exposes thread-safe accessors the physics thread calls each step."""
+    loop, and the setpoints they take, which the physics thread reads each
+    step (`setpoints`)."""
 
     def __init__(
         self,
@@ -153,11 +176,15 @@ class SimTopicIO:
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        # The four slots, read into robots, limbs and cameras.
+        # The robots in the scene, of which a capture of object_state lists
+        # the ones that stand.
+        self._robots = robots
+        # The five slots, read into robots, limbs, bases and cameras.
         self._pairs = PairTable(
             {
                 ARMS: lambda: arm_setpoints.peers(node_runner),
                 GRIPPERS: lambda: gripper_setpoints.peers(node_runner),
+                BASES: lambda: base_setpoints.peers(node_runner),
                 RGB_CAMERAS: lambda: rgb_video.peers(node_runner),
                 RGBD_CAMERAS: lambda: rgbd_video.peers(node_runner),
             },
@@ -165,15 +192,24 @@ class SimTopicIO:
         )
         self._arm_pub: Optional[peppylib.PeerPublisher] = None
         self._gripper_pub: Optional[peppylib.PeerPublisher] = None
-        # The latest setpoint of one limb of one robot, keyed by (limb, robot).
-        self._arm_cmd: dict[tuple[str, str], _LatestSlot] = {}
-        self._gripper_cmd: dict[tuple[str, str], _LatestSlot] = {}
-        self._cmd_lock = threading.Lock()
+        self._base_pub: Optional[peppylib.PeerPublisher] = None
+        # The latest setpoint of each limb and base of each robot, whose
+        # models give each limb and base its joint count.
+        self.setpoints = Setpoints(self._pairs, robots)
+        # Held while a camera's guard is made, on the thread that renders.
+        self._guards_lock = threading.Lock()
         # Camera publishers and their in-flight guards, keyed by (slot, topic)
         # and (robot, camera, surface); a slot's publisher reaches every
         # camera paired on it, so the guard is per robot and camera.
         self._camera_pubs: dict[tuple[str, str], peppylib.PeerPublisher] = {}
         self._camera_guards: dict[tuple[str, str, str], _PublishGuard] = {}
+        # The object_states publisher and its in-flight guard, and the latest
+        # capture, which get_object_states answers: written on the physics
+        # thread, read on the loop.
+        self._object_states_pub: Optional[peppylib.TopicPublisher] = None
+        self._object_states_guard = _PublishGuard()
+        self._snapshot: Optional[ObjectStateSnapshot] = None
+        self._snapshot_lock = threading.Lock()
         self._tasks: list[asyncio.Task] = []
         # Set in start() when the deployment names this instance the
         # publisher of a clock domain.
@@ -202,6 +238,8 @@ class SimTopicIO:
             logger.info(f"publishing clock domain {self._clock_publisher.domain}")
         self._arm_pub = await arm_states.declare_publisher(self._node_runner)
         self._gripper_pub = await gripper_states.declare_publisher(self._node_runner)
+        self._base_pub = await base_states.declare_publisher(self._node_runner)
+        self._object_states_pub = await object_states.declare_publisher(self._node_runner)
         await self._declare_camera_publishers(
             RGB_CAMERAS,
             [(_VIDEO_STREAM, rgb_video), (_STREAM_INFO, rgb_info), (_GEOMETRY, rgb_geometry)],
@@ -215,113 +253,66 @@ class SimTopicIO:
                 (_GEOMETRY, rgbd_geometry),
             ],
         )
+        # The consume tasks end with their subscriptions or the node's
+        # cancellation; the service runs for the life of the node.
+        runner = self._node_runner
+        token = runner.cancellation_token()
         self._tasks = [
-            asyncio.create_task(self._consume_arms()),
-            asyncio.create_task(self._consume_grippers()),
+            *(
+                asyncio.create_task(
+                    self.setpoints.consume(slot, partial(topic.subscribe, runner), token)
+                )
+                for slot, topic in _SETPOINT_TOPICS
+            ),
+            asyncio.create_task(self._serve_object_states()),
         ]
 
     async def stop(self) -> None:
         for task in self._tasks:
             task.cancel()
-        # Let the cancellations land so the consume loops exit before teardown.
+        # Let the cancellations land so the loops exit before teardown.
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def _consume_arms(self) -> None:
-        subscription = await arm_setpoints.subscribe(self._node_runner)
+    async def _serve_object_states(self) -> None:
+        """Answers get_object_states for the life of the node. When the
+        service stops, its request stream ended or it could not listen, the
+        log says why and it listens again a second later."""
         while True:
             try:
-                pair = await subscription.next()
-                if pair is None:
-                    return
+                await get_object_states.handle_requests(
+                    self._node_runner, self._answer_object_states
+                )
             except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                # A corrupt frame is dropped and logged rather than killing
-                # this consume task; the pause keeps a persistent fault from
-                # hot-spinning the loop.
-                logger.warning(f"{ARMS} setpoint consume error: {exc}")
-                await asyncio.sleep(0.1)
-                continue
-            peer, msg = pair
-            named = self._pairs.pair_of(ARMS, peer)
-            if named is None:
-                continue
-            robot, arm = named
-            # Drop a poisoned setpoint rather than writing NaN/Inf into the sim.
-            if not all(math.isfinite(v) for v in msg.positions) or not all(
-                math.isfinite(v) for v in msg.velocities
-            ):
-                logger.warning(f"dropping non-finite setpoint for '{robot}' {arm}")
-                continue
-            slot = self._command_slot(self._arm_cmd, arm, robot)
-            if slot.get() is None:
-                logger.info(f"first setpoint for '{robot}' {arm}")
-            slot.set((msg.positions, msg.velocities))
+                raise
+            except Exception:  # pylint: disable=W0718
+                logger.exception("get_object_states service failed")
+            else:
+                logger.warning("get_object_states service: its request stream ended")
+            await asyncio.sleep(1.0)
 
-    async def _consume_grippers(self) -> None:
-        subscription = await gripper_setpoints.subscribe(self._node_runner)
-        while True:
-            try:
-                pair = await subscription.next()
-                if pair is None:
-                    return
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                # A corrupt frame is dropped and logged rather than killing
-                # this consume task; the pause keeps a persistent fault from
-                # hot-spinning the loop.
-                logger.warning(f"{GRIPPERS} setpoint consume error: {exc}")
-                await asyncio.sleep(0.1)
-                continue
-            peer, msg = pair
-            named = self._pairs.pair_of(GRIPPERS, peer)
-            if named is None:
-                continue
-            robot, gripper = named
-            if not (
-                math.isfinite(msg.opening)
-                and math.isfinite(msg.max_effort)
-                and msg.max_effort >= 0.0
-            ):
-                logger.warning(f"dropping unusable setpoint for '{robot}' {gripper}")
-                continue
-            # max_effort caps the finger drive effort in engine units; 0
-            # (unset on the wire) leaves the engine's own force ceiling.
-            slot = self._command_slot(self._gripper_cmd, gripper, robot)
-            if slot.get() is None:
-                logger.info(f"first setpoint for '{robot}' {gripper}")
-            slot.set((msg.opening, msg.max_effort))
-
-    def _command_slot(self, slots: dict, limb: str, robot: str) -> "_LatestSlot":
-        with self._cmd_lock:
-            return slots.setdefault((limb, robot), _LatestSlot())
+    def _answer_object_states(self, _request) -> get_object_states.Response:
+        """The latest capture, in world. No capture yet is not an empty
+        scene: it gives an error reply with `precondition_failed`, as
+        object_state:v1 says of an implementer that is not ready."""
+        with self._snapshot_lock:
+            snapshot = self._snapshot
+        if snapshot is None:
+            raise get_object_states.Failure(_PRECONDITION_FAILED, _NOT_CAPTURED)
+        return get_object_states.Response(
+            frame=WORLD,
+            timestamp=snapshot.timestamp_s,
+            objects=[],
+            robots=[
+                get_object_states.ResponseRobotsItem(**record.fields())
+                for record in snapshot.robots
+            ],
+        )
 
     def held_by(self, robot: str) -> Held:
-        """What `robot` holds on the four slots: the limbs its pairs drive and
-        the cameras they stream. Read on the node loop, which is what keeps a
-        robot in the scene and what its readiness asks."""
+        """What `robot` holds on the five slots: the limbs and the base its
+        pairs drive and the cameras they stream. Read on the node loop, which
+        is what keeps a robot in the scene and what its readiness asks."""
         return self._pairs.held_by(robot)
-
-    # --- called from the physics thread ---
-
-    def latest_arm_command(
-        self, robot: str, arm: str
-    ) -> Optional[tuple[list[float], list[float]]]:
-        slot = self._arm_cmd.get((arm, robot))
-        return slot.get() if slot is not None else None
-
-    def latest_gripper_command(self, robot: str, gripper: str) -> Optional[tuple[float, float]]:
-        slot = self._gripper_cmd.get((gripper, robot))
-        return slot.get() if slot is not None else None
-
-    def forget(self, robot: str) -> None:
-        """Drops what a robot that left the scene had commanded, so a robot
-        rejoining under the same name starts from its model's pose."""
-        with self._cmd_lock:
-            for slots in (self._arm_cmd, self._gripper_cmd):
-                for key in [key for key in slots if key[1] == robot]:
-                    del slots[key]
 
     def record_engine_time(self, engine_time_s: float) -> None:
         """Adopt this step's engine clock for every stamp this engine emits.
@@ -340,7 +331,9 @@ class SimTopicIO:
         """Publish the recorded engine clock on the telemetry cadence. At most
         one publish is in flight; a tick arriving while one is out is latched
         and sent when it completes, so a slow send can delay the domain's clock
-        but never reorder it.
+        but never reorder it. The tick carries the instant that the stamps of
+        its step carry on the wire, so a consumer whose clock reads the tick
+        has reached every stamp of the step.
 
         Called from the physics thread, which must never block on messaging,
         so the publish is handed to the node loop like every other."""
@@ -351,7 +344,7 @@ class SimTopicIO:
             raise RuntimeError(
                 "a domain's publisher must record an engine step before publishing"
             )
-        time_ns = int(engine_time_s * 1e9)
+        time_ns = _wire_ns(engine_time_s)
         try:
             self._loop.call_soon_threadsafe(self._publish_clock_tick_on_loop, time_ns)
         except RuntimeError:
@@ -406,6 +399,48 @@ class SimTopicIO:
         # Efforts are empty: the engine measures no joint torques.
         payload = arm_states.build_message(self.timestamp_s(), positions, velocities, [])
         self._schedule_publish(self._arm_pub, ARMS, robot, arm, payload)
+
+    def publish_base_states(
+        self, robot: str, positions: list[float], velocities: list[float]
+    ) -> None:
+        """The measured angles and rates of `robot`'s wheels, left then
+        right, on its base's pair."""
+        if self._base_pub is None:
+            return
+        # Efforts are empty, as an arm's are: the engine measures no joint
+        # torques.
+        payload = base_states.build_message(self.timestamp_s(), positions, velocities, [])
+        self._schedule_publish(self._base_pub, BASES, robot, BASE_NAME, payload)
+
+    def publish_object_states(self, robots: list[RobotRecord]) -> None:
+        """Captures object_state as the robots stand now, stamped as this
+        tick's states are: the capture get_object_states answers from here
+        on, published on the object_states stream unless the previous one is
+        still in flight. Of `robots`, the records of the robots in the
+        scene, it lists each the registry has stood, as object_state lists a
+        robot from the feedback that reports it standing. Called on the
+        physics thread."""
+        standing = self._robots.standing()
+        snapshot = ObjectStateSnapshot(
+            timestamp_s=self.timestamp_s(),
+            objects=(),
+            robots=tuple(record for record in robots if record.robot in standing),
+        )
+        with self._snapshot_lock:
+            self._snapshot = snapshot
+        if self._object_states_pub is None:
+            return
+        payload = object_states.build_message(
+            WORLD,
+            snapshot.timestamp_s,
+            [],
+            [object_states.MessageRobotsItem(**record.fields()) for record in snapshot.robots],
+        )
+        self._publish_batch(
+            self._object_states_guard,
+            object_states.TOPIC_NAME,
+            [(self._object_states_pub, payload)],
+        )
 
     def publish_gripper_states(
         self, robot: str, gripper: str, opening: float, force: float = 0.0
@@ -610,7 +645,7 @@ class SimTopicIO:
             )
 
     def _camera_guard(self, robot: str, name: str, surface: str) -> "_PublishGuard":
-        with self._cmd_lock:
+        with self._guards_lock:
             return self._camera_guards.setdefault((robot, name, surface), _PublishGuard())
 
     def _publish_guarded(
@@ -719,3 +754,11 @@ def _log_publish_error(task: asyncio.Task) -> None:
     exc = task.exception()
     if exc is not None:
         logger.warning(f"publish failed: {exc}")
+
+
+def _wire_ns(time_s: float) -> int:
+    """The instant a stamp of `time_s` seconds carries on the wire, in
+    nanoseconds: the whole seconds and the nearest nanosecond of the rest, as
+    peppylib encodes the timestamp of every message the engine builds."""
+    stamp = peppylib.encoding.convert_time(time_s)
+    return stamp.sec * peppylib.encoding.NANOS_PER_SEC + stamp.nsec

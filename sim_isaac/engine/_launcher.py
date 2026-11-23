@@ -10,7 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import TYPE_CHECKING, Optional, Protocol
 
 from control_core_py.geometry import PoseTarget, quaternion_of_yaw
 from sim_robot_core.cameras import FramePacer
@@ -18,6 +18,10 @@ from sim_robot_core.cameras import FramePacer
 from bridge_extension import IsaacBridgeExtension
 from object_state import RUNTIME_OBJECTS_PATH, object_prim_path
 from runtime_commander_server import RuntimeCommanderServer
+from world import FLOOR_TOLERANCE_M, GROUND_PRIM, World
+
+if TYPE_CHECKING:  # the stage's edit queue, which the launch builds
+    from edits import Edits
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +33,15 @@ _WARMUP_STEPS = 100
 
 # Frames given to the stage after a robot joins or leaves, before the
 # timeline plays again and after it does: the prim has to load and physics
-# has to pick it up before a view of it can read.
+# has to pick it up before a view of it can read. Also the most frames the
+# loop gives the views a removal took again to read
+# (SimLauncher._read_views_taken_again).
 _STAGE_SETTLE_STEPS = 30
+# Where the timeline ends (s), past any run. The engine clock adds up the
+# time the timeline plays (IsaacBridgeExtension._engine_time_s), and a new
+# stage ends its timeline at 100 time codes, at which a looping timeline goes
+# back to its start.
+_TIMELINE_END_S = 1e9
 _MAIN_RATE_LIMIT_ENABLED = "/app/runLoops/main/rateLimitEnabled"
 # The renderer and anti-aliasing Kit actually runs; both are requested through
 # SimulationApp's launch config and both can be changed by Kit afterwards.
@@ -40,6 +51,12 @@ _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 # The one prim a runtime scene (an Isaac environment or any USD) is referenced
 # under. Loading a scene replaces whatever is there.
 _RUNTIME_SCENE_PATH = "/World/RuntimeScene"
+
+# How far above and below z 0 the floor rule looks for a scene's floor (m):
+# a downward ray from this height to as far under z 0. The rule asks only
+# whether a floor lies within FLOOR_TOLERANCE_M of z 0, and a ray that starts
+# this low stays under a scene's ceilings and the tops of its furniture.
+_FLOOR_PROBE_M = 0.05
 
 # The runtime commands that remove or replace the prim at a runtime object's
 # path. Each refuses a name scene_manipulation spawned; a move keeps the prim.
@@ -85,6 +102,9 @@ class SimLauncher:
         self._anti_aliasing = anti_aliasing
         self._timeline = None
         self._extension: Optional[IsaacBridgeExtension] = extension
+        # Whether a removal took the bridge's views again (_remove_prim) since
+        # the loop last read them (_read_views_taken_again).
+        self._views_to_read = False
         # Told once how the boot ended: when the loop starts to stand the
         # robots that attach, or with the error that ended the boot first.
         # The node's setup waits for it.
@@ -284,9 +304,11 @@ class SimLauncher:
     def unbind(self) -> None:
         """Lets go of the stage so it can be changed: every view on an
         articulation stops reading, and the timeline stops so the prims can
-        move under it."""
+        move under it, each robot that rolls held where its wheels carried
+        it."""
         self._extension.unbind()
         if self._timeline is not None:
+            self._extension.hold_through_stop()
             self._timeline.stop()
 
     def rebind(self) -> None:
@@ -353,6 +375,10 @@ class SimLauncher:
             omni.timeline.get_timeline_interface()
         )
 
+        # The timeline plays on to _TIMELINE_END_S and never loops, so its
+        # time goes back only where it stops for an edit of the stage.
+        self._timeline.set_looping(False)
+        self._timeline.set_end_time(_TIMELINE_END_S)
         self._timeline.play()
 
     # ------------------------------------------------------------------
@@ -569,16 +595,17 @@ class SimLauncher:
         '_physics_view') until they are created again, as does the
         rigid-body view the object state reads. Every removal goes through
         here: the bridge's views are dropped before the prim goes and taken
-        again after, and the commander's are re-created on their next use.
-        Adding prims leaves them intact.
+        again after, and the loop reads them before its next step
+        (_read_views_taken_again), once the edit is whole: no update runs
+        inside it. The commander's are re-created on their next use. Adding
+        prims leaves them intact.
         """
 
         if not stage.GetPrimAtPath(path).IsValid():
             return False
 
         # A view of a prim that is edited under it stops reading, so the
-        # views go before the prim does and are taken again after; they read
-        # on the steps that follow.
+        # views go before the prim does and are taken again after.
         if self._extension is not None:
             self._extension.unbind()
 
@@ -588,6 +615,7 @@ class SimLauncher:
 
         if self._extension is not None:
             self._extension.bind()
+            self._views_to_read = True
 
         return True
 
@@ -638,6 +666,60 @@ class SimLauncher:
             )
         )
 
+        self._world.lay_floor_until_judged(stage)
+
+    def _judge_floor(self) -> None:
+        """Judges the floor when an edit asked for it: the stage's floor comes
+        up when the scene's own floor lies within FLOOR_TOLERANCE_M of z 0
+        under every floor spot (World.scene_floor_holds), and is laid again
+        otherwise. Runs after an update, so physics holds the scene and the
+        robots as the edit left them."""
+        if not self._world.take_floor_judgment():
+            return
+
+        import omni.usd
+
+        stage = omni.usd.get_context().get_stage()
+        spots = self._world.floor_spots()
+        heights = [self._floor_height(x, y) for x, y in spots]
+        logger.info(
+            "the scene's floor under %s: %s",
+            [[round(x, 3), round(y, 3)] for x, y in spots],
+            heights,
+        )
+        if not World.scene_floor_holds(heights):
+            if not stage.GetPrimAtPath(GROUND_PRIM).IsValid():
+                self._world.lay_floor(stage)
+                logger.info("the scene's floor does not hold every robot; the stage's floor is laid")
+            return
+        if self._remove_prim(stage, GROUND_PRIM):
+            logger.info(
+                "the scene's floor lies within %.3g m of z 0 under every robot; the stage's floor is taken up",
+                FLOOR_TOLERANCE_M,
+            )
+
+    def _floor_height(self, x: float, y: float) -> Optional[float]:
+        """The height of the scene's floor under (x, y) in world (m): the
+        highest collider a downward ray meets from _FLOOR_PROBE_M above z 0
+        to as far under it, the stage's floor and every robot left out, or
+        None when it meets none."""
+        import carb
+        from omni.physx import get_physx_scene_query_interface
+
+        left_out = (GROUND_PRIM, *(robot.prim() for robot in self._world.robots()))
+        heights = []
+
+        def take(hit) -> bool:
+            path = str(hit.collision)
+            if not any(path == root or path.startswith(root + "/") for root in left_out):
+                heights.append(float(hit.position.z))
+            return True
+
+        get_physx_scene_query_interface().raycast_all(
+            carb.Float3(x, y, _FLOOR_PROBE_M), carb.Float3(0.0, 0.0, -1.0), 2.0 * _FLOOR_PROBE_M, take
+        )
+        return max(heights, default=None)
+
     def _runtime_clear_scene(self) -> None:
         """Remove the currently loaded runtime scene."""
 
@@ -654,6 +736,8 @@ class SimLauncher:
             logger.info(
                 "No runtime scene to remove"
             )
+
+        self._world.lay_floor_until_judged(stage)
 
     def _runtime_load_usd_scene(
         self,
@@ -1411,8 +1495,10 @@ class SimLauncher:
             # the stage is live, so early steps are cheap no-ops.
             self._sim_app.update()
             update_s = time.monotonic() - iteration_start
+            self._judge_floor()
 
             if self._extension is not None:
+                self._read_views_taken_again()
                 self._extension.step()
 
                 if (
@@ -1452,6 +1538,18 @@ class SimLauncher:
                     update_s * 1e3,
                     (iteration_s - update_s) * 1e3,
                 )
+
+    def _read_views_taken_again(self) -> None:
+        """Reads the views a removal took again, once, before the step that
+        reads the robots: after the update that hands physics the edits of the
+        last iteration and after the floor's judgment, whose take-up is a
+        removal too. Up to _STAGE_SETTLE_STEPS updates run until every view
+        reads (IsaacBridgeExtension.resolve); a step reads the robots whose
+        views read."""
+        if not self._views_to_read:
+            return
+        self._views_to_read = False
+        self._extension.resolve(self._sim_app.update, _STAGE_SETTLE_STEPS)
 
     def _shutdown(self) -> None:
         self._ready.clear()

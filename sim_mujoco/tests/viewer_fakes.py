@@ -102,3 +102,31 @@ class Viewer:
 
     def _refresh_scene_from_gui(self) -> None:
         self._server.events.append("refresh")
+
+
+class TimedViewer(Viewer):
+    """mjviser's viewer with the time its tick steps for: the time since its
+    last tick on `clock`, whose start a new viewer holds at 0.0 until whoever
+    drives it sets it, stepped one timestep at a time up to `FRAME_STEPS`,
+    which stand for the frame its tick may step for; what is left past them
+    is dropped but for one step."""
+
+    FRAME_STEPS = 1_000
+
+    def __init__(self, model, data, server, step_fn, clock) -> None:
+        super().__init__(model, data, server, step_fn)
+        self._clock = clock
+        self._last_tick = 0.0
+        self._budget = 0.0
+
+    def _tick(self) -> None:
+        now = self._clock()
+        self._budget += now - self._last_tick
+        self._last_tick = now
+        timestep = self._model.opt.timestep
+        taken = 0
+        while self._budget >= timestep and taken < self.FRAME_STEPS:
+            self._step_fn(self._model, self._data)
+            self._budget -= timestep
+            taken += 1
+        self._budget = min(self._budget, timestep)

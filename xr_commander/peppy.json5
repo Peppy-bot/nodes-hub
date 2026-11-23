@@ -33,9 +33,9 @@
         { name: "rgbd_camera", tag: "v1", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
         // Whole-robot posture moves.
         { name: "postures", tag: "v1", link_id: "postures", cardinality: "zero_or_more" },
-        // The planned moves of each robot: a squeeze stops the moves in
+        // The robot stop of each robot: a squeeze stops the moves in
         // flight on the robot it takes.
-        { name: "limb_motion", tag: "v1", link_id: "limb_motion", cardinality: "zero_or_more" },
+        { name: "robot_stop", tag: "v1", link_id: "robot_stop", cardinality: "zero_or_more" },
         // Operator alerts from any producer the launcher wires, listed on
         // the status panel: the headset has no text channel of its own.
         // Unbound, the panel draws no alert section.
@@ -95,7 +95,7 @@
         { link_id: "sensor_streams", name: "hold" },
         { link_id: "sensor_streams", name: "release" },
         // Ends the planned moves in flight on the robot a squeeze takes.
-        { link_id: "limb_motion", name: "stop" },
+        { link_id: "robot_stop", name: "stop" },
         // The lease of the robot a person drives, and whether the headset
         // may move a robot whose lease is open or that it calls.
         { link_id: "fleet", name: "take" },

@@ -1,8 +1,9 @@
 """The scene the robots standing compose: the body of each one's MJCF that
 carries the robot, with its servos and its weight compensated as the release
 gives them, and the cameras of its rig when the engine renders, attached
-under its own prefix at its own placement. The scenes are real (tiny) MJCF
-compiled by MuJoCo.
+under its own prefix at its own placement, and a robot that rolls on a free
+joint of its own, its placement following where its wheels carry it. The
+scenes are real (tiny) MJCF compiled by MuJoCo.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import mujoco
 import pytest
-from entries import camera, entry, known as known_model, placement_at
+from entries import camera, entry, known as known_model, placement_at, wheeled
 
 import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime the world imports)
 
@@ -477,3 +478,57 @@ class TestTheRecordOfWhoStands:
         world.remove("ghost")
 
         assert [robot.instance for robot in world.robots()] == ["alpha"]
+
+
+def _wheeled():
+    return wheeled(mujoco_models.ASSETS_DIR)
+
+
+class TestARobotThatRolls:
+    def test_it_hangs_from_the_world_on_a_free_joint_named_as_it_is_at_its_placement(self):
+        world = World(renders=False)
+        world.add("india", _wheeled(), placement_at(1.5, -3.0, yaw=0.5))
+        model = world.compose().compile()
+
+        free = model.joint("india")
+        assert model.jnt_type[free.id] == mujoco.mjtJoint.mjJNT_FREE
+        assert model.body(int(model.jnt_bodyid[free.id])).name == "india"
+        assert model.body("india/chassis").parentid[0] == model.body("india").id
+        data = mujoco.MjData(model)
+        start = data.qpos[free.qposadr[0] : free.qposadr[0] + 7]
+        assert start[:3] == pytest.approx([1.5, -3.0, 0.0])
+        assert start[3:] == pytest.approx([math.cos(0.25), 0.0, 0.0, math.sin(0.25)])
+
+    def test_a_robot_that_holds_where_it_is_placed_hangs_on_no_free_joint(self):
+        world = World(renders=False)
+        world.add("charlo", _known(), placement_at(0.0))
+        model = world.compose().compile()
+        free = mujoco.mjtJoint.mjJNT_FREE
+        assert [model.joint(j).name for j in range(model.njnt) if model.jnt_type[j] == free] == []
+
+    def test_the_scene_lays_its_floor_once_however_many_robots_roll(self):
+        world = World(renders=False)
+        world.add("india", _wheeled(), placement_at(0.0))
+        world.add("juliet", _wheeled(), placement_at(3.0))
+        model = world.compose().compile()
+        plane = mujoco.mjtGeom.mjGEOM_PLANE
+        assert sum(1 for geom in range(model.ngeom) if model.geom_type[geom] == plane) == 1
+
+    def test_its_placement_follows_where_its_wheels_carried_it(self):
+        world = World(renders=False)
+        world.add("india", _wheeled(), placement_at(0.0))
+        world.follow("india", placement_at(1.0, 0.5, yaw=1.0))
+
+        (india,) = world.robots()
+        assert india.placement == placement_at(1.0, 0.5, yaw=1.0)
+        assert world.occupied(placement_at(1.0, 0.5 + SPOT_PITCH_M / 2))
+        assert not world.occupied(placement_at(0.0, -SPOT_PITCH_M / 2))
+
+    def test_no_robot_stands_under_the_name_of_the_scenes_world_body(self):
+        with pytest.raises(ValueError, match="'world' is the name of the scene's own body: join under another name"):
+            World(renders=False).add("world", _wheeled(), placement_at(0.0))
+
+    def test_a_robot_that_left_is_followed_nowhere(self):
+        world = World(renders=False)
+        world.follow("india", placement_at(1.0))
+        assert world.robots() == []

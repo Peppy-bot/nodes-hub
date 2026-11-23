@@ -108,6 +108,15 @@ def test_an_index_that_is_not_the_pinned_release_is_refused(tmp_path, store):
         waldo_catalogue.fetch(tmp_path / "staged", other, read=keys.__getitem__)
 
 
+@pytest.mark.parametrize("index", [b"[]", b'"catalogues"', b"null"], ids=["list", "string", "null"])
+def test_an_index_that_is_not_a_json_object_is_refused(tmp_path, store, index):
+    keys, digest = store
+    keys[f"catalogues/{digest}/index.json"] = index
+    with pytest.raises(ValueError, match=f"^the release index is not a JSON object naming catalogues/{digest}$"):
+        waldo_catalogue.fetch(tmp_path / "staged", digest, read=keys.__getitem__)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_a_robot_the_release_does_not_stand_is_refused(tmp_path, store):
     keys, digest = store
     with pytest.raises(ValueError, match=r"stands no robot \['hand'\]; it stands \['arm'\]"):

@@ -19,29 +19,27 @@ mujoco, which the builder runs on, and USD.
 from __future__ import annotations
 
 import math
-import os
-import platform
+import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pytest
 import robot_description_py
 from control_core_py.geometry import wxyz_of_xyzw
 
-from _base_images import IMAGES_DIR, shell_value
+from _base_images import IMAGES_DIR, baked_stage, only_on_linux_x86_64, shell_value
+from _bundles import check_bundle, check_the_date_is_required, check_the_release_is_the_pinned_one, staged_release
 
 mujoco = pytest.importorskip("mujoco")
 pytest.importorskip("pxr")
 from pxr import Usd, UsdGeom, UsdPhysics  # noqa: E402  pylint: disable=C0413
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-sys.path.insert(0, str(IMAGES_DIR))
 
 import build_so101  # noqa: E402  pylint: disable=C0413
-import waldo_catalogue  # noqa: E402  pylint: disable=C0413
+import mujoco_usd  # noqa: E402  pylint: disable=C0413
 
 JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper")
 LINKS = (
@@ -54,35 +52,22 @@ LINKS = (
     "moving_jaw_so101_v1_link",
 )
 
-# The bundle is built on Linux x86_64, the platform of the Isaac image. MuJoCo
-# rounds what it compiles differently on another architecture, so only there
-# is the stage built here the bundle's byte for byte.
-_BUILDS_THE_BUNDLES_BYTES = sys.platform == "linux" and platform.machine() == "x86_64"
-
-
-def _baked_stage() -> Optional[Path]:
-    """The stage the base image bakes, where the assets directory holds one."""
-    assets = os.environ.get("PEPPY_ROBOT_ASSETS_DIR")
-    if not assets:
-        return None
-    path = Path(assets) / "so101" / build_so101.STAGE_FILENAME
-    return path if path.is_file() else None
-
-
 @pytest.fixture(scope="module")
 def description() -> build_so101.Description:
     return build_so101.read_description()
 
 
 @pytest.fixture(scope="module")
-def stage_path(tmp_path_factory, description) -> Path:
-    baked = _baked_stage()
+def release(tmp_path_factory) -> Path:
+    return staged_release(tmp_path_factory, "SO101_RELEASE", build_so101.ROBOT_ID)
+
+
+@pytest.fixture(scope="module")
+def stage_path(request, tmp_path_factory, description) -> Path:
+    baked = baked_stage(build_so101.ROBOT_ID, build_so101.STAGE_FILENAME)
     if baked is not None:
         return baked
-    staged = os.environ.get("SO101_RELEASE")
-    release = Path(staged) if staged else tmp_path_factory.mktemp("so101_release") / "release"
-    # Stages the release, or checks the one staged there against its digest.
-    waldo_catalogue.fetch(release, robots=[build_so101.ROBOT_ID])
+    release = request.getfixturevalue("release")
     return build_so101.build_stage(
         release / build_so101.ROBOT_ID, description, tmp_path_factory.mktemp("so101_stage")
     )
@@ -160,10 +145,7 @@ def urdf_tool_frame_in_world(
     return _matrix(data.xpos[body], data.xquat[body]) @ fixed
 
 
-@pytest.mark.skipif(
-    not _BUILDS_THE_BUNDLES_BYTES,
-    reason="the bundle is built on Linux x86_64, and MuJoCo rounds differently elsewhere",
-)
+@only_on_linux_x86_64
 def test_the_stage_is_the_one_the_pinned_bundle_holds(stage_path):
     """isaac_assets.env pins the bundle the image bakes and the digest of the
     stage in it, and download_assets.sh refuses a bundle whose stage is
@@ -171,7 +153,28 @@ def test_the_stage_is_the_one_the_pinned_bundle_holds(stage_path):
     or of the mujoco pin that moves the stage fails here until the bundle is
     built and pinned again (README, the SO-101 stage)."""
     pins = (IMAGES_DIR / "isaac_assets.env").read_text()
-    assert build_so101.sha256(stage_path.read_bytes()) == shell_value(pins, "SO101_STAGE_SHA256")
+    assert mujoco_usd.sha256(stage_path.read_bytes()) == shell_value(pins, "SO101_STAGE_SHA256")
+
+
+def test_the_bundle_carries_upstreams_license_and_how_the_stage_changes_its_files(release, tmp_path):
+    """Beside the stage, the bundle carries upstream's LICENSE, and
+    MODIFICATIONS.md names the files of MuJoCo Menagerie's robotstudio_so101
+    the stage changes."""
+    _, manifest, modifications = check_bundle(build_so101, release, tmp_path)
+    assert re.search(
+        r"files at https://raw\.githubusercontent\.com/google-deepmind/mujoco_menagerie/[0-9a-f]{40}/"
+        r"robotstudio_so101/, under Apache-2\.0\. MuJoCo compiles so101\.xml",
+        modifications,
+    )
+    assert manifest["source"]["license"] == "Apache-2.0"
+
+
+def test_a_build_with_no_date_is_refused(release, tmp_path, capsys):
+    check_the_date_is_required(build_so101, release, tmp_path, capsys)
+
+
+def test_a_build_from_another_release_or_one_without_the_robot_is_refused(release, tmp_path, capsys):
+    check_the_release_is_the_pinned_one(build_so101, release, tmp_path, capsys)
 
 
 def test_the_links_are_the_urdfs(stage):

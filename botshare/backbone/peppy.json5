@@ -1,0 +1,196 @@
+// botshare_backbone: see src/lib.rs.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "botshare_backbone",
+    tag: "v1",
+    description: [
+      "The robot's backbone of a differential mobile base alone: a base on two driven wheels, left and right, that moves along its forward axis and turns. It opens no device: it leads the wheels over joint_link, paired with whatever follows joint_link for them, Waldo's bases slot in a simulation, so it runs the same in a simulation and on hardware.",
+      "Every velocity it executes, streamed by its leader of drive_link or planned for a base_motion goal, passes base_state's limiter, control_core's, at the base's limits, stepped on the node's clock (the simulation clock in a simulation), and becomes two wheel rates. Each wheel setpoint is a wheel angle plus the wheel rate over one step, with the rate as its feedforward velocity. The measured wheel angles give the base's odometry, which base_state and drive_link report, transforms places as odom to base_footprint, and base_motion's moves steer by, and they place the wheels' links on transforms.",
+      "It asks the robot's initializer for the robot's model on robot_identity and drives the bundled model the initializer names, holding the digest of the description the initializer serves to the one it was built with; the model's URDF in robot_description gives the base: its two wheels, their radius and the distance between them, and the outline of its parts on the floor. It runs its goals once the initializer reports the robot ready on robot_ready.",
+      "It places each goal by the robot's tree, as base_motion states: the transforms of the robot's initializer (the model's fixed joints) and of the other publishers bound to other_transforms, and the transforms it publishes itself, odom to base_footprint and its wheel joints, taken into the tree as it publishes them.",
+    ],
+    implements: [
+      // The measured motion of the base and what the base is: its odometry
+      // stream, and on demand its name, odometry source, the limits of its
+      // motion and its outline.
+      { name: "base_state", tag: "v1", link_id: "base_state" },
+      // The base's planned moves: a drive at one velocity for a time and a
+      // move to a pose near the robot, both run by this node.
+      { name: "base_motion", tag: "v1", link_id: "base_motion" },
+      // The robot stop: it ends every base goal and holds the base
+      // against the leader of drive_link.
+      { name: "robot_stop", tag: "v1", link_id: "robot_stop" },
+      // The transforms the base measures: odom to base_footprint with each
+      // base_states, and its wheel joints' at each wheel measurement.
+      { name: "transforms", tag: "v1", link_id: "transforms" },
+    ],
+    depends_on: {
+      contracts: [
+        { name: "robot_ready", tag: "v1", link_id: "robot_init" },
+        // The robot's model, whose bundled description (URDF) the base is built
+        // from. The base asks for it once its setup has returned, until the
+        // initializer answers, and holds the digest of the description the
+        // initializer serves to the one it was built with. A model whose URDF
+        // gives no differential base ends the node naming why.
+        { name: "robot_identity", tag: "v1", link_id: "robot_identity" },
+        // The robot's tree of frames, bound to the other publishers of the
+        // tree: the robot's initializer (the fixed joints). The base takes the
+        // transforms it publishes itself into the tree as it publishes them.
+        // Each move_base target is placed by it into odom, and each drive_base
+        // velocity and drive_link setpoint into the robot frame.
+        { name: "transforms", tag: "v1", link_id: "other_transforms", cardinality: "one_or_more" },
+      ],
+      pairings: [
+        // The velocity stream of the base's one leader of drive_link, which
+        // gets the base's state back with whether the base follows it.
+        { name: "drive_link", tag: "v1", role: "follower", link_id: "leader_base", cardinality: "zero_or_one" },
+        // The exclusive command loop with the wheels' follower: the base
+        // plays the leader role, streams the wheel angle setpoints down
+        // joint_setpoints and reads the measured wheel angles back on
+        // joint_states, both in the order [left, right]. The follower's
+        // duties: positions are each wheel's accumulated angle (rad), never
+        // wrapped, a positive angle on either wheel rolls the base forward,
+        // and each joint_states timestamp is on the node's clock. The slot
+        // takes the base's own name, the one describe_base answers: a
+        // simulation learns which robot part a pair drives from the name of
+        // the link on this side.
+        { name: "joint_link", tag: "v1", role: "leader", link_id: "base" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      // The base_motion contract's actions; formats come from the contract.
+      exposes: [
+        { link_id: "base_motion", name: "drive_base" },
+        { link_id: "base_motion", name: "move_base" },
+      ],
+    },
+    topics: {
+      emits: [
+        // The contract-backed odometry stream, while the wheels are not
+        // silent: the newest wheel measurement whose stamp the node's clock
+        // has reached, an older one the clock reached with it going
+        // unreported, and the last one again when 0.1 s pass without one and
+        // it is at most 0.5 s old.
+        { link_id: "base_state", name: "base_states" },
+        // The transform odom to base_footprint with each base_states, its
+        // start the odometry's start, and the two wheel joints' transforms
+        // at each wheel measurement, their start the node's start.
+        { link_id: "transforms", name: "transforms" },
+        // The model's fixed joints are the robot initializer's: the node
+        // publishes nothing here.
+        { link_id: "transforms", name: "static_transforms" },
+        // The follower role's state back-channel to the leader: the same
+        // measurement as base_states, with whether the base follows it.
+        { link_id: "leader_base", name: "drive_states" },
+        // The wheel setpoint of each step, [left, right]: angles (rad) and
+        // the wheel rates (rad/s) as feedforward velocities.
+        {
+          link_id: "base",
+          name: "joint_setpoints",
+          refine: { message_format: { positions: { $length: 2 }, velocities: { $length: 2 } } },
+        },
+      ],
+      consumes: [
+        // The leader's body velocity setpoints.
+        { link_id: "leader_base", name: "drive_setpoints" },
+        // The measured wheel angles (rad), [left, right].
+        {
+          link_id: "base",
+          name: "joint_states",
+          refine: { message_format: { positions: { $length: 2 } } },
+        },
+        // Every message of the other publishers of the robot's tree, taken
+        // into the tree the goals and setpoints are placed by.
+        { link_id: "other_transforms", name: "transforms" },
+        { link_id: "other_transforms", name: "static_transforms" },
+      ],
+    },
+    services: {
+      exposes: [
+        // What the base is, answered from the parameters and the model for
+        // the life of the node.
+        { link_id: "base_state", name: "describe_base" },
+        // The robot stop, answered by the control loop.
+        { link_id: "robot_stop", name: "stop" },
+      ],
+      consumes: [
+        { link_id: "robot_init", name: "is_ready" },
+        { link_id: "robot_identity", name: "get_identity" },
+        { link_id: "robot_identity", name: "get_description" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The limits of the base's motion along x, forward (m/s, m/s^2), and
+      // of its turn, counterclockwise (rad/s, rad/s^2), which describe_base
+      // answers as the x of its linear_limits and as its angular_limits, and
+      // base_state's limiter holds every velocity to: the range, its lowest
+      // value 0 or below and its highest 0 or above, not both 0; the
+      // acceleration and the deceleration, each above 0; and the deadband, 0
+      // or above and below the larger magnitude of the range.
+      // linear_limits' rest_velocity, above 0, is the largest speed each
+      // wheel measures along the floor while the base stands: the bound of
+      // the noise of the wheels' measurement. The base counts as at rest
+      // while its measured velocity along x lies within it and its turn rate
+      // within the turn of the two wheels each at rest_velocity, twice
+      // rest_velocity over the wheel separation of the model's URDF, which
+      // describe_base answers as angular_limits' rest_rate. move_base drives
+      // the base ahead and turns it the shorter way: linear_limits'
+      // max_velocity is above 0, and angular_limits' min_rate is below 0 and
+      // its max_rate above 0. A differential base moves along no y:
+      // describe_base gives its limits along y as 0.
+      linear_limits: {
+        min_velocity: "f64",
+        max_velocity: "f64",
+        max_acceleration: "f64",
+        max_deceleration: "f64",
+        deadband: "f64",
+        rest_velocity: "f64",
+      },
+      angular_limits: {
+        min_rate: "f64",
+        max_rate: "f64",
+        max_acceleration: "f64",
+        max_deceleration: "f64",
+        deadband: "f64",
+      },
+      // How often (Hz) base_state's limiter steps, on the node's clock: one
+      // of 20, 25, 40, 50, 100, 125, 200, 250, 500 and 1000, each a period of
+      // whole milliseconds. Each step moves the executed velocity by at most
+      // an acceleration limit over this rate and streams one wheel setpoint.
+      smoothing_frequency_hz: "f64",
+      // How many wheel measurements the odometry's reported velocity is the
+      // rolling mean of. At least 1.
+      velocity_rolling_window_size: "u32",
+      // The largest bearing (rad) at which move_base's drive goes on toward
+      // its target, whatever the goal's orientation tolerance, as Nav2's regulated
+      // pure pursuit turns in place toward its path past its
+      // rotate_to_heading_min_angle. Above 0.
+      rotate_to_heading_min_angle_rad: "f64",
+      // How long (s) robot_stop's stop waits for the control loop to take
+      // and answer it before it answers attempt_failed: below the deadline of
+      // the stop's callers. Above 0.
+      stop_answer_timeout_s: "f64",
+      // How long (s) the base keeps each moving transform of the robot's
+      // tree, counted back from the newest stamp of its child frame: finite
+      // and above 0. A goal stamped before that is refused with
+      // extrapolation. The default is tf2's default cache time
+      // (BUFFER_CORE_DEFAULT_CACHE_TIME), which MoveIt's planning scene
+      // monitor keeps.
+      cache_window_s: { $type: "f64", $default: 10.0 },
+      // How long (s) the placement of a goal or a setpoint waits, on the
+      // base's clock, for the robot's tree to place it at its timestamp:
+      // finite and 0 or above, 0 for no wait. A goal whose wait runs out is
+      // refused with the failure of the lookup, and a setpoint is dropped.
+      lookup_timeout_s: "f64",
+    },
+  },
+}

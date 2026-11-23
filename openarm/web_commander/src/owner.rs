@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use control_core::geometry::Pose;
+use control_core::move_seconds::MAX_MOVE_DURATION_S;
 use peppygen::NodeRunner;
 use peppylib::runtime::CancellationToken;
 use robot_description::{ArmId, PerArm};
@@ -786,10 +787,6 @@ impl Owner {
             .set_status(format!("{}: {what}", limb.name_of(arm)));
     }
 }
-
-/// The longest duration a limb_motion goal may request: the contract's bound,
-/// which the backbone refuses past.
-const MAX_MOVE_DURATION_S: f64 = 60.0;
 
 // Clamp a requested move duration into the contract's range (finite, 0..=60 s).
 // 0 = fastest.
