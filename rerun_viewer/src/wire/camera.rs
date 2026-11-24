@@ -9,8 +9,9 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
-use control_core::geometry::{Pose, Stamped};
+use camera_core::depth_camera::{
+    DepthCamera, DepthCameraError, DepthExtrinsics, DepthIntrinsics, read_depth_camera,
+};
 use control_core::latched_log::LatchedLog;
 use control_core::positive_finite::PositiveFinite;
 use control_core::receiving;
@@ -27,7 +28,7 @@ use tracing::{error, info};
 
 use crate::canvas::Canvas;
 use crate::draw::camera::{draw_cloud, draw_color_image, draw_depth_image};
-use crate::model::camera::{ColorImage, DepthCamera, DepthImage, strided_points};
+use crate::model::camera::{ColorImage, DepthImage, strided_points};
 use crate::wire::{SERVICE_TIMEOUT, Shared, sendable, stopped};
 
 /// What the depth follower draws, and how often.
@@ -43,68 +44,44 @@ pub struct DepthSettings {
     pub lookup_timeout: Duration,
 }
 
-/// An answer of the camera's services that the viewer cannot use.
+/// A depth unit of `depth_stream_info` that the viewer cannot scale samples by.
 #[derive(Debug, thiserror::Error, PartialEq)]
-pub enum CameraError {
-    #[error("depth_stream_info: depth_unit {0} is not a positive number of meters")]
-    DepthUnit(f32),
-    #[error("get_depth_intrinsics: {0}")]
-    Intrinsics(String),
-    #[error("get_depth_to_color_extrinsics: {0}")]
-    Extrinsics(String),
-    #[error(
-        "get_depth_intrinsics describes align_mode {intrinsics:?} and \
-         get_depth_to_color_extrinsics {extrinsics:?}"
-    )]
-    AlignModes {
-        intrinsics: String,
-        extrinsics: String,
-    },
-}
+#[error("depth_stream_info: depth_unit {0} is not a positive number of meters")]
+pub struct DepthUnitError(pub f32);
 
 /// The meters a count of the depth stream is.
 pub fn parse_depth_unit(
     info: &depth_stream_info::ResponseData,
-) -> Result<PositiveFinite, CameraError> {
-    PositiveFinite::parse(f64::from(info.depth_unit))
-        .map_err(|_| CameraError::DepthUnit(info.depth_unit))
+) -> Result<PositiveFinite, DepthUnitError> {
+    PositiveFinite::parse(f64::from(info.depth_unit)).map_err(|_| DepthUnitError(info.depth_unit))
 }
 
-/// The depth stream as `intrinsics` and `extrinsics` describe it.
-pub fn parse_depth_camera(
+/// The depth camera `intrinsics` and `extrinsics` describe, read by camera_core.
+fn parse_depth_camera(
     intrinsics: &get_depth_intrinsics::ResponseData,
     extrinsics: &get_depth_to_color_extrinsics::ResponseData,
-) -> Result<DepthCamera, CameraError> {
-    if intrinsics.align_mode != extrinsics.align_mode {
-        return Err(CameraError::AlignModes {
-            intrinsics: intrinsics.align_mode.clone(),
-            extrinsics: extrinsics.align_mode.clone(),
-        });
-    }
-    let lens = Pinhole::parse(&Intrinsics {
-        width: intrinsics.width,
-        height: intrinsics.height,
-        fx: intrinsics.fx,
-        fy: intrinsics.fy,
-        cx: intrinsics.cx,
-        cy: intrinsics.cy,
-        distortion_model: &intrinsics.distortion_model,
-        distortion: &intrinsics.distortion,
-    })
-    .map_err(|e| CameraError::Intrinsics(e.to_string()))?;
-    let depth_model = DepthModel::parse(&intrinsics.depth_model)
-        .map_err(|e| CameraError::Intrinsics(e.to_string()))?;
+) -> Result<DepthCamera, DepthCameraError> {
     let depth_to_color = &extrinsics.depth_to_color;
-    let depth_in_color = Pose::parse(depth_to_color.position, depth_to_color.orientation)
-        .and_then(|pose| Stamped::parse(&depth_to_color.frame, None, pose))
-        .map_err(|e| CameraError::Extrinsics(e.to_string()))?;
-    Ok(DepthCamera {
-        lens,
-        depth_model,
-        frame: depth_in_color.frame().clone(),
-        depth_in_color: depth_in_color.value().transform(),
-        align_mode: intrinsics.align_mode.clone(),
-    })
+    read_depth_camera(
+        &DepthIntrinsics {
+            width: intrinsics.width,
+            height: intrinsics.height,
+            fx: intrinsics.fx,
+            fy: intrinsics.fy,
+            cx: intrinsics.cx,
+            cy: intrinsics.cy,
+            distortion_model: &intrinsics.distortion_model,
+            distortion: &intrinsics.distortion,
+            depth_model: &intrinsics.depth_model,
+            align_mode: &intrinsics.align_mode,
+        },
+        &DepthExtrinsics {
+            frame: &depth_to_color.frame,
+            position: depth_to_color.position,
+            orientation: depth_to_color.orientation,
+            align_mode: &extrinsics.align_mode,
+        },
+    )
 }
 
 /// Draws the color frames, at most one each image interval, each shrunk to at most
@@ -442,26 +419,16 @@ impl CloudMaker {
     /// unknown.
     async fn learn(&mut self, depth: &CloudFrame) -> Result<CloudFrames, String> {
         let stale = self.camera.as_ref().is_none_or(|camera| {
-            camera.align_mode != depth.align_mode
-                || !camera.fits(&depth.image)
-                || camera.frame.as_str() != depth.frame
+            camera
+                .admits_frame(&depth.align_mode, &depth.frame)
+                .is_err()
+                || !depth.image.fits(&camera.lens)
         });
         if stale {
             let asked = self.ask_depth_camera().await?;
-            if asked.align_mode != depth.align_mode {
-                return Err(format!(
-                    "the depth frames carry align_mode {:?}, the geometry describes {:?}",
-                    depth.align_mode, asked.align_mode
-                ));
-            }
-            if asked.frame.as_str() != depth.frame {
-                return Err(format!(
-                    "the depth frames name the frame {:?}, get_depth_to_color_extrinsics places \
-                     the depth stream in {:?}",
-                    depth.frame,
-                    asked.frame.as_str()
-                ));
-            }
+            asked
+                .admits_frame(&depth.align_mode, &depth.frame)
+                .map_err(|e| e.to_string())?;
             self.camera = Some(asked);
         }
         let camera_frame = self
@@ -519,10 +486,12 @@ impl CloudMaker {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::model::placement::tests::close;
+    use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
 
-    pub(crate) fn intrinsics() -> get_depth_intrinsics::ResponseData {
+    fn intrinsics() -> get_depth_intrinsics::ResponseData {
         get_depth_intrinsics::ResponseData {
             width: 4,
             height: 3,
@@ -539,7 +508,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn extrinsics() -> get_depth_to_color_extrinsics::ResponseData {
+    fn extrinsics() -> get_depth_to_color_extrinsics::ResponseData {
         get_depth_to_color_extrinsics::ResponseData {
             align_mode: "depth_to_color".to_string(),
             depth_to_color: get_depth_to_color_extrinsics::ResponseDataDepthToColor {
@@ -550,47 +519,56 @@ pub(crate) mod tests {
         }
     }
 
+    // Each field of the two answers reaches the depth camera: a lens whose focal lengths and
+    // principal point differ on each axis, the depth model, the frame, the alignment, and
+    // the depth optical frame 0.1 m along the color one's x.
     #[test]
     fn the_geometry_makes_the_depth_camera_in_the_frame_the_extrinsics_name() {
-        let camera = parse_depth_camera(&intrinsics(), &extrinsics()).expect("valid");
-        assert_eq!(camera.lens.width(), 4);
+        let lens = get_depth_intrinsics::ResponseData {
+            fy: 3.0,
+            cy: 1.25,
+            ..intrinsics()
+        };
+        let mut offset = extrinsics();
+        offset.depth_to_color.position = [0.1, 0.0, 0.0];
+        let camera = parse_depth_camera(&lens, &offset).expect("valid");
+        let expected = Pinhole::parse(&Intrinsics {
+            width: 4,
+            height: 3,
+            fx: 2.0,
+            fy: 3.0,
+            cx: 1.5,
+            cy: 1.25,
+            distortion_model: "none",
+            distortion: &[],
+        })
+        .expect("a valid model");
+        assert_eq!(camera.lens, expected);
         assert_eq!(camera.depth_model, DepthModel::Z);
         assert_eq!(camera.frame.as_str(), "chest_color_optical_frame");
         assert_eq!(camera.align_mode, "depth_to_color");
+        assert!(close(
+            camera.depth_in_color.apply([0.0; 3]),
+            [0.1, 0.0, 0.0],
+            1e-12
+        ));
     }
 
+    // Each answer's align_mode reaches its own side of camera_core's refusal of two
+    // alignments.
     #[test]
-    fn geometry_the_viewer_cannot_use_is_refused() {
+    fn geometry_of_two_alignments_is_refused_naming_each_answers() {
         let mut other = extrinsics();
         other.align_mode = "none".to_string();
-        assert!(matches!(
-            parse_depth_camera(&intrinsics(), &other),
-            Err(CameraError::AlignModes { .. })
-        ));
-        let mut flat = intrinsics();
-        flat.fx = 0.0;
-        assert!(matches!(
-            parse_depth_camera(&flat, &extrinsics()),
-            Err(CameraError::Intrinsics(_))
-        ));
-        let mut unknown = intrinsics();
-        unknown.depth_model = "disparity".to_string();
-        assert!(matches!(
-            parse_depth_camera(&unknown, &extrinsics()),
-            Err(CameraError::Intrinsics(_))
-        ));
-        let mut long = extrinsics();
-        long.depth_to_color.orientation = [0.0, 0.0, 0.0, 2.0];
-        assert!(matches!(
-            parse_depth_camera(&intrinsics(), &long),
-            Err(CameraError::Extrinsics(_))
-        ));
-        let mut unframed = extrinsics();
-        unframed.depth_to_color.frame.clear();
-        assert!(matches!(
-            parse_depth_camera(&intrinsics(), &unframed),
-            Err(CameraError::Extrinsics(_))
-        ));
+        let refused = parse_depth_camera(&intrinsics(), &other).expect_err("two alignments");
+        assert!(
+            matches!(
+                &refused,
+                DepthCameraError::AlignModes { intrinsics, extrinsics }
+                    if intrinsics == "depth_to_color" && extrinsics == "none"
+            ),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -602,6 +580,6 @@ pub(crate) mod tests {
             encoding: "z16".to_string(),
             depth_unit: 0.0,
         };
-        assert_eq!(parse_depth_unit(&info), Err(CameraError::DepthUnit(0.0)));
+        assert_eq!(parse_depth_unit(&info), Err(DepthUnitError(0.0)));
     }
 }
