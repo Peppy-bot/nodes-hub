@@ -1,1032 +1,541 @@
-"""The lease follows the grip: the driver's holds against a scripted daemon
-and scripted backbones, each call recorded in the order it is made."""
+"""The shell of the grip world: the driver steps the world at each event and
+runs each step's effects, against a scripted daemon, scripted backbones and
+scripted posture goals, each call recorded in the order it is made. The
+world's own rules are `test_grip_world`'s."""
 
-import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from types import SimpleNamespace
+
+import pytest
 
 from tests.helpers import (
+    AGREED,
+    CHANGES_ENDED,
     DIRECTOR,
+    DIRECTOR_LEASE,
     HALTED,
+    HALTER,
     HEADSET,
+    HOME_REACHED,
+    POSE,
+    REFUSED_GOAL,
     RETRY_S,
+    ROBOT_FRAME,
+    SETTINGS,
     FakeCalls,
+    FakeGoals,
     FakeStops,
     ManualClock,
+    NoWireSlot,
+    Peer,
+    ScriptedHeadset,
     fleet_view,
-    following_fleet,
+    limits_given,
+    listed,
+    postures_of,
+    reported,
+    scripted_driver,
     settle,
+    states,
+    unlisted_driver,
 )
-from xr_commander.bus import Answered, Failed, Unanswered
-from xr_commander.drive import (
-    BASE,
-    GOALS_ENDED,
-    GRIP_HELD,
-    GRIP_JUST_RELEASED,
-    POSTURE,
-    Driver,
-    Lost,
-    Refusal,
-    Withdrawn,
-)
+from xr_commander.base import BaseReports, NotedStops, base_tick
+from xr_commander.bus import FLASH_S, Failed, Unanswered
+from xr_commander.clutch import HandClutch
+from xr_commander.devices import Hand, HandSample, Thumbstick
+from xr_commander.drive import Driver
 from xr_commander.fleet import (
-    DAEMON_SILENT,
     LEASE_NAME,
     DaemonLost,
-    Fleet,
+    Following,
     Holder,
     Lease,
     Starting,
     Timing,
 )
-from xr_commander.robots import JOIN_COMMAND
+from xr_commander.grip_world import (
+    GOAL_UNSENT,
+    ROBOT_NOTE,
+    Engaged,
+    Pin,
+    Press,
+    PressInputs,
+    Reading,
+    Ready,
+    Requesting,
+    Shutdown,
+    Slot,
+    Tick,
+    TickInputs,
+)
+from xr_commander.publish import MeasuredPoses, pose_tick
+from xr_commander.robots import PairedRobots
 
 TIDY = Holder("tidy_inst", "fixture-core")
-OPEN_LEASE = {"alpha": Lease(DIRECTOR, "tidy the table", open=True)}
-CLOSED_LEASE = {"alpha": Lease(DIRECTOR, "tidy the table", open=False)}
+CLOSED_LEASE = {"alpha": Lease(DIRECTOR, DIRECTOR_LEASE, open=False)}
 MINE = {"alpha": Lease(HEADSET, LEASE_NAME, open=False)}
-# The goal handle that a posture start returns.
-GOAL = "goal"
-
-
-def held() -> bool:
-    return True
-
-
-def released() -> bool:
-    return False
+# A drive_states of a base that follows, with unit limits along x and y and
+# of the turn.
+FOLLOWING = states(limits=limits_given(x=(-1.0, 1.0), y=(-1.0, 1.0), turn=(-1.0, 1.0)))
 
 
 @dataclass
 class Driving:
     """A driver, the calls it makes in one log, its daemon, its backbones,
-    its fleet, its clock, and the listings it gave the page at each
-    change."""
+    its posture goals, its clock, and the listing at each refresh of the
+    page."""
 
     driver: Driver
     log: list
     calls: FakeCalls
     stops: FakeStops
-    fleet: Fleet
+    goals: FakeGoals
     clock: ManualClock
     changes: list
-    cancelled: list = field(default_factory=list)
 
-    def squeeze(self, robot="alpha", grip="right", wanted=held):
-        return self.driver.acquire(robot, grip, wanted)
+    def squeeze(self, robot="alpha", hand=Hand.RIGHT, reading=Reading.SQUEEZE):
+        """A tick of `hand`'s arm grip reading `reading`, with `robot`
+        chosen and its arm pair pinned and ready."""
+        pins = frozenset({Pin(Slot.ARM, Peer(f"{robot} {hand} arm"))})
+        inputs = TickInputs({hand: reading}, robot, pins, pins, Ready(), Ready())
+        return self.driver.step(Tick(hand, inputs))
 
-    async def press(self, robot="alpha", start=None):
-        """A posture press whose start returns `GOAL` and tells the driver
-        how to cancel it, unless `start` says otherwise."""
-
-        async def started():
-            self.log.append(("goal", robot))
-            self.driver.on_posture_cancel(robot, lambda: self.cancelled.append(robot))
-            return GOAL
-
-        return await self.driver.start_posture_move(robot, start or started)
-
-    def engage(self, grip="right", robot="alpha"):
-        """The grip, a hand's or the base's, engages on `robot`, as its
-        stream does once the driver holds the robot for it."""
-        state = self.driver.grip(grip)
-        state.engaged, state.robot = True, robot
-
-    def release_grip(self, grip="right"):
-        """The grip is released, as its stream sees it: its release burst
-        starts."""
-        self.driver.grip(grip).engaged = False
-
-    def hold_stops(self) -> asyncio.Event:
-        """From now on each stop answers only once the returned event is
-        set."""
-        answer = asyncio.Event()
-        stop = self.stops.stop
-
-        async def held_stop(robot):
-            stopped = await stop(robot)
-            await answer.wait()
-            return stopped
-
-        self.stops.stop = held_stop
-        return answer
-
-    async def settled(self):
-        """Let every task that the driver spawned reach the daemon."""
-        await self.clock.idle()
-
-    def releases(self, robot="alpha") -> int:
-        return self.log.count(("release", robot))
+    def press(self, robot="alpha"):
+        """A press of the home posture button, no hand squeezing."""
+        inputs = PressInputs(False, robot, postures_of(robot))
+        return self.driver.step(Press("home", inputs))
 
 
 def driving(*robots, **view) -> Driving:
     clock = ManualClock()
     log = []
-    calls = FakeCalls(log)
-    stops = FakeStops(log)
-    fleet = following_fleet(*robots, **view)
+    calls, stops, goals = FakeCalls(log), FakeStops(log), FakeGoals(log)
     changes = []
-    driver = Driver(
-        fleet,
-        calls,
-        stops,
-        timing=Timing(retry_s=RETRY_S),
-        on_change=lambda: changes.append(fleet.view),
+    driver = unlisted_driver(
         clock=clock,
+        calls=calls,
+        stops=stops,
+        goals=goals,
+        timing=Timing(retry_s=RETRY_S),
+        on_change=lambda: changes.append(driver.world.fleet.view),
     )
-    return Driving(driver, log, calls, stops, fleet, clock, changes)
+    listed(driver, *robots, **view)
+    return Driving(driver, log, calls, stops, goals, clock, changes)
 
 
-# A squeeze
+# Calls, timers and notes
 
 
-async def test_a_squeeze_takes_the_lease_then_stops_the_moves_in_flight():
+async def test_a_call_effect_runs_as_a_task_and_its_outcome_steps_the_world():
     r = driving("alpha")
-    assert await r.squeeze() is None
+    world = r.squeeze()
+    # The step starts the call: its outcome comes as a later event.
+    assert isinstance(world.grips.right.phase, Requesting)
+    assert r.log == []
+    await settle()
     assert r.log == [("take", "alpha"), ("stop", "alpha")]
-    assert r.driver.holds("alpha")
-    assert len(r.changes) == 1
+    assert isinstance(r.driver.world.grips.right.phase, Engaged)
 
 
-async def test_a_refused_take_stops_nothing_and_names_the_holder():
+async def test_a_call_that_raises_steps_raised_with_its_text(capsys):
     r = driving("alpha")
-    r.calls.take_outcome = Failed("robot `alpha` is leased by `director_inst`")
-    assert await r.squeeze() == Refusal("robot `alpha` is leased by `director_inst`")
-    await r.settled()
-    assert r.log == [("take", "alpha")]
-    assert not r.driver.holds("alpha")
+
+    async def raising_take(robot):
+        r.log.append(("take", robot))
+        raise RuntimeError("x")
+
+    r.calls.take = raising_take
+    r.squeeze()
+    await settle()
+    # A take that raised may have reached the daemon: its lease is released.
+    assert r.log == [("take", "alpha"), ("release", "alpha")]
+    assert r.driver.note(Hand.RIGHT) == "squeeze refused: RuntimeError('x')"
+    assert "TakeLease of alpha raised: RuntimeError('x')" in capsys.readouterr().out
 
 
-async def test_a_take_the_daemon_does_not_answer_is_released():
+async def test_a_stop_reaches_the_robots_stops_and_its_refusal_is_a_failed_call():
+    r = driving("alpha")
+    r.stops.refusal = "alpha did not answer"
+    r.squeeze()
+    await settle()
+    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("release", "alpha")]
+    assert r.driver.note(Hand.RIGHT) == (
+        "squeeze refused: stop failed: alpha did not answer"
+    )
+
+
+@pytest.mark.parametrize(
+    ("handle", "line", "after"),
+    [
+        (SimpleNamespace(accepted=True), "moving to home...", []),
+        (REFUSED_GOAL, "move to home refused: busy", [("release", "alpha")]),
+        (
+            None,
+            f"move to home refused: {GOAL_UNSENT}",
+            [("stop", "alpha"), ("release", "alpha")],
+        ),
+    ],
+    ids=["accepted", "refused", "unsent"],
+)
+async def test_a_fired_goal_is_answered_accepted_failed_refused_or_unanswered_unsent(
+    handle, line, after
+):
+    r = driving("alpha")
+    r.goals.handle = handle
+    r.press()
+    await settle()
+    assert r.log == [
+        ("take", "alpha"),
+        ("stop", "alpha"),
+        ("check_move", "alpha_inst"),
+        ("goal", "home"),
+        *after,
+    ]
+    assert r.driver.posture_line() == line
+
+
+async def test_a_retry_timer_steps_retry_due_after_retry_s():
     r = driving("alpha")
     r.calls.take_outcome = Unanswered()
-    assert await r.squeeze() == Refusal(DAEMON_SILENT)
-    await r.settled()
-    # The daemon may have recorded the take: the release undoes it.
-    assert r.log == [("take", "alpha"), ("release", "alpha")]
-
-
-async def test_a_squeeze_released_during_the_take_stops_nothing_and_releases_the_lease():
-    r = driving("alpha")
-    assert await r.squeeze(wanted=released) == Withdrawn()
-    await r.settled()
-    assert r.log == [("take", "alpha"), ("release", "alpha")]
-    assert not r.driver.holds("alpha")
-
-
-async def test_a_squeeze_released_during_the_stop_releases_the_lease():
-    r = driving("alpha")
-    grip = [True]
-    stop = r.stops.stop
-
-    async def released_while_stopping(robot):
-        grip[0] = False
-        return await stop(robot)
-
-    r.stops.stop = released_while_stopping
-    assert await r.squeeze(wanted=lambda: grip[0]) == Withdrawn()
-    await r.settled()
-    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("release", "alpha")]
-
-
-async def test_the_lease_is_released_after_the_last_reason_only():
-    r = driving("alpha")
-    await r.squeeze(grip="right")
-    r.engage("right")
-    await r.squeeze(grip="left")
-    # The second hand joins the hold: no take and no stop.
-    assert r.log == [("take", "alpha"), ("stop", "alpha")]
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    assert r.releases() == 0
-    r.driver.drop("alpha", "left")
-    await r.settled()
-    assert r.log[-1] == ("release", "alpha")
-    assert not r.driver.holds("alpha")
-    assert len(r.changes) == 2
-
-
-async def test_the_base_holds_the_robot_beside_a_hand_until_the_last_of_them():
-    r = driving("alpha")
-    await r.squeeze(grip=BASE)
-    r.engage(BASE)
-    await r.squeeze(grip="left")
-    # The hand joins the base's hold: no take and no stop.
-    assert r.log == [("take", "alpha"), ("stop", "alpha")]
-    r.driver.drop("alpha", "left")
-    await r.settled()
-    assert r.releases() == 0
-    r.driver.drop("alpha", BASE)
-    await r.settled()
-    assert r.log[-1] == ("release", "alpha")
-
-
-async def test_a_squeeze_in_the_hands_own_burst_engages_with_no_take_and_no_stop():
-    r = driving("alpha")
-    await r.squeeze()
-    # The hand's reason stays until its release burst ends: a squeeze in the
-    # burst joins it.
-    assert await r.squeeze() is None
-    assert r.log == [("take", "alpha"), ("stop", "alpha")]
-
-
-async def test_two_hands_that_squeeze_at_once_take_the_robot_once():
-    r = driving("alpha")
-    left, right = await asyncio.gather(r.squeeze(grip="left"), r.squeeze())
-    assert (left, right) == (None, None)
-    assert r.log == [("take", "alpha"), ("stop", "alpha")]
-
-
-# A squeeze during a posture move
-
-
-async def test_a_squeeze_during_a_posture_move_stops_it_and_keeps_the_lease():
-    r = driving("alpha")
-    assert await r.press() == GOAL
-    assert await r.squeeze() is None
-    # The squeeze stops the move in flight, the headset's own included, and
-    # takes nothing: the posture move took the lease.
-    assert r.log == [
-        ("take", "alpha"),
-        ("stop", "alpha"),
-        ("goal", "alpha"),
-        ("stop", "alpha"),
-    ]
-    # The end of the stopped move releases nothing: the hand holds it.
-    r.driver.drop("alpha", POSTURE)
-    await r.settled()
-    assert r.releases() == 0
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    assert r.log[-1] == ("release", "alpha")
-
-
-async def test_the_end_of_the_posture_move_a_squeeze_stops_releases_nothing():
-    r = driving("alpha")
-    await r.press()
-    stop = r.stops.stop
-
-    async def ends_the_posture_move(robot):
-        # The backbone ends the posture goal before it answers the stop.
-        r.driver.drop("alpha", POSTURE)
-        return await stop(robot)
-
-    r.stops.stop = ends_the_posture_move
-    assert await r.squeeze() is None
-    await r.settled()
-    assert r.driver.holds("alpha") and r.releases() == 0
-
-
-async def test_a_failed_stop_of_a_posture_move_refuses_the_squeeze_and_keeps_the_move():
-    r = driving("alpha")
-    await r.press()
-    r.stops.refusal = "alpha did not answer"
-    assert await r.squeeze() == Refusal("stop failed: alpha did not answer")
-    assert not r.driver.holds_for("alpha", "right")
-    # The move holds the robot to its end, then releases it.
-    assert r.driver.holds_for("alpha", POSTURE)
-    r.driver.drop("alpha", POSTURE)
-    await r.settled()
-    assert r.releases() == 1
-
-
-async def test_a_squeeze_leaves_a_posture_move_on_another_robot_alone():
-    r = driving("alpha", "bravo")
-    await r.press("alpha")
-    await r.squeeze("bravo")
-    assert r.log == [
-        ("take", "alpha"),
-        ("stop", "alpha"),
-        ("goal", "alpha"),
-        ("take", "bravo"),
-        ("stop", "bravo"),
-    ]
-    assert r.driver.holds("alpha") and r.cancelled == []
-
-
-async def test_a_squeeze_during_a_posture_start_waits_and_stops_the_started_move():
-    r = driving("alpha")
-    starting = asyncio.Event()
-    go_on = asyncio.Event()
-
-    async def start():
-        starting.set()
-        await go_on.wait()
-        r.log.append(("goal", "alpha"))
-        return GOAL
-
-    press = asyncio.create_task(r.press(start=start))
-    await starting.wait()
-    squeeze = asyncio.create_task(r.squeeze())
-    # The squeeze waits for the start, which waits for the test.
+    r.calls.release_outcome = Unanswered()
+    r.squeeze()
     await settle()
-    assert not squeeze.done() and r.log == [("take", "alpha"), ("stop", "alpha")]
-    go_on.set()
-    assert await press == GOAL and await squeeze is None
-    # The squeeze stops the move once it runs.
-    assert r.log[-2:] == [("goal", "alpha"), ("stop", "alpha")]
+    assert r.log == [("take", "alpha"), ("release", "alpha")]
+    await r.clock.advance(RETRY_S / 2)
+    assert r.log.count(("release", "alpha")) == 1
+    await r.clock.advance(RETRY_S / 2)
+    assert r.log.count(("release", "alpha")) == 2
 
 
-# A posture press
-
-
-async def test_a_press_takes_the_robot_and_holds_it_for_its_move():
+async def test_a_note_flashes_on_its_row_for_three_seconds_and_is_logged(capsys):
     r = driving("alpha")
-    assert await r.press() == GOAL
-    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("goal", "alpha")]
-    assert r.driver.holds_for("alpha", POSTURE)
-
-
-async def test_a_posture_start_that_is_refused_releases_the_lease():
-    r = driving("alpha")
-
-    async def refused_start():
-        return Refusal("a leader is streaming arm commands")
-
-    assert await r.press(start=refused_start) == Refusal(
-        "a leader is streaming arm commands"
-    )
-    await r.settled()
-    assert not r.driver.holds("alpha") and r.releases() == 1
-
-
-async def test_a_posture_start_that_a_let_go_overtakes_is_refused_and_its_move_cancelled():
-    r = driving("alpha")
-
-    async def start_during_a_halt():
-        r.driver.fleet_changed(fleet_view(["alpha"], halted_by="peppy-cli"))
-        r.driver.on_posture_cancel("alpha", lambda: r.cancelled.append("alpha"))
-        return GOAL
-
-    assert await r.press(start=start_during_a_halt) == Refusal(
-        "the headset let go of alpha"
-    )
-    assert r.cancelled == ["alpha"]
-    assert not r.driver.holds("alpha")
-
-
-async def test_a_press_on_a_robot_a_grip_holds_is_refused():
-    r = driving("alpha")
-    await r.squeeze()
-    r.engage("right")
-    assert await r.press() == Refusal(GRIP_HELD)
-    r.release_grip()
-    assert await r.press() == Refusal(GRIP_JUST_RELEASED)
-    assert r.log == [("take", "alpha"), ("stop", "alpha")]
-    assert not r.driver.holds_for("alpha", POSTURE)
-
-
-async def test_a_press_on_a_robot_whose_base_a_grip_holds_is_refused():
-    r = driving("alpha")
-    await r.squeeze(grip=BASE)
-    r.engage(BASE)
-    assert await r.press() == Refusal(GRIP_HELD)
-    r.release_grip(BASE)
-    assert await r.press() == Refusal(GRIP_JUST_RELEASED)
-    assert not r.driver.holds_for("alpha", POSTURE)
-
-
-# The halt and the refusals
-
-
-async def test_a_halt_refuses_every_squeeze_and_press_and_names_who_halted():
-    r = driving("alpha", halted_by="peppy-cli")
-    assert await r.squeeze() == Refusal(HALTED)
-    assert await r.press() == Refusal(HALTED)
-    assert r.log == []
-
-
-async def test_a_halt_during_the_stop_refuses_the_squeeze_and_releases_the_lease():
-    r = driving("alpha")
-    stop = r.stops.stop
-
-    async def halts_while_stopping(robot):
-        answer = await stop(robot)
-        r.fleet.view = fleet_view(["alpha"], halted_by="peppy-cli")
-        r.driver.fleet_changed(r.fleet.view)
-        return answer
-
-    r.stops.stop = halts_while_stopping
-    assert await r.squeeze() == Refusal(HALTED)
-    await r.settled()
-    assert not r.driver.holds("alpha") and r.releases() == 1
-
-
-async def test_a_let_go_during_the_stop_of_a_posture_move_refuses_the_squeeze():
-    r = driving("alpha")
-    await r.press()
-    stop = r.stops.stop
-
-    async def halts_while_stopping(robot):
-        r.driver.fleet_changed(fleet_view(["alpha"], halted_by="peppy-cli"))
-        return await stop(robot)
-
-    r.stops.stop = halts_while_stopping
-    assert await r.squeeze() == Refusal("the headset let go of alpha")
-    assert not r.driver.holds("alpha")
-
-
-async def test_a_restart_of_the_goals_during_the_take_refuses_the_squeeze():
-    r = driving("alpha")
-    take = r.calls.take
-
-    async def restarts_while_taking(robot):
-        r.fleet.generation += 1
-        return await take(robot)
-
-    r.calls.take = restarts_while_taking
-    assert await r.squeeze() == Refusal(GOALS_ENDED)
-    assert not r.driver.holds("alpha")
-
-
-async def test_the_end_of_the_changes_goal_during_the_take_refuses_the_squeeze():
-    r = driving("alpha")
-    take = r.calls.take
-
-    async def ends_while_taking(robot):
-        # The goals have not started again yet: the listing is gone.
-        r.fleet.view = None
-        r.fleet.status = Starting()
-        return await take(robot)
-
-    r.calls.take = ends_while_taking
-    assert await r.squeeze() == Refusal(GOALS_ENDED)
-    assert not r.driver.holds("alpha")
-
-
-async def test_a_robot_outside_the_fleet_listing_is_not_driven_and_says_how_to_join():
-    r = driving("alpha")
-    assert await r.squeeze("backbone_inst") == Refusal(
-        "backbone_inst is not in the fleet listing, which holds the copies of the"
-        f" stack: join a robot as a copy with {JOIN_COMMAND}"
-    )
-    assert r.log == []
-
-
-async def test_a_lost_daemon_makes_every_squeeze_and_press_do_nothing():
-    r = driving("alpha")
-    r.fleet.status = DaemonLost()
-    assert await r.squeeze() == Refusal("the daemon is lost")
-    assert await r.press() == Refusal("the daemon is lost")
-    assert r.log == []
-
-
-async def test_a_failed_stop_takes_nothing_and_releases_the_lease():
-    r = driving("alpha")
-    r.stops.refusal = "alpha did not answer"
-    assert await r.squeeze() == Refusal("stop failed: alpha did not answer")
-    await r.settled()
-    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("release", "alpha")]
-    assert not r.driver.holds("alpha")
-
-
-# Letting go
-
-
-async def test_the_headset_lets_go_at_a_halt():
-    r = driving("alpha")
-    await r.press()
-    await r.squeeze()
-    r.engage("right")
-    r.driver.fleet_changed(fleet_view(["alpha"], halted_by="peppy-cli"))
-    # Let go as at a grip release: the hand disengages and waits for its
-    # grip to be released, the posture move is cancelled.
-    hand = r.driver.hands["right"]
-    assert not hand.engaged and hand.wait_release
-    assert r.cancelled == ["alpha"] and not r.driver.holds("alpha")
-    assert r.driver.note.text() == f"let go of alpha: {HALTED}"
-    assert r.driver.robot_line("alpha").text == f"let go of alpha: {HALTED}"
-    # The halt ended the lease: nothing is released.
-    await r.settled()
-    assert r.releases() == 0
-
-
-async def test_a_let_go_disengages_the_base_on_that_robot_and_waits_for_a_release():
-    r = driving("alpha")
-    await r.squeeze(grip=BASE)
-    r.engage(BASE)
-    r.driver.fleet_changed(fleet_view(["alpha"], halted_by="peppy-cli"))
-    assert not r.driver.base.engaged and r.driver.base.wait_release
-    assert not r.driver.holds("alpha")
-
-
-async def test_a_let_go_disengages_only_the_hands_on_that_robot():
-    r = driving("alpha", "bravo")
-    await r.squeeze("alpha", grip="right")
-    r.engage("right", "alpha")
-    await r.squeeze("bravo", grip="left")
-    r.engage("left", "bravo")
-    r.driver.let_go("alpha", "a test let go", release=True)
-    assert not r.driver.hands["right"].engaged
-    assert r.driver.hands["left"].engaged and not r.driver.hands["left"].wait_release
-    assert r.driver.holds("bravo")
-
-
-async def test_a_lease_end_the_daemon_confirms_lets_go():
-    r = driving("alpha")
-    await r.squeeze()
-    r.calls.check_outcome = Failed("headset_inst holds no lease of robot `alpha`")
-    r.driver.own_lease_ended("alpha", "")
-    await r.settled()
-    assert not r.driver.holds("alpha")
-    assert r.driver.note.text() == "let go of alpha: the lease ended"
-    # The lease ended: nothing is released.
-    assert r.log[-1] == ("check_move", "alpha") and r.releases() == 0
-
-
-async def test_the_end_of_its_own_release_lets_go_of_no_new_take():
-    r = driving("alpha")
-    await r.squeeze()
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    # The person squeezes again before the lease feedback gives the end that
-    # the release caused: the daemon allows the move at a revision that the
-    # listing has not reached yet.
-    await r.squeeze()
-    r.calls.check_outcome = Answered(2)
-    r.driver.own_lease_ended("alpha", "headset_inst released it")
-    await r.settled()
-    assert r.driver.holds("alpha")
-    assert r.log[-1] == ("check_move", "alpha")
-    # The listing of that revision names the headset: it drives on.
-    r.driver.fleet_changed(fleet_view(["alpha"], leases=MINE, revision=2))
-    assert r.driver.holds("alpha")
-
-
-async def test_a_yes_that_the_current_listing_settles_keeps_the_hold():
-    r = driving("alpha")
-    await r.squeeze()
-    r.fleet.view = fleet_view(["alpha"], leases=MINE, revision=2)
-    r.calls.check_outcome = Answered(2)
-    r.driver.own_lease_ended("alpha", "headset_inst released it")
-    await r.settled()
-    assert r.driver.holds("alpha")
-
-
-async def test_a_yes_that_the_current_listing_settles_against_the_headset_lets_go():
-    r = driving("alpha")
-    await r.squeeze()
-    r.calls.check_outcome = Answered(3)
-    r.driver.own_lease_ended("alpha", "the stack was reset")
-    # The listing of the director's open lease comes before the daemon's yes.
-    r.fleet.view = fleet_view(["alpha"], leases=OPEN_LEASE, revision=3)
-    r.driver.fleet_changed(r.fleet.view)
-    assert r.driver.holds("alpha")
-    await r.settled()
-    assert not r.driver.holds("alpha")
-    assert r.driver.note.text() == "let go of alpha: the stack was reset"
-
-
-async def test_the_earliest_yes_settles_two_lease_ends():
-    r = driving("alpha")
-    await r.squeeze()
-    for revision in (5, 7):
-        r.calls.check_outcome = Answered(revision)
-        r.driver.own_lease_ended("alpha", f"the end read at {revision}")
-        await r.settled()
-    r.driver.fleet_changed(fleet_view(["alpha"], revision=5))
-    assert not r.driver.holds("alpha")
-    assert r.driver.note.text() == "let go of alpha: the end read at 5"
-
-
-async def test_a_yes_under_another_clients_open_lease_lets_go_at_the_listing():
-    r = driving("alpha")
-    await r.squeeze()
-    # A reset ends the lease, and the director takes and opens it before the
-    # daemon answers: the yes is for the director's open lease.
-    r.calls.check_outcome = Answered(3)
-    r.driver.own_lease_ended("alpha", "the stack was reset")
-    await r.settled()
-    r.driver.fleet_changed(fleet_view(["alpha"], leases=OPEN_LEASE, revision=3))
-    assert not r.driver.holds("alpha")
-    assert r.driver.note.text() == "let go of alpha: the stack was reset"
-    await r.settled()
-    assert r.releases() == 0
-
-
-async def test_a_lease_end_during_the_take_is_confirmed_once_the_take_is_done():
-    r = driving("alpha")
-    take = r.calls.take
-
-    async def ends_while_taking(robot):
-        answer = await take(robot)
-        r.driver.own_lease_ended("alpha", "the stack was reset")
-        return answer
-
-    r.calls.take = ends_while_taking
-    r.calls.check_outcome = Failed("headset_inst holds no lease of robot `alpha`")
-    assert await r.squeeze() is None
-    await r.settled()
-    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("check_move", "alpha")]
-    assert not r.driver.holds("alpha")
-
-
-async def test_a_lease_end_the_daemon_does_not_confirm_lets_go_and_releases():
-    r = driving("alpha")
-    await r.squeeze()
-    r.calls.check_outcome = Unanswered()
-    r.driver.own_lease_ended("alpha", "the stack was reset")
-    await r.settled()
-    assert not r.driver.holds("alpha")
-    assert r.driver.note.text() == f"let go of alpha: {DAEMON_SILENT}"
-    # The daemon may still hold the lease for the headset.
-    assert r.log[-2:] == [("check_move", "alpha"), ("release", "alpha")]
-
-
-async def test_a_lease_end_of_a_robot_the_headset_does_not_hold_asks_nothing():
-    r = driving("alpha")
-    r.driver.own_lease_ended("alpha", "headset_inst released it")
-    await r.settled()
-    assert r.log == []
-
-
-async def test_a_lease_end_of_the_goals_before_a_restart_asks_nothing():
-    r = driving("alpha")
-    await r.squeeze()
-    r.driver.own_lease_ended("alpha", "the lease goal ended")
-    r.fleet.generation += 1
-    await r.settled()
-    assert r.driver.holds("alpha") and r.log == [("take", "alpha"), ("stop", "alpha")]
-
-
-async def test_the_end_of_a_goal_of_the_fleet_lets_go_of_every_robot():
-    r = driving("alpha", "bravo")
-    await r.squeeze("alpha")
-    await r.press("bravo")
-    r.driver.let_go_of_every_robot("the changes goal of the fleet ended")
-    assert not r.driver.holds("alpha") and not r.driver.holds("bravo")
-    assert (
-        r.driver.note.text() == "let go of bravo: the changes goal of the fleet ended"
-    )
-    # The leases end with the lease goal: nothing is asked of the daemon.
-    await r.settled()
-    assert r.releases("alpha") == 0 and r.releases("bravo") == 0
-
-
-# Take-over under an open lease
-
-
-async def test_under_an_open_lease_the_headset_drives_with_a_move_check_and_no_take():
-    r = driving("alpha", leases=OPEN_LEASE)
-    assert await r.squeeze() is None
-    assert r.log == [("check_move", "alpha"), ("stop", "alpha")]
-    assert r.driver.driven_under_open("alpha")
-    assert (
-        r.driver.state_of("alpha")
-        == "driven from this headset under the open lease of director_inst"
-    )
-    # The lease is the run's: the end of the drive releases nothing.
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    assert r.releases() == 0
-
-
-async def test_under_an_open_lease_a_squeeze_in_a_burst_asks_again_and_stops():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", grip="right")
-    # The right hand's burst runs, and a program moves the other arm under
-    # the open lease: the left squeeze asks the daemon and stops it.
-    assert await r.squeeze("alpha", grip="left") is None
-    assert r.log == [("check_move", "alpha"), ("stop", "alpha")] * 2
-
-
-async def test_under_an_open_lease_a_squeeze_beside_the_other_hand_engages_at_once():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", grip="right")
-    r.engage("right")
-    assert await r.squeeze("alpha", grip="left") is None
-    assert r.log == [("check_move", "alpha"), ("stop", "alpha")]
-
-
-async def test_a_withdrawn_squeeze_in_its_own_burst_leaves_the_burst_its_hold():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze()
-    assert await r.squeeze(wanted=released) == Withdrawn()
-    assert r.driver.holds_for("alpha", "right")
-    # It asked the daemon again, and stopped nothing.
-    assert r.log == [
-        ("check_move", "alpha"),
-        ("stop", "alpha"),
-        ("check_move", "alpha"),
-    ]
-
-
-async def test_a_squeeze_withdrawn_behind_a_posture_start_stops_nothing():
-    r = driving("alpha")
-    starting = asyncio.Event()
-    go_on = asyncio.Event()
-    grip = [True]
-
-    async def start():
-        starting.set()
-        await go_on.wait()
-        r.log.append(("goal", "alpha"))
-        return GOAL
-
-    press = asyncio.create_task(r.press(start=start))
-    await starting.wait()
-    squeeze = asyncio.create_task(r.squeeze(wanted=lambda: grip[0]))
+    r.calls.take_outcome = Failed("leased")
+    r.squeeze()
     await settle()
-    grip[0] = False
-    go_on.set()
-    assert await press == GOAL and await squeeze == Withdrawn()
-    assert r.log[-1] == ("goal", "alpha")
-    assert r.driver.holds_for("alpha", POSTURE)
+    assert r.driver.note(Hand.RIGHT) == "squeeze refused: leased"
+    assert "squeeze refused: leased" in capsys.readouterr().out
+    await r.clock.advance(FLASH_S)
+    assert r.driver.note(Hand.RIGHT) == ""
 
 
-async def test_an_open_lease_beside_a_posture_move_of_another_robot_takes_nothing():
-    r = driving("alpha", "bravo", leases=OPEN_LEASE)
-    await r.press("bravo")
-    assert await r.squeeze("alpha") is None
-    assert ("take", "alpha") not in r.log
-    assert r.driver.holds("bravo")
+async def test_changed_refreshes_the_page_and_a_failing_refresh_is_logged_once(
+    capsys,
+):
+    r = driving("alpha")
+    r.changes.clear()
+    r.driver.fleet_changed(fleet_view(["alpha", "bravo"]))
+    assert [view.robots for view in r.changes] == [frozenset({"alpha", "bravo"})]
+
+    def failing_refresh():
+        raise RuntimeError("page gone")
+
+    failing = unlisted_driver(clock=ManualClock(), on_change=failing_refresh)
+    # The start, the first listing and the next each refresh the page.
+    listed(failing, "alpha")
+    failing.fleet_changed(fleet_view(["alpha", "bravo"]))
+    out = capsys.readouterr().out
+    assert out.count("the page's refresh failed: RuntimeError('page gone')") == 1
 
 
-async def test_the_headset_lets_go_when_the_open_lease_closes_and_drives_again_when_it_reopens():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze()
-    r.driver.fleet_changed(fleet_view(["alpha"], leases=CLOSED_LEASE))
-    assert not r.driver.holds("alpha")
-    assert (
-        r.driver.note.text()
-        == "let go of alpha: the open lease of director_inst closed"
-    )
-    # A refused resume opens the lease again: the next squeeze drives.
-    r.fleet.view = fleet_view(["alpha"], leases=OPEN_LEASE)
-    assert await r.squeeze() is None
-    assert r.log.count(("check_move", "alpha")) == 2
-    # The lease was the run's: nothing is released.
-    await r.settled()
-    assert r.releases() == 0
+async def test_a_step_from_inside_an_effect_fails_loudly():
+    r = driving("alpha")
+    r.press()
+    await settle()
+    assert r.driver.world.robot("alpha").hold.goal is not None
+    r.goals.cancel = lambda label, goal: r.driver.step(Shutdown())
+    with pytest.raises(AssertionError, match="a step runs its effects before"):
+        r.driver.fleet_changed(fleet_view(["alpha"], halted_by=HALTER))
 
 
-async def test_the_headset_lets_go_when_the_open_lease_ends_or_passes_to_another_holder():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze()
-    r.driver.fleet_changed(fleet_view(["alpha"]))
-    assert not r.driver.holds("alpha")
-    r.fleet.view = fleet_view(["alpha"], leases=OPEN_LEASE)
-    await r.squeeze()
-    tidy_open = {"alpha": Lease(TIDY, "tidy the table", open=True)}
-    r.driver.fleet_changed(fleet_view(["alpha"], leases=tidy_open))
-    assert not r.driver.holds("alpha")
-
-
-async def test_under_an_open_lease_a_refused_move_check_takes_nothing_and_says_why():
-    r = driving("alpha", leases=OPEN_LEASE)
-    r.calls.check_outcome = Failed("the stack is halted (by peppy-cli)")
-    assert await r.squeeze() == Refusal("the stack is halted (by peppy-cli)")
-    assert r.log == [("check_move", "alpha")]
-    assert not r.driver.holds("alpha")
-
-
-async def test_under_an_open_lease_a_refused_check_in_a_burst_stops_nothing():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", grip="right")
-    r.calls.check_outcome = Failed("the stack is halted (by peppy-cli)")
-    assert await r.squeeze("alpha", grip="left") == Refusal(
-        "the stack is halted (by peppy-cli)"
-    )
-    assert r.log == [
-        ("check_move", "alpha"),
-        ("stop", "alpha"),
-        ("check_move", "alpha"),
-    ]
-    assert r.driver.holds_for("alpha", "right")
-    assert not r.driver.holds_for("alpha", "left")
-
-
-async def test_under_an_open_lease_a_close_during_the_check_of_a_burst_stops_nothing():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.squeeze("alpha", grip="right")
-    check = r.calls.check_move
-
-    async def closes_while_checking(**target):
-        answer = await check(**target)
-        r.fleet.view = fleet_view(["alpha"], leases=CLOSED_LEASE)
-        r.driver.fleet_changed(r.fleet.view)
-        return answer
-
-    r.calls.check_move = closes_while_checking
-    assert await r.squeeze("alpha", grip="left") == Refusal(
-        "the headset let go of alpha"
-    )
-    assert r.log == [
-        ("check_move", "alpha"),
-        ("stop", "alpha"),
-        ("check_move", "alpha"),
-    ]
-
-
-async def test_a_squeeze_on_a_robot_another_client_holds_asks_to_take_it():
-    r = driving("alpha", leases=CLOSED_LEASE)
-    r.calls.take_outcome = Failed("robot `alpha` is leased by `director_inst`")
-    assert await r.squeeze() == Refusal("robot `alpha` is leased by `director_inst`")
+async def test_no_event_steps_after_shutdown():
+    r = driving("alpha")
+    r.squeeze()
+    r.driver.step(Shutdown())
+    world = r.driver.world
+    await settle()
+    # The take answered after the shutdown, and its answer stepped nothing:
+    # no release follows it.
     assert r.log == [("take", "alpha")]
+    assert r.driver.world is world
+    r.driver.fleet_changed(fleet_view(["alpha"], halted_by=HALTER))
+    assert r.driver.world is world
 
 
-async def test_an_open_lease_that_closes_before_the_stop_sends_no_stop_and_releases_nothing():
-    r = driving("alpha", leases=OPEN_LEASE)
-    check = r.calls.check_move
-
-    async def closes_while_checking(**target):
-        answer = await check(**target)
-        r.fleet.view = fleet_view(["alpha"], leases=CLOSED_LEASE)
-        return answer
-
-    r.calls.check_move = closes_while_checking
-    assert await r.squeeze() == Refusal("the open lease of director_inst closed")
-    await r.settled()
-    assert r.log == [("check_move", "alpha")]
-    assert not r.driver.holds("alpha")
+# Posture goals
 
 
-# Lost posture moves
-
-
-async def test_a_posture_start_whose_send_is_lost_stops_the_moves_before_the_release():
+async def test_a_watched_goal_steps_its_result_or_its_loss(capsys):
     r = driving("alpha")
-    answer = None
-
-    async def lost():
-        nonlocal answer
-        answer = r.hold_stops()
-        return Lost("the goal could not be sent (see log)")
-
-    press = asyncio.create_task(r.press(start=lost))
+    r.press()
     await settle()
-    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("stop", "alpha")]
-    answer.set()
-    assert await press == Refusal("the goal could not be sent (see log)")
-    await r.settled()
+    r.goals.results.put_nowait(HOME_REACHED)
+    await settle()
+    assert r.driver.world.posture_moving is None
+    assert r.driver.posture_line() == HOME_REACHED
     assert r.log[-1] == ("release", "alpha")
-
-
-def halt(r: Driving) -> None:
-    r.fleet.view = fleet_view(["alpha"], halted_by="peppy-cli")
-    r.driver.fleet_changed(r.fleet.view)
-
-
-async def test_a_posture_start_lost_at_a_halt_is_stopped():
-    r = driving("alpha")
-
-    async def lost_during_a_halt():
-        halt(r)
-        return Lost("the goal could not be sent (see log)")
-
-    assert await r.press(start=lost_during_a_halt) == Refusal(
-        "the goal could not be sent (see log)"
-    )
-    # No goal handle cancels the move that the backbone may run: the stop
-    # does.
-    assert r.log == [("take", "alpha"), ("stop", "alpha"), ("stop", "alpha")]
-
-
-async def test_a_posture_move_whose_result_is_lost_is_stopped_before_the_release():
-    r = driving("alpha")
-    await r.press()
-    answer = r.hold_stops()
-    ending = asyncio.create_task(r.driver.end_lost_posture_move("alpha"))
+    r.press()
     await settle()
-    assert r.log[-1] == ("stop", "alpha")
-    answer.set()
-    await ending
-    await r.settled()
+    r.goals.results.put_nowait(RuntimeError("gone"))
+    await settle()
+    assert "move to home: result unknown: RuntimeError('gone')" in (
+        capsys.readouterr().out
+    )
+    assert r.driver.posture_line() == "move to home: result unknown"
+    # The move that may run is stopped, and then its lease released.
     assert r.log[-2:] == [("stop", "alpha"), ("release", "alpha")]
-    assert not r.driver.holds("alpha")
 
 
-async def test_a_posture_move_lost_at_a_halt_is_stopped():
+async def test_a_failed_stop_of_a_lost_move_is_noted_and_logged(capsys):
     r = driving("alpha")
-    await r.press()
-    halt(r)
-    await r.driver.end_lost_posture_move("alpha")
-    assert r.log[-2:] == [("goal", "alpha"), ("stop", "alpha")]
+    r.press()
+    await settle()
+    r.stops.refusal = "alpha did not answer"
+    r.goals.results.put_nowait(RuntimeError("gone"))
+    await settle()
+    note = "move to home: its stop failed: alpha did not answer"
+    assert r.driver.posture_line() == note
+    assert note in capsys.readouterr().out
 
 
-async def test_a_posture_move_lost_after_its_open_lease_closed_stops_nothing():
-    r = driving("alpha", leases=OPEN_LEASE)
-    await r.press()
-    # The run resumes and closes its lease: its own goals now move the robot.
-    r.fleet.view = fleet_view(["alpha"], leases=CLOSED_LEASE)
-    r.driver.fleet_changed(r.fleet.view)
-    await r.driver.end_lost_posture_move("alpha")
-    assert r.log == [("check_move", "alpha"), ("stop", "alpha"), ("goal", "alpha")]
-
-
-# Releases
-
-
-async def test_a_release_the_daemon_does_not_answer_is_asked_again_on_the_clock():
+async def test_a_cancelled_goal_is_cancelled_without_waiting():
     r = driving("alpha")
-    await r.squeeze()
-    r.calls.release_outcome = Unanswered()
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    assert r.releases() == 1
-    r.calls.release_outcome = Failed("headset_inst holds no lease of robot `alpha`")
-    await r.clock.advance(RETRY_S)
-    await r.settled()
-    assert r.releases() == 2
-    # A refused release is not asked again.
-    await r.clock.advance(RETRY_S)
-    await r.settled()
-    assert r.releases() == 2
+    r.press()
+    await settle()
+    r.driver.fleet_changed(fleet_view(["alpha"], halted_by=HALTER))
+    # The cancel goes out in the step itself, with no await.
+    assert r.log[-1] == ("cancel", "home")
 
 
-async def test_a_release_is_asked_again_only_under_the_goals_it_was_asked_under():
+async def test_the_posture_line_gives_the_note_then_the_move_in_flight():
     r = driving("alpha")
-    await r.squeeze()
-    r.calls.release_outcome = Unanswered()
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    r.fleet.generation += 1
-    await r.clock.advance(RETRY_S)
-    await r.settled()
-    assert r.releases() == 1
+    assert r.driver.posture_line() is None
+    r.press()
+    assert r.driver.posture_line() == "moving to home..."
+    r.press()
+    assert r.driver.posture_line() == "move to home ignored: still moving to home"
+    await r.clock.advance(FLASH_S)
+    assert r.driver.posture_line() == "moving to home..."
 
 
-async def test_a_release_retry_waits_for_a_take_in_flight():
+# The streams' ticks
+
+
+class RaisingClutch:
+    """A clutch whose step raises, as a fault after the tick's step."""
+
+    def step(self, **_):
+        raise RuntimeError("clutch")
+
+
+async def test_a_raise_after_a_step_still_runs_its_call():
+    clock = ManualClock()
+    log = []
+    driver = scripted_driver("alpha", clock=clock, log=log)
+    pair = Peer("alpha right arm")
+    arm, no_gripper = NoWireSlot(("alpha", pair)), NoWireSlot()
+    robots = PairedRobots(
+        None,
+        arms={Hand.RIGHT: arm},
+        grippers={Hand.RIGHT: no_gripper},
+        base=NoWireSlot(),
+    )
+    session = ScriptedHeadset(clock)
+    session.press(right=(False, False, True))
+    measured = MeasuredPoses(clock)
+    measured.set(pair, reported(POSE))
+    tick = pose_tick(
+        topic_module=arm,
+        gripper_module=no_gripper,
+        handedness=Hand.RIGHT,
+        driver=driver,
+        clutch=RaisingClutch(),
+        session=session,
+        measured=measured,
+        robots=robots,
+        settings=SETTINGS,
+        clock=clock,
+        timestamp_s=lambda: 0.0,
+    )
+    with pytest.raises(RuntimeError, match="clutch"):
+        tick()
+    await settle()
+    assert log == [("take", "alpha"), ("stop", "alpha")]
+
+
+async def test_a_slow_call_holds_no_tick():
+    clock = ManualClock()
+    log = []
+    instance_ns = {"now": 0}
+    reports = BaseReports(lambda: instance_ns["now"])
+    stops = NotedStops(FakeStops(log), reports)
+    calls = FakeCalls(log)
+    driver = scripted_driver(
+        "alpha", "bravo", clock=clock, log=log, calls=calls, stops=stops
+    )
+    alpha_left, bravo_right = Peer("alpha left arm"), Peer("bravo right arm")
+    alpha_base = Peer("alpha base")
+    left_arm = NoWireSlot(("alpha", alpha_left))
+    right_arm = NoWireSlot(("bravo", bravo_right))
+    base_slot = NoWireSlot(("alpha", alpha_base))
+    no_gripper = NoWireSlot()
+    robots = PairedRobots(
+        None,
+        arms={Hand.LEFT: left_arm, Hand.RIGHT: right_arm},
+        grippers={Hand.LEFT: no_gripper, Hand.RIGHT: no_gripper},
+        base=base_slot,
+    )
+    session = ScriptedHeadset(clock)
+    measured = MeasuredPoses(clock)
+    measured.set(alpha_left, reported(POSE))
+    measured.set(bravo_right, reported(POSE))
+
+    def arm_tick(hand, slot):
+        return pose_tick(
+            topic_module=slot,
+            gripper_module=no_gripper,
+            handedness=hand,
+            driver=driver,
+            clutch=HandClutch(1.0),
+            session=session,
+            measured=measured,
+            robots=robots,
+            settings=SETTINGS,
+            clock=clock,
+            timestamp_s=lambda: 0.0,
+        )
+
+    left, right = arm_tick(Hand.LEFT, left_arm), arm_tick(Hand.RIGHT, right_arm)
+    base = base_tick(
+        topic_module=base_slot,
+        driver=driver,
+        stops=stops,
+        reports=reports,
+        session=session,
+        robots=robots,
+        settings=SETTINGS,
+        clock=clock,
+    )
+    driving_left = HandSample(
+        pose=POSE, squeezing=True, trigger=0.0, thumbstick=Thumbstick(forward=1.0)
+    )
+    squeezing_right = HandSample(pose=POSE, squeezing=True, trigger=0.0)
+    # The left squeeze takes alpha for its arm and the base.
+    session.hands = {Hand.LEFT: driving_left}
+    reports.record(alpha_base, FOLLOWING)
+    left()
+    base()
+    await settle()
+    # The base follows once a report arrives more than 0.5 s after the stop.
+    instance_ns["now"] = 600_000_000
+    reports.record(alpha_base, FOLLOWING)
+    left()
+    assert base() == (alpha_base, (None, None, [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]))
+    # Bravo chosen: the left arm and the base linger on alpha, and the right
+    # squeeze asks for bravo, whose take does not answer yet.
+    takes = calls.takes_on_cue()
+    assert robots.choose("bravo")
+    measured_pose = (ROBOT_FRAME, 0.0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0])
+    still = (None, None, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    assert left() == (alpha_left, measured_pose)
+    assert base() == (alpha_base, still)
+    session.hands = {Hand.LEFT: driving_left, Hand.RIGHT: squeezing_right}
+    assert right() is None
+    await settle()
+    assert takes.unanswered() == [0]
+    # Every tick steps both bursts while the take waits.
+    for _ in range(3):
+        assert left() == (alpha_left, measured_pose)
+        assert base() == (alpha_base, still)
+        assert right() is None
+    takes.answer(0, AGREED)
+    await settle()
+    assert isinstance(driver.world.grips.right.phase, Engaged)
+
+
+# The listener and the status words
+
+
+async def test_a_status_write_that_changes_nothing_steps_nothing():
     r = driving("alpha")
-    await r.squeeze()
-    r.calls.release_outcome = Unanswered()
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    take = r.calls.take
-    taking = asyncio.Event()
-    go_on = asyncio.Event()
-
-    async def slow_take(robot):
-        taking.set()
-        await go_on.wait()
-        return await take(robot)
-
-    r.calls.take = slow_take
-    squeeze = asyncio.create_task(r.squeeze())
-    await taking.wait()
-    # The retry comes round while the take runs: it waits for the take, and
-    # then the headset holds the robot.
-    await r.clock.advance(RETRY_S)
-    go_on.set()
-    assert await squeeze is None
-    await r.settled()
-    assert r.releases() == 1 and r.driver.holds("alpha")
+    world = r.driver.world
+    r.driver.goals_status(Following())
+    assert r.driver.world is world
+    r.driver.goals_ended(CHANGES_ENDED)
+    r.driver.goals_status(Starting())
+    r.driver.goals_started(2)
+    world = r.driver.world
+    # The status is starting already at the start after an end.
+    r.driver.goals_status(Starting())
+    assert r.driver.world is world
+    # After a lost daemon the start's write changes it.
+    r.driver.goals_status(DaemonLost())
+    r.driver.goals_started(3)
+    r.driver.goals_status(Starting())
+    assert r.driver.world.fleet.status == Starting()
+    assert r.driver.world.fleet.generation == 3
 
 
-async def test_a_pending_release_gives_way_to_a_new_squeeze():
-    r = driving("alpha")
-    await r.squeeze()
-    r.calls.release_outcome = Unanswered()
-    r.driver.drop("alpha", "right")
-    await r.settled()
-    # The robot is taken again before the retry comes round: the retry must
-    # not release the lease the new squeeze drives under.
-    await r.squeeze()
-    await r.clock.advance(RETRY_S)
-    await r.settled()
-    assert r.releases() == 1
-    assert r.driver.holds("alpha")
-
-
-# The page and the panel
+async def test_the_fleet_listener_steps_each_event():
+    log = []
+    driver = unlisted_driver(clock=ManualClock(), log=log)
+    driver.goals_started(1)
+    assert driver.world.fleet.generation == 1
+    driver.goals_status(Following())
+    assert driver.world.fleet.goals_run
+    driver.fleet_changed(fleet_view(["alpha"]))
+    assert driver.world.fleet.view.robots == frozenset({"alpha"})
+    pins = frozenset({Pin(Slot.ARM, Peer("alpha right arm"))})
+    inputs = TickInputs(
+        {Hand.RIGHT: Reading.SQUEEZE}, "alpha", pins, pins, Ready(), Ready()
+    )
+    driver.step(Tick(Hand.RIGHT, inputs))
+    await settle()
+    driver.own_lease_ended("alpha", "")
+    await settle()
+    # The daemon's yes settles against the listing, which names no holder of
+    # alpha: the headset lets go.
+    assert log[-1] == ("check_move", "alpha")
+    assert driver.note(ROBOT_NOTE) == "let go of alpha: the lease ended"
+    driver.goals_ended("the lease goal of the fleet ended")
+    assert driver.world.fleet.view is None
 
 
 async def test_the_robot_row_says_who_holds_the_chosen_robot():
     r = driving("alpha", leases=CLOSED_LEASE)
     line = r.driver.robot_line("alpha")
     assert (line.text, line.tone) == (
-        "alpha: leased by director_inst (tidy the table)",
+        f"alpha: leased by director_inst ({DIRECTOR_LEASE})",
         "waiting",
     )
-    r.fleet.view = fleet_view(
-        ["alpha"], leases={"alpha": Lease(HEADSET, LEASE_NAME, open=False)}
-    )
+    r.driver.fleet_changed(fleet_view(["alpha"], leases=MINE))
     line = r.driver.robot_line("alpha")
     assert (line.text, line.tone) == ("alpha: driven from this headset", "driving")
-    r.fleet.view = fleet_view(["alpha"])
+    r.driver.fleet_changed(fleet_view(["alpha"]))
     assert r.driver.robot_line("alpha").tone == "resting"
-    r.fleet.view = fleet_view(["alpha"], halted_by="peppy-cli")
+    r.driver.fleet_changed(fleet_view(["alpha"], halted_by=HALTER))
     line = r.driver.robot_line("alpha")
     assert (line.text, line.tone) == (f"alpha: {HALTED}", "waiting")
     assert r.driver.robot_line(None).text == "no robot paired"
-    r.fleet.status = DaemonLost()
+    r.driver.goals_ended("the daemon is lost")
+    r.driver.goals_status(DaemonLost())
     assert r.driver.robot_line("alpha").text == "the daemon is lost"
 
 
 async def test_a_robot_reads_as_the_cause_while_the_fleet_cannot_be_asked():
     r = driving("alpha")
-    r.fleet.view = None
-    r.fleet.status = Starting()
+    r.driver.goals_ended(CHANGES_ENDED)
+    r.driver.goals_status(Starting())
     assert r.driver.state_of("alpha") == "waiting for the fleet listing"
 
 
 async def test_the_page_hears_each_change_a_transfer_and_a_give_back_included():
     r = driving("alpha", leases=CLOSED_LEASE)
+    r.changes.clear()
     # The director transfers the lease to a run, which gives it back.
     for view in (
-        fleet_view(["alpha"], leases={"alpha": Lease(TIDY, "tidy the table", False)}),
+        fleet_view(["alpha"], leases={"alpha": Lease(TIDY, DIRECTOR_LEASE, False)}),
         fleet_view(["alpha"], leases=CLOSED_LEASE),
     ):
-        r.fleet.view = view
         r.driver.fleet_changed(view)
     assert [view.leases["alpha"].holder for view in r.changes] == [TIDY, DIRECTOR]
-    assert r.driver.state_of("alpha") == "leased by director_inst (tidy the table)"
+    assert r.driver.state_of("alpha") == f"leased by director_inst ({DIRECTOR_LEASE})"

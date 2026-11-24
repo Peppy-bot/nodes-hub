@@ -128,19 +128,26 @@ outside any copy:
   of its own. When the holder closes the lease, the headset lets go.
 - **The halt.** At `peppy fleet halt` the lease ends, and the headset lets go
   as at a grip release: the release burst holds the arm where it is
-  measured. Each squeeze and press then does nothing, and the panel says
-  that the stack is halted. After `peppy fleet clear-halt` nothing starts by
-  itself: a new squeeze takes the lease again.
+  measured. Each squeeze and press then does nothing, and its row says why.
+  After `peppy fleet clear-halt` nothing starts by itself: a squeeze held
+  through the halt drives nothing until it is released, and a new squeeze
+  takes the lease again.
 - **Letting go.** The headset also lets go when its lease ends, and at once
   when its `changes` or `lease` goal ends. The lease feedback names the
   robot of each lease that ends: the headset asks the daemon (`check_move`)
   whether it may still move that robot, and lets go unless a fleet listing
-  as recent as a yes names it as the holder. A grip held through a let-go
-  drives nothing until it is released. The headset starts the goals again
-  as soon as its daemon answers; while the daemon does not answer, each
-  squeeze and press does nothing. When the daemon refuses a goal, nothing
-  drives until the next launch, except for a `lease` goal refused while the
-  daemon still ends the last one, which the headset asks for again.
+  as recent as a yes names it as the holder. A squeeze held through a let-go
+  of the chosen robot, a refused squeeze, a change of robot or the loss of
+  the robot's pair drives nothing until it is released, on every grip it
+  drives: its hand's arm and gripper, and the base. A squeeze or a press
+  still waiting when the headset lets go of its robot is dropped, and its
+  row says why, so nothing started before a let-go runs after it. While the
+  headset asks the daemon whether a lease of the robot ended, a squeeze
+  waits for the answer. The headset starts the goals again as soon as its
+  daemon answers; while the daemon does not answer, each squeeze and press
+  does nothing. When the daemon refuses a goal, nothing drives until the
+  next launch, except for a `lease` goal refused while the daemon still
+  ends the last one, which the headset asks for again.
 - **Lost answers.** The headset releases the lease of a take whose answer
   does not come; the daemon refuses that release when the take never
   reached it. A posture move whose goal send or result is lost on the
@@ -172,8 +179,11 @@ whatever camera you bind.
   hand: the headset takes the robot first (see Robot leases), and a refused
   squeeze says why on the hand's row for three seconds; the grip drives
   nothing until it is released. Release to let go. Letting go streams the
-  measured pose for a quarter second, so the follower stops where it is,
-  and then that hand's slots fall silent until the next squeeze.
+  measured pose for a quarter second and at least three setpoints, so the
+  follower stops where it is, and then that hand's slots fall silent until
+  the next squeeze. A squeeze on a robot whose pair has no fresh measured
+  pose says `squeeze refused: no measured pose` on the hand's row for three
+  seconds.
 - **Motion**: relative to the squeeze. The commanded pose is where the
   end-effector was when you engaged, displaced by your hand's motion since,
   scaled by `motion_scale` (orientation is never scaled). Release, reposition,
@@ -214,11 +224,14 @@ whatever camera you bind.
   a base whose y range is 0 to 0 rests, and so does any deflection within 0.05
   of rest, as joy's `deadzone` does. The headset streams only while the sticks
   command a velocity other than zero. When every stick rests, or the grip is
-  released, the base gets zero velocity for a quarter second, then nothing,
-  and the base's follower brings it to rest. While the base reports that it
-  does not follow (its mode, a silence of its sensing, a robot stop or a goal
-  of the base's node holds it), the headset sends nothing, and once it follows
-  again a stick drives only after every stick rested.
+  released, the base gets zero velocity for a quarter second and at least
+  three setpoints, then nothing, and the base's follower brings it to rest.
+  While the base does not follow (its mode, a silence of its sensing, a robot
+  stop or a goal of the base's node holds it), the headset streams it nothing
+  but that burst, and once it follows again a stick still held drives at
+  once. After each stop of the robot the headset sends, the base drives only
+  from a `drive_states` that arrives more than 0.5 s after the stop's answer,
+  or its refusal.
 - **Changing the robot**: choosing another robot releases both hands and the base. The previous robot stops where it is, and the next squeeze engages the new one. A grip held through the change drives nothing until it is released; the status panel says so.
 
 The mapping assumes you share the robot's facing (natural once your view is
@@ -232,9 +245,9 @@ that decides whether a hand can drive: whether the headset link is live, the
 chosen robot and who holds it, and per hand whether it has a controller, a
 held grip, a fresh measurement from its follower, and an engagement. While
 the chosen robot pairs a base, the `BASE` row says why the base does not
-follow, by its newest `drive_states`, with what to do, or that the base does
-not report once 0.5 s of the instance's clock pass with none; else whether a
-grip drives it. The
+follow, by its newest `drive_states`, or that the base does not report once
+0.5 s of the instance's clock pass with none; else whether a grip drives it,
+and while a stop of the robot holds it, "waiting for the base". The
 `ROBOT` row gives the chosen robot's state with the Robot card's words, why
 the headset let go of it for three seconds, or why the headset cannot ask
 the fleet: the daemon is lost, or refused the fleet. It answers "why is
@@ -246,10 +259,13 @@ reports the posture buttons: "moving to home..." while the move runs, then
 "move to home completed", "move to home cancelled", "move to home failed:
 <cause>" or "move to home refused: <cause>" for three seconds. A press that
 does nothing says why for three seconds: "move to home ignored: release the
-grip first", "move to home ignored: still moving to ready", "move to home:
-bravo has no postures". A refused squeeze says why on its hand's row for
-three seconds: "squeeze refused: <cause>", and on the `BASE` row when it
-asked for the base. A `drive_states` whose `follow_state` or limits
+grip first", "move to home ignored: the grip was just released", "move to
+home ignored: still moving to ready", "move to home: bravo has no postures",
+and a second press while a move starts says "still moving to" at once. A
+refused squeeze says why on its hand's row for three seconds: "squeeze
+refused: <cause>", and on the `BASE` row when it asked for the base. A
+squeeze on a robot whose base does not report says `squeeze refused: the
+base does not report` there. A `drive_states` whose `follow_state` or limits
 `drive_link` does not allow is dropped and logged once, and the `BASE` row
 names the value until the base sends one the headset keeps.
 

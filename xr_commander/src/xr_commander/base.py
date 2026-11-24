@@ -1,10 +1,8 @@
 """The base stream: the thumbsticks drive the chosen robot's base over
 drive_link while a grip of either hand is held.
 
-A squeeze takes the robot as it does for an arm (`drive`): the lease, then
-robot_stop's stop. The stream then sends nothing until a drive_states that
-reports following arrives more than 0.5 s after the stop's answer, counted
-on the instance's clock. The left thumbstick gives the velocity forward and
+A squeeze takes the robot as it does for an arm (`grip_world`): the lease,
+then robot_stop's stop. The left thumbstick gives the velocity forward and
 back along x and, on a base that drives sideways, along y; the right
 thumbstick's left and right give the turn. A full deflection gives the limit
 in its direction that the newest drive_states gives, as base_state's
@@ -12,12 +10,15 @@ describe_base gives it, and a partial one that fraction, so every setpoint
 lies within the base's limits. Each setpoint is in the robot frame at the
 latest time: it carries no frame and no timestamp.
 
-The stream runs while the sticks give a velocity other than zero. When they
-give zero, or the grip is released, it streams zero velocity for the release
-burst, then nothing, and the grip holds the robot through that burst. A
-drive_states that reports another follow_state ends the stream at once, and
-the stream sends nothing until every stick rests. A change of robot sends the
-burst to the base left behind; the new base engages on the next squeeze.
+The stream streams the commanded twist while the base grip is engaged, the
+base follows now and the twist is not zero. The base follows now while its
+newest drive_states, recorded within 0.5 s, reports following, no stop of
+its robot is in flight, and that report arrived more than 0.5 s after the
+newest stop of the robot that was answered or refused. When the stream stops
+driving it streams zero velocity for the release burst, then nothing, and
+the grip holds the robot through that burst; a hold the base reports does
+not end the burst. A change of robot sends the burst to the base left
+behind; the new base engages on the next squeeze.
 
 The times of drive_states count by their arrival on the instance's clock,
 the clock of transforms, never by their timestamps; a step back of that
@@ -27,7 +28,8 @@ clock counts as no time passing.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Hashable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -42,9 +44,25 @@ from xr_commander.devices import (
     Thumbstick,
     XrFrame,
     fresh_frame,
-    gripping,
+    hand_squeezing,
 )
-from xr_commander.drive import BASE, Driver, Stops
+from xr_commander.drive import Driver, Stops
+from xr_commander.grip_world import (
+    BASE,
+    Engaged,
+    NotReady,
+    Phase,
+    Ready,
+    Readiness,
+    Slot,
+    Streamed,
+    Tick,
+    TickInputs,
+    driven_pins,
+    pin_on,
+    reading_of,
+    slot_pins,
+)
 from xr_commander.publish import GripStream, run_stream
 from xr_commander.robots import PairedRobots
 
@@ -233,13 +251,10 @@ class BaseReports:
             return 0
 
     def newest(self, peer) -> BaseReport | None:
-        """`peer`'s newest report, None before its first and for no peer."""
-        return self._newest.get(peer) if peer is not None else None
-
-    def fresh(self, peer) -> BaseReport | None:
-        """`peer`'s newest report while the base reports: None once more
-        than `REPORT_SILENCE_NS` passed since it arrived."""
-        report = self.newest(peer)
+        """`peer`'s newest report while the base reports: None before its
+        first, for no peer, and once more than `REPORT_SILENCE_NS` passed
+        since it arrived."""
+        report = self._newest.get(peer) if peer is not None else None
         if report is None:
             return None
         if self._elapsed_ns() - report.arrived_ns > REPORT_SILENCE_NS:
@@ -254,20 +269,28 @@ class BaseReports:
 
 class NotedStops:
     """The robot stops of the headset, each noted on the elapsed instance
-    clock of `BaseReports`: when the newest stop of a robot that was answered
-    or refused ended. A refused stop counts: a backbone runs a stop it took,
-    whatever its answer (robot_stop)."""
+    clock of `BaseReports`: how many stops of a robot are in flight, and when
+    the newest that was answered or refused ended. A refused stop counts: a
+    backbone runs a stop it took, whatever its answer (robot_stop)."""
 
     def __init__(self, stops: Stops, reports: BaseReports) -> None:
         self._stops = stops
         self._reports = reports
+        self._in_flight: Counter[str] = Counter()
         self._ended: dict[str, int] = {}
 
     async def stop(self, robot: str) -> str | None:
+        self._in_flight[robot] += 1
         try:
             return await self._stops.stop(robot)
         finally:
+            self._in_flight[robot] -= 1
             self._ended[robot] = self._reports.mark()
+
+    def in_flight(self, robot: str) -> int:
+        """How many stops of `robot` were sent and have neither an answer
+        nor a refusal yet."""
+        return self._in_flight[robot]
 
     def ended_at(self, robot: str) -> int | None:
         """When the newest stop of `robot` that was answered or refused
@@ -317,9 +340,34 @@ def _setpoint(topic_module, twist: Twist) -> bytes:
     )
 
 
-def _holds(report: BaseReport | None) -> bool:
-    """Whether `report` gives a hold of the base."""
-    return report is not None and report.follow_state is not FollowState.FOLLOWING
+# Why the base grip's squeeze requests nothing.
+NO_BASE_PAIR = "no base pair"
+NOT_REPORTING = "the base does not report"
+
+
+def base_ready(pin: Hashable | None, report: BaseReport | None) -> Readiness:
+    """The base grip's readiness: a base pin with a report recorded within
+    0.5 s."""
+    if pin is None:
+        return NotReady(NO_BASE_PAIR)
+    if report is None:
+        return NotReady(NOT_REPORTING)
+    return Ready()
+
+
+def follows_now(
+    report: BaseReport | None, *, stops_in_flight: int, stop_ended_ns: int | None
+) -> bool:
+    """Whether the base of `report` follows now: `report` is its newest
+    report within `REPORT_SILENCE_NS` and gives following, no stop of its
+    robot is in flight, and the report arrived more than `STOP_HOLD_NS`
+    after the newest stop of the robot that was answered or refused."""
+    if report is None or report.follow_state is not FollowState.FOLLOWING:
+        return False
+    if stops_in_flight:
+        return False
+    assert stop_ended_ns is not None, "an engaged base was taken with a stop"
+    return report.follows_after(stop_ended_ns)
 
 
 async def stream_base(
@@ -337,64 +385,90 @@ async def stream_base(
 ) -> None:
     """Drive the chosen robot's pair on the base slot from the thumbsticks
     while a grip of either hand is held, as the module states."""
-    grip = driver.base
-    stream = GripStream[Twist](driver, BASE, settings.tick_period_s)
-
-    def still_gripping(robot: str) -> Callable[[], bool]:
-        def wanted() -> bool:
-            """The take runs over ticks: the grips may be released, or
-            another robot chosen, since the squeeze."""
-            frame = fresh_frame(session, settings.stale_timeout_s, clock)
-            return gripping(frame) is True and robots.chosen() == robot
-
-        return wanted
-
-    def held_still(driven) -> Twist | None:
-        """The burst holds zero velocity; a hold ends the stream with no
-        burst, as the follower drops each setpoint during it."""
-        return None if _holds(reports.newest(driven)) else STILL
-
-    def drive(peer, frame: XrFrame | None) -> Twist | None:
-        """The velocity the engaged base streams this tick, None for none."""
-        report = reports.newest(peer)
-        if not grip.engaged or report is None:
-            return None
-        if not grip.followed:
-            # Every hold of the headset starts with a stop of its robot.
-            answered_ns = stops.ended_at(grip.robot)
-            assert answered_ns is not None, f"{grip.robot} was taken with no stop"
-            grip.followed = report.follows_after(answered_ns)
-            if not grip.followed:
-                return None
-        twist = twist_of(
-            _stick(frame, LINEAR_HAND), _stick(frame, TURN_HAND), report.limits
-        )
-        grip.wait_rest = (grip.wait_rest or _holds(report)) and not twist.is_zero
-        return None if grip.wait_rest or twist.is_zero else twist
-
-    async def build():
-        frame = fresh_frame(session, settings.stale_timeout_s, clock)
-        gripped = gripping(frame)
-        chosen = robots.chosen()
-        grip.observe(chosen, gripped)
-        peer = robots.peer_of(topic_module, chosen)
-        if reports.newest(peer) is not None and grip.may_engage(gripped):
-            await driver.engage(chosen, BASE, still_gripping(chosen))
-        sent = stream.step(peer, drive(peer, frame), held_still, clock.monotonic())
-        if sent is None:
-            return None
-        driven, twist = sent
-        # Nothing goes out while the base reports a hold.
-        if _holds(reports.newest(driven)):
-            return None
-        return driven, _setpoint(topic_module, twist)
-
     await run_stream(
         node_runner,
         topic_module,
         settings.tick_period_s,
         "base",
         token,
-        build,
+        base_tick(
+            topic_module=topic_module,
+            driver=driver,
+            stops=stops,
+            reports=reports,
+            session=session,
+            robots=robots,
+            settings=settings,
+            clock=clock,
+        ),
         clock,
     )
+
+
+def base_tick(
+    *,
+    topic_module,
+    driver: Driver,
+    stops: NotedStops,
+    reports: BaseReports,
+    session: FrameSource,
+    robots: PairedRobots,
+    settings: Settings,
+    clock: Clock,
+) -> Callable[[], tuple[object, bytes] | None]:
+    """One tick of the base stream: the base grip's `Tick`, the target, the
+    burst, its `Streamed`, then the setpoint to send."""
+    stream = GripStream[Twist](Slot.BASE)
+
+    def tick() -> tuple[object, bytes] | None:
+        frame = fresh_frame(session, settings.stale_timeout_s, clock)
+        _names, chosen = robots.standing()
+        base = robots.pairs(topic_module)
+        reported = {peer: reports.newest(peer) for peer in base.peers}
+        stops_in_flight = stops.in_flight(chosen) if chosen is not None else 0
+        stop_ended_ns = stops.ended_at(chosen) if chosen is not None else None
+        now_s = clock.monotonic()
+        peers, pins = slot_pins({Slot.BASE: base}, chosen)
+        pin = pin_on(pins, Slot.BASE)
+        readings = {hand: reading_of(hand_squeezing(frame, hand)) for hand in Hand}
+        phase_pin = pin_on(driven_pins(driver.world.grips.base.phase), Slot.BASE)
+        inputs = TickInputs(
+            readings,
+            chosen,
+            peers,
+            pins,
+            base_ready(pin, reported.get(pin)),
+            base_ready(phase_pin, reported.get(phase_pin)),
+        )
+        phase = driver.step(Tick(BASE, inputs)).grips.base.phase
+        target = _target(phase, frame, reported, stops_in_flight, stop_ended_ns)
+        streamed = stream.step(
+            phase, target=target, held=STILL, peers=base.peers, now_s=now_s
+        )
+        driver.step(Streamed(BASE, streamed.burst_running))
+        if streamed.send is None:
+            return None
+        pair, twist = streamed.send
+        return pair, _setpoint(topic_module, twist)
+
+    return tick
+
+
+def _target(
+    phase: Phase,
+    frame: XrFrame | None,
+    reported: Mapping[Hashable, BaseReport | None],
+    stops_in_flight: int,
+    stop_ended_ns: int | None,
+) -> Twist | None:
+    """The twist the engaged base streams this tick, None for none."""
+    if not isinstance(phase, Engaged):
+        return None
+    report = reported.get(pin_on(phase.pins, Slot.BASE))
+    if not follows_now(
+        report, stops_in_flight=stops_in_flight, stop_ended_ns=stop_ended_ns
+    ):
+        return None
+    left, right = _stick(frame, LINEAR_HAND), _stick(frame, TURN_HAND)
+    twist = twist_of(left, right, report.limits)
+    return None if twist.is_zero else twist

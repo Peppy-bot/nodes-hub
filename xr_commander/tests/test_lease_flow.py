@@ -29,8 +29,12 @@ from peppygen.paired_topics.right_gripper import (
 from tests.helpers import (
     CALL_S,
     DIRECTOR,
+    DIRECTOR_LEASE,
+    ELSEWHERE,
     HALTED,
+    HALTER,
     HELD_TICKS,
+    HOME_REACHED,
     OTHER_FRAME,
     POSE,
     REPORTED_AT_S,
@@ -52,8 +56,8 @@ from tests.helpers import (
     driver_on_the_wire,
     eventually,
     fleet_view,
-    following_fleet,
     lease_event,
+    listed,
     pose_at,
     posture_done,
     reported,
@@ -64,10 +68,10 @@ from tests.helpers import (
 )
 from xr_commander import fleet, postures, publish
 from xr_commander.clutch import HandClutch
-from xr_commander.devices import primary_pressed
+from xr_commander.devices import Hand, primary_pressed
 from xr_commander.fleet import LEASE_NAME, Timing
+from xr_commander.grip_world import ROBOT_NOTE, Engaged, Idle, Requesting
 
-ELSEWHERE = pose_at((0.4, 0.0, 0.0))
 # Where the hand drives the arm in the halt test: neither the arm's pose nor
 # the pose it moves to later.
 HAND_AWAY = pose_at((0.1, 0.0, 0.0))
@@ -75,15 +79,20 @@ HAND_AWAY = pose_at((0.1, 0.0, 0.0))
 
 class Rig(TickedRig):
     """The headset's right hand on one robot of the fleet listing, with the
-    daemon, the robot's robot_stop and its postures played by the mocks."""
+    daemon, the robot's robot_stop and its postures played by the mocks.
+    The driver is listed with the robot unless the rig `follows_fleet`: the
+    goals of the fleet then give it its listing."""
 
-    def __init__(self, h, clock: ManualClock) -> None:
+    def __init__(self, h, clock: ManualClock, *, follows_fleet: bool = False) -> None:
         super().__init__(clock)
         self.h = h
-        self.fleet = following_fleet(ROBOT)
         robots = robots_of(h)
-        self.driver = driver_on_the_wire(h, self.fleet, wire_stops(h, robots), clock)
-        self.hand = self.driver.hands["right"]
+        goals = postures.PostureGoals(
+            h.node_runner, {"home": move_to_home}, SETTINGS.posture_move_duration_s
+        )
+        self.driver = driver_on_the_wire(h, wire_stops(h, robots), clock, goals)
+        if not follows_fleet:
+            listed(self.driver, ROBOT)
         self.robots = robots
         self.session = ScriptedHeadset(clock)
         self.measured = publish.MeasuredPoses(clock)
@@ -96,7 +105,25 @@ class Rig(TickedRig):
         self.stops = h.mocks.deps.robot_stop[0].robot_stop_stop
         self.postures = h.mocks.deps.postures[0].move_to_home
         self.wire = h.mocks.pairings.right_arm[0].pose_setpoints
-        self.status = postures.PostureStatus(clock)
+
+    def phase(self):
+        """The right hand's grip phase."""
+        return self.driver.world.grips.right.phase
+
+    def engaged(self) -> bool:
+        return isinstance(self.phase(), Engaged)
+
+    def must_release(self) -> bool:
+        return self.driver.world.hands.right.must_release
+
+    def holds(self) -> bool:
+        """Whether the headset holds the robot."""
+        return self.driver.world.robot(ROBOT).hold is not None
+
+    def grip_holds(self) -> bool:
+        """Whether the right hand's grip is a reason of the robot's hold."""
+        hold = self.driver.world.robot(ROBOT).hold
+        return hold is not None and hold.has(Hand.RIGHT)
 
     def pose_stream(self, token):
         return publish.stream_pose(
@@ -119,7 +146,6 @@ class Rig(TickedRig):
         listener."""
         return fleet.follow_fleet(
             self.h.node_runner,
-            self.fleet,
             self.driver,
             changes_module=changes,
             lease_module=lease,
@@ -130,13 +156,11 @@ class Rig(TickedRig):
 
     def posture_button(self, token):
         return postures.run_posture_button(
-            self.h.node_runner,
             action_module=move_to_home,
             pressed=primary_pressed,
             session=self.session,
             robots=self.robots,
             driver=self.driver,
-            status=self.status,
             settings=SETTINGS,
             token=token,
             clock=self.clock,
@@ -173,20 +197,22 @@ class Rig(TickedRig):
         await self.tick()
 
     async def release_grip(self):
-        """Release the grip, and tick until the hand has seen the release."""
+        """Release the grip, and tick until the hand has seen the release and
+        the grip is idle."""
         self.hold(squeeze=False)
         await self.ticks_until(
-            lambda: not self.hand.wait_release and not self.hand.engaged
+            lambda: not self.must_release() and isinstance(self.phase(), Idle)
         )
 
     async def squeeze_and_take(self):
         """A squeeze that takes the robot: the take, then the stop, then the
-        stream engages at the measured pose."""
+        grip engages, and its next tick streams from the measured pose."""
         self.hold(squeeze=True)
         await self.tick()
         await self.answer_take()
         await self.answer_stop()
-        await self.ticks_until(lambda: self.hand.engaged)
+        await eventually(self.engaged)
+        await self.tick()
 
     async def next_streamed(self):
         """One tick, then the next pose on the wire: for a hand that streams
@@ -206,7 +232,7 @@ class Rig(TickedRig):
 
 
 @contextlib.asynccontextmanager
-async def rig(*loops: str):
+async def rig(*loops: str, follows_fleet: bool = False):
     """The rig with the named loops of the headset running."""
     async with boot_clocked(
         robot_stop_instance_ids=[ROBOT],
@@ -214,7 +240,7 @@ async def rig(*loops: str):
         right_arm_members={ROBOT: None},
         right_gripper_members={ROBOT: None},
     ) as h:
-        the_rig = Rig(h, ManualClock())
+        the_rig = Rig(h, ManualClock(), follows_fleet=follows_fleet)
         async with running(*(getattr(the_rig, loop) for loop in loops)) as tasks:
             the_rig.loops = tasks
             yield the_rig
@@ -238,8 +264,11 @@ NO_RESULT = move_to_home.ResultResponseData(
 
 
 def halt(r: "Rig") -> None:
-    r.fleet.view = fleet_view([ROBOT], halted_by="peppy-cli")
-    r.driver.fleet_changed(r.fleet.view)
+    r.driver.fleet_changed(fleet_view([ROBOT], halted_by=HALTER))
+
+
+def clear_halt(r: "Rig") -> None:
+    r.driver.fleet_changed(fleet_view([ROBOT]))
 
 
 async def start_home(r: "Rig"):
@@ -262,8 +291,9 @@ async def test_a_squeeze_takes_the_lease_then_stops_the_moves_then_streams():
         request, responder = await r.stops.next_request(CALL_S)
         assert request.reason == LEASE_NAME
         await settle()
-        assert not r.hand.engaged
+        assert isinstance(r.phase(), Requesting)
         await responder.respond(stop.ResponseData(stopped=["right_arm"]))
+        await eventually(r.engaged)
         first = await r.next_streamed()
         assert first.position == [0.0, 0.0, 0.0]
 
@@ -275,14 +305,14 @@ async def test_a_refused_take_streams_nothing_and_the_hand_says_who_holds_the_ro
         await r.answer_take(
             refusal="robot `backbone_inst` is leased by `director_inst`"
         )
-        await r.ticks_until(lambda: r.hand.note.text() != "")
+        await eventually(lambda: r.driver.note(Hand.RIGHT) != "")
         assert (
-            r.hand.note.text()
+            r.driver.note(Hand.RIGHT)
             == "squeeze refused: robot `backbone_inst` is leased by `director_inst`"
         )
         # The held grip asks nothing again until it is released.
         await r.tick(HELD_TICKS)
-        assert r.hand.wait_release
+        assert r.must_release()
         assert len(r.daemon.take.captured()) == 1
         await r.release_grip()
         r.arm_at = ELSEWHERE
@@ -290,14 +320,21 @@ async def test_a_refused_take_streams_nothing_and_the_hand_says_who_holds_the_ro
         assert position_of(await r.next_streamed()) == pytest.approx(0.4)
 
 
-async def test_a_release_before_the_take_returns_stops_nothing_streams_nothing_and_releases_the_lease():
+async def test_a_release_no_tick_read_before_the_take_answers_still_gets_its_stop():
     async with rig("pose_stream") as r:
         r.hold(squeeze=True)
         await r.tick()
         r.hold(squeeze=False)
+        # No tick read the release: the take goes on to its stop, and the
+        # grip engages at the stop's answer.
         await r.answer_take()
+        await r.answer_stop()
+        await eventually(r.engaged)
+        # The next tick reads the release. The grip never drove, so no burst
+        # runs, and it drops at that tick: the lease is released.
+        await r.ticks_until(lambda: isinstance(r.phase(), Idle))
         await r.answer_release()
-        assert r.stops.captured() == []
+        assert not r.holds()
         r.arm_at = ELSEWHERE
         await r.squeeze_and_take()
         assert position_of(await r.next_streamed()) == pytest.approx(0.4)
@@ -339,7 +376,7 @@ async def test_a_change_of_the_measured_frame_re_anchors_the_hand_where_the_arm_
         changed = frames.index(OTHER_FRAME)
         assert set(frames[changed:]) == {OTHER_FRAME}
         assert all(position_of(m) == pytest.approx(0.0) for m in streamed[changed:])
-        assert r.hand.engaged and r.driver.holds(ROBOT)
+        assert r.engaged() and r.holds()
 
 
 async def test_the_lease_is_released_only_after_the_release_burst():
@@ -351,8 +388,8 @@ async def test_the_lease_is_released_only_after_the_release_burst():
         # The burst runs a quarter second: the headset holds the robot
         # through it.
         await r.tick()
-        assert r.driver.holds(ROBOT)
-        await r.ticks_until(lambda: not r.driver.holds(ROBOT))
+        assert r.holds()
+        await r.ticks_until(lambda: not r.holds())
         assert r.clock.monotonic() - released_at >= publish.RELEASE_HOLD_S
         await r.answer_release()
 
@@ -363,13 +400,13 @@ async def test_a_squeeze_in_the_release_burst_drives_on_and_keeps_the_lease():
         await r.next_streamed()
         r.hold(squeeze=False)
         await r.tick()
-        assert r.driver.grip_holds(ROBOT) and not r.hand.engaged
+        assert r.grip_holds() and not r.engaged()
         r.hold(squeeze=True)
-        await r.ticks_until(lambda: r.hand.engaged)
+        await r.ticks_until(r.engaged)
         # The burst stops: no take, no stop, and the lease stays past the
         # end the burst had.
         await r.tick(int(publish.RELEASE_HOLD_S / TICK_S) + 1)
-        assert r.driver.holds(ROBOT)
+        assert r.holds()
         assert len(r.daemon.take.captured()) == 1 and len(r.stops.captured()) == 1
 
 
@@ -379,10 +416,12 @@ async def test_a_press_in_the_release_burst_does_nothing_and_says_why():
         await r.next_streamed()
         r.hold(squeeze=False)
         await r.tick()
-        assert r.driver.grip_holds(ROBOT)
+        assert r.grip_holds()
         r.hold(a=True)
         await r.tick()
-        assert r.status.state() == "move to home ignored: the grip was just released"
+        assert r.driver.posture_line() == (
+            "move to home ignored: the grip was just released"
+        )
 
 
 async def test_a_posture_press_takes_the_robot_asks_the_daemon_and_holds_it_for_the_move():
@@ -392,10 +431,10 @@ async def test_a_posture_press_takes_the_robot_asks_the_daemon_and_holds_it_for_
         await r.answer_stop()
         await r.answer_check_move()
         goal = await (await r.postures.next_goal(CALL_S)).accept()
-        assert r.driver.holds(ROBOT)
+        assert r.holds()
         await goal.complete(posture_done(move_to_home))
         await r.answer_release()
-        await eventually(lambda: r.status.state() == "move to home completed")
+        await eventually(lambda: r.driver.posture_line() == HOME_REACHED)
 
 
 async def test_a_posture_press_the_daemon_refuses_releases_the_lease():
@@ -403,12 +442,12 @@ async def test_a_posture_press_the_daemon_refuses_releases_the_lease():
         await r.press_a()
         await r.answer_take()
         await r.answer_stop()
-        await r.answer_check_move(refusal="the stack is halted (by peppy-cli)")
+        await r.answer_check_move(refusal=f"the stack is halted (by {HALTER})")
         await r.answer_release()
         await eventually(
             lambda: (
-                r.status.state()
-                == "move to home refused: the stack is halted (by peppy-cli)"
+                r.driver.posture_line()
+                == f"move to home refused: the stack is halted (by {HALTER})"
             )
         )
 
@@ -427,7 +466,7 @@ async def test_a_posture_goal_the_robot_refuses_releases_the_lease():
         await r.answer_release()
         await eventually(
             lambda: (
-                r.status.state()
+                r.driver.posture_line()
                 == "move to home refused: a leader is streaming arm commands"
             )
         )
@@ -445,14 +484,15 @@ async def test_a_squeeze_during_a_posture_move_stops_it_and_keeps_the_lease_for_
         await r.tick()
         await r.answer_stop()
         await goal.complete_cancelled("stopped: driven from the headset", NO_RESULT)
-        await eventually(lambda: r.status.state() == "move to home cancelled")
+        await eventually(lambda: r.driver.posture_line() == "move to home cancelled")
+        await eventually(r.engaged)
         first = await r.next_streamed()
         assert first.position == [0.0, 0.0, 0.0]
         # The end of the stopped move released nothing: the hand holds the
         # robot until its burst ends.
-        assert r.driver.holds(ROBOT)
+        assert r.holds()
         r.hold(squeeze=False)
-        await r.ticks_until(lambda: not r.driver.holds(ROBOT))
+        await r.ticks_until(lambda: not r.holds())
         await r.answer_release()
 
 
@@ -464,9 +504,9 @@ async def test_a_grip_held_through_a_halt_streams_nothing_until_a_new_squeeze():
         halt(r)
         # The let-go is a release: the hand disengages and waits for its grip
         # to be released, and the burst holds the arm where it is measured.
-        await r.ticks_until(lambda: r.hand.robot is None)
-        assert not r.hand.engaged and r.hand.wait_release
-        r.fleet.view = fleet_view([ROBOT])
+        await r.ticks_until(lambda: isinstance(r.phase(), Idle))
+        assert r.must_release()
+        clear_halt(r)
         await r.tick(HELD_TICKS)
         # A new squeeze asks again.
         await r.release_grip()
@@ -483,15 +523,15 @@ async def test_a_squeeze_or_a_press_during_a_halt_takes_nothing_and_says_so():
     async with rig("pose_stream", "posture_button") as r:
         halt(r)
         r.hold(squeeze=True)
-        await r.ticks_until(lambda: r.hand.note.text() != "")
-        assert r.hand.note.text() == f"squeeze refused: {HALTED}"
+        await r.ticks_until(lambda: r.driver.note(Hand.RIGHT) != "")
+        assert r.driver.note(Hand.RIGHT) == f"squeeze refused: {HALTED}"
         await r.release_grip()
         await r.press_a()
-        await r.ticks_until(lambda: r.status.state() is not None)
-        assert r.status.state() == f"move to home refused: {HALTED}"
+        await r.ticks_until(lambda: r.driver.posture_line() is not None)
+        assert r.driver.posture_line() == f"move to home refused: {HALTED}"
         assert r.daemon.take.captured() == [] and r.stops.captured() == []
         # Nothing streamed: after the halt, the first pose is the new one.
-        r.fleet.view = fleet_view([ROBOT])
+        clear_halt(r)
         r.arm_at = ELSEWHERE
         await r.squeeze_and_take()
         assert position_of(await r.next_streamed()) == pytest.approx(0.4)
@@ -502,7 +542,7 @@ async def test_a_halt_during_a_posture_move_cancels_it():
         goal = await start_home(r)
         halt(r)
         await asyncio.wait_for(goal.cancel_signal(), CALL_S)
-        assert not r.driver.holds(ROBOT)
+        assert not r.holds()
         await goal.complete_cancelled("cancelled by its caller", NO_RESULT)
 
 
@@ -518,9 +558,9 @@ async def test_a_posture_goal_accepted_after_a_let_go_is_cancelled():
         goal = await pending.accept()
         await asyncio.wait_for(goal.cancel_signal(), CALL_S)
         await goal.complete_cancelled("cancelled by its caller", NO_RESULT)
+        # The halt still stands at the accept: its cause is the refusal's.
         await eventually(
-            lambda: r.status.state() == "move to home refused: the headset let go of "
-            f"{ROBOT}"
+            lambda: r.driver.posture_line() == f"move to home refused: {HALTED}"
         )
 
 
@@ -536,7 +576,7 @@ async def test_a_posture_goal_whose_send_is_lost_is_stopped_before_the_release()
         await r.answer_release()
         await eventually(
             lambda: (
-                r.status.state()
+                r.driver.posture_line()
                 == "move to home refused: the goal could not be sent (see log)"
             )
         )
@@ -547,33 +587,35 @@ async def test_a_press_landing_with_a_squeeze_takes_nothing_and_says_to_let_go()
         r.hold()
         await r.tick()
         r.hold(squeeze=True, a=True)
-        await r.ticks_until(lambda: r.status.state() is not None)
-        assert r.status.state() == "move to home ignored: release the grip first"
+        await r.ticks_until(lambda: r.driver.posture_line() is not None)
+        assert r.driver.posture_line() == "move to home ignored: release the grip first"
         assert r.daemon.take.captured() == []
 
 
 async def test_a_press_during_a_posture_move_does_nothing_and_says_why():
     async with rig("posture_button") as r:
         goal = await start_home(r)
-        await r.ticks_until(lambda: r.status.state() == "moving to home...")
+        await r.ticks_until(lambda: r.driver.posture_line() == "moving to home...")
         r.hold()
         await r.tick()
         r.hold(a=True)
-        await r.ticks_until(lambda: r.status.state() != "moving to home...")
-        assert r.status.state() == "move to home ignored: still moving to home"
+        await r.ticks_until(lambda: r.driver.posture_line() != "moving to home...")
+        assert r.driver.posture_line() == "move to home ignored: still moving to home"
         assert len(r.daemon.take.captured()) == 1
         await goal.complete(posture_done(move_to_home))
         await r.answer_release()
 
 
 async def test_a_lease_end_that_a_listing_settles_against_the_headset_lets_go():
-    async with rig("pose_stream") as r, running(r.follow):
+    async with rig("pose_stream", follows_fleet=True) as r, running(r.follow):
         follow, hold = await accept_both(r.daemon)
         await follow.publish_feedback(change("listing", robots=[ROBOT]))
-        # The rig's fleet follows from its start: wait for the listing of
-        # the goals just started.
+        # The rig's driver follows the fleet from its start: wait for the
+        # listing of the goals just started.
         await eventually(
-            lambda: r.fleet.generation == 1 and r.fleet.unavailable() is None
+            lambda: (
+                r.driver.world.fleet.generation == 1 and r.driver.world.fleet.goals_run
+            )
         )
         await r.squeeze_and_take()
         await hold.publish_feedback(
@@ -584,12 +626,12 @@ async def test_a_lease_end_that_a_listing_settles_against_the_headset_lets_go():
         request, responder = await r.daemon.check_move.next_request(CALL_S)
         assert (request.instance, request.robot) == (None, ROBOT)
         await responder.respond(check_move.ResponseData(refusal=None, revision=3))
-        assert r.driver.holds(ROBOT)
-        director_open = [(ROBOT, DIRECTOR, "tidy the table", True)]
+        assert r.holds()
+        director_open = [(ROBOT, DIRECTOR, DIRECTOR_LEASE, True)]
         await follow.publish_feedback(
             change(
                 "lease_open", ROBOT, revision=3, robots=[ROBOT], leases=director_open
             )
         )
-        await eventually(lambda: not r.driver.holds(ROBOT))
-        assert r.driver.note.text() == f"let go of {ROBOT}: the stack was reset"
+        await eventually(lambda: not r.holds())
+        assert r.driver.note(ROBOT_NOTE) == f"let go of {ROBOT}: the stack was reset"

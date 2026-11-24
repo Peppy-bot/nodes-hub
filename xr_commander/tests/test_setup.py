@@ -110,5 +110,20 @@ async def test_setup_holds_no_sensors_without_a_simulation(wired):
 
     async with set_up(runner):
         wired.follow_chosen_robot.assert_not_awaited()
-        # The session's stop is the only hook.
-        assert runner.on_shutdown.call_count == 1
+        # The session's stop and the let-go are the hooks.
+        assert runner.on_shutdown.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_the_nodes_shutdown_steps_the_worlds_shutdown(wired, monkeypatch):
+    runner = MagicMock()
+    runner.optional_bound_producer.return_value = None
+    step = MagicMock()
+    monkeypatch.setattr(wiring.drive.Driver, "step", step)
+
+    async with set_up(runner):
+        _stop_session, let_go = (
+            call.args[0] for call in runner.on_shutdown.call_args_list
+        )
+        await let_go()
+    step.assert_called_with(wiring.grip_world.Shutdown())

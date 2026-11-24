@@ -14,7 +14,7 @@ being that one proves that nothing went out before it.
 
 import asyncio
 import contextlib
-from types import SimpleNamespace
+from functools import partial
 
 import peppygen.clock
 import pytest
@@ -24,12 +24,20 @@ from peppygen.paired_topics.base import drive_setpoints, drive_states
 
 from tests.helpers import (
     CALL_S,
+    DIFFERENTIAL,
     HALTED,
+    HALTER,
     HELD_TICKS,
+    HOLONOMIC,
+    HOME_REACHED,
     ROBOT,
     SETTINGS,
+    TICK_S,
     WIRE_TICKS,
+    FakeStops,
     ManualClock,
+    NoWireSlot,
+    Peer,
     ScriptedHeadset,
     StopsOnCue,
     TickedRig,
@@ -42,11 +50,14 @@ from tests.helpers import (
     driver_on_the_wire,
     eventually,
     fleet_view,
-    following_fleet,
+    limits_given,
+    listed,
     posture_done,
     robots_of,
     running,
+    scripted_driver,
     settle,
+    states,
     wire_stops,
 )
 from xr_commander import base, panel, postures, publish
@@ -60,9 +71,22 @@ from xr_commander.base import (
     Twist,
     twist_of,
 )
+from xr_commander.bus import FLASH_S
 from xr_commander.devices import Thumbstick, parse_hands, primary_pressed
+from xr_commander.drive import Goals
 from xr_commander.fleet import LEASE_NAME
+from xr_commander.grip_world import (
+    BASE,
+    ROBOT_NOTE,
+    Engaged,
+    NotReady,
+    Phase,
+    Ready,
+    Requesting,
+    robot_of_phase,
+)
 from xr_commander.motor_health import MotorHealthReports
+from xr_commander.robots import PairedRobots
 
 # The instance's clock when each test starts (ns).
 START_NS = 1_000_000_000_000
@@ -72,35 +96,6 @@ ODOMETRY_START_S = 500.0
 # 0.05 + 0.5 * 0.95.
 FULL = 1.0
 HALF = 0.525
-
-
-def limits_given(*, x=(-0.4, 0.8), y=(0.0, 0.0), turn=(-1.5, 1.0)):
-    """The limits a drive_states gives for a base with these ranges (m/s,
-    rad/s): a differential base by default, whose backward and clockwise
-    limits differ from its forward and counterclockwise ones."""
-    drives_y = y != (0.0, 0.0)
-    return SimpleNamespace(
-        linear_limits=drive_states.MessageLinearLimits(
-            min_velocity=[x[0], y[0]],
-            max_velocity=[x[1], y[1]],
-            max_acceleration=[1.0, 1.0 if drives_y else 0.0],
-            max_deceleration=[2.0, 2.0 if drives_y else 0.0],
-            deadband=[0.0, 0.0],
-            rest_velocity=[0.01, 0.01 if drives_y else 0.0],
-        ),
-        angular_limits=drive_states.MessageAngularLimits(
-            min_rate=turn[0],
-            max_rate=turn[1],
-            max_acceleration=2.0,
-            max_deceleration=3.0,
-            deadband=0.0,
-            rest_rate=0.02,
-        ),
-    )
-
-
-DIFFERENTIAL = limits_given()
-HOLONOMIC = limits_given(y=(-0.3, 0.6))
 
 
 def stick_axes(forward=0.0, left=0.0) -> list[float]:
@@ -137,15 +132,15 @@ class Rig(TickedRig):
     the daemon, each robot's robot_stop and each base's follower played by
     the mocks."""
 
-    def __init__(self, h, clock: ManualClock, robots: list[str]) -> None:
+    def __init__(
+        self, h, clock: ManualClock, robots: list[str], goals: Goals | None = None
+    ) -> None:
         super().__init__(clock)
         self.h = h
-        self.fleet = following_fleet(*robots)
         self.robots = robots_of(h)
         self.reports = BaseReports()
         self.noted = base.NotedStops(wire_stops(h, self.robots), self.reports)
-        self.driver = driver_on_the_wire(h, self.fleet, self.noted, clock)
-        self.state = self.driver.base
+        self.driver = listed(driver_on_the_wire(h, self.noted, clock, goals), *robots)
         self.session = ScriptedHeadset(clock)
         self.daemon = h.mocks.deps.fleet
         # The harness starts the mocks of each slot in the order it is given.
@@ -243,6 +238,25 @@ class Rig(TickedRig):
             if member.info.producer.instance_id == robot
         )
 
+    def phase(self) -> Phase:
+        """The base grip's phase now."""
+        return self.driver.world.grips.base.phase
+
+    def follows(self, robot=ROBOT) -> bool:
+        """Whether the engaged base of `robot` follows now, as its stream
+        reads it."""
+        return isinstance(self.phase(), Engaged) and base.follows_now(
+            self.reports.newest(self.peer(robot)),
+            stops_in_flight=self.noted.in_flight(robot),
+            stop_ended_ns=self.noted.ended_at(robot),
+        )
+
+    async def until_engaged(self) -> None:
+        """Wait until the answer of the base's acquisition engages it."""
+        await eventually(
+            lambda: isinstance(self.phase(), Engaged), message="the base engaged"
+        )
+
     async def answer_take(self, refusal=None, robot=ROBOT):
         await daemon_answers_take(self.daemon, robot, refusal)
 
@@ -265,19 +279,20 @@ class Rig(TickedRig):
         await self.tick()
         await self.answer_take(robot=robot)
         await self.answer_stop(robot)
-        await self.ticks_until(lambda: self.state.engaged)
+        await self.until_engaged()
         await self.report("robot_stop", robot=robot)
         await self.clock_by(base.STOP_HOLD_NS + 1)
         await self.report(robot=robot)
-        await self.ticks_until(lambda: self.state.followed)
+        await self.ticks_until(lambda: self.follows(robot))
 
     async def burst(self, robot=ROBOT) -> list[tuple[float, float, float]]:
-        """Each setpoint of the release burst toward `robot`, one per tick
-        while the grips hold the robot for the base."""
+        """Each setpoint of the release burst toward `robot`, one per tick,
+        until the first tick after which the base grip's phase is off
+        `robot`."""
         streamed = []
         for _ in range(WIRE_TICKS):
             await self.tick()
-            if self.state.robot != robot:
+            if robot_of_phase(self.phase()) != robot:
                 return streamed
             message = await asyncio.wait_for(self.wire(robot).next(), CALL_S)
             streamed.append(setpoint_of(message))
@@ -292,8 +307,9 @@ class Rig(TickedRig):
     def row(self) -> str:
         """What the panel's base row says now."""
         source = panel.BaseSource(
-            state=self.state,
+            grip=partial(self.driver.grip_status, BASE),
             reports=self.reports,
+            stops=self.noted,
             peer=lambda: self.robots.peer_of(drive_setpoints, self.robots.chosen()),
         )
         state = panel.snapshot(
@@ -338,18 +354,18 @@ async def test_a_stop_before_the_instance_clock_ticks_takes_holds_and_releases()
         postures_instance_ids=[ROBOT],
         base_members={ROBOT: None},
     ) as h:
-        r = Rig(h, ManualClock(), [ROBOT])
-        status = postures.PostureStatus(r.clock)
+        goals = postures.PostureGoals(
+            h.node_runner, {"home": move_to_home}, SETTINGS.posture_move_duration_s
+        )
+        r = Rig(h, ManualClock(), [ROBOT], goals)
 
         def posture_button(token):
             return postures.run_posture_button(
-                h.node_runner,
                 action_module=move_to_home,
                 pressed=primary_pressed,
                 session=r.session,
                 robots=r.robots,
                 driver=r.driver,
-                status=status,
                 settings=SETTINGS,
                 token=token,
                 clock=r.clock,
@@ -368,11 +384,13 @@ async def test_a_stop_before_the_instance_clock_ticks_takes_holds_and_releases()
             await daemon_answers_check_move(r.daemon, ROBOT)
             pending = await h.mocks.deps.postures[0].move_to_home.next_goal(CALL_S)
             goal = await pending.accept()
-            assert r.driver.holds(ROBOT)
+            assert r.driver.world.robot(ROBOT).hold is not None
             await goal.complete(posture_done(move_to_home))
             await r.answer_release()
-            await eventually(lambda: status.state() == "move to home completed")
-            assert not r.driver.holds(ROBOT)
+            await eventually(
+                lambda: r.driver.posture_line() == HOME_REACHED
+            )
+            assert r.driver.world.robot(ROBOT).hold is None
             # The clock runs: a base take waits for the stop's hold, then
             # drives.
             await instance_clock_at(h, START_NS)
@@ -432,20 +450,10 @@ def test_limits_that_base_state_does_not_allow_are_refused_by_name(limits, messa
     assert str(refused.value) == message
 
 
-def states(follow_state="following", limits=DIFFERENTIAL):
-    """A drive_states as the headset reads it."""
-    return SimpleNamespace(
-        follow_state=follow_state,
-        mode="standing",
-        linear_limits=limits.linear_limits,
-        angular_limits=limits.angular_limits,
-    )
-
-
-def test_a_base_reports_by_arrival_on_the_instances_clock_and_counts_its_reports():
+def test_a_base_reports_by_arrival_on_the_instances_clock_and_its_newest_goes_stale():
     now = {"ns": 7_000}
     reports = BaseReports(lambda: now["ns"])
-    assert reports.newest("peer") is None and reports.fresh("peer") is None
+    assert reports.newest("peer") is None
     assert reports.newest(None) is None
     reports.record("peer", states("robot_stop"))
     now["ns"] += 100
@@ -455,10 +463,9 @@ def test_a_base_reports_by_arrival_on_the_instances_clock_and_counts_its_reports
     # Arrival counts from the clock's first reading.
     assert (newest.arrived_ns, newest.limits) == (100, limits_of(HOLONOMIC))
     now["ns"] += base.REPORT_SILENCE_NS
-    assert reports.fresh("peer") is newest
-    now["ns"] += 1
-    assert reports.fresh("peer") is None
     assert reports.newest("peer") is newest
+    now["ns"] += 1
+    assert reports.newest("peer") is None
 
 
 @pytest.mark.parametrize(
@@ -477,7 +484,7 @@ def test_a_drive_states_that_drive_link_does_not_allow_is_dropped_and_named(drop
     assert reports.dropped("peer") is None
 
 
-async def test_a_stop_is_noted_at_its_answer_or_its_refusal():
+async def test_a_stop_is_noted_in_flight_and_at_its_answer_or_its_refusal():
     now = {"ns": 0}
     reports = BaseReports(lambda: now["ns"])
     assert reports.mark() == 0
@@ -486,19 +493,24 @@ async def test_a_stop_is_noted_at_its_answer_or_its_refusal():
     first = asyncio.create_task(noted.stop("alpha"))
     second = asyncio.create_task(noted.stop("alpha"))
     await settle()
+    assert noted.in_flight("alpha") == 2
+    assert noted.in_flight("bravo") == 0
     assert noted.ended_at("alpha") is None
     now["ns"] = 300
     stops.answer(0)
     stops.answer(1)
     assert await first is None
     assert await second is None
+    assert noted.in_flight("alpha") == 0
     assert noted.ended_at("alpha") == 300
     # A refused stop counts too: the backbone runs a stop it took.
     now["ns"] = 700
     refused = asyncio.create_task(noted.stop("alpha"))
     await settle()
+    assert noted.in_flight("alpha") == 1
     stops.answer(2, "alpha did not answer")
     assert await refused == "alpha did not answer"
+    assert noted.in_flight("alpha") == 0
     assert noted.ended_at("alpha") == 700
     assert noted.ended_at("bravo") is None
 
@@ -514,6 +526,7 @@ async def test_a_stop_cut_short_is_noted_at_its_end():
     stopping.cancel()
     with pytest.raises(asyncio.CancelledError):
         await stopping
+    assert noted.in_flight("alpha") == 0
     assert noted.ended_at("alpha") == 400
 
 
@@ -568,25 +581,255 @@ def test_a_clock_that_goes_back_counts_as_no_time_passing():
     reports = BaseReports(lambda: now["ns"])
     reports.record("peer", states())
     now["ns"] += 400_000_000
-    assert reports.fresh("peer") is not None
+    assert reports.newest("peer") is not None
     # The instance's clock steps back 8 s: the report keeps the 0.4 s it had.
     now["ns"] = 2_000_000_000
-    assert reports.fresh("peer") is not None
+    assert reports.newest("peer") is not None
     now["ns"] += 100_000_000
-    assert reports.fresh("peer") is not None
+    assert reports.newest("peer") is not None
     now["ns"] += 1
-    assert reports.fresh("peer") is None
+    assert reports.newest("peer") is None
     # A report after the step back arrives 0.5 s and 1 ns after the first on
     # the clock that counts the step as no time and starts at its first
     # reading, and the base reports again.
     reports.record("peer", states())
     report = reports.newest("peer")
     assert report.arrived_ns == 500_000_001
-    assert reports.fresh("peer") is report
     now["ns"] += base.REPORT_SILENCE_NS
-    assert reports.fresh("peer") is report
+    assert reports.newest("peer") is report
     now["ns"] += 1
-    assert reports.fresh("peer") is None
+    assert reports.newest("peer") is None
+
+
+# When the robot's stop of `test_follows_now_...` ends, on the elapsed
+# instance clock (ns).
+STOP_ENDED_NS = 1_000_000_000
+
+
+def follow_case(
+    case_id: str,
+    follows: bool,
+    *,
+    state: FollowState | None = FollowState.FOLLOWING,
+    after_ns: int = base.STOP_HOLD_NS + 1,
+    refused: bool = False,
+    in_flight: int = 0,
+):
+    """A case of `test_follows_now_...`: a report of `state`, None for none,
+    arriving `after_ns` after the robot's stop ended, answered or refused,
+    with `in_flight` more stops of the robot sent and not answered."""
+    return pytest.param(state, after_ns, refused, in_flight, follows, id=case_id)
+
+
+@pytest.mark.parametrize(
+    ("state", "after_ns", "refused", "in_flight", "follows"),
+    [
+        follow_case("following", True),
+        *(
+            follow_case(state.value, False, state=state)
+            for state in FollowState
+            if state is not FollowState.FOLLOWING
+        ),
+        follow_case("no report", False, state=None),
+        follow_case("in flight", False, in_flight=1),
+        follow_case("0.25 s", False, after_ns=base.STOP_HOLD_NS // 2),
+        follow_case("exactly 0.5 s", False, after_ns=base.STOP_HOLD_NS),
+        follow_case("refused", False, after_ns=base.STOP_HOLD_NS, refused=True),
+        follow_case("refused, then 0.5 s and 1 ns", True, refused=True),
+    ],
+)
+async def test_follows_now_by_its_report_its_stops_and_half_a_second(
+    state, after_ns, refused, in_flight, follows
+):
+    now = {"ns": 0}
+    reports = BaseReports(lambda: now["ns"])
+    assert reports.mark() == 0
+    stops = StopsOnCue()
+    noted = base.NotedStops(stops, reports)
+    stopping = asyncio.create_task(noted.stop(ROBOT))
+    await settle()
+    now["ns"] = STOP_ENDED_NS
+    stops.answer(0, f"{ROBOT} did not answer" if refused else None)
+    await stopping
+    pending = [asyncio.create_task(noted.stop(ROBOT)) for _ in range(in_flight)]
+    await settle()
+    report = (
+        None
+        if state is None
+        else BaseReport(state, "standing", limits_of(), STOP_ENDED_NS + after_ns)
+    )
+    following = base.follows_now(
+        report,
+        stops_in_flight=noted.in_flight(ROBOT),
+        stop_ended_ns=noted.ended_at(ROBOT),
+    )
+    assert following is follows
+    for index, task in enumerate(pending, start=1):
+        stops.answer(index)
+        await task
+
+
+def test_base_ready_needs_a_pin_and_a_report():
+    following = BaseReport(FollowState.FOLLOWING, "standing", limits_of(), 0)
+    held = BaseReport(FollowState.ROBOT_STOP, "standing", limits_of(), 0)
+    assert base.base_ready(None, following) == NotReady("no base pair")
+    assert base.base_ready("peer", None) == NotReady("the base does not report")
+    assert base.base_ready("peer", following) == Ready()
+    # A hold the report gives asks for no other readiness: the take stops the
+    # robot, and the base streams once it follows.
+    assert base.base_ready("peer", held) == Ready()
+
+
+ALPHA_BASE = Peer("alpha base")
+BRAVO_BASE = Peer("bravo base")
+
+
+def setpoint_sent(send) -> tuple[Peer, tuple[float, float, float]] | None:
+    """A base tick's send as its pair and its setpoint's x, y and turn, None
+    for silence; the setpoint carries no frame and no timestamp."""
+    if send is None:
+        return None
+    pair, (frame, timestamp, linear, angular) = send
+    assert (frame, timestamp) == (None, None)
+    return pair, (linear[0], linear[1], angular[2])
+
+
+class TickRig:
+    """`base_tick` with no wire: a scripted daemon and backbones, the base
+    pairs of alpha and bravo on a slot whose setpoints are their fields, the
+    instance's clock the test sets, and a manual clock for the ticks."""
+
+    def __init__(self) -> None:
+        self.log: list = []
+        self.clock = ManualClock()
+        self.now = {"ns": 0}
+        self.reports = BaseReports(lambda: self.now["ns"])
+        self.noted = base.NotedStops(FakeStops(self.log), self.reports)
+        self.driver = scripted_driver(
+            "alpha", "bravo", clock=self.clock, log=self.log, stops=self.noted
+        )
+        slot = NoWireSlot(("alpha", ALPHA_BASE), ("bravo", BRAVO_BASE))
+        self.robots = PairedRobots(None, arms={}, grippers={}, base=slot)
+        self.session = ScriptedHeadset(self.clock)
+        self._tick = base.base_tick(
+            topic_module=slot,
+            driver=self.driver,
+            stops=self.noted,
+            reports=self.reports,
+            session=self.session,
+            robots=self.robots,
+            settings=SETTINGS,
+            clock=self.clock,
+        )
+
+    def hold(self, *, squeeze=False, forward=0.0):
+        """The left grip and the left thumbstick deflected `forward`; the
+        right hand tracked, its grip released."""
+        self.session.hands = parse_hands(
+            [
+                controller("left", squeezing=squeeze, axes=stick_axes(forward)),
+                controller("right"),
+            ]
+        )
+
+    def report(self, follow_state="following", pair=ALPHA_BASE):
+        self.reports.record(pair, states(follow_state))
+
+    async def tick(self):
+        """One tick of the base stream, as `setpoint_sent` gives its send,
+        then the clock moves on by a tick period."""
+        sent = setpoint_sent(self._tick())
+        await self.clock.advance(TICK_S)
+        return sent
+
+    async def engage(self) -> None:
+        """A squeeze takes alpha and engages the base, and alpha's base then
+        reports following more than 0.5 s after the stop."""
+        self.hold(squeeze=True)
+        self.report()
+        assert await self.tick() is None
+        await settle()
+        assert isinstance(self.driver.world.grips.base.phase, Engaged)
+        assert self.log == [("take", "alpha"), ("stop", "alpha")]
+        self.now["ns"] += base.STOP_HOLD_NS + 1
+        self.report()
+
+
+def drive_half(r: TickRig) -> None:
+    r.hold(squeeze=True, forward=HALF)
+
+
+def rest(r: TickRig) -> None:
+    r.hold(squeeze=True)
+
+
+def release(r: TickRig) -> None:
+    r.hold(forward=HALF)
+
+
+def go_stale(r: TickRig) -> None:
+    r.session.age_s = SETTINGS.stale_timeout_s + 1.0
+
+
+def choose_bravo(r: TickRig) -> None:
+    assert r.robots.choose("bravo")
+
+
+def keep(r: TickRig) -> None:
+    """Nothing changes."""
+
+
+def held_by(follow_state: str):
+    """A change that has alpha's base report `follow_state`, the stick held
+    at half a deflection forward."""
+
+    def change(r: TickRig) -> None:
+        r.report(follow_state)
+        drive_half(r)
+
+    return change
+
+
+# Half a deflection forward on the differential base, and the burst's zero,
+# each sent to alpha's base.
+DRIVEN = (ALPHA_BASE, pytest.approx((0.4, 0.0, 0.0)))
+ZERO = (ALPHA_BASE, (0.0, 0.0, 0.0))
+HOLDS = ("base_mode", "base_silence", "robot_stop", "follower_goal")
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        pytest.param([(drive_half, DRIVEN)], id="twist"),
+        pytest.param([(rest, None)], id="zero twist"),
+        *(pytest.param([(held_by(state), None)], id=state) for state in HOLDS),
+        pytest.param([(release, None)], id="released"),
+        pytest.param([(drive_half, DRIVEN), (rest, ZERO)], id="sticks rest"),
+        pytest.param(
+            [(drive_half, DRIVEN), (release, ZERO)], id="released after a drive"
+        ),
+        pytest.param([(drive_half, DRIVEN), (go_stale, ZERO)], id="stale frames"),
+        pytest.param(
+            [(drive_half, DRIVEN), (choose_bravo, ZERO)], id="another robot chosen"
+        ),
+        pytest.param(
+            [(drive_half, DRIVEN), (held_by("robot_stop"), ZERO), (keep, ZERO)],
+            id="a burst through a hold",
+        ),
+    ],
+)
+async def test_the_base_tick_streams_by_the_rule(steps):
+    """After the base is engaged and follows, each step changes what the
+    tick reads and gives its send: the twist while engaged, following and
+    not zero; nothing else but the burst's zeros, to the pair last driven,
+    once the base drove."""
+    r = TickRig()
+    await r.engage()
+    for change, sent in steps:
+        change(r)
+        assert await r.tick() == sent
+    # A release the last step started ends before the loop does.
+    await settle()
 
 
 # The stream on the wire.
@@ -603,9 +846,9 @@ async def test_the_first_setpoint_comes_after_the_lease_the_stop_and_a_late_foll
         assert request.reason == LEASE_NAME
         # The stream waits on the stop's answer.
         await settle()
-        assert not r.state.engaged
+        assert isinstance(r.phase(), Requesting)
         await responder.respond(stop.ResponseData(stopped=["base"]))
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
         assert r.row() == "waiting for the base"
         # The stop holds the base: nothing streams, the stick held or not,
         # and a report of the hold past 0.5 s starts nothing either.
@@ -614,9 +857,7 @@ async def test_the_first_setpoint_comes_after_the_lease_the_stop_and_a_late_foll
         await r.clock_by(base.STOP_HOLD_NS + 1)
         await r.report("robot_stop")
         await r.tick(HELD_TICKS)
-        assert r.row() == (
-            "a robot stop holds the base: let the sticks rest, then drive again"
-        )
+        assert r.row() == "a robot stop holds the base"
         # A following more than 0.5 s after the answer starts the stream, at
         # the stick held now.
         r.hold(squeeze=True, forward=HALF)
@@ -652,11 +893,11 @@ async def test_a_following_more_than_half_a_second_after_the_answer_starts_the_g
         await r.answer_take()
         await instance_clock_at(r.h, START_NS + answered_ns)
         await r.answer_stop()
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
         await instance_clock_at(r.h, START_NS + arrives_ns)
         await r.report()
         await r.tick()
-        assert r.state.followed is drives
+        assert r.follows() is drives
         if drives:
             setpoint = await asyncio.wait_for(r.wire().next(), CALL_S)
             assert setpoint_of(setpoint) == pytest.approx((0.4, 0.0, 0.0))
@@ -681,13 +922,13 @@ async def test_hold_reports_before_the_answer_then_a_late_following_starts_the_g
         await r.answer_take()
         await r.report("robot_stop")
         await r.answer_stop()
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
         await r.report()
         await r.tick(HELD_TICKS)
         await r.clock_by(base.STOP_HOLD_NS)
         await r.report()
         await r.tick(HELD_TICKS)
-        assert not r.state.followed
+        assert not r.follows()
         await r.clock_by(1)
         await r.report()
         assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.4, 0.0, 0.0))
@@ -707,7 +948,7 @@ async def test_each_take_waits_past_the_answer_of_its_own_stop():
         await r.tick()
         await r.answer_take()
         await r.answer_stop()
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
         await r.report()
         await r.tick(HELD_TICKS)
         await r.clock_by(base.STOP_HOLD_NS + 1)
@@ -776,7 +1017,7 @@ async def test_a_release_streams_zero_velocity_for_the_burst_then_nothing():
         assert len(burst) >= publish.RELEASE_HOLD_MESSAGES
         assert set(burst) == {(0.0, 0.0, 0.0)}
         assert r.clock.monotonic() - released_at >= publish.RELEASE_HOLD_S
-        assert not r.driver.holds(ROBOT)
+        assert r.driver.world.robot(ROBOT).hold is None
         await r.answer_release()
         await r.tick(HELD_TICKS)
         await r.squeeze_and_take()
@@ -792,16 +1033,19 @@ async def test_a_refused_take_streams_nothing_and_the_row_says_why():
         await r.answer_take(
             refusal="robot `backbone_inst` is leased by `director_inst`"
         )
-        await r.ticks_until(lambda: r.state.note.text() != "")
+        await eventually(
+            lambda: r.driver.note(BASE) != "", message="the refusal's note"
+        )
         assert r.row() == (
             "squeeze refused: robot `backbone_inst` is leased by `director_inst`"
         )
         # The held grip asks nothing again until it is released.
         await r.tick(HELD_TICKS)
-        assert r.state.wait_release and len(r.daemon.take.captured()) == 1
+        assert r.driver.world.hands.left.must_release
+        assert len(r.daemon.take.captured()) == 1
         assert r.stops[ROBOT].robot_stop_stop.captured() == []
         r.hold()
-        await r.ticks_until(lambda: not r.state.wait_release)
+        await r.ticks_until(lambda: not r.driver.world.hands.left.must_release)
         await r.squeeze_and_take()
         r.hold(squeeze=True, forward=FULL)
         assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.8, 0.0, 0.0))
@@ -816,39 +1060,39 @@ async def test_a_refused_take_streams_nothing_and_the_row_says_why():
         ("follower_goal", "moving"),
     ],
 )
-async def test_each_hold_the_base_reports_ends_the_stream_until_every_stick_rests(
+async def test_each_hold_the_base_reports_streams_the_burst_and_a_stick_held_through_it_drives_once_it_follows(
     follow_state, mode
 ):
     async with rig() as r:
         await r.squeeze_and_take()
         r.hold(squeeze=True, forward=HALF)
         assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.4, 0.0, 0.0))
+        # The hold ends the drive: the burst's zeros go out through it, one
+        # at each tick.
         await r.report(follow_state, mode=mode)
-        await r.tick(HELD_TICKS)
+        held = [setpoint_of(await r.next_setpoint()) for _ in range(HELD_TICKS)]
+        assert held == [(0.0, 0.0, 0.0)] * HELD_TICKS
         assert r.row() == panel._HOLD_TEXTS[FollowState(follow_state)].format(
             mode=mode
         )
-        # The base follows again: the stick held through the hold drives
-        # nothing until every stick rests.
+        # The base follows again more than 0.5 s after the newest stop: the
+        # stick held through the hold drives at once.
         await r.report()
-        await r.tick(HELD_TICKS)
-        assert r.row() == "let the sticks rest"
-        r.hold(squeeze=True)
-        await r.tick()
-        r.hold(squeeze=True, forward=FULL)
-        # No burst and no stick held through the hold went out before.
-        assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.8, 0.0, 0.0))
+        assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.4, 0.0, 0.0))
+        assert r.row() == "driving"
 
 
-async def test_a_hold_reported_in_the_release_burst_ends_the_burst():
+async def test_a_hold_reported_in_the_release_burst_does_not_end_it():
     async with rig() as r:
         await r.squeeze_and_take()
         r.hold(squeeze=True, forward=HALF)
         await r.next_setpoint()
         r.hold(squeeze=True)
         assert setpoint_of(await r.next_setpoint()) == (0.0, 0.0, 0.0)
+        # The burst runs on through the hold, a zero at each tick.
         await r.report("robot_stop")
-        await r.tick(HELD_TICKS)
+        held = [setpoint_of(await r.next_setpoint()) for _ in range(HELD_TICKS)]
+        assert held == [(0.0, 0.0, 0.0)] * HELD_TICKS
         await r.report()
         r.hold(squeeze=True, forward=FULL)
         assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.8, 0.0, 0.0))
@@ -857,25 +1101,28 @@ async def test_a_hold_reported_in_the_release_burst_ends_the_burst():
 async def a_drive_stamped(stamp_offset_s: float) -> list:
     """A take, a drive through a hold, the instance's clock past the bound
     of silence, and a release, with each report stamped `stamp_offset_s`
-    off the instance's clock: every setpoint and every row, in order."""
+    off the instance's clock: every setpoint, one per tick, and every row,
+    in order."""
     seen = []
     async with rig() as r:
         r.stamp_offset_s = stamp_offset_s
         await r.squeeze_and_take()
         r.hold(squeeze=True, forward=HALF)
         seen += [setpoint_of(await r.next_setpoint()) for _ in range(HELD_TICKS)]
+        # A robot stop holds the base: the burst's zeros go out through it.
         await r.report("robot_stop")
-        await r.tick()
+        seen.append(setpoint_of(await r.next_setpoint()))
         seen.append(r.row())
+        # The base follows again more than 0.5 s after the newest stop: the
+        # stick held drives at once.
         await r.report()
-        r.hold(squeeze=True)
-        await r.tick()
         r.hold(squeeze=True, turn=HALF)
         seen.append(setpoint_of(await r.next_setpoint()))
         # 0.5 s of the instance's clock since the last report: it reports.
         await r.clock_by(base.REPORT_SILENCE_NS)
         seen.append(r.row())
         seen.append(setpoint_of(await r.next_setpoint()))
+        # 1 ns more: it does not report, and the burst's zeros go out.
         await r.clock_by(1)
         seen.append(r.row())
         seen.append(setpoint_of(await r.next_setpoint()))
@@ -890,13 +1137,21 @@ async def test_reports_stamped_behind_or_ahead_of_the_instances_clock_change_not
     stamp_offset_s,
 ):
     on_time = await a_drive_stamped(0.0)
-    assert on_time[HELD_TICKS : HELD_TICKS + 4] == [
-        "a robot stop holds the base: let the sticks rest, then drive again",
+    driving = [pytest.approx((0.4, 0.0, 0.0))] * HELD_TICKS
+    assert on_time[: HELD_TICKS + 7] == [
+        *driving,
+        (0.0, 0.0, 0.0),
+        "a robot stop holds the base",
         pytest.approx((0.0, 0.0, 0.5)),
         "driving",
         pytest.approx((0.0, 0.0, 0.5)),
+        "the base does not report: check its base node",
+        (0.0, 0.0, 0.0),
     ]
-    assert on_time[HELD_TICKS + 4] == "the base does not report: check its base node"
+    # The burst that the silence started runs on through the release.
+    rest_of_burst = on_time[HELD_TICKS + 7]
+    assert len(rest_of_burst) + 1 >= publish.RELEASE_HOLD_MESSAGES
+    assert set(rest_of_burst) == {(0.0, 0.0, 0.0)}
     assert await a_drive_stamped(stamp_offset_s) == on_time
 
 
@@ -920,9 +1175,12 @@ async def test_a_drive_states_outside_the_contract_is_dropped_logged_once_and_sh
         await r.send_report(limits=outside)
         await eventually(lambda: r.reports.dropped(r.peer()) == why)
         await r.tick(HELD_TICKS)
-        # Dropped, the base has not reported: the squeeze takes nothing.
-        assert r.row() == f"drive_states unreadable ({why}): check its base node"
+        # Dropped, the base has not reported: the squeeze takes nothing, and
+        # the row says why for three seconds, then names the dropped value.
+        assert r.row() == "squeeze refused: the base does not report"
         assert r.daemon.take.captured() == []
+        await r.clock.advance(FLASH_S, parked=r.loops)
+        assert r.row() == f"drive_states unreadable ({why}): check its base node"
         await r.send_report("resting")
         await eventually(
             lambda: r.reports.dropped(r.peer())
@@ -935,7 +1193,7 @@ async def test_a_drive_states_outside_the_contract_is_dropped_logged_once_and_sh
         await r.tick()
         await r.answer_take()
         await r.answer_stop()
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
 
 
 async def test_frames_that_go_stale_mid_drive_stream_the_burst_then_nothing():
@@ -959,20 +1217,29 @@ async def test_frames_that_go_stale_mid_drive_stream_the_burst_then_nothing():
         assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.8, 0.0, 0.0))
 
 
-async def test_a_take_withdrawn_between_the_lease_and_the_stop_stops_nothing():
+async def test_a_base_grip_released_before_the_take_answers_still_gets_its_stop():
     async with rig() as r:
         r.hold(squeeze=True, forward=FULL)
         await r.report()
         await r.tick()
         request, responder = await r.daemon.take.next_request(CALL_S)
         assert request.robot == ROBOT
-        # The grip is released while the daemon answers the take.
+        # The grip is released while the daemon answers the take: no tick
+        # read the release by the answer, so the take stops the robot and
+        # engages the base.
         r.hold(forward=FULL)
         await responder.respond()
+        await r.answer_stop()
+        await r.until_engaged()
+        # The next tick reads the release. The base drove nothing, so no
+        # burst runs, and the robot is released.
+        assert await r.burst() == []
         await r.answer_release()
-        await r.tick(HELD_TICKS)
-        assert r.stops[ROBOT].robot_stop_stop.captured() == []
-        assert not r.state.engaged and not r.driver.holds(ROBOT)
+        assert r.driver.world.robot(ROBOT).hold is None
+        # Nothing went out: the first setpoint is the next squeeze's.
+        await r.squeeze_and_take()
+        r.hold(squeeze=True, forward=HALF)
+        assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.4, 0.0, 0.0))
 
 
 async def test_each_setpoint_gives_no_frame_or_timestamp_and_planar_velocity_alone():
@@ -997,9 +1264,9 @@ async def test_a_grip_released_before_the_base_follows_releases_the_robot():
         await r.tick()
         await r.answer_take()
         await r.answer_stop()
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
         r.hold(forward=FULL)
-        await r.ticks_until(lambda: not r.driver.holds(ROBOT))
+        await r.ticks_until(lambda: r.driver.world.robot(ROBOT).hold is None)
         await r.answer_release()
         await r.report()
         await r.tick(HELD_TICKS)
@@ -1012,14 +1279,18 @@ async def test_a_squeeze_on_a_base_that_has_not_reported_takes_nothing_until_it_
     async with rig() as r:
         r.hold(squeeze=True)
         await r.tick(HELD_TICKS)
-        assert r.row() == "the base does not report: check its base node"
+        # The squeeze says why on the base's row for three seconds, and the
+        # row then says that the base does not report.
+        assert r.row() == "squeeze refused: the base does not report"
         assert r.daemon.take.captured() == []
+        await r.clock.advance(FLASH_S, parked=r.loops)
+        assert r.row() == "the base does not report: check its base node"
         # The held grip takes the robot once the base reports.
         await r.report()
         await r.tick()
         await r.answer_take()
         await r.answer_stop()
-        await r.ticks_until(lambda: r.state.engaged)
+        await r.until_engaged()
 
 
 async def test_choosing_another_robot_sends_the_burst_to_the_first_base_alone():
@@ -1039,7 +1310,7 @@ async def test_choosing_another_robot_sends_the_burst_to_the_first_base_alone():
         # released; the next squeeze drives bravo.
         assert r.row() == "release the grip, then squeeze again"
         r.hold(forward=HALF)
-        await r.ticks_until(lambda: not r.state.wait_release)
+        await r.ticks_until(lambda: not r.driver.world.hands.left.must_release)
         await r.squeeze_and_take(robot="bravo")
         r.hold(squeeze=True, forward=FULL)
         assert setpoint_of(await r.next_setpoint("bravo")) == pytest.approx(
@@ -1052,17 +1323,16 @@ async def test_a_halt_lets_go_of_the_base_with_the_burst_and_a_held_grip_drives_
         await r.squeeze_and_take()
         r.hold(squeeze=True, forward=HALF)
         await r.next_setpoint()
-        r.fleet.view = fleet_view([ROBOT], halted_by="peppy-cli")
-        r.driver.fleet_changed(r.fleet.view)
-        assert r.driver.note.text() == f"let go of {ROBOT}: {HALTED}"
+        r.driver.fleet_changed(fleet_view([ROBOT], halted_by=HALTER))
+        assert r.driver.note(ROBOT_NOTE) == f"let go of {ROBOT}: {HALTED}"
         burst = await r.burst()
         assert len(burst) >= publish.RELEASE_HOLD_MESSAGES
         assert set(burst) == {(0.0, 0.0, 0.0)}
         assert r.row() == "release the grip, then squeeze again"
         await r.tick(HELD_TICKS)
-        r.fleet.view = fleet_view([ROBOT])
+        r.driver.fleet_changed(fleet_view([ROBOT]))
         r.hold()
-        await r.ticks_until(lambda: not r.state.wait_release)
+        await r.ticks_until(lambda: not r.driver.world.hands.left.must_release)
         await r.squeeze_and_take()
         r.hold(squeeze=True, forward=FULL)
         assert setpoint_of(await r.next_setpoint()) == pytest.approx((0.8, 0.0, 0.0))

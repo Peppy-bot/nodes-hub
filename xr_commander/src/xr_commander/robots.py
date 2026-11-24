@@ -40,6 +40,10 @@ class SlotPairs:
 
     pairs: tuple[tuple[str, Hashable], ...]
 
+    @property
+    def peers(self) -> frozenset[Hashable]:
+        return frozenset(info for _robot, info in self.pairs)
+
     def pin_of(self, robot: str | None) -> Hashable | None:
         """`robot`'s first pair in delivered order, None while it has none
         here."""

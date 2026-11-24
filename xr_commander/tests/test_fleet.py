@@ -11,7 +11,10 @@ from peppygen.consumed_services.robot_stop import stop
 
 from tests.helpers import (
     CALL_S,
+    CHANGES_ENDED,
     DIRECTOR,
+    DIRECTOR_LEASE,
+    HALTER,
     HEADSET,
     RETRY_S,
     ManualClock,
@@ -32,7 +35,6 @@ from xr_commander.fleet import (
     LEASE_NAME,
     DaemonLost,
     DrivenHere,
-    Fleet,
     FleetCalls,
     FleetView,
     Following,
@@ -57,16 +59,16 @@ def test_a_listing_parses_into_the_robots_their_leases_and_the_halt():
     view = FleetView.parse(
         listing(
             robots=["alpha", "bravo"],
-            leases=[("alpha", DIRECTOR, "tidy the table", False)],
+            leases=[("alpha", DIRECTOR, DIRECTOR_LEASE, False)],
         ),
         revision=7,
     )
     assert view.revision == 7
     assert view.robots == {"alpha", "bravo"}
-    assert view.leases["alpha"] == Lease(DIRECTOR, "tidy the table", open=False)
+    assert view.leases["alpha"] == Lease(DIRECTOR, DIRECTOR_LEASE, open=False)
     assert view.halted_by is None
-    halted = FleetView.parse(listing(robots=["alpha"], halted_by="peppy-cli"), 8)
-    assert halted.halted_by == "peppy-cli"
+    halted = FleetView.parse(listing(robots=["alpha"], halted_by=HALTER), 8)
+    assert halted.halted_by == HALTER
 
 
 def test_each_robot_state_reads_off_the_listing_and_says_who_holds_it():
@@ -74,8 +76,8 @@ def test_each_robot_state_reads_off_the_listing_and_says_who_holds_it():
         ["free", "mine", "leased", "open"],
         leases={
             "mine": Lease(HEADSET, LEASE_NAME, open=False),
-            "leased": Lease(DIRECTOR, "tidy the table", open=False),
-            "open": Lease(DIRECTOR, "tidy the table", open=True),
+            "leased": Lease(DIRECTOR, DIRECTOR_LEASE, open=False),
+            "open": Lease(DIRECTOR, DIRECTOR_LEASE, open=True),
         },
     )
 
@@ -84,7 +86,7 @@ def test_each_robot_state_reads_off_the_listing_and_says_who_holds_it():
 
     assert state("free") == Free()
     assert state("mine") == DrivenHere()
-    assert state("leased") == Leased("director_inst", "tidy the table")
+    assert state("leased") == Leased("director_inst", DIRECTOR_LEASE)
     assert state("open") == OpenLease("director_inst")
     assert state("open", under_open=True) == DrivenHere(open_of="director_inst")
     assert state("gone") == NotListed()
@@ -93,7 +95,7 @@ def test_each_robot_state_reads_off_the_listing_and_says_who_holds_it():
     ] == [
         "free",
         "driven from this headset",
-        "leased by director_inst (tidy the table)",
+        f"leased by director_inst ({DIRECTOR_LEASE})",
         "open for a take-over by director_inst",
         "not in the fleet listing",
     ]
@@ -114,19 +116,41 @@ def test_the_goals_status_says_why_the_headset_cannot_ask_the_fleet():
 
 
 class Listener:
-    """Records what the two goals hand on, each in turn."""
+    """Records what the two goals hand on: the listings, the ends of leases
+    and the end of a goal, each in turn, and apart from them each write of
+    the goals' status, each start and each view."""
 
     def __init__(self) -> None:
         self.heard: asyncio.Queue = asyncio.Queue()
+        self.statuses: list = []
+        self.starts: list[int] = []
+        self.views: list = []
+
+    def goals_status(self, status):
+        self.statuses.append(status)
+
+    def goals_started(self, generation):
+        self.starts.append(generation)
 
     def fleet_changed(self, view):
+        self.views.append(view)
         self.heard.put_nowait(("changed", view.revision))
 
     def own_lease_ended(self, robot, why):
         self.heard.put_nowait(("lease_end", robot, why))
 
-    def let_go_of_every_robot(self, why):
-        self.heard.put_nowait(("let_go", why))
+    def goals_ended(self, why):
+        self.heard.put_nowait(("goals_ended", why))
+
+    def status(self):
+        """The last status written, None before the first."""
+        return self.statuses[-1] if self.statuses else None
+
+    def unavailable(self) -> str | None:
+        """Why the headset cannot ask the fleet, by the last status
+        written."""
+        assert self.statuses, "a status was written"
+        return status_text(self.statuses[-1])
 
     async def next(self):
         return await asyncio.wait_for(self.heard.get(), CALL_S)
@@ -134,15 +158,12 @@ class Listener:
 
 @contextlib.asynccontextmanager
 async def following(node_runner, clock, changes_module=changes, lease_module=lease):
-    """`follow_fleet` running: yields the fleet, the listener and the
-    task."""
-    the_fleet = Fleet(HEADSET)
+    """`follow_fleet` running: yields the listener and the task."""
     listener = Listener()
 
     def follow(token):
         return fleet.follow_fleet(
             node_runner,
-            the_fleet,
             listener,
             changes_module=changes_module,
             lease_module=lease_module,
@@ -152,21 +173,21 @@ async def following(node_runner, clock, changes_module=changes, lease_module=lea
         )
 
     async with running(follow) as (task,):
-        yield the_fleet, listener, task
+        yield listener, task
 
 
 async def test_the_headset_follows_the_listing_and_hears_the_end_of_its_leases():
     async with (
         boot() as h,
-        following(h.node_runner, ManualClock()) as (the_fleet, listener, _),
+        following(h.node_runner, ManualClock()) as (listener, _),
     ):
         follow, hold = await accept_both(h.mocks.deps.fleet)
-        await eventually(lambda: the_fleet.generation == 1)
-        assert the_fleet.unavailable() == "waiting for the fleet listing"
+        await eventually(lambda: listener.starts == [1])
+        assert listener.unavailable() == "waiting for the fleet listing"
         await follow.publish_feedback(change("listing", revision=3, robots=["alpha"]))
         assert await listener.next() == ("changed", 3)
-        assert the_fleet.unavailable() is None
-        assert the_fleet.view.robots == {"alpha"}
+        assert listener.unavailable() is None
+        assert listener.views[-1].robots == {"alpha"}
         # Only the end of a lease reaches the listener: the headset gives
         # and receives no lease.
         await hold.publish_feedback(lease_event("offer"))
@@ -177,10 +198,10 @@ async def test_the_headset_follows_the_listing_and_hears_the_end_of_its_leases()
         assert await listener.next() == ("lease_end", "alpha", "the stack is halted")
 
 
-async def test_an_ended_changes_goal_lets_go_of_every_robot_and_both_goals_start_again():
+async def test_an_ended_changes_goal_reports_the_goals_end_and_both_goals_start_again():
     async with (
         boot() as h,
-        following(h.node_runner, ManualClock()) as (the_fleet, listener, _),
+        following(h.node_runner, ManualClock()) as (listener, _),
     ):
         mock = h.mocks.deps.fleet
         follow, hold = await accept_both(mock)
@@ -188,33 +209,35 @@ async def test_an_ended_changes_goal_lets_go_of_every_robot_and_both_goals_start
         assert await listener.next() == ("changed", 1)
         await follow.complete()
         assert await listener.next() == (
-            "let_go",
-            "the changes goal of the fleet ended",
+            "goals_ended",
+            CHANGES_ENDED,
         )
-        assert the_fleet.view is None
-        assert the_fleet.unavailable() == "waiting for the fleet listing"
+        assert listener.unavailable() == "waiting for the fleet listing"
         # The lease goal that still ran is ended, so no lease outlives the
         # listing the headset drives by.
         await asyncio.wait_for(hold.cancel_signal(), CALL_S)
         # Both start again at once: the daemon answers.
         follow, hold = await accept_both(mock)
-        await eventually(lambda: the_fleet.generation == 2)
+        await eventually(lambda: listener.starts == [1, 2])
         await follow.publish_feedback(change("listing", revision=2, robots=["alpha"]))
         assert await listener.next() == ("changed", 2)
-        assert the_fleet.unavailable() is None
+        assert listener.unavailable() is None
 
 
-async def test_an_ended_lease_goal_lets_go_of_every_robot_and_both_goals_start_again():
+async def test_an_ended_lease_goal_reports_the_goals_end_and_both_goals_start_again():
     async with (
         boot() as h,
-        following(h.node_runner, ManualClock()) as (the_fleet, listener, _),
+        following(h.node_runner, ManualClock()) as (listener, _),
     ):
         mock = h.mocks.deps.fleet
         follow, hold = await accept_both(mock)
         await follow.publish_feedback(change("listing", robots=["alpha"]))
         assert await listener.next() == ("changed", 1)
         await hold.complete()
-        assert await listener.next() == ("let_go", "the lease goal of the fleet ended")
+        assert await listener.next() == (
+            "goals_ended",
+            "the lease goal of the fleet ended",
+        )
         await asyncio.wait_for(follow.cancel_signal(), CALL_S)
         await accept_both(mock)
 
@@ -223,14 +246,14 @@ async def test_a_refused_goal_leaves_the_headset_unable_to_drive_until_the_next_
     clock = ManualClock()
     async with (
         boot() as h,
-        following(h.node_runner, clock) as (the_fleet, listener, task),
+        following(h.node_runner, clock) as (listener, task),
     ):
         mock = h.mocks.deps.fleet
         follow = await (await mock.changes.next_goal(CALL_S)).accept()
         pending = await mock.lease.next_goal(CALL_S)
         await pending.refuse(lease.FailureKind.REJECTED, "the instance has no scope")
-        await eventually(lambda: isinstance(the_fleet.status, Refused))
-        assert the_fleet.unavailable() == (
+        await eventually(lambda: isinstance(listener.status(), Refused))
+        assert listener.unavailable() == (
             "the daemon refused the fleet goals until the next launch: "
             "the instance has no scope"
         )
@@ -243,7 +266,7 @@ async def test_a_refused_goal_leaves_the_headset_unable_to_drive_until_the_next_
 
 async def test_a_lease_goal_refused_while_the_last_one_ends_starts_again_on_the_clock():
     clock = ManualClock()
-    async with boot() as h, following(h.node_runner, clock) as (the_fleet, _, task):
+    async with boot() as h, following(h.node_runner, clock) as (listener, task):
         mock = h.mocks.deps.fleet
         follow = await (await mock.changes.next_goal(CALL_S)).accept()
         pending = await mock.lease.next_goal(CALL_S)
@@ -254,17 +277,17 @@ async def test_a_lease_goal_refused_while_the_last_one_ends_starts_again_on_the_
         await asyncio.wait_for(follow.cancel_signal(), CALL_S)
         await clock.advance(0.0, parked=[task])
         # The daemon answers: the headset waits for the listing.
-        assert the_fleet.unavailable() == "waiting for the fleet listing"
+        assert listener.unavailable() == "waiting for the fleet listing"
         await clock.advance(RETRY_S, parked=[task])
         await accept_both(mock)
-        await eventually(lambda: the_fleet.generation == 1)
-        assert not isinstance(the_fleet.status, Refused)
+        await eventually(lambda: listener.starts == [1])
+        assert not isinstance(listener.status(), Refused)
 
 
-async def test_a_lost_daemon_lets_go_of_every_robot_and_says_so():
+async def test_a_lost_daemon_reports_the_goals_end_and_says_so():
     async with (
         boot() as h,
-        following(h.node_runner, ManualClock()) as (the_fleet, listener, _),
+        following(h.node_runner, ManualClock()) as (listener, _),
     ):
         mock = h.mocks.deps.fleet
         follow, _ = await accept_both(mock)
@@ -272,8 +295,8 @@ async def test_a_lost_daemon_lets_go_of_every_robot_and_says_so():
         assert await listener.next() == ("changed", 1)
         # The daemon process dies.
         await mock.stop()
-        assert await listener.next() == ("let_go", "the daemon is lost")
-        assert the_fleet.unavailable() == "the daemon is lost"
+        assert await listener.next() == ("goals_ended", "the daemon is lost")
+        assert listener.unavailable() == "the daemon is lost"
 
 
 class ScriptedGoals:
@@ -335,9 +358,9 @@ class ScriptedGoals:
 async def test_the_goals_start_again_only_once_the_daemon_answers():
     clock = ManualClock()
     follow, hold = ScriptedGoals("changes"), ScriptedGoals("lease")
-    async with following(None, clock, follow, hold) as (the_fleet, _, task):
+    async with following(None, clock, follow, hold) as (listener, task):
         await clock.advance(0.0, parked=[task])
-        assert the_fleet.unavailable() == "the daemon is lost"
+        assert listener.unavailable() == "the daemon is lost"
         assert follow.starts == 1
         # Each retry asks again, on the clock.
         await clock.advance(RETRY_S, parked=[task])
@@ -345,27 +368,27 @@ async def test_the_goals_start_again_only_once_the_daemon_answers():
         follow.answers = hold.answers = True
         await clock.advance(RETRY_S, parked=[task])
         assert (follow.starts, hold.starts) == (3, 1)
-        assert the_fleet.unavailable() == "waiting for the fleet listing"
+        assert listener.unavailable() == "waiting for the fleet listing"
 
 
 async def test_a_lease_goal_refused_after_a_lost_daemon_says_the_headset_waits(capsys):
     clock = ManualClock()
     follow, hold = ScriptedGoals("changes"), ScriptedGoals("lease")
-    async with following(None, clock, follow, hold) as (the_fleet, _, task):
+    async with following(None, clock, follow, hold) as (listener, task):
         await clock.advance(0.0, parked=[task])
-        assert the_fleet.unavailable() == "the daemon is lost"
+        assert listener.unavailable() == "the daemon is lost"
         # The daemon answers, and still ends the last lease goal of the
         # headset: the headset waits for the listing and asks again.
         follow.answers = hold.answers = True
         hold.refusal_kind = lease.FailureKind.PRECONDITION_FAILED
         await clock.advance(RETRY_S, parked=[task])
-        assert the_fleet.unavailable() == "waiting for the fleet listing"
+        assert listener.unavailable() == "waiting for the fleet listing"
         await clock.advance(RETRY_S, parked=[task])
         assert hold.starts == 2
         assert capsys.readouterr().out.count("the fleet goals start again later") == 1
         hold.refusal_kind = None
         await clock.advance(RETRY_S, parked=[task])
-        await eventually(lambda: the_fleet.generation == 1)
+        await eventually(lambda: listener.starts == [1])
 
 
 async def test_a_changes_goal_refused_with_precondition_failed_is_final():
@@ -373,23 +396,23 @@ async def test_a_changes_goal_refused_with_precondition_failed_is_final():
     follow, hold = ScriptedGoals("changes"), ScriptedGoals("lease")
     follow.answers = hold.answers = True
     follow.refusal_kind = lease.FailureKind.PRECONDITION_FAILED
-    async with following(None, clock, follow, hold) as (the_fleet, _, task):
+    async with following(None, clock, follow, hold) as (listener, task):
         await asyncio.wait_for(task, CALL_S)
-        assert isinstance(the_fleet.status, Refused)
+        assert isinstance(listener.status(), Refused)
 
 
 async def test_a_lost_cancel_of_the_last_lease_goal_is_asked_again_before_a_restart():
     clock = ManualClock()
     follow, hold = ScriptedGoals("changes"), ScriptedGoals("lease", exclusive=True)
     follow.answers = hold.answers = True
-    async with following(None, clock, follow, hold) as (the_fleet, listener, _):
-        await eventually(lambda: the_fleet.generation == 1)
+    async with following(None, clock, follow, hold) as (listener, _):
+        await eventually(lambda: listener.starts == [1])
         # The changes goal ends, and the cancel of the lease goal gets no
-        # answer: the daemon would refuse every new lease goal.
+        # answer: the daemon refuses every new lease goal while it runs.
         hold.lost_cancels = 1
         follow.ended.set()
-        assert (await listener.next())[0] == "let_go"
-        await eventually(lambda: the_fleet.generation == 2)
+        assert (await listener.next())[0] == "goals_ended"
+        await eventually(lambda: listener.starts == [1, 2])
         assert hold.starts == 2 and len(hold.running) == 1
 
 
@@ -414,13 +437,13 @@ async def test_a_take_carries_the_lease_name_and_a_refusal_names_the_holder():
             await responder.respond_failure(
                 take.FailureKind.LEASED,
                 "robot `alpha` is leased by `director_inst` on `core` under the "
-                "name `tidy the table`",
+                f"name `{DIRECTOR_LEASE}`",
             )
 
         refused, _ = await asyncio.gather(calls.take("alpha"), refuse())
         assert refused == Failed(
             "robot `alpha` is leased by `director_inst` on `core` under the name "
-            "`tidy the table`"
+            f"`{DIRECTOR_LEASE}`"
         )
 
         async def agree():
@@ -445,12 +468,12 @@ async def test_a_move_check_asks_by_robot_or_by_instance_and_gives_the_refusal()
 
         refusal = check_move.ResponseDataRefusal(
             failure_kind="halted",
-            message="the stack is halted (by peppy-cli); clear the halt first",
+            message=f"the stack is halted (by {HALTER}); clear the halt first",
         )
         refused, _ = await asyncio.gather(
             calls.check_move(robot="alpha"), answer((None, "alpha"), refusal)
         )
-        assert refused == Failed("the stack is halted (by peppy-cli)")
+        assert refused == Failed(f"the stack is halted (by {HALTER})")
         allowed, _ = await asyncio.gather(
             calls.check_move(instance="backbone_inst"),
             answer(("backbone_inst", None), None),

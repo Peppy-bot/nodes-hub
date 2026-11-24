@@ -125,12 +125,11 @@ def fresh_sample(
     return frame.hand(handedness) if frame else None
 
 
-def gripping(frame: XrFrame | None) -> bool | None:
-    """Whether a grip of either hand is held in `frame`; None while no frame
-    is fresh or it tracks no hand, which says nothing about the grips."""
-    if frame is None or not frame.hands:
-        return None
-    return any(sample.squeezing for sample in frame.hands.values())
+def hand_squeezing(frame: XrFrame | None, hand: Hand) -> bool | None:
+    """Whether `hand`'s grip is held in `frame`, None while no fresh frame
+    tracks it."""
+    sample = frame.hand(hand) if frame is not None else None
+    return None if sample is None else sample.squeezing
 
 
 def primary_pressed(sample: HandSample) -> bool:

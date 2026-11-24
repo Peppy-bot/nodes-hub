@@ -1,4 +1,3 @@
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
@@ -6,7 +5,7 @@ from peppygen.paired_topics.right_gripper import (
     gripper_setpoints as right_gripper_setpoints,
 )
 
-from tests.helpers import boot, robots_of
+from tests.helpers import Peer, boot, robots_of
 from xr_commander.robots import (
     PairedRobots,
     robot_of_peer,
@@ -134,15 +133,8 @@ def test_the_chosen_robots_pair_is_found_per_slot_and_absent_where_it_has_none()
     )
 
 
-@dataclass(frozen=True)
-class Info:
-    """A pair's `PeerInfo` in a test: hashable, as the generated one is."""
-
-    name: str
-
-
 def test_a_slot_read_gives_every_pair_and_each_robots_first_pair_in_delivered_order():
-    first, other, second = Info("alpha first"), Info("bravo"), Info("alpha second")
+    first, other, second = Peer("alpha first"), Peer("bravo"), Peer("alpha second")
     module = slot(
         SimpleNamespace(copy="alpha", info=first),
         SimpleNamespace(copy="bravo", info=other),
@@ -151,6 +143,7 @@ def test_a_slot_read_gives_every_pair_and_each_robots_first_pair_in_delivered_or
     robots = one_slot()
     read = robots.pairs(module)
     assert read.pairs == (("alpha", first), ("bravo", other), ("alpha", second))
+    assert read.peers == frozenset({first, other, second})
     assert read.pin_of("alpha") is first
     assert read.pin_of("bravo") is other
     assert read.pin_of("charlie") is None

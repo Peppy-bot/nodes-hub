@@ -6,12 +6,13 @@ import pytest
 from tests.helpers import ScriptedHeadset, controller, squeezing_hand
 from xr_commander.devices import (
     RESTING,
+    Hand,
     RisingEdge,
     Thumbstick,
     XrFrame,
     fresh_sample,
     gripper_opening,
-    gripping,
+    hand_squeezing,
     parse_hands,
     past_rest_band,
 )
@@ -237,10 +238,10 @@ def test_an_axis_past_full_deflection_reads_as_full_deflection():
     assert stick_of([0.0, 0.0, -7.0, 3.0]) == Thumbstick(forward=-1.0, left=1.0)
 
 
-def test_either_grip_holds_and_a_frame_with_no_hand_says_nothing():
-    held = squeezing_hand()
+def test_a_hands_squeeze_is_read_from_its_sample_and_unknown_without_one():
     released = parse_hands([controller("left")])["left"]
-    assert gripping(None) is None
-    assert gripping(XrFrame(0.0, {})) is None
-    assert gripping(XrFrame(0.0, {"left": released, "right": held})) is True
-    assert gripping(XrFrame(0.0, {"left": released})) is False
+    frame = XrFrame(0.0, {"left": released, "right": squeezing_hand()})
+    assert hand_squeezing(frame, Hand.RIGHT) is True
+    assert hand_squeezing(frame, Hand.LEFT) is False
+    assert hand_squeezing(XrFrame(0.0, {}), Hand.LEFT) is None
+    assert hand_squeezing(None, Hand.LEFT) is None

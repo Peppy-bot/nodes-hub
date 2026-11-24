@@ -8,6 +8,7 @@ The server is started, never awaited: the health probe registers only once
 from __future__ import annotations
 
 import asyncio
+import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,7 @@ from xr_commander import (
     config,
     drive,
     fleet,
+    grip_world,
     motor_health,
     page,
     panel,
@@ -190,9 +192,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # The robot leases: the headset holds the lease of the robot a person
     # drives, and follows the fleet listing.
     fleet_timing = fleet.Timing()
-    the_fleet = fleet.Fleet(
-        fleet.Holder(node_runner.bound_instance_id(), node_runner.bound_core_node())
-    )
+    me = fleet.Holder(node_runner.bound_instance_id(), node_runner.bound_core_node())
     # The page follows the robots, their states and the choice; the driver
     # sends each change it makes.
     robot_states = robot_choice.RobotStates(
@@ -206,7 +206,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         base_reports,
     )
     driver = drive.Driver(
-        the_fleet,
+        me,
         fleet.FleetCalls(
             node_runner,
             take_module=fleet_take,
@@ -215,6 +215,11 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
             timing=fleet_timing,
         ),
         stops,
+        postures.PostureGoals(
+            node_runner,
+            {postures.label_of(module): module for module, _ in _POSTURE_BUTTONS},
+            settings.posture_move_duration_s,
+        ),
         timing=fleet_timing,
         on_change=robot_states.refresh,
     )
@@ -232,6 +237,12 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
 
     # Registered before start: a failed start must still be torn down.
     node_runner.on_shutdown(stop_session)
+
+    # The node's shutdown lets go of every robot.
+    async def let_go_at_shutdown() -> None:
+        driver.step(grip_world.Shutdown())
+
+    node_runner.on_shutdown(let_go_at_shutdown)
 
     # start() blocks until the server is up (or raises); keep it off the loop.
     await asyncio.to_thread(session.start)
@@ -275,7 +286,6 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         asyncio.create_task(
             fleet.follow_fleet(
                 node_runner,
-                the_fleet,
                 driver,
                 changes_module=fleet_changes,
                 lease_module=fleet_lease,
@@ -285,17 +295,14 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         ),
         asyncio.create_task(robot_choice.follow_robot_states(robot_states, token)),
     ]
-    posture_status = postures.PostureStatus()
     tasks.extend(
         asyncio.create_task(
             postures.run_posture_button(
-                node_runner,
                 action_module=action_module,
                 pressed=pressed,
                 session=session,
                 robots=robots,
                 driver=driver,
-                status=posture_status,
                 settings=settings,
                 token=token,
             )
@@ -414,15 +421,16 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
         return lambda: robots.peer_of(topic_module, robots.chosen())
 
     base_source = panel.BaseSource(
-        state=driver.base,
+        grip=functools.partial(driver.grip_status, grip_world.BASE),
         reports=base_reports,
+        stops=stops,
         peer=slot_peer(base_drive_setpoints),
     )
     hands = tuple(
         panel.HandSource(
             handedness=handedness,
             clutch=HandClutch(settings.motion_scale),
-            state=driver.hands[handedness],
+            grip=functools.partial(driver.grip_status, handedness),
             measured=MeasuredPoses(),
             arm_peer=slot_peer(wiring.pose_setpoints),
             gripper_peer=slot_peer(wiring.gripper_setpoints),
@@ -442,7 +450,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     health=motor_reports,
                     recorder=recorder_row,
                     read_task=task_label.current,
-                    posture=posture_status,
+                    posture=driver.posture_line,
                     robot=lambda: driver.robot_line(robots.chosen()),
                     base=base_source,
                 )
@@ -485,7 +493,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
                     node_runner,
                     topic_module=wiring.gripper_setpoints,
                     handedness=hand.handedness,
-                    hand=hand.state,
+                    driver=driver,
                     session=session,
                     robots=robots,
                     settings=settings,
