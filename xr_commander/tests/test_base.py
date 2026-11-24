@@ -32,6 +32,7 @@ from tests.helpers import (
     HOME_REACHED,
     ROBOT,
     SETTINGS,
+    START_NS,
     TICK_S,
     WIRE_TICKS,
     FakeStops,
@@ -56,8 +57,10 @@ from tests.helpers import (
     robots_of,
     running,
     scripted_driver,
+    setpoint_sent,
     settle,
     states,
+    stick_axes,
     wire_stops,
 )
 from xr_commander import base, panel, postures, publish
@@ -88,20 +91,12 @@ from xr_commander.grip_world import (
 from xr_commander.motor_health import MotorHealthReports
 from xr_commander.robots import PairedRobots
 
-# The instance's clock when each test starts (ns).
-START_NS = 1_000_000_000_000
 # When the base's odometry started, on the wall clock of its machine (s).
 ODOMETRY_START_S = 500.0
 # A full deflection, and half a deflection past joy's 0.05 rest band:
 # 0.05 + 0.5 * 0.95.
 FULL = 1.0
 HALF = 0.525
-
-
-def stick_axes(forward=0.0, left=0.0) -> list[float]:
-    """The xr-standard axes of a controller whose thumbstick is deflected
-    `forward` and `left`: the Gamepad API gives -1 forward and left."""
-    return [0.0, 0.0, -left, -forward]
 
 
 async def instance_clock_at(h, time_ns: int) -> None:
@@ -682,16 +677,6 @@ def test_base_ready_needs_a_pin_and_a_report():
 
 ALPHA_BASE = Peer("alpha base")
 BRAVO_BASE = Peer("bravo base")
-
-
-def setpoint_sent(send) -> tuple[Peer, tuple[float, float, float]] | None:
-    """A base tick's send as its pair and its setpoint's x, y and turn, None
-    for silence; the setpoint carries no frame and no timestamp."""
-    if send is None:
-        return None
-    pair, (frame, timestamp, linear, angular) = send
-    assert (frame, timestamp) == (None, None)
-    return pair, (linear[0], linear[1], angular[2])
 
 
 class TickRig:

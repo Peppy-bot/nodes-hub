@@ -226,15 +226,20 @@ class GatedPublisher:
 
 
 class NoWireSlot:
-    """A pairing slot of a test with no wire: its pairs, each with its
-    robot, a message of the fields it is built from, and one gated
-    publisher."""
+    """A pairing slot of a test with no wire: its pairs in delivered order,
+    each with its robot, which `set_pairs` changes, a message of the fields
+    it is built from, and one gated publisher."""
 
     def __init__(self, *pairs: tuple[str, Peer]) -> None:
+        self.set_pairs(*pairs)
+        self.publisher = GatedPublisher()
+
+    def set_pairs(self, *pairs: tuple[str, Peer]) -> None:
+        """The slot holds `pairs` from its next read on, in delivered
+        order."""
         self._members = tuple(
             SimpleNamespace(copy=robot, info=info) for robot, info in pairs
         )
-        self.publisher = GatedPublisher()
 
     def peers(self, _runner):
         return list(self._members)
@@ -693,6 +698,9 @@ RETRY_S = 1.0
 FIRST_REVISION = 1
 # A measured pose away from `POSE`, so a message at it is told apart.
 ELSEWHERE = pose_at((0.4, 0.0, 0.0))
+# The pairs a robot holds on a slot at most, in a test whose pairs join,
+# leave and restart: one that restarts, and the one it replaces.
+MOST_PAIRS = 2
 
 
 def fleet_view(
@@ -738,6 +746,10 @@ class OnCue:
     def answer(self, index: int, value) -> None:
         """Call `index` of `calls` returns `value`."""
         self.calls[index][1].set_result(value)
+
+    def throw(self, index: int, error: Exception) -> None:
+        """Call `index` of `calls` raises `error`."""
+        self.calls[index][1].set_exception(error)
 
 
 AGREED = Answered(None)
@@ -1056,6 +1068,10 @@ async def accept_both(mock):
     return follow, hold
 
 
+# The instance's clock when each base test starts (ns).
+START_NS = 1_000_000_000_000
+
+
 def limits_given(*, x=(-0.4, 0.8), y=(0.0, 0.0), turn=(-1.5, 1.0)):
     """The limits a drive_states gives for a base with these ranges (m/s,
     rad/s): a differential base by default, whose backward and clockwise
@@ -1085,6 +1101,12 @@ DIFFERENTIAL = limits_given()
 HOLONOMIC = limits_given(y=(-0.3, 0.6))
 
 
+def stick_axes(forward=0.0, left=0.0) -> list[float]:
+    """The xr-standard axes of a controller whose thumbstick is deflected
+    `forward` and `left`: the Gamepad API gives -1 forward and left."""
+    return [0.0, 0.0, -left, -forward]
+
+
 def states(follow_state="following", limits=DIFFERENTIAL):
     """A drive_states as the headset reads it."""
     return SimpleNamespace(
@@ -1093,3 +1115,13 @@ def states(follow_state="following", limits=DIFFERENTIAL):
         linear_limits=limits.linear_limits,
         angular_limits=limits.angular_limits,
     )
+
+
+def setpoint_sent(send) -> tuple[Peer, tuple[float, float, float]] | None:
+    """A base tick's send as its pair and its setpoint's x, y and turn, None
+    for silence; the setpoint carries no frame and no timestamp."""
+    if send is None:
+        return None
+    pair, (frame, timestamp, linear, angular) = send
+    assert (frame, timestamp) == (None, None)
+    return pair, (linear[0], linear[1], angular[2])
