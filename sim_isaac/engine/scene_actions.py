@@ -36,7 +36,7 @@ from queue import Empty, Queue
 from types import ModuleType
 from typing import Callable
 
-from control_core_py.geometry import IDENTITY, GeometryError, Pose, PoseTarget, UnitQuaternion
+from control_core_py.geometry import GeometryError, Pose, PoseTarget, UnitQuaternion
 from peppygen.exposed_actions.scene import (
     apply_force,
     clear_scene,
@@ -129,7 +129,7 @@ _PHYSICS = ("none", "static", "dynamic")
 
 # How a spawned object stands when its target gives no orientation: as
 # authored.
-_AS_AUTHORED = UnitQuaternion(IDENTITY)
+_AS_AUTHORED = UnitQuaternion.IDENTITY
 
 # How a refusal names each kind of asset.
 _ASSET_KIND_WORDS = {"scene": "a scene", "object": "an object"}
@@ -1035,7 +1035,7 @@ class SceneActionIO:
                 robot=robot.instance,
                 model=robot.model,
                 position=list(robot.placement.position.position),
-                orientation=list(robot.placement.orientation.quaternion),
+                orientation=list(robot.placement.orientation.xyzw),
                 # Every robot on this stage joined it by attaching.
                 attached=True,
             )
@@ -1284,7 +1284,7 @@ class SceneActionIO:
             "name": object_id,
             "path": spawn.path,
             "position": list(spawn.pose.position.position),
-            "orientation": list(spawn.pose.orientation.quaternion),
+            "orientation": list(spawn.pose.orientation.xyzw),
             "scale": [
                 spawn.scale,
                 spawn.scale,
@@ -1334,7 +1334,7 @@ class SceneActionIO:
         }
 
         if move.target.orientation is not None:
-            command["orientation"] = list(move.target.orientation.quaternion)
+            command["orientation"] = list(move.target.orientation.xyzw)
 
         launcher._runtime_move_object(command)
 

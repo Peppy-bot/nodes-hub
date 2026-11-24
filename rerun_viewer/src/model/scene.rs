@@ -284,7 +284,7 @@ pub(crate) mod tests {
         // 0.1 m along the object's x, which the turn points along the robot's y.
         let object = SceneObject {
             id: "brain/lime_1".to_string(),
-            placement: Placement::parse([1.0, 0.0, 0.0], quarter_turn_about_z()).unwrap(),
+            placement: Placement::parse([1.0, 0.0, 0.0], quarter_turn_about_z().to_xyzw()).unwrap(),
             shapes: vec![Shape {
                 kind: ShapeKind::Sphere { radius: 0.03 },
                 placement: at([0.1, 0.0, 0.0]),
@@ -292,7 +292,7 @@ pub(crate) mod tests {
         };
         let shapes = object_shapes(&object);
         assert_eq!(shapes.len(), 1);
-        assert!(close(shapes[0].pose.origin(), [1.0, 0.1, 0.0], 1e-12));
+        assert!(close(shapes[0].pose.position(), [1.0, 0.1, 0.0], 1e-12));
     }
 
     #[test]
@@ -307,7 +307,7 @@ pub(crate) mod tests {
             }],
         };
         assert!(close(
-            attached_shapes(&attached)[0].pose.origin(),
+            attached_shapes(&attached)[0].pose.position(),
             [0.0, 0.0, 0.06],
             1e-12
         ));
@@ -381,7 +381,7 @@ pub(crate) mod tests {
                 size: [1.0 + 0.2, 1.0 + 0.2, 1.0 + 0.2]
             }
         );
-        assert!(close(grown.pose.origin(), [2.5, 0.5, 0.5], 1e-12));
+        assert!(close(grown.pose.position(), [2.5, 0.5, 0.5], 1e-12));
     }
 
     /// The corner of a cube at the origin, and the ends of its three edges from there.

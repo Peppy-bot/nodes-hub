@@ -84,12 +84,6 @@ fn within_range(field: &str, value: f64, limits: &str, range: &AxisSpec) -> Resu
     ))
 }
 
-/// `values` as the refusals of control_core print a vector.
-fn listed(values: &[f64]) -> String {
-    let printed: Vec<String> = values.iter().map(f64::to_string).collect();
-    format!("[{}]", printed.join(", "))
-}
-
 /// The refusal of a target that, placed in odom, lies off the floor plane.
 fn target_off_the_floor(refusal: &GeometryError) -> String {
     match refusal {
@@ -100,9 +94,8 @@ fn target_off_the_floor(refusal: &GeometryError) -> String {
             orientation,
             tilt_rad,
         } => format!(
-            "the target's orientation, placed in odom, {} tilts {tilt_rad} rad off the vertical: \
-             {FLOOR_TARGET}",
-            listed(orientation)
+            "the target's orientation, placed in odom, {orientation} tilts {tilt_rad} rad off the \
+             vertical: {FLOOR_TARGET}"
         ),
         other => format!("the target, placed in odom: {other}"),
     }

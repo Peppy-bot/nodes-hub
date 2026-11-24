@@ -629,7 +629,7 @@ impl Rig {
                     frame: transform.parent().as_str().to_owned(),
                     child_frame: transform.child().as_str().to_owned(),
                     position: transform.placement().position(),
-                    orientation: transform.placement().orientation(),
+                    orientation: transform.placement().orientation().to_xyzw(),
                 }
             })
             .collect();

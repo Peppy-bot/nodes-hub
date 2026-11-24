@@ -42,6 +42,6 @@ dev = ["pytest>=8"]
 package = false
 
 [tool.uv.sources]
-control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py", rev = "8ef54d8a75ddbd112c0a8c37bd5e413afad67b0a" }
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "8ef54d8a75ddbd112c0a8c37bd5e413afad67b0a" }
-robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "8ef54d8a75ddbd112c0a8c37bd5e413afad67b0a" }
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
+robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }

@@ -12,7 +12,7 @@ def test_a_pose_setpoint_is_a_pose_in_its_frame_at_its_time():
     setpoint = parse_pose_setpoint("odom", 12.5, [0.1, 0.2, 0.3], [0.0, 0.0, 0.0, 1.0])
     assert (setpoint.frame, setpoint.timestamp) == ("odom", 12.5)
     assert setpoint.value.position.position == (0.1, 0.2, 0.3)
-    assert setpoint.value.orientation.quaternion == (0.0, 0.0, 0.0, 1.0)
+    assert setpoint.value.orientation.xyzw == (0.0, 0.0, 0.0, 1.0)
 
 
 def test_a_pose_setpoint_with_no_frame_lies_in_the_robot_frame():

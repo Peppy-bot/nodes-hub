@@ -101,7 +101,7 @@ mod tests {
             panic!("the grasp point first, got {:?}", drawn[1])
         };
         assert_eq!(path, "world/arms/right_arm/grasp");
-        assert_eq!(pose.origin(), [0.3, -0.2, 0.4]);
+        assert_eq!(pose.position(), [0.3, -0.2, 0.4]);
         assert!(matches!(
             &drawn[2],
             Drawn::LineStrip { path, points, .. }

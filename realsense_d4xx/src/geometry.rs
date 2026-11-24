@@ -546,7 +546,7 @@ pub(crate) mod tests {
             rotation: column_major(rotation_about_z(90_f64.to_radians())),
             translation: [0.0; 3],
         };
-        let q = pose(&quarter).unwrap().orientation().quaternion();
+        let q = pose(&quarter).unwrap().orientation().to_xyzw();
         let turned = arithmetic::rotate(q, [1.0, 0.0, 0.0]);
         assert!(
             (turned[0]).abs() < 1e-6 && (turned[1] - 1.0).abs() < 1e-6,
@@ -587,7 +587,7 @@ pub(crate) mod tests {
             })
             .unwrap()
             .orientation()
-            .quaternion();
+            .to_xyzw();
             let length: f64 = q.iter().map(|c| c * c).sum::<f64>().sqrt();
             assert!((length - 1.0).abs() < 1e-9);
             for p in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.3, -0.2, 1.5]] {

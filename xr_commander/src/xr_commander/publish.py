@@ -304,7 +304,7 @@ async def stream_pose(
             commanded.frame,
             timestamp,
             list(pose.position.position),
-            list(pose.orientation.quaternion),
+            list(pose.orientation.xyzw),
         )
 
     await _run_stream(

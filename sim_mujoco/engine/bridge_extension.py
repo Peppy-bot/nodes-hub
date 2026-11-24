@@ -221,7 +221,7 @@ class _RobotLimbs:
                 robot.instance,
                 robot.model,
                 placement.position.position,
-                placement.orientation.quaternion,
+                placement.orientation.xyzw,
             )
         at, dof = self.free_qpos, self.free_dof
         qpos, qvel = self._data.qpos, self._data.qvel

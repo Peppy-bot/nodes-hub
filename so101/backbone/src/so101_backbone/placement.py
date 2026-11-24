@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
-from control_core_py.geometry import GeometryError, Placement, Point, Pose, PoseTarget, Stamped
+from control_core_py.geometry import GeometryError, Placement, Point, Pose, PoseTarget, Stamped, UnitQuaternion
 from peppygen import NodeRunner
 from peppygen.consumed_services.transform_lookup import lookup_transform
 
@@ -128,14 +128,19 @@ def _placed_by(answer: lookup_transform.ResponseData, value: T, what: str) -> T:
     """`value` carried into the answer's frame by the answer's placement; a
     Refusal with `rejected` naming `what` when the placement carries a
     coordinate past the finite numbers."""
+    placement = _placement_of(answer, what)
     try:
-        return _placement_of(answer).place(value)
+        return placement.place(value)
     except GeometryError as e:
         raise Refusal(FailureKind.REJECTED, f"{what}: {e}") from None
 
 
-def _placement_of(answer: lookup_transform.ResponseData) -> Placement:
-    """The place of the answer's child frame in its frame."""
-    x, y, z = answer.position
-    qx, qy, qz, qw = answer.orientation
-    return Placement((float(x), float(y), float(z)), (float(qx), float(qy), float(qz), float(qw)))
+def _placement_of(answer: lookup_transform.ResponseData, what: str) -> Placement:
+    """The place of the answer's child frame in its frame, parsed as the contracts parse a pose;
+    a Refusal with `attempt_failed` naming `what` for an answer that holds no pose."""
+    try:
+        return Placement(Point.parse(answer.position).position, UnitQuaternion.parse(answer.orientation))
+    except GeometryError as e:
+        raise Refusal(
+            FailureKind.ATTEMPT_FAILED, f"{what}: the robot's transform lookup gave no pose: {e}"
+        ) from None

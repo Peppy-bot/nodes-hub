@@ -585,7 +585,7 @@ class TestDrivingABase:
         ((name, (frame, linear, angular)),) = rolled.items()
         assert name == "delta"
         assert frame.position.position == (1.0, 2.0, 0.01)
-        assert frame.orientation.quaternion == pytest.approx(tilted)
+        assert frame.orientation.xyzw == pytest.approx(tilted)
         assert (linear, angular) == ((0.2, 0.0, 0.0), (0.0, 0.0, 0.1))
 
     def test_a_robot_moved_since_the_last_step_is_set_down_at_rest(self, engine, rolling):

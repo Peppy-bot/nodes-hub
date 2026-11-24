@@ -20,14 +20,10 @@ from dataclasses import dataclass, replace
 from control_core_py.geometry import (
     Point,
     Pose,
-    Quaternion,
     Stamped,
     UnitQuaternion,
     Vector,
     angle_shortest_path,
-    inverse,
-    normalized,
-    product,
 )
 
 # A measured pose that moved this far between consecutive state reports did not
@@ -49,10 +45,10 @@ class Setpoint:
     pose: Pose
 
 
-def _rotation_between(current: UnitQuaternion, reference: UnitQuaternion) -> Quaternion:
+def _rotation_between(current: UnitQuaternion, reference: UnitQuaternion) -> UnitQuaternion:
     """The rotation carrying `reference` onto `current`, about the axes both
     are given in."""
-    return product(current.quaternion, inverse(reference.quaternion))
+    return current.compose(reference.inverse())
 
 
 def _travel(current: Point, reference: Point, scale: float) -> Vector:
@@ -61,13 +57,13 @@ def _travel(current: Point, reference: Point, scale: float) -> Vector:
     return (scale * (x - rx), scale * (y - ry), scale * (z - rz))
 
 
-def _displaced(base: Pose, translation: Vector, rotation: Quaternion) -> Pose:
+def _displaced(base: Pose, translation: Vector, rotation: UnitQuaternion) -> Pose:
     """`base` moved by `translation` and turned by `rotation`, both about the
     axes `base` is given in."""
     (x, y, z), (dx, dy, dz) = base.position.position, translation
     return Pose(
         Point((x + dx, y + dy, z + dz)),
-        UnitQuaternion(normalized(product(rotation, base.orientation.quaternion))),
+        rotation.compose(base.orientation),
     )
 
 
@@ -76,7 +72,7 @@ def _jumped(last: Pose, measured: Pose) -> bool:
     frame, farther than one state report's travel."""
     jump_m = math.dist(measured.position.position, last.position.position)
     jump_rad = angle_shortest_path(
-        measured.orientation.quaternion, last.orientation.quaternion
+        measured.orientation.xyzw, last.orientation.xyzw
     )
     return jump_m > _MEASURED_JUMP_M or jump_rad > _MEASURED_JUMP_RAD
 

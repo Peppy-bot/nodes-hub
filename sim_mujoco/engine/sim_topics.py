@@ -629,7 +629,7 @@ class SimTopicIO:
             depth_to_color=rgbd_geometry.MessageDepthToColor(
                 frame=frame,
                 position=list(depth_to_color.position.position),
-                orientation=list(depth_to_color.orientation.quaternion),
+                orientation=list(depth_to_color.orientation.xyzw),
             ),
         )
         self._publish_guarded(

@@ -10,14 +10,12 @@ from types import ModuleType
 
 import pytest
 from control_core_py.geometry import (
-    IDENTITY,
     Point,
     Pose,
     PoseTarget,
     UnitQuaternion,
     product,
     quaternion_of_yaw,
-    yaw_of_quaternion,
 )
 from pxr import Gf, Usd, UsdGeom
 
@@ -198,7 +196,7 @@ def test_a_spot_promised_to_an_admitted_robot_is_not_offered_twice():
 
     assert second.position != first.position
     # A spot the engine lays out faces as authored.
-    assert first.orientation == second.orientation == UnitQuaternion(IDENTITY)
+    assert first.orientation == second.orientation == UnitQuaternion.IDENTITY
     assert world.occupied(first, promised=(first,))
     assert not world.occupied(second, promised=(first,))
 
@@ -398,12 +396,12 @@ def test_a_robot_that_rolls_is_recorded_where_its_wheels_carried_it_tilted_as_it
 
     (robot,) = world.robots()
     record = robot.record()
-    assert (record.position, record.orientation) == (TILTED.position.position, TILTED.orientation.quaternion)
+    assert (record.position, record.orientation) == (TILTED.position.position, TILTED.orientation.xyzw)
     assert (record.linear_velocity, record.angular_velocity) == ((0.2, 0.0, 0.0), (0.0, 0.0, 0.3))
     # It stands at that position, facing the heading its wheels turned it to.
     assert robot.placement.position.position == (3.0, 0.5, 0.01)
-    assert robot.placement.orientation.quaternion[:2] == (0.0, 0.0)
-    assert yaw_of_quaternion(robot.placement.orientation.quaternion) == pytest.approx(QUARTER_TURN)
+    assert robot.placement.orientation.xyzw[:2] == (0.0, 0.0)
+    assert robot.placement.orientation.yaw() == pytest.approx(QUARTER_TURN)
     # The next robot is given room from where it rolled to.
     assert world.occupied(placement_at(3.0, 0.5))
     assert not world.occupied(placement_at(0.0))
@@ -422,7 +420,7 @@ def test_a_robot_fixed_to_the_world_is_recorded_at_its_placement_at_rest():
     assert (record.robot, record.model) == ("alpha", "so101")
     assert (record.position, record.orientation) == (
         robot.placement.position.position,
-        robot.placement.orientation.quaternion,
+        robot.placement.orientation.xyzw,
     )
     assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
 
@@ -443,7 +441,7 @@ def test_a_robot_that_rolls_is_set_down_once_it_is_moved_and_a_standing_one_is_n
     record = moved.record()
     assert (record.position, record.orientation) == (
         moved.placement.position.position,
-        moved.placement.orientation.quaternion,
+        moved.placement.orientation.xyzw,
     )
     assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
 
@@ -495,7 +493,7 @@ def test_a_robot_that_rolls_is_stood_where_it_rolled_before_the_stage_is_edited(
     record = stood.record()
     assert (record.position, record.orientation) == (
         stood.placement.position.position,
-        stood.placement.orientation.quaternion,
+        stood.placement.orientation.xyzw,
     )
     assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
     bravo = _stage.GetPrimAtPath("/World/bravo")

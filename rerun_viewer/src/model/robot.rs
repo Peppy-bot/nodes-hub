@@ -266,7 +266,7 @@ impl RobotBody {
         self.links
             .iter()
             .map(|link| {
-                pose_of(&in_robot[link.index])
+                Transform::try_from(&in_robot[link.index])
                     .map(|pose| (link, pose))
                     .map_err(|reason| PlacingError::Pose {
                         link: link.name.clone(),
@@ -375,19 +375,10 @@ fn collision_shapes(
 fn urdf_pose(origin: &urdf_rs::Pose) -> Result<Transform, NotATransform> {
     let [x, y, z] = origin.xyz.0;
     let [roll, pitch, yaw] = origin.rpy.0;
-    pose_of(&Isometry3::from_parts(
+    Transform::try_from(&Isometry3::from_parts(
         Translation3::new(x, y, z),
         UnitQuaternion::from_euler_angles(roll, pitch, yaw),
     ))
-}
-
-fn pose_of(isometry: &Isometry3<f64>) -> Result<Transform, NotATransform> {
-    let position = isometry.translation.vector;
-    let turn = isometry.rotation.quaternion();
-    Transform::new(
-        [position.x, position.y, position.z],
-        [turn.i, turn.j, turn.k, turn.w],
-    )
 }
 
 #[cfg(test)]
@@ -439,7 +430,7 @@ mod tests {
                 size: [0.2, 0.2, 0.1]
             }
         );
-        assert_eq!(base[0].pose.origin(), [0.0, 0.0, 0.05]);
+        assert_eq!(base[0].pose.position(), [0.0, 0.0, 0.05]);
         let upper = &body.links()[1].shapes[0];
         assert_eq!(
             upper.kind,
@@ -490,10 +481,10 @@ mod tests {
             }
         );
         // The capsule lies along the base's x (pitched a quarter turn), 0.1 m out.
-        assert!(close(capsule[0].pose.origin(), [0.1, 0.0, 0.0], 1e-12));
+        assert!(close(capsule[0].pose.position(), [0.1, 0.0, 0.0], 1e-12));
         assert_eq!(capsule[1].kind, ShapeKind::Sphere { radius: 0.01 });
-        assert!(close(capsule[1].pose.origin(), [0.12, 0.0, 0.0], 1e-12));
-        assert!(close(capsule[2].pose.origin(), [0.08, 0.0, 0.0], 1e-12));
+        assert!(close(capsule[1].pose.position(), [0.12, 0.0, 0.0], 1e-12));
+        assert!(close(capsule[2].pose.position(), [0.08, 0.0, 0.0], 1e-12));
     }
 
     #[test]
@@ -504,20 +495,20 @@ mod tests {
         let poses = body
             .link_poses(&snapshot(FRAC_PI_2, FRAC_PI_2, 0.5))
             .expect("mini's arm and gripper");
-        assert_eq!(pose_of_link(&poses, "base").origin(), [0.0, 0.0, 0.0]);
+        assert_eq!(pose_of_link(&poses, "base").position(), [0.0, 0.0, 0.0]);
         assert!(close(
-            pose_of_link(&poses, "upper").origin(),
+            pose_of_link(&poses, "upper").position(),
             [0.0, 0.0, 0.1],
             1e-12
         ));
         let hand = pose_of_link(&poses, "hand");
-        assert!(close(hand.origin(), [0.0, 0.0, 0.3], 1e-12));
+        assert!(close(hand.position(), [0.0, 0.0, 0.3], 1e-12));
         // The hand's x points down, its y along -x of the robot.
         assert!(close(hand.apply([1.0, 0.0, 0.0]), [0.0, 0.0, -0.7], 1e-12));
         assert!(close(hand.apply([0.0, 1.0, 0.0]), [-1.0, 0.0, 0.3], 1e-12));
         // Half open: the finger slides 0.02 m along the hand's y, 0.1 m along its x.
         assert!(close(
-            pose_of_link(&poses, "finger").origin(),
+            pose_of_link(&poses, "finger").position(),
             [-0.02, 0.0, 0.2],
             1e-12
         ));
@@ -528,13 +519,13 @@ mod tests {
         let body = mini();
         let poses = body.link_poses(&snapshot(0.0, 0.0, 1.5)).unwrap();
         assert!(close(
-            pose_of_link(&poses, "finger").origin(),
+            pose_of_link(&poses, "finger").position(),
             [0.1, 0.04, 0.3],
             1e-12
         ));
         let poses = body.link_poses(&snapshot(0.0, 0.0, -0.5)).unwrap();
         assert!(close(
-            pose_of_link(&poses, "finger").origin(),
+            pose_of_link(&poses, "finger").position(),
             [0.1, 0.0, 0.3],
             1e-12
         ));

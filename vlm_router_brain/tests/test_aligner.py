@@ -20,7 +20,7 @@ from brain_core.manipulators.scripted.grasp import GraspDirection, approach, jaw
 from brain_core.ports import Cancelled, CancelToken, FailureKind, Gripper, Item, Refusal, TargetItem
 from brain_core.robot import MoveEnd, MoveResult
 from brain_core.stages import CarryReports, GrabReports, Report
-from control_core_py.geometry import Placement
+from control_core_py.geometry import Placement, UnitQuaternion
 
 from vlm_router_brain.manipulators.vlm.aligner import MIN_FRAME_WAIT_S, NOT_STARTED, ModelAligner
 
@@ -36,7 +36,10 @@ LOOKING_DOWN = (math.sqrt(0.5), math.sqrt(0.5), 0.0, 0.0)
 # The frames the pictures name, and where the robot's tree places each.
 WRIST_FRAME = "wrist_left_color_optical_frame"
 CHEST_FRAME = "chest_color_optical_frame"
-POSES = {WRIST_FRAME: Placement((0.2, 0.2, 0.5), LOOKING_DOWN), CHEST_FRAME: Placement((0.08, 0.03, 0.79), (0.0, 0.0, 0.0, 1.0))}
+POSES = {
+    WRIST_FRAME: Placement((0.2, 0.2, 0.5), UnitQuaternion(LOOKING_DOWN)),
+    CHEST_FRAME: Placement((0.08, 0.03, 0.79), UnitQuaternion.IDENTITY),
+}
 
 
 def cube(position=SEEN) -> Item:

@@ -499,12 +499,7 @@ mod tests {
             1.0,
         )
         .expect("a quaternion within tf2's tolerance");
-        let [_, _, _, w] = typed
-            .target
-            .value()
-            .orientation()
-            .expect("one")
-            .quaternion();
+        let [_, _, _, w] = typed.target.value().orientation().expect("one").to_xyzw();
         assert!((w - 1.0).abs() < 1e-15, "normalized: {w}");
         let off_unit = arm_move_fields(
             "left_arm",

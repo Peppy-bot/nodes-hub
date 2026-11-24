@@ -18,7 +18,7 @@ import threading
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from control_core_py.geometry import IDENTITY, Point, Pose, PoseTarget, UnitQuaternion, wxyz_of_xyzw
+from control_core_py.geometry import Point, Pose, PoseTarget, UnitQuaternion, wxyz_of_xyzw
 from sim_robot_core.object_state import AT_REST, RobotRecord
 from sim_robot_core.world import rolled_placement
 
@@ -240,7 +240,7 @@ class Robot:
             robot=self.instance,
             model=self.model,
             position=frame.position.position,
-            orientation=frame.orientation.quaternion,
+            orientation=frame.orientation.xyzw,
             linear_velocity=self.linear_velocity,
             angular_velocity=self.angular_velocity,
         )
@@ -303,7 +303,7 @@ class World:
             # a cross around the origin.
             for row, column in sorted(square, key=lambda spot: (abs(spot[0]) + abs(spot[1]), spot)):
                 spot = Pose(
-                    Point((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)), UnitQuaternion(IDENTITY)
+                    Point((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)), UnitQuaternion.IDENTITY
                 )
                 if not self.occupied(spot, promised, leaving):
                     return spot
@@ -452,7 +452,7 @@ class World:
             raise RuntimeError(
                 f"the prim {moved.prim()} of robot {name!r} does not exist"
             )
-        World.place(prim, moved.placement.position.position, moved.placement.orientation.quaternion)
+        World.place(prim, moved.placement.position.position, moved.placement.orientation.xyzw)
 
         with self._lock:
             self._robots[moved.instance] = moved
@@ -463,7 +463,7 @@ class World:
             "robot '%s' moves to %s turned to %s",
             name,
             list(moved.placement.position.position),
-            list(moved.placement.orientation.quaternion),
+            list(moved.placement.orientation.xyzw),
         )
         return moved
 
@@ -487,7 +487,7 @@ class World:
                     continue
                 self._robots[instance] = replace(
                     robot,
-                    placement=rolled_placement(frame.position.position, frame.orientation.quaternion),
+                    placement=rolled_placement(frame.position.position, frame.orientation.xyzw),
                     linear_velocity=linear_velocity,
                     angular_velocity=angular_velocity,
                     rolled_frame=frame,
@@ -558,7 +558,7 @@ class World:
                 World.place(
                     stage.GetPrimAtPath(robot.prim()),
                     robot.placement.position.position,
-                    robot.placement.orientation.quaternion,
+                    robot.placement.orientation.xyzw,
                 )
             self._robots.update(
                 {
@@ -611,7 +611,7 @@ class World:
         prim = stage.DefinePrim(robot.prim(), "Xform")
         prim.GetReferences().AddReference(str(known.stage_path()))
 
-        World.place(prim, robot.placement.position.position, robot.placement.orientation.quaternion)
+        World.place(prim, robot.placement.position.position, robot.placement.orientation.xyzw)
         World._hold_to_description(prim, known)
         World._start_in_posture(prim, known)
         World._couple_followers(prim, known)
