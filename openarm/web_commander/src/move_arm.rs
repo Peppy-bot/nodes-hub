@@ -152,7 +152,7 @@ fn target_record(
         frame: Some(robot_frame.to_owned()),
         timestamp: None,
         position: target.position().position(),
-        orientation: Some(target.orientation().quaternion()),
+        orientation: Some(target.orientation().to_xyzw()),
     }
 }
 
