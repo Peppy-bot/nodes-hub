@@ -1,7 +1,7 @@
 """The models this engine stands, one entry per model under models/.
 
-What a robot of a model is made of (its limbs, base, joints, cameras and
-start posture) comes from the description its attach goal carries, through
+What a robot of a model is made of (its limbs, base, joints, cameras, lidars
+and start posture) comes from the description its attach goal carries, through
 sim_robot_core's entry of the same model, shared with every engine, and so
 does the effort ceiling of each of its limbs' PhysX drives, the effort limit
 the description gives the drive's joint. What is here is what Isaac Sim alone
@@ -123,6 +123,31 @@ class IsaacModel:
     def prim_of(self, link: str) -> str:
         """The name of the prim a URDF link is."""
         return self.link_prims.get(link, link)
+
+    def link_prim(self, root, link: str):
+        """The prim the URDF link `link` is under `root`, the prim of a robot
+        of this model, wherever under it the prim sits; None where `root`
+        holds none."""
+        from pxr import Usd  # pylint: disable=C0415
+
+        name = self.prim_of(link)
+        return next((prim for prim in Usd.PrimRange(root) if prim.GetName() == name), None)
+
+    def mount_prim(self, root, sensor: str, link: str):
+        """The prim `sensor`, a camera or a lidar of a robot of this model
+        under `root`, hangs from: the prim its parent link `link` is. A link
+        `root` holds no prim for is refused naming every prim it holds,
+        since that is an error of the model's entry no retry fixes."""
+        from pxr import Usd  # pylint: disable=C0415
+
+        parent = self.link_prim(root, link)
+        if parent is None:
+            names = sorted(prim.GetName() for prim in Usd.PrimRange(root))
+            raise RuntimeError(
+                f"{sensor} parent link '{link}' is not under {root.GetPath()} as"
+                f" '{self.prim_of(link)}'; prims: {names}"
+            )
+        return parent
 
     def arm_params(self, arm: Arm) -> dict:
         """What one arm's actuator controller applies to its drives."""

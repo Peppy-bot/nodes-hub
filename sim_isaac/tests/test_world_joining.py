@@ -197,6 +197,7 @@ def _rig_of_followers(*pairs):
             Gripper(name="gripper", joints=tuple(joints), spans=tuple(spans), mimics=tuple(mimics)),
         ),
         cameras=(),
+        lidars=(),
         start_posture={joint: 0.0 for joint in joints},
         base=None,
     )

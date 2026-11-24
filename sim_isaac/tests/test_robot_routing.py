@@ -1,17 +1,20 @@
-"""Which robot, limb, base and camera a pair names, and what that decides.
+"""Which robot, limb, base, camera and lidar a pair names, and what that
+decides.
 
-Every robot's limbs reach the engine on two slots, its base on one more and
-its cameras on two more, each holding any number of pairs. The copy a pair
-carries is the robot that attached under that name, the link it comes from
-on the robot's side is its limb or its base, and its relay's name in the copy
-is its camera. These cover the ways that is read: a setpoint arriving on a
-pair, a state or a frame published back on one, what a robot holds, and
-which robots a rig is rendered for.
+Every robot's limbs reach the engine on two slots, its base on one more, its
+cameras on two more and its lidars on one more, each holding any number of
+pairs. The copy a pair carries is the robot that attached under that name,
+the link it comes from on the robot's side is its limb or its base, and its
+relay's name in the copy is its camera or its lidar. These cover the ways
+that is read: a setpoint arriving on a pair, a state, a frame or a scan
+published back on one, what a robot holds, which robots a rig is rendered
+for and which lidars are swept.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +24,7 @@ import pytest
 from robot_description_py import model as bundled
 from sim_robot_core.cameras import DEPTH_TO_COLOR, pinhole
 from sim_robot_core.models import shipped_entry
-from sim_robot_core.pairs import ARMS, BASES, GRIPPERS, RGB_CAMERAS, RGBD_CAMERAS, Held
+from sim_robot_core.pairs import ARMS, BASES, GRIPPERS, LIDARS, RGB_CAMERAS, RGBD_CAMERAS, Held
 from sim_robot_core.registry import Caller, Registry
 from sim_robot_core.setpoints import MAX_VALUE, GripperSetpoint, JointSetpoint
 
@@ -48,6 +51,8 @@ ALPHA_CHEST = member("alpha_chest", "simulation", "alpha")
 CHARLO_WRIST = member("charlo_wrist", "simulation", "charlo")
 # A base node leads its robot's wheels from the link named after the base.
 DELTA_BASE = member("delta_backbone_inst", "base", "delta")
+# A lidar pair comes from its relay, named after the lidar in the copy.
+DELTA_LIDAR = member("delta_lidar", "simulation", "delta")
 
 
 @pytest.fixture(name="scene")
@@ -114,7 +119,7 @@ class TestTheNodesSlots:
     def node_fixture(self):
         return pyjson5.loads((Path(__file__).resolve().parents[1] / "peppy.json5").read_text())
 
-    def test_the_node_declares_the_five_slots_every_pair_is_read_from(self, node):
+    def test_the_node_declares_the_six_slots_every_pair_is_read_from(self, node):
         assert node["manifest"]["name"] == "sim_isaac"
         pairings = {
             pairing["link_id"]: (pairing["name"], pairing["role"], pairing["cardinality"])
@@ -126,6 +131,7 @@ class TestTheNodesSlots:
             BASES: ("joint_link", "follower", "zero_or_more"),
             RGB_CAMERAS: ("sim_rgb_camera_link", "camera", "zero_or_more"),
             RGBD_CAMERAS: ("sim_rgbd_camera_link", "camera", "zero_or_more"),
+            LIDARS: ("sim_lidar_2d_link", "lidar", "zero_or_more"),
         }
 
     def test_the_faked_runtime_carries_the_topics_the_node_declares_on_them(self, node):
@@ -446,6 +452,92 @@ class TestCameras:
             (ALPHA_WRIST_RIGHT.info, b"other"),
             (ALPHA_WRIST_LEFT.info, b"third"),
         ]
+
+
+class TestLidars:
+    @pytest.fixture(name="swept")
+    def swept_fixture(self, scene):
+        _admit(scene, "delta", "botshare_base")
+        pair("bases", DELTA_BASE)
+        pair("lidars", DELTA_LIDAR)
+        _serve(scene)
+        return scene
+
+    @staticmethod
+    def _lidar():
+        (lidar,) = shipped_entry("botshare_base", bundled("botshare_base").description()).lidars
+        return lidar
+
+    def test_a_lidar_pair_is_the_lidar_its_relay_is_named_after(self, swept):
+        assert swept.io.held_by("delta") == Held(
+            bases=frozenset({"base"}), lidars=frozenset({"lidar"})
+        )
+        assert swept.io.lidar_pairs() == {("delta", "lidar")}
+
+    def test_a_lidar_is_viewed_while_its_own_pair_holds(self, swept):
+        assert swept.io.lidar_viewed("delta", "lidar")
+        # Another lidar of the same robot, and the same lidar of another robot.
+        assert not swept.io.lidar_viewed("delta", "front_lidar")
+        assert not swept.io.lidar_viewed("echo", "lidar")
+
+        pair("lidars")
+        assert not swept.io.lidar_viewed("delta", "lidar")
+
+    def test_a_lidar_pair_with_no_copy_is_the_only_robots(self, scene):
+        _admit(scene, "solo", "botshare_base")
+        pair("lidars", member("lidar", "simulation", None))
+
+        assert scene.io.lidar_pairs() == {("solo", "lidar")}
+
+    def test_a_robot_pairing_no_lidar_has_none_swept(self, scene):
+        _admit(scene, "delta", "botshare_base")
+        pair("bases", DELTA_BASE)
+
+        assert scene.io.lidar_pairs() == set()
+
+    def test_a_scan_goes_to_the_relay_named_after_the_lidar_naming_its_frame(self, swept):
+        lidar = self._lidar()
+
+        assert swept.io.publish_scan("delta", lidar, 1.5, 7, [0.0, 2.5, 10000.0])
+        _publishes(swept)
+
+        ((peer, payload),) = _sent("lidars", "scan_stream")
+        header, *fields = payload
+        assert peer == DELTA_LIDAR.info
+        assert vars(header) == {"timestamp": 1.5, "frame": "lidar_frame", "capture_index": 7}
+        # The sweep as the botshare base's entry gives it, the ranges its
+        # description's gpu_lidar measures, and no intensities.
+        assert fields == [
+            -math.pi,
+            2.0 * math.pi / 3239,
+            lidar.time_increment_s,
+            0.05,
+            40.0,
+            [0.0, 2.5, 10000.0],
+            [],
+        ]
+
+    def test_a_scan_no_pair_views_is_delivered_to_nobody(self, swept):
+        lidar = self._lidar()
+
+        assert not swept.io.publish_scan("echo", lidar, 1.5, 0, [])
+        pair("lidars")
+        assert not swept.io.publish_scan("delta", lidar, 1.5, 0, [])
+        _publishes(swept)
+
+        assert _sent("lidars", "scan_stream") == []
+
+    def test_a_scan_behind_one_still_in_flight_is_dropped(self, swept):
+        lidar = self._lidar()
+
+        assert swept.io.publish_scan("delta", lidar, 0.1, 0, [1.0])
+        # The loop has not run, so the first scan is still in flight.
+        assert not swept.io.publish_scan("delta", lidar, 0.2, 1, [2.0])
+        _publishes(swept)
+        assert swept.io.publish_scan("delta", lidar, 0.3, 2, [3.0])
+        _publishes(swept)
+
+        assert [payload[0].capture_index for _, payload in _sent("lidars", "scan_stream")] == [0, 2]
 
 
 class TestSetpoints:

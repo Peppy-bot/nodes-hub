@@ -88,6 +88,7 @@ def bridge(monkeypatch):
     # stands two robots and rigs alpha unless a test says otherwise.
     extension._world.robots.return_value = [Mock(instance="alpha"), Mock(instance="bravo")]
     extension._io.camera_robots.return_value = {"alpha"}
+    extension._io.lidar_pairs.return_value = set()
     return extension
 
 

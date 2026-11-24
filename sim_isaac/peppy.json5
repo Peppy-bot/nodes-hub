@@ -37,7 +37,7 @@
         // is the link it comes from on the robot's side (left_arm, arm), so
         // nothing on the wire carries an arm_id or a robot id, and robots of
         // any models pair here side by side. A robot whose pairs are not the
-        // limbs and cameras of its model does not stay.
+        // limbs, cameras and lidars of its model does not stay.
         { name: "joint_link", tag: "v1", role: "follower", link_id: "arms", cardinality: "zero_or_more" },
         { name: "gripper_link", tag: "v1", role: "follower", link_id: "grippers", cardinality: "zero_or_more" },
         // A rolling robot's base: each wheel runs at the velocity its base
@@ -54,6 +54,12 @@
         // none and pays for none.
         { name: "sim_rgb_camera_link", tag: "v1", role: "camera", link_id: "rgb_cameras", cardinality: "zero_or_more" },
         { name: "sim_rgbd_camera_link", tag: "v1", role: "camera", link_id: "rgbd_cameras", cardinality: "zero_or_more" },
+        // Robot-mounted 2-D lidars swept in the live scene: the engine plays
+        // the lidar role and a per-lidar relay presents the lidar_2d
+        // contract. A pair's lidar is its relay's name in the copy (lidar),
+        // and it is swept for the robot of its pair, so a stack that pairs no
+        // lidar sweeps none and pays for none.
+        { name: "sim_lidar_2d_link", tag: "v1", role: "lidar", link_id: "lidars", cardinality: "zero_or_more" },
       ],
     },
   },
@@ -106,7 +112,7 @@
     },
 
     // ------------------------------------------------------------------
-    // Limb, camera and object streams
+    // Limb, camera, lidar and object streams
     // ------------------------------------------------------------------
     topics: {
       emits: [
@@ -120,6 +126,7 @@
         { link_id: "rgbd_cameras", name: "depth_stream" },
         { link_id: "rgbd_cameras", name: "stream_info" },
         { link_id: "rgbd_cameras", name: "geometry" },
+        { link_id: "lidars", name: "scan_stream" },
         { link_id: "objects", name: "object_states" },
       ],
 

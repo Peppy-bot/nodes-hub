@@ -14,7 +14,7 @@ wheels = [
 [[package]]
 name = "control-core-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=0eb26e91b92cbbf19d146063b9a8b7f19d074765#0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=083006fee593ac39c3dd714e85bf64a754a27e76#083006fee593ac39c3dd714e85bf64a754a27e76" }
 
 [[package]]
 name = "glfw"
@@ -227,7 +227,7 @@ wheels = [
 [[package]]
 name = "robot-description-py"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=0eb26e91b92cbbf19d146063b9a8b7f19d074765#0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=083006fee593ac39c3dd714e85bf64a754a27e76#083006fee593ac39c3dd714e85bf64a754a27e76" }
 
 [[package]]
 name = "sim-isaac-tests"
@@ -251,11 +251,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=0eb26e91b92cbbf19d146063b9a8b7f19d074765" },
+    { name = "control-core-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=control_core_py&rev=083006fee593ac39c3dd714e85bf64a754a27e76" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "pyjson5", specifier = "==2.0.1" },
-    { name = "robot-description-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=0eb26e91b92cbbf19d146063b9a8b7f19d074765" },
-    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=0eb26e91b92cbbf19d146063b9a8b7f19d074765" },
+    { name = "robot-description-py", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=robot_description_py&rev=083006fee593ac39c3dd714e85bf64a754a27e76" },
+    { name = "sim-robot-core", git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=083006fee593ac39c3dd714e85bf64a754a27e76" },
 ]
 
 [package.metadata.requires-dev]
@@ -269,7 +269,7 @@ dev = [
 [[package]]
 name = "sim-robot-core"
 version = "0.1.0"
-source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=0eb26e91b92cbbf19d146063b9a8b7f19d074765#0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
+source = { git = "https://github.com/Peppy-bot/public-peppy-libs?subdirectory=sim_robot_core&rev=083006fee593ac39c3dd714e85bf64a754a27e76#083006fee593ac39c3dd714e85bf64a754a27e76" }
 dependencies = [
     { name = "control-core-py" },
     { name = "numpy" },

@@ -87,6 +87,20 @@ def test_a_publisher_stamps_from_its_recorded_engine_clock(io):
     assert io.timestamp_s() == 1.5
 
 
+def test_a_publisher_stamps_an_earlier_engine_instant_as_itself(io):
+    # A scan's ray 0, due 0.15 s before the step its last ray completes.
+    io.record_engine_time(1.25)
+    assert io.timestamp_at_s(1.1, 1.25) == 1.1
+
+
+def test_a_consumer_stamps_an_earlier_engine_instant_that_long_before_its_bound_clocks_now(
+    loop, monkeypatch
+):
+    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=_Robots())
+    monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 5_000_000_000)
+    assert io.timestamp_at_s(1.1, 1.25) == pytest.approx(4.85)
+
+
 def test_a_publisher_must_record_before_stamping_or_publishing(io):
     with pytest.raises(RuntimeError, match="record an engine step"):
         io.timestamp_s()

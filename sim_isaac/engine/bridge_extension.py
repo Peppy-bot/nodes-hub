@@ -8,7 +8,8 @@ each robot that rolls, reads the measured joint and gripper state, and
 (throttled to state_rate_hz) publishes the engine clock, the time Isaac's
 timeline played (`_engine_time_s`), followed by the state it stamps: each
 robot's joint, wheel and gripper states and a snapshot of every spawned
-object and standing robot.
+object and standing robot. Each step also sweeps every lidar a robot holds a
+pair for on the engine clock (exts.lidar_sensor).
 
 Every robot is commanded through its own limb and base pairs and publishes
 its state back on them; the copy a pair carries is the robot it belongs to,
@@ -35,7 +36,13 @@ from sim_robot_core.setpoints import GripperSetpoint, JointSetpoint
 
 from wheel_loop import WheelLoop
 from world import Robot, World
-from exts import IsaacActuatorCtrl, IsaacArticulation, IsaacCameraSensor, IsaacGripperSensor
+from exts import (
+    IsaacActuatorCtrl,
+    IsaacArticulation,
+    IsaacCameraSensor,
+    IsaacGripperSensor,
+    IsaacLidarSensor,
+)
 
 if TYPE_CHECKING:  # the transport, which carries the node runtime with it
     from sim_topics import SimTopicIO
@@ -192,6 +199,12 @@ class IsaacBridgeExtension:
         # pays for nothing.
         self._renders = renders
         self._camera_sensors: dict[str, IsaacCameraSensor] = {}
+        # The sweep of each lidar a robot on the stage has held a pair for, by
+        # (robot, lidar), kept while the robot stands so its capture index
+        # counts on, and the lidar pairs the last state tick read: a sweep
+        # steps while its pair holds, and a lidar nobody views is not swept.
+        self._lidar_sensors: dict[tuple[str, str], IsaacLidarSensor] = {}
+        self._lidar_pairs: set[tuple[str, str]] = set()
         self._limbs: dict[str, RobotLimbs] = {}
         # The rate loop of each wheel of each robot that rolls, left then
         # right, kept while the stage is edited so the angle a wheel reports
@@ -211,13 +224,14 @@ class IsaacBridgeExtension:
         self._views_to_read = False
 
     def bind(self) -> None:
-        """Builds a view of every robot on the stage, and a camera rig on
-        each robot holding a camera pair. The rigs follow their pairs before
-        the views are built: a rig's drop removes its render product's prim,
-        and Isaac's Articulation drops its PhysX view on the removal of any
-        prim. The views read once resolve runs, or on the steps that follow,
-        once the stage is playing again. Every caller lets go of the views it
-        held first."""
+        """Builds a view of every robot on the stage, a camera rig on each
+        robot holding a camera pair, and a sweep of each lidar a robot holds
+        a pair for. The rigs follow their pairs before the views are built: a
+        rig's drop removes its render product's prim, and Isaac's
+        Articulation drops its PhysX view on the removal of any prim. The
+        views read once resolve runs, or on the steps that follow, once the
+        stage is playing again. Every caller lets go of the views it held
+        first."""
         assert not self._limbs, "bind takes the stage up after unbind let it go"
         self._drop_rigs(self._rigs_to_drop())
         self._mount_rigs()
@@ -227,6 +241,7 @@ class IsaacBridgeExtension:
         self._wheels = {
             name: loops for name, loops in self._wheels.items() if name in self._limbs
         }
+        self._reconcile_sweeps()
         self._views_to_read = True
 
     def resolve(self, update, steps: int) -> None:
@@ -300,6 +315,34 @@ class IsaacBridgeExtension:
                 robot.instance, robot.prim(), robot.known, self._io
             )
 
+    def _reconcile_sweeps(self) -> None:
+        """Sweeps each lidar a robot on the stage holds a pair for, of the
+        lidars of its model, and tears down the sweep of one whose pair is
+        gone, which keeps it while its robot stands: a robot's relays pair
+        in after it stands, and a relay that stops takes its pair with it.
+        The sweep of a robot that left goes. A pair naming a lidar the model
+        lacks sweeps nothing, and its robot does not stay."""
+        paired = self._io.lidar_pairs()
+        on_stage = {robot.instance: robot for robot in self._world.robots()}
+        for key, sensor in list(self._lidar_sensors.items()):
+            robot, _ = key
+            if key in paired and robot in on_stage:
+                continue
+            sensor.teardown()
+            if robot not in on_stage:
+                del self._lidar_sensors[key]
+        self._lidar_pairs = paired
+        for instance, name in sorted(paired - self._lidar_sensors.keys()):
+            robot = on_stage.get(instance)
+            if robot is None:
+                continue
+            lidar = next((one for one in robot.known.entry.lidars if one.name == name), None)
+            if lidar is None:
+                continue
+            self._lidar_sensors[(instance, name)] = IsaacLidarSensor(
+                instance, robot.prim(), robot.known, lidar, self._io
+            )
+
     def hold_through_stop(self) -> None:
         """Readies the robots that roll and the engine clock for a timeline
         that stops, which sets every body and joint back on its stage and its
@@ -317,11 +360,15 @@ class IsaacBridgeExtension:
     def unbind(self) -> None:
         """Drops every view. A view of a prim that is edited under it stops
         reading, so this runs before the stage changes, and the bind after
-        the change takes the views again. The camera rigs stay: their render
-        products ride the robots' prims, and the next bind drops the rigs of
-        robots that left or hold no camera pair."""
+        the change takes the views again. Each lidar's sweep lets go of its
+        body's view and drops its scan in progress, and sets up again on the
+        next step. The camera rigs stay: their render products ride the
+        robots' prims, and the next bind drops the rigs of robots that left
+        or hold no camera pair."""
         for limbs in self._limbs.values():
             limbs.teardown()
+        for sensor in self._lidar_sensors.values():
+            sensor.teardown()
         self._limbs = {}
         gc.collect()
 
@@ -358,13 +405,18 @@ class IsaacBridgeExtension:
         for sensor in self._camera_sensors.values():
             if sensor.setup():
                 sensor.step()
+        for key, sensor in self._lidar_sensors.items():
+            if key in self._lidar_pairs and sensor.setup():
+                sensor.step(now_s)
 
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
-        # The camera and base pairs are read on each state tick: a base
-        # whose pair is gone holds its wheels where they stand, and a rig
-        # follows its pair within a tick of it forming or dissolving.
+        # The camera, lidar and base pairs are read on each state tick: a
+        # base whose pair is gone holds its wheels where they stand, and a
+        # rig or a sweep follows its pair within a tick of it forming or
+        # dissolving.
         self._io.setpoints.keep_paired_bases()
+        self._reconcile_sweeps()
         # Published before the state it stamps; a stopped timeline stops the
         # domain's clock with it.
         self._io.publish_clock_tick()
