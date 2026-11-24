@@ -5,17 +5,19 @@ applies the latest setpoint of every limb and base of every robot standing,
 clamps the integral of each wheel's rate loop, advances physics, and
 (throttled to state_rate_hz) publishes MuJoCo's own clock followed by the
 measured joint, gripper and wheel state it stamps and each robot's record on
-object_state under the same stamp, and records where each robot that rolls
-stands.
+object_state under the same stamp, records where each robot that rolls
+stands, and sweeps the lidars of the robots standing against the geometry
+the step computed (exts.lidar_sensor).
 
 Every robot is driven through its own limb and base pairs and publishes its
 state back on them. A base's wheels run at the rates of its pair's latest
 setpoint, and at rate 0 while it holds none; once a reading of the pairs
 finds that pair gone, or the setpoint outlives its leader's window on the
 engine's clock, they are held where they stand, the integral of each wheel's
-rate loop cleared (sim_robot_core.setpoints). A robot's joints, actuators and
-cameras carry its own prefix in the scene, which is what tells one robot's
-limbs from another's when two robots of the same model stand together.
+rate loop cleared (sim_robot_core.setpoints). A robot's joints, actuators,
+cameras and bodies carry its own prefix in the scene, which is what tells one
+robot's limbs and lidars from another's when two robots of the same model
+stand together.
 Transport is typed peppygen via SimTopicIO; there is no JSON and no raw
 peppylib on the path.
 """
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
 
 from control_core_py.geometry import normalized, rotate, xyzw_of_wxyz
 from sim_robot_core.cameras import FramePacer
@@ -36,6 +39,7 @@ from exts import (
     MujocoArticulation,
     MujocoCameraSensor,
     MujocoGripperSensor,
+    MujocoLidarSensor,
     MujocoWheelDrive,
     home_inertia,
 )
@@ -44,6 +48,17 @@ from sim_topics import SimTopicIO
 from world import Robot, World
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CarriedSensors:
+    """What a scene's sensors hand the scene composed next, by robot and
+    camera or lidar: each standing camera's capture index counter and each
+    standing lidar's sweep, so a sensor that was already streaming counts on
+    from where it was."""
+
+    camera_counters: dict = field(default_factory=dict)
+    lidar_sweepers: dict = field(default_factory=dict)
 
 
 class _RobotLimbs:
@@ -281,7 +296,7 @@ class MujocoBridgeExtension:
         state_rate_hz: int,
         renders: bool,
         time_base_s: float,
-        camera_counters=None,
+        carried_sensors: CarriedSensors | None = None,
     ) -> None:
         self._model = model
         self._data = data
@@ -301,12 +316,19 @@ class MujocoBridgeExtension:
         self._limbs: dict[str, _RobotLimbs] = {
             robot.instance: _RobotLimbs(robot, model, data) for robot in self._robots
         }
+        carried = carried_sensors or CarriedSensors()
         # The cameras of every robot whose model carries a rig, rendered off
         # this thread when the engine renders at all.
         self._camera_sensor = (
-            MujocoCameraSensor(model, self._rigs(), io, camera_counters)
+            MujocoCameraSensor(model, self._rigs(), io, carried.camera_counters)
             if renders and self._rigs()
             else None
+        )
+        # The lidars of every robot whose model carries one, swept on this
+        # thread after each step. A lidar whose parent link is no body of its
+        # robot's MJCF is refused here.
+        self._lidar_sensor = MujocoLidarSensor(
+            model, data, self._robots, io, carried.lidar_sweepers
         )
 
     def _rigs(self) -> "list[Rig]":
@@ -362,8 +384,9 @@ class MujocoBridgeExtension:
         mujoco.mj_step(self._model, self._data)
         # `data.time` is MuJoCo's own clock, advanced by mj_step above, so a
         # paused engine stops advancing it. Recorded ahead of every stamp of
-        # this step, the camera snapshot included.
+        # this step, the camera snapshot and the lidars' scans included.
         self._io.record_engine_time(self.engine_time_s())
+        self._lidar_sensor.after_step(self.engine_time_s())
         if self._camera_sensor is not None:
             self._camera_sensor.snapshot(self._data.qpos)
             self._camera_sensor.raise_if_failed()
@@ -448,22 +471,22 @@ class MujocoBridgeExtension:
                 self._world.follow(robot, limbs.rolled_placement())
         self._io.publish_object_states([limbs.robot_record() for limbs in self._limbs.values()])
 
-    def shutdown(self) -> dict:
-        """Stops every view this scene reads the model through, and says what
-        each standing camera counted, so the scene composed next carries on
-        from there."""
+    def shutdown(self) -> CarriedSensors:
+        """Stops every view this scene reads the model through, and hands on
+        each standing camera's counter and each standing lidar's sweep,
+        interrupted, so the scene composed next carries on from there."""
         logger.info(
             "MujocoBridgeExtension shutting down: %s",
             ", ".join(f"'{name}'" for name in self._limbs) or "an empty scene",
         )
-        counters: dict = {}
+        cameras: dict = {}
 
         def stop_rendering() -> None:
-            nonlocal counters
+            nonlocal cameras
             if self._camera_sensor is None:
                 return
             self._camera_sensor.stop()
-            counters = self._camera_sensor.counters()
+            cameras = self._camera_sensor.counters()
 
         for close in (
             stop_rendering,
@@ -474,4 +497,4 @@ class MujocoBridgeExtension:
                 close()
             except Exception:  # pylint: disable=W0718
                 logger.exception("a view of this scene did not close")
-        return counters
+        return CarriedSensors(camera_counters=cameras, lidar_sweepers=self._lidar_sensor.sweepers())

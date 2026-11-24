@@ -77,6 +77,24 @@ def test_a_publisher_stamps_from_its_recorded_engine_clock(io):
     assert io.timestamp_s() == 1.5
 
 
+def test_a_past_engine_instant_is_stamped_as_itself_by_a_publisher(io):
+    """A lidar's ray 0 falls due before the step that completes its scan:
+    on the engine's own clock its stamp is the instant it fell due."""
+    io.record_engine_time(1.19)
+    assert io.timestamp_at_s(1.1, 1.19) == 1.1
+    assert io.timestamp_at_s(0.0, 1.19) == 1e-9
+
+
+def test_a_past_engine_instant_is_stamped_by_a_consumer_as_long_ago_on_its_bound_clock(
+    loop, monkeypatch
+):
+    """The bound clock reads 5 s as the engine clock reads 1.19 s, so the
+    engine's 1.1 s was 90 ms ago."""
+    io = sim_topics.SimTopicIO(node_runner=object(), loop=loop, robots=Registry())
+    monkeypatch.setattr(sim_topics.clock, "now_ns", lambda: 5_000_000_000)
+    assert io.timestamp_at_s(1.1, 1.19) == pytest.approx(4.91, abs=1e-12)
+
+
 def test_a_publisher_must_record_before_stamping_or_publishing(io):
     with pytest.raises(RuntimeError, match="record an engine step"):
         io.timestamp_s()

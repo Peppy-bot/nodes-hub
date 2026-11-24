@@ -150,7 +150,8 @@ class _BaseSetpoint:
 
 class _Driver:
     """The transport as the bridge meets it while a base node drives the
-    wheels: the base's setpoint, and nothing published."""
+    wheels: the base's setpoint, nothing published, and no viewer of its
+    lidar, which therefore casts no ray."""
 
     def __init__(self) -> None:
         self.setpoints = _BaseSetpoint()
@@ -166,6 +167,9 @@ class _Driver:
 
     def publish_base_states(self, _robot, _positions, _velocities) -> None:
         return None
+
+    def lidar_viewed(self, _robot, _lidar) -> bool:
+        return False
 
 
 @dataclass

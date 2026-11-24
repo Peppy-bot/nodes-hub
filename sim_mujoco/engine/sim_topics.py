@@ -16,7 +16,9 @@ robot the engine does not stand is left alone. The engine also plays the
 camera role of the sim_rgb_camera_link / sim_rgbd_camera_link pairings on
 `rgb_cameras` and `rgbd_cameras`, one pair per rendered camera named after
 its relay, handing finished frames to the same loop and dropping a frame
-whose stream's previous publish is still in flight. Every hop is a generated
+whose stream's previous publish is still in flight, and the lidar role of the
+sim_lidar_2d_link pairing on `lidars`, one pair per swept lidar named after
+its relay, whose scans go to the loop the same way. Every hop is a generated
 peppygen pairing topic.
 
 Beside the pairings, the engine implements object_state: the bridge captures
@@ -56,6 +58,7 @@ from peppygen.paired_topics.bases import joint_setpoints as base_setpoints
 from peppygen.paired_topics.bases import joint_states as base_states
 from peppygen.paired_topics.grippers import gripper_setpoints
 from peppygen.paired_topics.grippers import gripper_states
+from peppygen.paired_topics.lidars import scan_stream as lidar_scans
 from peppygen.paired_topics.rgb_cameras import geometry as rgb_geometry
 from peppygen.paired_topics.rgb_cameras import stream_info as rgb_info
 from peppygen.paired_topics.rgb_cameras import video_stream as rgb_video
@@ -64,12 +67,14 @@ from peppygen.paired_topics.rgbd_cameras import geometry as rgbd_geometry
 from peppygen.paired_topics.rgbd_cameras import stream_info as rgbd_info
 from peppygen.paired_topics.rgbd_cameras import video_stream as rgbd_video
 from sim_robot_core.cameras import DISTORTION_MODEL
+from sim_robot_core.lidars import LidarConfig
 from sim_robot_core.object_state import ObjectStateSnapshot, RobotRecord
 from sim_robot_core.pairs import (
     ARMS,
     BASE_NAME,
     BASES,
     GRIPPERS,
+    LIDARS,
     RGB_CAMERAS,
     RGBD_CAMERAS,
     Held,
@@ -95,13 +100,15 @@ _SETPOINT_TOPICS = (
 _MIN_ENGINE_TIME_S = 1e-9
 
 # Publisher and guard keys, spelled once: a publisher is keyed by
-# (slot, topic) and a guard by (robot, camera, surface).
+# (slot, topic) and a guard by (robot, camera or lidar, surface).
 _VIDEO_STREAM = "video_stream"
 _DEPTH_STREAM = "depth_stream"
 _STREAM_INFO = "stream_info"
 _GEOMETRY = "geometry"
+_SCAN_STREAM = "scan_stream"
 _FRAMES_SURFACE = "frames"
 _INFO_SURFACE = "info"
+_SCANS_SURFACE = "scans"
 # Geometry goes out on the same tick as the stream info, so it takes a guard
 # of its own: sharing the info one would drop whichever was scheduled second.
 _GEOMETRY_SURFACE = "geometry"
@@ -122,11 +129,13 @@ _PUBLISH_STALL_S = 5.0
 
 
 class _PublishGuard:
-    """At most one in-flight publish batch per camera surface: acquired on the
-    render thread when a capture is scheduled, released on the loop when every
-    publish task of the batch finishes. A camera that can't keep up drops
-    whole captures instead of piling publish tasks onto the loop, and an rgbd
-    color + depth pair shares one guard so a pair is never half-dropped."""
+    """At most one in-flight publish batch per sensor surface: acquired on the
+    thread that captures (the render thread for a camera, the physics thread
+    for a lidar) when a capture is scheduled, released on the loop when every
+    publish task of the batch finishes. A sensor that can't keep up drops
+    whole captures, so the loop holds at most one batch of each of its
+    surfaces, and an rgbd color + depth pair shares one guard so a pair is
+    never half-dropped."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -179,7 +188,7 @@ class SimTopicIO:
         # The robots in the scene, of which a capture of object_state lists
         # the ones that stand.
         self._robots = robots
-        # The five slots, read into robots, limbs, bases and cameras.
+        # The six slots, read into robots, limbs, bases, cameras and lidars.
         self._pairs = PairTable(
             {
                 ARMS: lambda: arm_setpoints.peers(node_runner),
@@ -187,6 +196,7 @@ class SimTopicIO:
                 BASES: lambda: base_setpoints.peers(node_runner),
                 RGB_CAMERAS: lambda: rgb_video.peers(node_runner),
                 RGBD_CAMERAS: lambda: rgbd_video.peers(node_runner),
+                LIDARS: lambda: lidar_scans.peers(node_runner),
             },
             robots.sole_name,
         )
@@ -196,13 +206,15 @@ class SimTopicIO:
         # The latest setpoint of each limb and base of each robot, whose
         # models give each limb and base its joint count.
         self.setpoints = Setpoints(self._pairs, robots)
-        # Held while a camera's guard is made, on the thread that renders.
+        # Held while a sensor's guard is made, on the thread that renders or
+        # the one that steps the scene.
         self._guards_lock = threading.Lock()
-        # Camera publishers and their in-flight guards, keyed by (slot, topic)
-        # and (robot, camera, surface); a slot's publisher reaches every
-        # camera paired on it, so the guard is per robot and camera.
-        self._camera_pubs: dict[tuple[str, str], peppylib.PeerPublisher] = {}
-        self._camera_guards: dict[tuple[str, str, str], _PublishGuard] = {}
+        # Camera and lidar publishers and their in-flight guards, keyed by
+        # (slot, topic) and (robot, camera or lidar, surface); a slot's
+        # publisher reaches every sensor paired on it, so the guard is per
+        # robot and sensor.
+        self._sensor_pubs: dict[tuple[str, str], peppylib.PeerPublisher] = {}
+        self._sensor_guards: dict[tuple[str, str, str], _PublishGuard] = {}
         # The object_states publisher and its in-flight guard, and the latest
         # capture, which get_object_states answers: written on the physics
         # thread, read on the loop.
@@ -240,11 +252,11 @@ class SimTopicIO:
         self._gripper_pub = await gripper_states.declare_publisher(self._node_runner)
         self._base_pub = await base_states.declare_publisher(self._node_runner)
         self._object_states_pub = await object_states.declare_publisher(self._node_runner)
-        await self._declare_camera_publishers(
+        await self._declare_sensor_publishers(
             RGB_CAMERAS,
             [(_VIDEO_STREAM, rgb_video), (_STREAM_INFO, rgb_info), (_GEOMETRY, rgb_geometry)],
         )
-        await self._declare_camera_publishers(
+        await self._declare_sensor_publishers(
             RGBD_CAMERAS,
             [
                 (_VIDEO_STREAM, rgbd_video),
@@ -253,6 +265,7 @@ class SimTopicIO:
                 (_GEOMETRY, rgbd_geometry),
             ],
         )
+        await self._declare_sensor_publishers(LIDARS, [(_SCAN_STREAM, lidar_scans)])
         # The consume tasks end with their subscriptions or the node's
         # cancellation; the service runs for the life of the node.
         runner = self._node_runner
@@ -309,10 +322,17 @@ class SimTopicIO:
         )
 
     def held_by(self, robot: str) -> Held:
-        """What `robot` holds on the five slots: the limbs and the base its
-        pairs drive and the cameras they stream. Read on the node loop, which
-        is what keeps a robot in the scene and what its readiness asks."""
+        """What `robot` holds on the six slots: the limbs and the base its
+        pairs drive and the cameras and lidars they stream. Read on the node
+        loop, which is what keeps a robot in the scene and what its readiness
+        asks."""
         return self._pairs.held_by(robot)
+
+    def lidar_viewed(self, robot: str, name: str) -> bool:
+        """Whether `robot` holds the pair of its lidar `name`, so a viewer
+        reads its scans. Read on the physics thread as each scan of the lidar
+        is due to start."""
+        return self._pairs.peer_of(LIDARS, robot, name) is not None
 
     def record_engine_time(self, engine_time_s: float) -> None:
         """Adopt this step's engine clock for every stamp this engine emits.
@@ -390,6 +410,17 @@ class SimTopicIO:
                 "a domain's publisher must record an engine step before stamping"
             )
         return engine_time_s
+
+    def timestamp_at_s(self, instant_s: float, now_s: float) -> float:
+        """The stamp of `instant_s`, an instant of the engine clock no later
+        than `now_s`, the engine clock of this step: the instant itself while
+        this engine publishes a clock domain, floored as a recorded engine
+        clock is, and otherwise its bound clock's time now (timestamp_s) less
+        how long ago the instant was on the engine clock, so it sits on the
+        timeline of every other stamp this engine emits."""
+        if self._clock_publisher is None:
+            return self.timestamp_s() - (now_s - instant_s)
+        return max(instant_s, _MIN_ENGINE_TIME_S)
 
     def publish_arm_states(
         self, robot: str, arm: str, positions: list[float], velocities: list[float]
@@ -477,6 +508,36 @@ class SimTopicIO:
         )
         return self._publish_guarded(
             RGB_CAMERAS, robot, name, _FRAMES_SURFACE, [(_VIDEO_STREAM, payload)]
+        )
+
+    def publish_scan(
+        self,
+        robot: str,
+        lidar: LidarConfig,
+        timestamp_s: float,
+        capture_index: int,
+        ranges: list[float],
+    ) -> bool:
+        """One scan of `robot`'s lidar on the pair of its relay, its header
+        naming the lidar's frame, the time of its ray 0 and its capture
+        counter, with the angles, the ray timing and the ranges the lidar's
+        config gives. False when the scan is dropped: the robot holds no pair
+        for the lidar, or its previous scan is still in flight."""
+        # Intensities are empty: the engine measures none.
+        payload = lidar_scans.build_message(
+            lidar_scans.MessageHeader(
+                timestamp=timestamp_s, frame=lidar.frame, capture_index=capture_index
+            ),
+            lidar.sweep.min_angle_rad,
+            lidar.sweep.angle_increment_rad,
+            lidar.time_increment_s,
+            lidar.min_range_m,
+            lidar.max_range_m,
+            ranges,
+            [],
+        )
+        return self._publish_guarded(
+            LIDARS, robot, lidar.name, _SCANS_SURFACE, [(_SCAN_STREAM, payload)]
         )
 
     def publish_color_stream_info(
@@ -636,17 +697,17 @@ class SimTopicIO:
             RGBD_CAMERAS, robot, name, _GEOMETRY_SURFACE, [(_GEOMETRY, payload)]
         )
 
-    async def _declare_camera_publishers(
+    async def _declare_sensor_publishers(
         self, slot: str, topics: list[tuple[str, object]]
     ) -> None:
         for topic_name, module in topics:
-            self._camera_pubs[(slot, topic_name)] = await module.declare_publisher(
+            self._sensor_pubs[(slot, topic_name)] = await module.declare_publisher(
                 self._node_runner
             )
 
-    def _camera_guard(self, robot: str, name: str, surface: str) -> "_PublishGuard":
+    def _sensor_guard(self, robot: str, name: str, surface: str) -> "_PublishGuard":
         with self._guards_lock:
-            return self._camera_guards.setdefault((robot, name, surface), _PublishGuard())
+            return self._sensor_guards.setdefault((robot, name, surface), _PublishGuard())
 
     def _publish_guarded(
         self,
@@ -656,18 +717,18 @@ class SimTopicIO:
         surface: str,
         topic_payloads: list[tuple[str, bytes]],
     ) -> bool:
-        """One camera's batch, behind that robot's own guard on this surface.
-        False when the robot holds no pair for this camera on `slot`, so
-        there is nothing to publish to."""
+        """One camera's or lidar's batch, behind that robot's own guard on
+        this surface. False when the robot holds no pair for this camera or
+        lidar on `slot`, so there is nothing to publish to."""
         peer = self._pairs.peer_of(slot, robot, name)
         if peer is None:
             return False
         publishes = [
-            (self._camera_pubs[(slot, topic_name)], payload)
+            (self._sensor_pubs[(slot, topic_name)], payload)
             for topic_name, payload in topic_payloads
         ]
         return self._publish_batch(
-            self._camera_guard(robot, name, surface),
+            self._sensor_guard(robot, name, surface),
             f"'{robot}' {name} {surface}",
             publishes,
             peer=peer,

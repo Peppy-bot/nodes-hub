@@ -102,7 +102,13 @@ def known_model(cameras, link_bodies=None, camera_lights=True):
     maps its links to (the welded pedestal to the world body, unless
     `link_bodies` says otherwise) and how the scene is lit."""
     entry = ModelEntry(
-        model="test", arms=(), grippers=(), cameras=tuple(cameras), start_posture={}, base=None
+        model="test",
+        arms=(),
+        grippers=(),
+        cameras=tuple(cameras),
+        lidars=(),
+        start_posture={},
+        base=None,
     )
     return known(
         "test",

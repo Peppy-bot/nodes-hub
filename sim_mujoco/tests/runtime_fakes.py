@@ -6,9 +6,9 @@ the engine imports, once, ahead of the engine's own imports. Every suite that
 needs the runtime imports it, so they all meet the same modules whichever of
 them a session collects first.
 
-The pairing modules follow the node's five slots. A slot's pairs are the
-slot's, so every topic module of a slot reads the same members, exactly as the
-generated `peers()` does. A setpoint module hands the engine the arrivals a
+The pairing modules follow the node's six slots, from `arms` to `lidars`
+(SLOT_TOPICS). A slot's pairs are the slot's, so every topic module of a slot
+reads the same members, exactly as the generated `peers()` does. A setpoint module hands the engine the arrivals a
 test queued and then ends its subscription, saying so, and every publisher records the
 peer each payload was addressed to, so nothing here waits on a clock.
 """
@@ -29,6 +29,7 @@ SLOT_TOPICS = {
     "bases": ("joint_setpoints", "joint_states"),
     "rgb_cameras": ("video_stream", "stream_info", "geometry"),
     "rgbd_cameras": ("video_stream", "depth_stream", "stream_info", "geometry"),
+    "lidars": ("scan_stream",),
 }
 
 # The core node every fake instance runs on.

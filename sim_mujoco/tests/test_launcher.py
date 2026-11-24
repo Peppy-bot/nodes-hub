@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "engine"))
 import mujoco_models  # noqa: E402  pylint: disable=C0413
 import _launcher as launcher_module  # noqa: E402  pylint: disable=C0413
 from _launcher import SimLauncher, _NoView  # noqa: E402  pylint: disable=C0413
+from bridge_extension import CarriedSensors  # noqa: E402  pylint: disable=C0413
 from edits import Edits  # noqa: E402  pylint: disable=C0413
 from exts import camera_sensor  # noqa: E402  pylint: disable=C0413
 from viewer_server import ViewerServer  # noqa: E402  pylint: disable=C0413
@@ -401,7 +402,10 @@ class TestTheThreadThatStepsTheScene:
             launcher._extension.shutdown = refuse  # pylint: disable=W0212
         # What the scene before this one counted, which only a scene that
         # shuts down hands on.
-        launcher._camera_counters = {("alpha", "wrist"): object()}  # pylint: disable=W0212
+        launcher._carried_sensors = CarriedSensors(  # pylint: disable=W0212
+            camera_counters={("alpha", "wrist"): object()},
+            lidar_sweepers={("alpha", "lidar"): object()},
+        )
 
         with caplog.at_level(logging.ERROR):
             launcher.unbind()
@@ -409,8 +413,9 @@ class TestTheThreadThatStepsTheScene:
         assert launcher._extension is None  # pylint: disable=W0212
         assert isinstance(launcher._view, _NoView)  # pylint: disable=W0212
         assert "did not" in caplog.text
-        # A scene that did not shut down counted frames nobody carries on.
-        assert launcher._camera_counters == {}  # pylint: disable=W0212
+        # A scene that did not shut down counted frames and scans nobody
+        # carries on.
+        assert launcher._carried_sensors == CarriedSensors()  # pylint: disable=W0212
 
     def test_a_view_that_cannot_open_leaves_the_scene_stepping(self, caplog, monkeypatch):
         """The robots standing keep their physics, their state and the clock
