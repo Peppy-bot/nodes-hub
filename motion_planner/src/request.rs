@@ -385,7 +385,7 @@ pub fn parse_plan<const N: usize, const K: usize>(
                 link_name: &c.link_name,
                 frame: frame_or_robot(c.frame.as_deref(), robot),
                 timestamp: c.timestamp,
-                pose: Pose::new(point, control_core::geometry::UnitQuaternion::IDENTITY),
+                pose: Pose::new(point, frame_tree::UnitQuaternion::IDENTITY),
             };
             constraint(&named, fingers, "goal_position_constraints", record, within)
         })
@@ -1862,8 +1862,7 @@ mod tests {
             panic!("one arm moves");
         };
         let half_turn = UnitQuaternion::from(
-            control_core::geometry::UnitQuaternion::parse([0.0, 0.0, 1.0, 0.0])
-                .expect("a half turn about z"),
+            frame_tree::UnitQuaternion::parse([0.0, 0.0, 1.0, 0.0]).expect("a half turn about z"),
         );
         let expected = Goal::new(
             ARM_DOF,

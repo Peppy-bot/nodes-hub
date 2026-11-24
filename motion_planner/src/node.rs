@@ -3550,11 +3550,6 @@ mod tests {
         }
     }
 
-    /// The transform that moves nothing.
-    fn identity() -> Transform {
-        Transform::new([0.0; 3], [0.0, 0.0, 0.0, 1.0]).expect("the identity is a transform")
-    }
-
     /// The frame of the one-pixel camera of `intake`.
     const CAMERA_FRAME: &str = "chest_optical_frame";
 
@@ -3575,7 +3570,7 @@ mod tests {
             node,
             DepthStream {
                 frame: CAMERA_FRAME.to_string(),
-                depth_in_color: identity(),
+                depth_in_color: Transform::IDENTITY,
                 lens,
                 depth_model: DepthModel::Z,
                 depth_unit: 0.001,
@@ -3729,8 +3724,8 @@ mod tests {
         else {
             panic!("the camera's transform of 2 s places the frame");
         };
-        assert_eq!(pose.origin(), [0.5, 0.0, 1.0]);
-        assert_eq!(pose.orientation(), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pose.position(), [0.5, 0.0, 1.0]);
+        assert_eq!(pose.orientation(), frame_tree::UnitQuaternion::IDENTITY);
 
         let at_once = started(
             &Parameters {
@@ -3828,7 +3823,7 @@ mod tests {
         let first = after(1_000);
         let mut intake = intake(node.clone());
         assert!(!intake.took_recently(first), "no frame taken yet");
-        take_frame(&mut intake, &frame_at(first), &identity());
+        take_frame(&mut intake, &frame_at(first), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(first));
         assert!(intake.took_recently(first + interval / 2));
         assert!(!intake.took_recently(first + interval));
@@ -3951,7 +3946,7 @@ mod tests {
         measure_at(&node, after(1_100), still());
         clear(&node);
         assert_eq!(given(&mut waiting), Some(after(1_050)));
-        take_frame(&mut intake, &frame_at(after(1_050)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_050)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None, "the frame taken before the clear");
         assert_eq!(snapshot(&node), waiting_on(AWAITING_FRAME.to_string()));
 
@@ -3971,7 +3966,7 @@ mod tests {
     fn a_clock_that_steps_back_clears_the_map() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(1_000)));
         let (newest, mut waiting) = waiting_frames(&node);
         send_frame(&newest, 2_050);
@@ -3992,9 +3987,9 @@ mod tests {
         );
         measure(&node, 600, 2_100);
         assert_eq!(given(&mut waiting), None, "the frame of the clock before");
-        take_frame(&mut intake, &frame_at(after(500)), &identity());
+        take_frame(&mut intake, &frame_at(after(500)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None, "the frame at the restart");
-        take_frame(&mut intake, &frame_at(after(700)), &identity());
+        take_frame(&mut intake, &frame_at(after(700)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(700)));
     }
 
@@ -4143,7 +4138,7 @@ mod tests {
         measure_at(&node, after(1_000), opened(0.0));
         measure_at(&node, after(1_100), opened(1.0));
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_050)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_050)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(1_050)));
         let mut halfway = node.own.clone();
         halfway.set_openings(&PerArm::new([0.5, 0.5]));
@@ -4164,18 +4159,18 @@ mod tests {
     fn a_frame_taken_before_a_clear_marks_nothing() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(1_000)));
         clear(&node);
         assert_eq!(map_stamp(&node), None);
-        take_frame(&mut intake, &frame_at(after(1_500)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_500)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None, "the frame of 1.5 s");
         assert_eq!(
             lock(&node.map).waiting,
             Waiting::Passing(AWAITING_FRAME.to_string())
         );
         measure(&node, 2_100, 2_500);
-        take_frame(&mut intake, &frame_at(after(2_400)), &identity());
+        take_frame(&mut intake, &frame_at(after(2_400)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(2_400)));
     }
 
@@ -4192,12 +4187,12 @@ mod tests {
         };
         let mut intake = intake(node.clone());
         node.wait_on("a depth frame was skipped: no joint positions were measured at its stamp");
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         clear(&node);
         assert_eq!(snapshot(&node), waiting(AWAITING_FRAME));
 
         measure(&node, 2_100, 2_500);
-        take_frame(&mut intake, &frame_at(after(2_400)), &identity());
+        take_frame(&mut intake, &frame_at(after(2_400)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(2_400)));
         let lasting = "the depth camera: get_depth_intrinsics: no answer";
         node.wait_on_lasting(lasting);
@@ -4218,7 +4213,7 @@ mod tests {
                 encoding: "rgb8".to_string(),
                 ..frame_at(after(1_000))
             },
-            &identity(),
+            &Transform::IDENTITY,
         );
         assert_eq!(map_stamp(&node), None);
         assert_eq!(
@@ -4236,7 +4231,7 @@ mod tests {
     fn a_frame_whose_objects_the_tree_cannot_place_is_skipped() {
         let node = Arc::new(holding_an_object_the_tree_cannot_place());
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None);
         let Waiting::Passing(reason) = &lock(&node.map).waiting else {
             panic!("the map waits on the frame");
@@ -4309,7 +4304,8 @@ mod tests {
         let eye = point + Vector3::new(0.3, 0.0, 0.0);
         let facing = UnitQuaternion::rotation_between(&Vector3::z(), &-Vector3::x())
             .expect("a turn from +z to -x");
-        let camera = transform_of(&Isometry3::from_parts(eye.coords.into(), facing));
+        let camera = Transform::try_from(&Isometry3::from_parts(eye.coords.into(), facing))
+            .expect("a finite pose");
         let mut intake = intake(node.clone());
         take_frame(&mut intake, &frame_seeing(after(1_050), 300), &camera);
         assert_eq!(map_stamp(&node), Some(after(1_050)));
@@ -4324,16 +4320,11 @@ mod tests {
     /// A camera 0.3 m above `point`, looking down at it.
     fn above(point: [f64; 3]) -> Transform {
         let down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
-        transform_of(&Isometry3::from_parts(
+        Transform::try_from(&Isometry3::from_parts(
             Translation3::new(point[0], point[1], point[2] + 0.3),
             down,
         ))
-    }
-
-    /// `pose` as tf2's transform.
-    fn transform_of(pose: &Isometry3<f64>) -> Transform {
-        let (position, orientation) = pose_arrays(pose);
-        Transform::new(position, orientation).expect("a pose is a transform")
+        .expect("a finite pose")
     }
 
     /// The entry of apply_collision_objects that applies `operation` to the cube `id`,
