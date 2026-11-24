@@ -269,8 +269,12 @@ three to the API as headers when they are set.
 starts on that machine, so a local launch reads what the shell exports. A
 launcher that names a variable as a launch variable (`env_from_launch`)
 passes it to the brain alone, and refuses a launch that does not hold what
-it names. `simulation_mcp` names `GEMINI_API_KEY`; `openarm_simulation`
-names no launch variable, so its brain reads the shell's environment:
+it names. `simulation_mcp` names an `any_of` of two sets,
+`OPENAI_COMPATIBLE_API_BASE` and `OPENAI_COMPATIBLE_API_KEY`, or
+`GEMINI_API_KEY`: the brain takes the first set that the shell holds
+complete, and a shell that holds one of the API's two variables without the
+other is refused. `openarm_simulation` names no launch variable, so its
+brain reads the shell's environment:
 
 ```sh
 export GEMINI_API_KEY=...
