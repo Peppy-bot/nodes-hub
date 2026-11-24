@@ -116,6 +116,39 @@ async def test_a_lookup_that_gives_nothing_the_node_can_use_refuses_the_command_
     ), str(refused.value)
 
 
+@pytest.mark.parametrize(
+    "position, orientation, reason",
+    [
+        (
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 2.0],
+            "the orientation [0, 0, 0, 2] has a squared norm of 4, 0.01 or more from 1: send a unit "
+            "quaternion [x, y, z, w], such as [0, 0, 0, 1]",
+        ),
+        (
+            [float("nan"), 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            "a position must be finite: got x NaN, y 0, z 0; give a finite number of meters on each axis",
+        ),
+    ],
+)
+async def test_an_answer_that_holds_no_pose_refuses_the_command_with_attempt_failed(
+    monkeypatch, position, orientation, reason
+):
+    # The answer is parsed as the contracts parse a pose; one the parse
+    # refuses places nothing.
+    async def poll(*_arguments):
+        return SimpleNamespace(data=SimpleNamespace(position=position, orientation=orientation, timestamp=None))
+
+    placer = placer_with_lookup(monkeypatch, poll)
+
+    with pytest.raises(Refusal) as refused:
+        await placer.place(TARGET, "the target")
+
+    assert refused.value.kind is FailureKind.ATTEMPT_FAILED
+    assert str(refused.value) == f"the target: the robot's transform lookup gave no pose: {reason}"
+
+
 async def test_an_error_of_another_kind_is_no_refusal(monkeypatch):
     placer = placer_whose_lookup_raises(monkeypatch, TypeError("a fault of the node"))
 
