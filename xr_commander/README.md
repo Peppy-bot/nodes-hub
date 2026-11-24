@@ -150,10 +150,12 @@ outside any copy:
   ends the last one, which the headset asks for again.
 - **Lost answers.** The headset releases the lease of a take whose answer
   does not come; the daemon refuses that release when the take never
-  reached it. A posture move whose goal send or result is lost on the
-  robot's backbone is stopped before its lease is released. After a
-  let-go, such as at a halt, it is stopped too, unless another client
-  holds the robot by then.
+  reached it. When the fleet listing names the headset as the holder of a
+  robot it neither holds nor works on, such as a take the daemon served
+  after that release, the headset releases that lease too. A posture move
+  whose goal send or result is lost on the robot's backbone is stopped
+  before its lease is released. After a let-go, such as at a halt, it is
+  stopped too, unless another client holds the robot by then.
 
 After the headset releases a lease, a program that takes it at once can see
 the backbone refuse its first goals with `leader_streaming` for up to 250

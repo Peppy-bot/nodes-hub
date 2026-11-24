@@ -11,9 +11,12 @@ The headset holds a robot while a hand drives its arm or its base, through
 the release burst of the last of them, and while a posture move of its own
 runs; then it releases the lease. It lets go at once, as at a grip release,
 when its lease ends, at a halt, when the open lease it drives under closes
-or ends, and when a goal of the fleet ends. One squeeze is one claim: a
-squeeze held through a let-go of the chosen robot, a refusal, a change of
-robot, the loss of its pair or a halt drives nothing until it is released.
+or ends, and when a goal of the fleet ends. A lease that the newest listing
+shows the headset holding on a robot it neither holds nor works on is
+released, so a take the daemon served late does not stay with the headset.
+One squeeze is one claim: a squeeze held through a let-go of the chosen
+robot, a refusal, a change of robot, the loss of its pair or a halt drives
+nothing until it is released.
 
 `step` is a pure function of the world and the event: the shell (`drive`)
 turns each effect into a call, a timer, a note or a refresh, and each
@@ -532,6 +535,8 @@ class Robot:
     # The call of a stop of a posture move that may run, outside the op slot.
     lost_stop: int | None = None
     epoch: int = 0
+    # The world's `listing_seq` when the robot's last `Release` started.
+    release_seq: int = 0
 
 
 @dataclass(frozen=True)
@@ -595,6 +600,8 @@ class World:
     # Every robot the world holds state for, in name order.
     robots: tuple[Robot, ...] = ()
     posture_moving: PostureMoving | None = None
+    # The number of listings stepped so far.
+    listing_seq: int = 0
     next_id: int = 0
 
     @classmethod
@@ -843,12 +850,12 @@ Effects = tuple[Effect, ...]
 
 def step(world: World, event: Event) -> tuple[World, Effects]:
     """The world after `event`, and the effects to run in order. Every step
-    but `Shutdown`'s ends with the next ops."""
+    but `Shutdown`'s ends with the lease reconcile and the next ops."""
     after, applied = _apply(world, event)
     after, followed = _follow_hands(after, note=None)
     started: Effects = ()
     if not isinstance(event, Shutdown):
-        after, started = _next_ops(after)
+        after, started = _next_ops(_reconcile(after))
     assert after.fleet.view is None or after.fleet.goals_run, (
         "a listing stands only while the goals run"
     )
@@ -1816,8 +1823,32 @@ def _next_op(world: World, r: str) -> tuple[World, Effects]:
     if not _release_due(world, robot):
         return world, ()
     world, call, release_id = _new_call_and_op(world)
-    world = _update_robot(world, r, op=Release(release_id, call))
+    release = Release(release_id, call)
+    world = _update_robot(world, r, op=release, release_seq=world.listing_seq)
     return world, (Call(r, call, ReleaseLease()),)
+
+
+def _reconcile(world: World) -> World:
+    """Each robot with no hold, op, queue or retry owes a release while the
+    newest listing, newer than the robot's last `Release` and not halted,
+    names the headset as its lease holder: the daemon's book holds that
+    lease for the headset. A listing stands only while the goals run."""
+    fleet = world.fleet
+    view = fleet.view
+    if view is None or view.halted_by is not None:
+        return world
+    for r in sorted(view.leases):
+        robot = world.robot(r)
+        idle = (
+            robot.hold is None
+            and robot.op is None
+            and not robot.queue
+            and robot.retry is None
+        )
+        listed_since = world.listing_seq > robot.release_seq
+        if idle and listed_since and _leased_by(view, r, fleet.me):
+            world = _owe_release(world, r)
+    return world
 
 
 def _start_queued(world: World, r: str, head: Queued) -> tuple[World, Effects]:
@@ -1959,7 +1990,9 @@ def _listing(world: World, view: FleetView) -> tuple[World, Effects]:
     fleet = world.fleet
     assert fleet.goals_run, "a listing comes after the goals' status says they run"
     starts = view.halted_by is not None and not fleet.halted
-    world = replace(world, fleet=replace(fleet, view=view))
+    world = replace(
+        world, fleet=replace(fleet, view=view), listing_seq=world.listing_seq + 1
+    )
     if starts:
         world, effects = _let_go_of_every_robot(
             world, halted_text(view.halted_by), cancel_goal=True

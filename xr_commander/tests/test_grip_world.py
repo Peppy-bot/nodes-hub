@@ -263,6 +263,13 @@ def posture_held(world: World, robot=ALPHA, target=HOME) -> World:
     return world
 
 
+def taken_and_listed() -> World:
+    """Alpha taken by the left grip, then a listing that names the headset as
+    alpha's lease holder, at revision 2."""
+    world, _ = step(taken(listed_world(ALPHA)), listing_of(ALPHA, leases=MINE))
+    return world
+
+
 def release_running() -> World:
     """Alpha's taken hold ended at the left burst's end: its release runs."""
     return released(taken(listed_world(ALPHA)))
@@ -1634,6 +1641,90 @@ def test_an_unanswered_release_after_the_owed_release_cleared_starts_no_timer():
     assert world.robot(ALPHA).retry is None
 
 
+def test_a_listing_that_names_the_headset_on_a_robot_it_does_not_hold_releases_it():
+    world, effects = step(listed_world(ALPHA), listing_of(ALPHA, leases=MINE))
+    assert calls(effects) == [(ALPHA, ReleaseLease)]
+    assert world.robot(ALPHA).release_owed
+    assert world.robot(ALPHA).release_seq == world.listing_seq == 2
+
+
+def test_a_lease_named_by_the_listing_alone_is_released():
+    leases = {BRAVO: Lease(HEADSET, LEASE_NAME, open=False)}
+    world, effects = step(listed_world(ALPHA), listing_of(ALPHA, leases=leases))
+    assert calls(effects) == [(BRAVO, ReleaseLease)]
+    assert world.robot(BRAVO).release_owed
+
+
+def test_a_take_served_after_its_refused_release_is_released_at_the_listing_that_shows_it():
+    world, _ = tick(listed_world(ALPHA), LEFT)
+    world, released = answer(world, ALPHA, Unanswered())
+    assert calls(released) == [(ALPHA, ReleaseLease)]
+    # The daemon had not served the take yet: the release is refused.
+    world, _ = answer(world, ALPHA, Failed("alpha is not leased by the headset"))
+    assert not world.robot(ALPHA).release_owed
+    world, effects = step(world, listing_of(ALPHA, leases=MINE))
+    assert calls(effects) == [(ALPHA, ReleaseLease)]
+
+
+def test_a_listing_from_before_a_releases_effect_gives_one_more_release():
+    world = release_running()
+    world, effects = step(world, listing_of(ALPHA, leases=MINE))
+    assert calls(effects) == []
+    world, spare = answer(world, ALPHA)
+    assert calls(spare) == [(ALPHA, ReleaseLease)]
+    # The daemon refuses the spare release, and no newer listing asks again.
+    world, effects = answer(world, ALPHA, Failed("alpha is not leased by the headset"))
+    assert calls(effects) == []
+    assert not world.robot(ALPHA).release_owed
+
+
+def _reconciled_beside_a_hold():
+    return taken(listed_world(ALPHA)), listing_of(ALPHA, leases=MINE)
+
+
+def _reconciled_beside_an_op():
+    world, _ = tick(listed_world(ALPHA), LEFT)
+    return world, listing_of(ALPHA, leases=MINE)
+
+
+def _reconciled_beside_a_retry():
+    world, _ = answer(release_running(), ALPHA, Unanswered())
+    return world, listing_of(ALPHA, leases=MINE)
+
+
+def _reconciled_at_a_halt():
+    return listed_world(ALPHA), listing_of(ALPHA, leases=MINE, halted_by=HALTER)
+
+
+@pytest.mark.parametrize(
+    "reach",
+    [
+        _reconciled_beside_a_hold,
+        _reconciled_beside_an_op,
+        _reconciled_beside_a_retry,
+        _reconciled_at_a_halt,
+    ],
+    ids=["a hold", "an op", "a retry", "a halt"],
+)
+def test_the_reconcile_releases_nothing_beside_a_hold_an_op_a_retry_or_at_a_halt(
+    reach,
+):
+    world, listing = reach()
+    owed = world.robot(ALPHA).release_owed
+    world, effects = step(world, listing)
+    assert (ALPHA, ReleaseLease) not in calls(effects)
+    assert world.robot(ALPHA).release_owed is owed
+
+
+def test_the_reconcile_waits_for_the_first_listing_after_the_goals_start():
+    world, effects = run(
+        taken_and_listed(), *GOALS_END, GoalsStarted(2), GoalsStatusChanged(Following())
+    )
+    assert calls(effects) == []
+    world, effects = step(world, listing_of(ALPHA, leases=MINE, revision=3))
+    assert calls(effects) == [(ALPHA, ReleaseLease)]
+
+
 @pytest.mark.parametrize(
     "reach",
     [
@@ -1649,17 +1740,17 @@ def test_a_confirm_ends_at_once_unless_the_hold_is_taken(reach):
 
 
 def test_a_confirm_answered_sets_the_pending_end_and_settles():
-    world, asked = lease_ended(taken(listed_world(ALPHA, leases=MINE)))
+    world, asked = lease_ended(taken_and_listed())
     assert calls(asked) == [(ALPHA, CheckMove)]
-    world, _ = answer(world, ALPHA, Answered(2))
-    assert world.robot(ALPHA).hold.pending_end == PendingEnd(2, "the lease ended")
-    world, effects = step(world, listing_of(ALPHA, leases=MINE, revision=2))
+    world, _ = answer(world, ALPHA, Answered(3))
+    assert world.robot(ALPHA).hold.pending_end == PendingEnd(3, "the lease ended")
+    world, effects = step(world, listing_of(ALPHA, leases=MINE, revision=3))
     assert world.robot(ALPHA).hold.pending_end is None
     assert notes(effects) == []
 
 
 def test_the_earliest_answered_confirm_settles_two_lease_ends():
-    world = taken(listed_world(ALPHA, leases=MINE))
+    world = taken_and_listed()
     world, _ = step(world, LeaseEnded(ALPHA, "first"))
     world, _ = answer(world, ALPHA, Answered(3))
     world, _ = step(world, LeaseEnded(ALPHA, "second"))
@@ -1726,9 +1817,9 @@ def test_a_settled_end_that_does_not_name_the_headset_lets_go():
 
 
 def test_a_settled_end_that_names_the_headset_clears_the_pending_end():
-    world, _ = lease_ended(taken(listed_world(ALPHA, leases=MINE)))
-    world, _ = answer(world, ALPHA, Answered(2))
-    world, effects = step(world, listing_of(ALPHA, leases=MINE, revision=2))
+    world, _ = lease_ended(taken_and_listed())
+    world, _ = answer(world, ALPHA, Answered(3))
+    world, effects = step(world, listing_of(ALPHA, leases=MINE, revision=3))
     hold = world.robot(ALPHA).hold
     assert hold is not None and hold.pending_end is None
     assert notes(effects) == []
@@ -1929,7 +2020,7 @@ def test_a_request_waits_behind_a_release_a_confirm_or_a_posture_start(reach):
 
 
 def test_a_queued_acquisition_at_its_turn_joins_at_once_beside_an_engaged_grip():
-    world, _ = lease_ended(taken(listed_world(ALPHA, leases=MINE)))
+    world, _ = lease_ended(taken_and_listed())
     world, _ = tick(world, BASE, right=SQUEEZE)
     assert isinstance(phase(world, BASE), Requesting)
     world, effects = answer(world, ALPHA)
@@ -2105,12 +2196,21 @@ def test_shutdown_lets_go_of_every_robot():
     assert world.robot(BRAVO).epoch == 1
 
 
-def test_shutdown_starts_no_release():
+def _owed_at_shutdown() -> World:
     world, timer = _owed_beside_an_open_hold()
     world, _ = step(world, RetryDue(ALPHA, timer))
-    world, effects = step(world, Shutdown())
+    return world
+
+
+@pytest.mark.parametrize(
+    ("reach", "owed"),
+    [(_owed_at_shutdown, True), (taken_and_listed, False)],
+    ids=["an owed release", "a listing that names the headset"],
+)
+def test_shutdown_starts_no_release(reach, owed):
+    world, effects = step(reach(), Shutdown())
     assert world.robot(ALPHA).hold is None
-    assert world.robot(ALPHA).release_owed
+    assert world.robot(ALPHA).release_owed is owed
     assert calls(effects) == []
     assert world.robot(ALPHA).op is None
 
