@@ -45,7 +45,7 @@ async fn a_snapshot_draws_the_arms_with_every_optional_link_vacant() -> Result<(
     let Drawn::Frame { pose, .. } = &canvas.at("world/arms/right_arm/grasp")[0] else {
         panic!("the grasp point is a frame")
     };
-    assert_eq!(pose.origin(), [0.3, -0.2, 0.4]);
+    assert_eq!(pose.position(), [0.3, -0.2, 0.4]);
     // Each plot takes the names of its lines, then a value for each.
     let names = |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
     assert!(matches!(
@@ -136,7 +136,7 @@ async fn a_snapshot_in_another_frame_than_the_robot_frame_is_dropped_and_logged(
     let Some(Drawn::Frame { pose, .. }) = canvas.at(GRASP_PATH).last().cloned() else {
         panic!("the grasp point is a frame")
     };
-    assert_eq!(pose.origin(), [0.3, -0.2, 0.4]);
+    assert_eq!(pose.position(), [0.3, -0.2, 0.4]);
     let Some(Drawn::LineStrip { points, .. }) =
         canvas.at("world/arms/right_arm/trail").last().cloned()
     else {

@@ -310,7 +310,7 @@ mod tests {
                 size: [0.1 + 0.08, 0.2 + 0.08, 0.3 + 0.08]
             }
         );
-        assert_eq!(shape.pose.origin(), [0.4, -0.2, 0.1]);
+        assert_eq!(shape.pose.position(), [0.4, -0.2, 0.1]);
         assert_eq!(canvas.log_lines(CHANGES_PATH), ["added brain/lime_1"]);
     }
 
@@ -343,7 +343,7 @@ mod tests {
                 if *position == [0.0, 0.0, 0.05] && text == "brain/lime_1 (carried)"
         ));
         assert_eq!(
-            shape.pose.origin(),
+            shape.pose.position(),
             [0.0, 0.0, 0.05],
             "in the grasp link's frame"
         );

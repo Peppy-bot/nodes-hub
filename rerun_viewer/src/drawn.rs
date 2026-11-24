@@ -354,9 +354,9 @@ fn same_numbers(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= SAME_WITHIN)
 }
 
-/// Whether the origins and the rotations of two poses are within `SAME_WITHIN`.
+/// Whether the positions and the rotations of two poses are within `SAME_WITHIN`.
 fn same_pose(a: &Transform, b: &Transform) -> bool {
-    same_numbers(&a.origin(), &b.origin())
+    same_numbers(&a.position(), &b.position())
         && rotation_columns(a)
             .iter()
             .zip(&rotation_columns(b))
@@ -501,6 +501,8 @@ impl<T: DrawnCanvas> Canvas for T {
 
 #[cfg(test)]
 mod tests {
+    use frame_tree::UnitQuaternion;
+
     use super::*;
     use crate::model::placement::translation;
 
@@ -521,10 +523,13 @@ mod tests {
             "another entity"
         );
         // A quarter turn about z moves no origin.
-        let half = std::f64::consts::FRAC_PI_4;
         let turned = Drawn::Place {
             path: "world/robot/link1".to_string(),
-            pose: Transform::new([0.3, 0.0, 0.0], [0.0, 0.0, half.sin(), half.cos()]).unwrap(),
+            pose: Transform::new(
+                [0.3, 0.0, 0.0],
+                UnitQuaternion::from_yaw(std::f64::consts::FRAC_PI_2).unwrap(),
+            )
+            .unwrap(),
         };
         assert!(!at.same_as(&turned));
     }

@@ -465,7 +465,7 @@ mod tests {
         camera.depth_in_color = translation([0.1, 0.0, 0.0]);
         let color_in_robot = Transform::new([1.0, 0.0, 0.0], quarter_turn_about_z()).unwrap();
         let depth_in_robot = camera.depth_in_robot(&color_in_robot);
-        assert!(close(depth_in_robot.origin(), [1.0, 0.1, 0.0], 1e-12));
+        assert!(close(depth_in_robot.position(), [1.0, 0.1, 0.0], 1e-12));
     }
 
     #[test]

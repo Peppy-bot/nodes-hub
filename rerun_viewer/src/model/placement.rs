@@ -2,7 +2,7 @@
 //! unit quaternion [x, y, z, w].
 
 use control_core::geometry::{GeometryError, Pose};
-use frame_tree::Transform;
+use frame_tree::{Transform, UnitQuaternion};
 
 /// A position and a unit quaternion, kept as they came so that two placements compare
 /// equal when the wire gave the same numbers, with the pose they make.
@@ -32,15 +32,14 @@ impl Placement {
     }
 }
 
-/// The pose with no turn whose origin is `position`.
+/// The pose with no turn at `position`.
 pub fn translation(position: [f64; 3]) -> Transform {
-    Transform::new(position, [0.0, 0.0, 0.0, 1.0])
-        .expect("a finite position and the unit quaternion")
+    Transform::new(position, UnitQuaternion::IDENTITY).expect("a finite position")
 }
 
 /// The columns of the rotation of `pose`: where it takes the unit vectors x, y and z.
 pub fn rotation_columns(pose: &Transform) -> [[f64; 3]; 3] {
-    let origin = pose.origin();
+    let origin = pose.position();
     let unit = |axis: usize| {
         let mut vector = [0.0; 3];
         vector[axis] = 1.0;
@@ -64,9 +63,8 @@ pub(crate) mod tests {
     }
 
     /// A quarter turn about +z: x goes to y.
-    pub(crate) fn quarter_turn_about_z() -> [f64; 4] {
-        let half = std::f64::consts::FRAC_PI_4;
-        [0.0, 0.0, half.sin(), half.cos()]
+    pub(crate) fn quarter_turn_about_z() -> UnitQuaternion {
+        UnitQuaternion::from_yaw(std::f64::consts::FRAC_PI_2).expect("a finite yaw")
     }
 
     #[test]

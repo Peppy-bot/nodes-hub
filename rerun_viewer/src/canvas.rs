@@ -447,7 +447,7 @@ fn fill_mode(look: Look) -> FillMode {
 /// The transform that places an entity at `pose`.
 fn transform_of(pose: &Transform) -> Transform3D {
     let columns = rotation_columns(pose).map(|column| column.map(|c| c as f32));
-    let origin = pose.origin().map(|c| c as f32);
+    let origin = pose.position().map(|c| c as f32);
     Transform3D::from_translation_mat3x3(origin, columns)
 }
 
