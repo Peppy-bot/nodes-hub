@@ -11,8 +11,8 @@ use std::f64::consts::PI;
 use std::num::NonZeroUsize;
 use std::time::SystemTime;
 
-use frame_tree::Transform;
-use frame_tree::arithmetic::{quaternion_of_yaw, yaw_of_quaternion};
+use frame_tree::arithmetic::yaw_of_quaternion;
+use frame_tree::{Transform, UnitQuaternion};
 
 use control_core::odometry::{Odometry, WheelGeometry};
 use helpers::{
@@ -2063,7 +2063,7 @@ fn fixed_place(link: &str) -> Transform {
         .iter()
         .map(|joint| joint.frame_transform().expect("a fixed joint"))
         .collect();
-    let mut place = Transform::new([0.0; 3], [0.0, 0.0, 0.0, 1.0]).expect("the identity");
+    let mut place = Transform::IDENTITY;
     let mut child = link.to_owned();
     while child != "base_footprint" {
         let joint = joints
@@ -2099,8 +2099,11 @@ async fn a_target_in_the_camera_frame_at_a_state_time_is_placed_in_odom_by_the_t
     }
     // The target in odom, and the same pose seen from the camera as the base
     // stood at the state's time.
-    let in_odom = Transform::new([0.6, 0.4, 0.0], quaternion_of_yaw(0.8)).expect("a pose");
-    let camera = Transform::new(seen.pose.position, seen.pose.orientation)
+    let heading = UnitQuaternion::from_yaw(0.8).expect("a finite yaw");
+    let in_odom = Transform::new([0.6, 0.4, 0.0], heading).expect("a pose");
+    let odometry =
+        UnitQuaternion::parse(seen.pose.orientation).expect("the odometry's orientation");
+    let camera = Transform::new(seen.pose.position, odometry)
         .expect("the odometry's pose")
         .compose(&fixed_place("base_camera_optical_frame"));
     let in_camera = camera.inverse().compose(&in_odom);
@@ -2109,8 +2112,8 @@ async fn a_target_in_the_camera_frame_at_a_state_time_is_placed_in_odom_by_the_t
             peppygen::exposed_actions::base_motion::move_base::GoalTarget {
                 frame: Some("base_camera_optical_frame".to_owned()),
                 timestamp: Some(seen.timestamp),
-                position: in_camera.origin(),
-                orientation: in_camera.orientation(),
+                position: in_camera.position(),
+                orientation: in_camera.orientation().to_xyzw(),
             },
             5.0,
         ))
