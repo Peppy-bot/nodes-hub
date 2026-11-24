@@ -56,9 +56,9 @@ TURN_HAND = Hand.RIGHT
 # A base that has sent no drive_states for longer than this (ns) on the
 # instance's clock does not report: base_state's bound of silence, 0.5 s.
 REPORT_SILENCE_NS = 500_000_000
-# How long after a stop's answer a following starts the stream (ns): a robot
-# stop holds the base until more than 0.5 s pass, from the stop on, with no
-# setpoint, as drive_link states.
+# How long after a stop's answer or refusal a following starts the stream
+# (ns): a robot stop holds the base until more than 0.5 s pass, from the stop
+# on, with no setpoint, as drive_link states.
 STOP_HOLD_NS = 500_000_000
 
 
@@ -157,9 +157,9 @@ class BaseReport:
     arrived_ns: int
 
     def follows_after(self, answered_ns: int) -> bool:
-        """Whether the base follows after a stop answered at `answered_ns`,
-        by the take rule of the module: this report gives following and
-        arrived more than `STOP_HOLD_NS` after the answer."""
+        """Whether the base follows after a stop answered or refused at
+        `answered_ns`: this report gives following and arrived more than
+        `STOP_HOLD_NS` after it."""
         return (
             self.follow_state is FollowState.FOLLOWING
             and self.arrived_ns - answered_ns > STOP_HOLD_NS
@@ -253,24 +253,26 @@ class BaseReports:
 
 
 class NotedStops:
-    """The robot stops, each answered stop noted at its time on the elapsed
-    instance clock of `BaseReports`, for the take rule of the module."""
+    """The robot stops of the headset, each noted on the elapsed instance
+    clock of `BaseReports`: when the newest stop of a robot that was answered
+    or refused ended. A refused stop counts: a backbone runs a stop it took,
+    whatever its answer (robot_stop)."""
 
     def __init__(self, stops: Stops, reports: BaseReports) -> None:
         self._stops = stops
         self._reports = reports
-        self._noted: dict[str, int] = {}
+        self._ended: dict[str, int] = {}
 
     async def stop(self, robot: str) -> str | None:
-        refused = await self._stops.stop(robot)
-        if refused is None:
-            self._noted[robot] = self._reports.mark()
-        return refused
+        try:
+            return await self._stops.stop(robot)
+        finally:
+            self._ended[robot] = self._reports.mark()
 
-    def stopped_at(self, robot: str) -> int | None:
-        """When `robot`'s newest stop was answered (ns), None before its
-        first."""
-        return self._noted.get(robot)
+    def ended_at(self, robot: str) -> int | None:
+        """When the newest stop of `robot` that was answered or refused
+        ended (ns), None before its first."""
+        return self._ended.get(robot)
 
 
 @dataclass(frozen=True)
@@ -359,7 +361,7 @@ async def stream_base(
             return None
         if not grip.followed:
             # Every hold of the headset starts with a stop of its robot.
-            answered_ns = stops.stopped_at(grip.robot)
+            answered_ns = stops.ended_at(grip.robot)
             assert answered_ns is not None, f"{grip.robot} was taken with no stop"
             grip.followed = report.follows_after(answered_ns)
             if not grip.followed:

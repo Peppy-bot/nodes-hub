@@ -29,9 +29,9 @@ from tests.helpers import (
     ROBOT,
     SETTINGS,
     WIRE_TICKS,
-    FakeStops,
     ManualClock,
     ScriptedHeadset,
+    StopsOnCue,
     TickedRig,
     backbone_answers_stop,
     boot_clocked,
@@ -477,22 +477,44 @@ def test_a_drive_states_that_drive_link_does_not_allow_is_dropped_and_named(drop
     assert reports.dropped("peer") is None
 
 
-async def test_a_stop_is_noted_at_its_answer_and_a_refused_one_is_not():
-    log = []
+async def test_a_stop_is_noted_at_its_answer_or_its_refusal():
     now = {"ns": 0}
     reports = BaseReports(lambda: now["ns"])
-    stops = FakeStops(log)
+    assert reports.mark() == 0
+    stops = StopsOnCue()
     noted = base.NotedStops(stops, reports)
-    reports.record("peer", states())
+    first = asyncio.create_task(noted.stop("alpha"))
+    second = asyncio.create_task(noted.stop("alpha"))
+    await settle()
+    assert noted.ended_at("alpha") is None
     now["ns"] = 300
-    assert await noted.stop("alpha") is None
-    assert noted.stopped_at("alpha") == 300
-    assert noted.stopped_at("bravo") is None
+    stops.answer(0)
+    stops.answer(1)
+    assert await first is None
+    assert await second is None
+    assert noted.ended_at("alpha") == 300
+    # A refused stop counts too: the backbone runs a stop it took.
     now["ns"] = 700
-    stops.refusal = "alpha did not answer"
-    assert await noted.stop("alpha") == "alpha did not answer"
-    assert noted.stopped_at("alpha") == 300
-    assert log == [("stop", "alpha"), ("stop", "alpha")]
+    refused = asyncio.create_task(noted.stop("alpha"))
+    await settle()
+    stops.answer(2, "alpha did not answer")
+    assert await refused == "alpha did not answer"
+    assert noted.ended_at("alpha") == 700
+    assert noted.ended_at("bravo") is None
+
+
+async def test_a_stop_cut_short_is_noted_at_its_end():
+    now = {"ns": 0}
+    reports = BaseReports(lambda: now["ns"])
+    assert reports.mark() == 0
+    noted = base.NotedStops(StopsOnCue(), reports)
+    stopping = asyncio.create_task(noted.stop("alpha"))
+    await settle()
+    now["ns"] = 400
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert noted.ended_at("alpha") == 400
 
 
 def test_a_following_more_than_half_a_second_after_the_answer_follows():

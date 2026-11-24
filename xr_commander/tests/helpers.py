@@ -687,6 +687,24 @@ class FakeStops:
         return self.refusal
 
 
+class StopsOnCue:
+    """A backbone that answers each stop once the test answers it: each
+    call parks on a future of its own, kept in call order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, asyncio.Future]] = []
+
+    async def stop(self, robot):
+        answer = asyncio.get_running_loop().create_future()
+        self.calls.append((robot, answer))
+        return await answer
+
+    def answer(self, index: int, refusal: str | None = None) -> None:
+        """Answer stop `index` of `calls`: with `refusal`, None for an
+        answer."""
+        self.calls[index][1].set_result(refusal)
+
+
 def scripted_driver(*robots, clock=REAL_CLOCK, log=None) -> Driver:
     """A driver whose fleet lists `robots` free, whose daemon agrees to
     every call and whose backbones stop on demand; `log` records the
