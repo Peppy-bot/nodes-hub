@@ -415,7 +415,7 @@ class IsaacBridgeExtension:
             if robot is None:
                 continue
             if not limbs.articulation.set_down_at(
-                robot.placement.position.position, robot.placement.orientation.quaternion
+                robot.placement.position.position, robot.placement.orientation.xyzw
             ):
                 continue
             self._let_go_of_wheels(name)
