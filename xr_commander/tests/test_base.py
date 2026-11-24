@@ -294,7 +294,7 @@ class Rig(TickedRig):
         source = panel.BaseSource(
             state=self.state,
             reports=self.reports,
-            peer=lambda: self.robots.peer_for(drive_setpoints),
+            peer=lambda: self.robots.peer_of(drive_setpoints, self.robots.chosen()),
         )
         state = panel.snapshot(
             self.session,

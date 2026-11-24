@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 from peppygen.paired_topics.right_arm import pose_setpoints as right_arm_pose_setpoints
@@ -121,10 +122,41 @@ def test_the_chosen_robots_pair_is_found_per_slot_and_absent_where_it_has_none()
     robots = PairedRobots(
         None, arms={"left": left, "right": right}, grippers={}, base=slot()
     )
-    assert robots.peer_for(right).producer.instance_id == "alpha_backbone_inst"
+    assert (
+        robots.peer_of(right, robots.chosen()).producer.instance_id
+        == "alpha_backbone_inst"
+    )
     robots.choose("charlie")
-    assert robots.peer_for(left) is None
-    assert robots.peer_for(right).producer.instance_id == "charlie_backbone_inst"
+    assert robots.peer_of(left, robots.chosen()) is None
+    assert (
+        robots.peer_of(right, robots.chosen()).producer.instance_id
+        == "charlie_backbone_inst"
+    )
+
+
+@dataclass(frozen=True)
+class Info:
+    """A pair's `PeerInfo` in a test: hashable, as the generated one is."""
+
+    name: str
+
+
+def test_a_slot_read_gives_every_pair_and_each_robots_first_pair_in_delivered_order():
+    first, other, second = Info("alpha first"), Info("bravo"), Info("alpha second")
+    module = slot(
+        SimpleNamespace(copy="alpha", info=first),
+        SimpleNamespace(copy="bravo", info=other),
+        SimpleNamespace(copy="alpha", info=second),
+    )
+    robots = one_slot()
+    read = robots.pairs(module)
+    assert read.pairs == (("alpha", first), ("bravo", other), ("alpha", second))
+    assert read.pin_of("alpha") is first
+    assert read.pin_of("bravo") is other
+    assert read.pin_of("charlie") is None
+    assert read.pin_of(None) is None
+    assert robots.peer_of(module, "alpha") is first
+    assert robots.peer_of(module, None) is None
 
 
 def test_the_chosen_robots_producer_is_found_on_a_contract_slot():
@@ -192,12 +224,11 @@ async def test_the_pairs_the_harness_seeds_are_grouped_by_copy_over_the_wire():
     ) as h:
         robots = robots_of(h)
         assert robots.names() == ["alpha", "bravo"]
-        assert robots.peer_for(right_gripper_setpoints) is None
+        assert robots.peer_of(right_gripper_setpoints, robots.chosen()) is None
         assert robots.choose("bravo")
-        assert robots.peer_for(right_arm_pose_setpoints).producer.instance_id == (
-            "bravo_backbone_inst"
-        )
-        assert robots.peer_for(right_gripper_setpoints) is not None
+        bravo = robots.peer_of(right_arm_pose_setpoints, robots.chosen())
+        assert bravo.producer.instance_id == "bravo_backbone_inst"
+        assert robots.peer_of(right_gripper_setpoints, robots.chosen()) is not None
 
 
 def test_a_producer_is_found_for_any_robot_by_name():

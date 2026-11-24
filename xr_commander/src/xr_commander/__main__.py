@@ -411,7 +411,7 @@ async def setup(params: Parameters, node_runner: NodeRunner) -> list[asyncio.Tas
     # Shared with the status panel, which reports the same pairs the streams
     # command.
     def slot_peer(topic_module):
-        return lambda: robots.peer_for(topic_module)
+        return lambda: robots.peer_of(topic_module, robots.chosen())
 
     base_source = panel.BaseSource(
         state=driver.base,

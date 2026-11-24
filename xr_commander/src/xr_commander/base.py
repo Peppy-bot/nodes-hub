@@ -377,7 +377,7 @@ async def stream_base(
         gripped = gripping(frame)
         chosen = robots.chosen()
         grip.observe(chosen, gripped)
-        peer = robots.peer_for(topic_module)
+        peer = robots.peer_of(topic_module, chosen)
         if reports.newest(peer) is not None and grip.may_engage(gripped):
             await driver.engage(chosen, BASE, still_gripping(chosen))
         sent = stream.step(peer, drive(peer, frame), held_still, clock.monotonic())

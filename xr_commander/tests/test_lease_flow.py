@@ -87,7 +87,7 @@ class Rig(TickedRig):
         self.robots = robots
         self.session = ScriptedHeadset(clock)
         self.measured = publish.MeasuredPoses(clock)
-        self.peer = robots.peer_for(right_arm_pose_setpoints)
+        self.peer = robots.peer_of(right_arm_pose_setpoints, robots.chosen())
         # Where the follower measures the arm, and the frame it reports it
         # in; it reports at every tick.
         self.arm_at = POSE

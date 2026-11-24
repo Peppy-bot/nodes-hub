@@ -319,7 +319,7 @@ async def stream_pose(
         squeezing = grip is True
         chosen = robots.chosen()
         hand.observe(chosen, grip)
-        peer = robots.peer_for(topic_module)
+        peer = robots.peer_of(topic_module, chosen)
         if peer != last_peer:
             clutch.release()
         last_peer = peer
@@ -331,7 +331,7 @@ async def stream_pose(
                 f"{handedness} arm: squeeze ignored until the follower "
                 "reports a fresh measured pose"
             )
-        paired = peer is not None or robots.peer_for(gripper_module) is not None
+        paired = peer is not None or robots.peer_of(gripper_module, chosen) is not None
         ready = paired and (peer is None or measured_ee is not None)
         if ready and hand.may_engage(grip):
             await driver.engage(chosen, handedness, still_squeezing(chosen))
@@ -385,8 +385,9 @@ async def stream_gripper(
 
     async def build():
         sample = fresh_sample(session, handedness, settings.stale_timeout_s, clock)
-        peer = robots.peer_for(topic_module)
-        engaged = hand.engaged and hand.robot == robots.chosen()
+        chosen = robots.chosen()
+        peer = robots.peer_of(topic_module, chosen)
+        engaged = hand.engaged and hand.robot == chosen
         if sample is None or not engaged or peer is None:
             return None
         opening = gripper_opening(sample.trigger, settings.gripper_open_fraction)
