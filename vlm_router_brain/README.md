@@ -268,7 +268,9 @@ three to the API as headers when they are set.
 `peppy stack launch` passes the launching shell's environment to the nodes it
 starts on that machine, so a local launch reads what the shell exports. A
 launcher that names a variable as a launch variable (`env_from_launch`)
-passes it to the brain alone, and refuses a launch without it:
+passes it to the brain alone, and refuses a launch that does not hold what
+it names. `simulation_mcp` names `GEMINI_API_KEY`; `openarm_simulation`
+names no launch variable, so its brain reads the shell's environment:
 
 ```sh
 export GEMINI_API_KEY=...
@@ -277,7 +279,7 @@ peppy stack launch simulation_mcp --join openarm_sim:alpha --with alpha.vlm_rout
 
 ```sh
 export OPENAI_COMPATIBLE_API_BASE=http://localhost:11434/v1 OPENAI_COMPATIBLE_API_KEY=...
-peppy stack launch simulation_mcp --join openarm_sim:alpha --with openai_compatible,alpha.vlm_router_brain
+peppy stack launch openarm_simulation --with alpha.vlm_router_brain
 ```
 
 ## What a search asks
