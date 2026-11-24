@@ -8,11 +8,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use control_core::drive_link;
 use control_core::move_slot::{MoveSlot, SlotRelease};
 use control_core::sync::lock_ignoring_poison;
 
 use crate::failure::{Failure, FailureKind};
-use crate::follower;
 
 const WHEELS_SILENT: &str = "the base's wheels are silent: retry once base_states reports";
 const NO_ODOMETRY: &str = "the base's odometry has no report yet: retry once base_states reports";
@@ -74,7 +74,7 @@ impl BaseStatus {
         let Some(odometry_start) = placed_by else {
             return Err(Failure::new(FailureKind::ResourceUnavailable, NO_ODOMETRY));
         };
-        if follower::LEADER_STREAM.streams(state.setpoint_ns, now_ns) {
+        if drive_link::LEADER_STREAM.streams(state.setpoint_ns, now_ns) {
             return Err(Failure::new(FailureKind::LeaderStreaming, LEADER_STREAMS));
         }
         if state.resting {
@@ -107,7 +107,7 @@ impl BaseStatus {
 
     /// The base's clock went back to `now_ns`: the leader's newest setpoint,
     /// when it came after it, takes `now_ns` as its time, as the follower's
-    /// does ([`follower::Follower::clock_went_back`]).
+    /// does ([`crate::follower::Follower::clock_went_back`]).
     pub fn clock_went_back(&self, now_ns: i64) {
         let mut state = lock_ignoring_poison(&self.0);
         state.setpoint_ns = state.setpoint_ns.map(|received_ns| received_ns.min(now_ns));
@@ -143,7 +143,6 @@ impl Admitted {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::follower::LEADER_STREAMING_WINDOW_NS;
 
     /// The odometry_start_timestamp of an odometry the base reported.
     const REPORTED: Option<SystemTime> = Some(SystemTime::UNIX_EPOCH);
@@ -156,8 +155,8 @@ mod tests {
     fn a_goal_is_refused_by_the_wheels_first_then_the_leader_then_the_goal() {
         let (status, slot) = (BaseStatus::default(), MoveSlot::default());
         let (streaming_ns, free_ns) = (
-            1_000 + LEADER_STREAMING_WINDOW_NS,
-            1_000 + LEADER_STREAMING_WINDOW_NS + 1,
+            1_000 + drive_link::WINDOW_NS,
+            1_000 + drive_link::WINDOW_NS + 1,
         );
         status.note_setpoint(1_000);
         assert_eq!(
@@ -229,7 +228,7 @@ mod tests {
             "a setpoint later than the time streams"
         );
         status.clock_went_back(1_000);
-        let streaming_ns = 1_000 + LEADER_STREAMING_WINDOW_NS;
+        let streaming_ns = 1_000 + drive_link::WINDOW_NS;
         assert_eq!(
             kind(status.admit(Some(streaming_ns), REPORTED, &slot)),
             Some(FailureKind::LeaderStreaming),

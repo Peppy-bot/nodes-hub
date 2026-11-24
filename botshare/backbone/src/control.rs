@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use control_core::drive_link;
 use control_core::limiter::Limiter;
 use control_core::move_slot::MoveSlot;
 use control_core::odometry::{Odometry, WheelSetpoint};
@@ -43,7 +44,7 @@ use tracing::{error, info, warn};
 use crate::clock::{self, wire_from_ns};
 use crate::config::{BaseConfig, MotionLimits};
 use crate::failure::{Failure, FailureKind};
-use crate::follower::{Follower, LEADER_STREAMING_WINDOW_NS};
+use crate::follower::Follower;
 use crate::goal::{DriveRequest, MoveRequest};
 use crate::move_control::MoveController;
 use crate::reports::{PendingReports, StateReport};
@@ -116,7 +117,7 @@ pub enum Event {
 /// the limiter takes such a setpoint as one that stopped, brings the base to
 /// rest at its deceleration limits and then gives nothing.
 fn expired_at(now_ns: i64) -> i64 {
-    now_ns - LEADER_STREAMING_WINDOW_NS - 1
+    now_ns - drive_link::WINDOW_NS - 1
 }
 
 /// Why a goal fails when the base's clock reads earlier than a time the

@@ -2,57 +2,22 @@
 //! on the node's clock: the arrival of each setpoint counts, never its stamp.
 //!
 //! The leader streams from each setpoint that arrives until more than
-//! [`LEADER_STREAMING_WINDOW_NS`] pass with no setpoint. The base follows the leader's
+//! [`drive_link::WINDOW_NS`] pass with no setpoint. The base follows the leader's
 //! setpoints while no hold keeps the base from it; a setpoint that arrives
 //! during a hold is dropped, and counts for every rule here. The holds, in
 //! the order drive_states names the first that holds:
 //!
 //! - base silence: the wheels' silence holds the base; when the leader
 //!   streamed as the silence started, the hold lasts on after it ends until
-//!   more than [`LEADER_STREAMING_WINDOW_NS`] pass with no setpoint. The node
+//!   more than [`drive_link::WINDOW_NS`] pass with no setpoint. The node
 //!   senses no state of the base's drives, so its mode is standing or moving
 //!   while the wheels report, and drive_link's base_mode never holds.
-//! - robot stop: from robot_stop's stop until more than [`LEADER_STREAMING_WINDOW_NS`]
+//! - robot stop: from robot_stop's stop until more than [`drive_link::WINDOW_NS`]
 //!   pass, from the stop on, with no setpoint.
 //! - follower goal: a goal of base_motion holds the base while it runs; the
 //!   caller says whether one does.
 
-use control_core::stream_window::StreamWindow;
-
-/// How long the leader's silence ends its stream and the holds that wait on
-/// it (ns): drive_link's 0.5 s.
-pub const LEADER_STREAMING_WINDOW_NS: i64 = 500_000_000;
-
-/// The leader's stream, on the node's clock: live from each setpoint that
-/// arrives until more than [`LEADER_STREAMING_WINDOW_NS`] pass with no
-/// setpoint, a setpoint that arrived after the time asked about included.
-pub const LEADER_STREAM: StreamWindow<i64> = StreamWindow::new(LEADER_STREAMING_WINDOW_NS);
-
-/// Whether the base follows the leader, as drive_states tells it: the first
-/// that holds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FollowState {
-    /// The wheels' silence holds the base.
-    BaseSilence,
-    /// A robot stop holds the base.
-    RobotStop,
-    /// A goal of the node holds the base.
-    FollowerGoal,
-    /// The base follows the leader, or would follow its next setpoint.
-    Following,
-}
-
-impl FollowState {
-    /// drive_states' follow_state.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::BaseSilence => "base_silence",
-            Self::RobotStop => "robot_stop",
-            Self::FollowerGoal => "follower_goal",
-            Self::Following => "following",
-        }
-    }
-}
+use control_core::drive_link::{self, FollowState};
 
 /// The leader's stream and the holds that wait on it.
 #[derive(Clone, Debug)]
@@ -84,7 +49,7 @@ impl Default for Follower {
 impl Follower {
     /// Whether the leader streams at `now_ns`.
     pub fn streams_at(&self, now_ns: i64) -> bool {
-        LEADER_STREAM.streams(self.last_ns, now_ns)
+        drive_link::LEADER_STREAM.streams(self.last_ns, now_ns)
     }
 
     /// Ends each hold whose pause has passed by `now_ns`, for good: a later
@@ -92,7 +57,7 @@ impl Follower {
     fn release(&mut self, now_ns: i64) {
         if let Some(stop_ns) = self.stop_ns {
             let quiet_from = self.last_ns.map_or(stop_ns, |last_ns| last_ns.max(stop_ns));
-            if !LEADER_STREAM.streams(Some(quiet_from), now_ns) {
+            if !drive_link::LEADER_STREAM.streams(Some(quiet_from), now_ns) {
                 self.stop_ns = None;
             }
         }

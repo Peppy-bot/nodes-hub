@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 # drive_link's window: the leader streams from each setpoint until more than
-# 0.5 s pass with no setpoint (botshare_backbone's `LEADER_STREAMING_WINDOW_NS`).
-LEADER_STREAMING_WINDOW_NS = 500_000_000
+# 0.5 s pass with no setpoint (control_core::drive_link's `WINDOW_NS`).
+WINDOW_NS = 500_000_000
 # The longest the follower goes without a drive_states while the wheels
 # report: base_state's 0.1 s (botshare_backbone's `REPORT_PERIOD_NS`).
 REPORT_PERIOD_NS = 100_000_000
@@ -158,7 +158,7 @@ class FollowerModel(Generic[Limits]):
         """Whether the leader streams at `now_ns` (`Follower::streams_at`)."""
         return (
             self._last_setpoint_ns is not None
-            and now_ns - self._last_setpoint_ns <= LEADER_STREAMING_WINDOW_NS
+            and now_ns - self._last_setpoint_ns <= WINDOW_NS
         )
 
     def _release(self, now_ns: int) -> None:
@@ -170,7 +170,7 @@ class FollowerModel(Generic[Limits]):
                 if self._last_setpoint_ns is None
                 else max(self._last_setpoint_ns, self._stop_ns)
             )
-            if now_ns - quiet_from > LEADER_STREAMING_WINDOW_NS:
+            if now_ns - quiet_from > WINDOW_NS:
                 self._stop_ns = None
         if self._silence_lingers and not self._silent and not self._streams_at(now_ns):
             self._silence_lingers = False

@@ -14,6 +14,7 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
 
+use control_core::drive_link;
 use control_core::footprint::Footprint;
 use control_core::limiter::{AxisLimits, AxisLimitsParams, Limiter, LimiterError, LimiterParams};
 use control_core::non_negative_finite::{NonNegativeFinite, NotNonNegativeFinite};
@@ -22,7 +23,6 @@ use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
 use control_core::time::{SecondsParameterError, duration_parameter, seconds, wait_parameter};
 use peppygen::Parameters;
 
-use crate::follower::LEADER_STREAMING_WINDOW_NS;
 use crate::model::{BaseModel, BundledBase, ModelError};
 use crate::move_control::AxisProfile;
 use crate::transforms::JointTransforms;
@@ -135,14 +135,14 @@ pub struct BaseAxes {
 impl BaseAxes {
     /// base_state's limiter of the base, stepping at `frequency_hz`: each
     /// axis within its limits, and to rest once the leader sends nothing for
-    /// [`LEADER_STREAMING_WINDOW_NS`].
+    /// [`drive_link::WINDOW_NS`].
     pub fn limiter_settings(&self, frequency_hz: f64) -> Result<LimiterSettings, ConfigError> {
         let smoothing_frequency_hz =
             PositiveFinite::parse(frequency_hz).map_err(|source| ConfigError::NotPositive {
                 name: "smoothing_frequency_hz",
                 source,
             })?;
-        let velocity_timeout_s = NonNegativeFinite::parse(seconds(LEADER_STREAMING_WINDOW_NS))
+        let velocity_timeout_s = NonNegativeFinite::parse(seconds(drive_link::WINDOW_NS))
             .expect("drive_link's stream gap is a finite time of at least 0");
         LimiterSettings::parse(LimiterParams {
             linear_x: self.linear.limits("linear_limits")?,
