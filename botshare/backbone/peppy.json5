@@ -43,7 +43,8 @@
       ],
       pairings: [
         // The velocity stream of the base's one leader of drive_link, which
-        // gets the base's state back with whether the base follows it.
+        // gets the base's state and limits back with whether the base follows
+        // it.
         { name: "drive_link", tag: "v1", role: "follower", link_id: "leader_base", cardinality: "zero_or_one" },
         // The exclusive command loop with the wheels' follower: the base
         // plays the leader role, streams the wheel angle setpoints down
@@ -83,7 +84,8 @@
         // publishes nothing here.
         { link_id: "transforms", name: "static_transforms" },
         // The follower role's state back-channel to the leader: the same
-        // measurement as base_states, with whether the base follows it.
+        // measurement as base_states, the limits describe_base answers, and
+        // whether the base follows it.
         { link_id: "leader_base", name: "drive_states" },
         // The wheel setpoint of each step, [left, right]: angles (rad) and
         // the wheel rates (rad/s) as feedforward velocities.
@@ -131,11 +133,12 @@
     parameters: {
       // The limits of the base's motion along x, forward (m/s, m/s^2), and
       // of its turn, counterclockwise (rad/s, rad/s^2), which describe_base
-      // answers as the x of its linear_limits and as its angular_limits, and
-      // base_state's limiter holds every velocity to: the range, its lowest
-      // value 0 or below and its highest 0 or above, not both 0; the
-      // acceleration and the deceleration, each above 0; and the deadband, 0
-      // or above and below the larger magnitude of the range.
+      // answers, and drive_states gives the leader, as the x of its
+      // linear_limits and as its angular_limits, and base_state's limiter
+      // holds every velocity to: the range, its lowest value 0 or below and
+      // its highest 0 or above, not both 0; the acceleration and the
+      // deceleration, each above 0; and the deadband, 0 or above and below
+      // the larger magnitude of the range.
       // linear_limits' rest_velocity, above 0, is the largest speed each
       // wheel measures along the floor while the base stands: the bound of
       // the noise of the wheels' measurement. The base counts as at rest

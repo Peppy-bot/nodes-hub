@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
+use control_core::drive_link;
 use control_core::fault::Fault;
 use frame_tree::Stamp;
 use frame_tree::arithmetic::quaternion_of_yaw;
@@ -36,10 +37,6 @@ pub const DT: f64 = 0.05;
 
 /// The time the rig starts at (ns): a whole step.
 pub const START_NS: i64 = 1_000_000_000;
-
-/// How long a leader's stream lasts after its last setpoint arrives (ns):
-/// drive_link's 0.5 s.
-pub const LEADER_STREAMING_WINDOW_NS: i64 = 500_000_000;
 
 /// How many steps without a measurement the wheels still report:
 /// base_state's 0.5 s of silence. The step after them finds them silent.
@@ -519,7 +516,7 @@ impl Rig {
             };
             let taken_ns = self.now_ns;
             self.end_probe(probe).await;
-            self.step_to(taken_ns + LEADER_STREAMING_WINDOW_NS + STEP_NS)
+            self.step_to(taken_ns + drive_link::WINDOW_NS + STEP_NS)
                 .await;
         }
         panic!("the node follows none of {LEADS} leads");

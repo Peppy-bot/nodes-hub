@@ -74,6 +74,42 @@ def _host(name: str, value) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
 _MAX_COMMAND_RATE_HZ = 1000
 # Wider than any sensor this node should be asked to relay.
 _MAX_VIEW_WIDTH_PX = 8192
+# drive_link's window: the leader streams from each setpoint until more
+# than 0.5 s pass with no setpoint, then the follower brings the base to rest
+# (drive_link.json5:9).
+_DRIVE_LINK_WINDOW_S = 0.5
+# The lowest whole rate whose tick is shorter than drive_link's window, as
+# the base stream sends its setpoints at this rate.
+_MIN_COMMAND_RATE_HZ = math.floor(1.0 / _DRIVE_LINK_WINDOW_S) + 1
+
+
+def _command_rate_hz(value) -> int:
+    """The rate of every setpoint stream: at least `_MIN_COMMAND_RATE_HZ`,
+    so the base stream sends a setpoint within drive_link's window, and at
+    most `_MAX_COMMAND_RATE_HZ`."""
+    rate = _integer("command_rate_hz", value)
+    if rate < _MIN_COMMAND_RATE_HZ:
+        raise ValueError(
+            f"command_rate_hz must be at least {_MIN_COMMAND_RATE_HZ}, got {rate}: "
+            "the base stream sends its setpoints at this rate, and drive_link "
+            f"asks its leader for one more often than every {_DRIVE_LINK_WINDOW_S} s"
+        )
+    return _int_in("command_rate_hz", rate, _MIN_COMMAND_RATE_HZ, _MAX_COMMAND_RATE_HZ)
+
+
+def _stale_timeout_s(value) -> float:
+    """How old a frame or a measured pose may be and still count: positive,
+    and at most drive_link's window, as long as a silent leader's stream
+    runs."""
+    stale = _positive("stale_timeout_s", value)
+    if stale > _DRIVE_LINK_WINDOW_S:
+        raise ValueError(
+            f"stale_timeout_s must be at most {_DRIVE_LINK_WINDOW_S}, got {stale!r}: "
+            "the base streams a frozen headset's last thumbsticks until its frames "
+            "are this old, and drive_link brings a silent leader's base to rest "
+            f"after {_DRIVE_LINK_WINDOW_S} s"
+        )
+    return stale
 
 
 def _flag(name: str, value) -> bool:
@@ -106,9 +142,7 @@ class Settings:
 def from_parameters(params) -> Settings:
     """Parse the launch parameters; ValueError on anything the node cannot run with."""
     return Settings(
-        command_rate_hz=_int_in(
-            "command_rate_hz", params.command_rate_hz, 1, _MAX_COMMAND_RATE_HZ
-        ),
+        command_rate_hz=_command_rate_hz(params.command_rate_hz),
         https_port=_port("https_port", params.https_port),
         https_host=_host("https_host", params.https_host),
         motion_scale=_positive("motion_scale", params.motion_scale),
@@ -118,7 +152,7 @@ def from_parameters(params) -> Settings:
         posture_move_duration_s=_non_negative(
             "posture_move_duration_s", params.posture_move_duration_s
         ),
-        stale_timeout_s=_positive("stale_timeout_s", params.stale_timeout_s),
+        stale_timeout_s=_stale_timeout_s(params.stale_timeout_s),
         view_max_width=_int_in(
             "view_max_width", params.view_max_width, 0, _MAX_VIEW_WIDTH_PX
         ),

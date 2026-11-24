@@ -11,7 +11,8 @@ it is paired, and otherwise go to the robot that first paired.
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
+from dataclasses import dataclass
 from types import ModuleType
 
 from xr_commander.devices import Hand
@@ -33,6 +34,22 @@ def robot_of_producer(member) -> str:
     return member.copy.name if member.copy is not None else member.producer.instance_id
 
 
+@dataclass(frozen=True)
+class SlotPairs:
+    """One read of a slot: each pair with its robot, in delivered order."""
+
+    pairs: tuple[tuple[str, Hashable], ...]
+
+    @property
+    def peers(self) -> frozenset[Hashable]:
+        return frozenset(info for _robot, info in self.pairs)
+
+    def pin_of(self, robot: str | None) -> Hashable | None:
+        """`robot`'s first pair in delivered order, None while it has none
+        here."""
+        return next((info for name, info in self.pairs if name == robot), None)
+
+
 class PairedRobots:
     """The live view of the slots, by robot, and the choice among them.
 
@@ -49,12 +66,13 @@ class PairedRobots:
         node_runner,
         arms: Mapping[Hand, ModuleType],
         grippers: Mapping[Hand, ModuleType],
+        base: ModuleType,
     ) -> None:
         """`arms` and `grippers` are the pose and gripper slots' modules by
-        the hand that drives them."""
+        the hand that drives them, and `base` the base slot's module."""
         self._node_runner = node_runner
         self._arms = dict(arms)
-        self._slots = (*arms.values(), *grippers.values())
+        self._slots = (*arms.values(), *grippers.values(), base)
         self._lock = threading.Lock()
         self._choice: str | None = None
         # The robot the hands drove at the last read.
@@ -103,16 +121,16 @@ class PairedRobots:
             )
         )
 
-    def peer_for(self, module: ModuleType):
-        """The chosen robot's pair on `module`'s slot, or None while that
-        robot holds no pair there (a one-armed robot on the other side)."""
-        chosen = self.chosen()
-        if chosen is None:
-            return None
-        for member in module.peers(self._node_runner):
-            if robot_of_peer(member) == chosen:
-                return member.info
-        return None
+    def pairs(self, module: ModuleType) -> SlotPairs:
+        """One read of `module`'s slot."""
+        return SlotPairs(
+            tuple((robot_of_peer(m), m.info) for m in module.peers(self._node_runner))
+        )
+
+    def peer_of(self, module: ModuleType, robot: str | None) -> Hashable | None:
+        """`robot`'s first pair on `module`'s slot, None while it has none
+        there."""
+        return self.pairs(module).pin_of(robot)
 
     def producer_for(self, module: ModuleType):
         """The producer on `module`'s contract slot that serves the chosen

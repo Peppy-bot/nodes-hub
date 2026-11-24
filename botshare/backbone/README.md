@@ -168,18 +168,18 @@ new, and a goal in flight fails with `resource_unavailable`, its message `the
 base's odometry started over`. A measurement stamped less than a microsecond
 after the last one is dropped.
 
-`base_states`, and `drive_states` to the leader with its `follow_state`,
-report, once the node's clock reads a measurement's stamp, the newest
-measurement whose stamp the clock has reached as an odometry record, stamped
-with it: the pose of base_footprint in odom and its twist in base_footprint;
-an older one the clock reached with it goes unreported. The node holds the
-measurements no report has taken, back to 0.5 s before the newest. A
-report's `mode` is `standing` while the base rests by the rule below as of the
-report, and `moving` otherwise; its `parts_within_footprint` is true, since
-the base carries no limb. While the wheels report and the clock reaches no new
-measurement, a step that would leave 0.1 s without a report publishes the last
-one again, its stamp included, while it is at most 0.5 s old. While they are
-silent, the node publishes neither.
+`base_states`, and `drive_states` to the leader with the base's limits and
+its `follow_state`, report, once the node's clock reads a measurement's stamp,
+the newest measurement whose stamp the clock has reached as an odometry
+record, stamped with it: the pose of base_footprint in odom and its twist in
+base_footprint; an older one the clock reached with it goes unreported. The
+node holds the measurements no report has taken, back to 0.5 s before the
+newest. A report's `mode` is `standing` while the base rests by the rule below
+as of the report, and `moving` otherwise; its `parts_within_footprint` is
+true, since the base carries no limb. While the wheels report and the clock
+reaches no new measurement, a step that would leave 0.1 s without a report
+publishes the last one again, its stamp included, while it is at most 0.5 s
+old. While they are silent, the node publishes neither.
 
 The base rests while the wheels report and each axis of every `base_states`
 whose stamp lies within 0.2 s of the newest lies within its rest bound,
@@ -275,7 +275,10 @@ that sends its next goal on the result is admitted.
 pairing slot, its odometry source, `measured`, its linear_limits along x and
 y, y 0 to 0, and its angular_limits, each with its rest bound, the turn's
 derived from `linear_limits.rest_velocity` as above, and the four corners of
-its footprint, counterclockwise, in base_footprint at every time.
+its footprint, counterclockwise, in base_footprint at every time. Each
+`drive_states` gives the leader the same `linear_limits` and
+`angular_limits`: `describe_base` and `drive_states` take them from
+`BaseConfig::motion_limits` (`config.rs`).
 
 ## Module map
 

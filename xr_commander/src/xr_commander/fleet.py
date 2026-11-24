@@ -215,31 +215,16 @@ def status_text(status: GoalsStatus) -> str | None:
             return "the daemon is lost"
 
 
-class Fleet:
-    """The latest listing and the state of the goals that keep it, on the
-    node's loop; `follow_fleet` is the one writer."""
-
-    def __init__(self, me: Holder) -> None:
-        self.me = me
-        self.view: FleetView | None = None
-        self.status: GoalsStatus = Starting()
-        # Counts the starts of the goals: a release that the daemon did not
-        # answer is asked again only while the goals of the start that it
-        # was first asked under run.
-        self.generation = 0
-
-    def unavailable(self) -> str | None:
-        """Why a squeeze or a press cannot ask the fleet now, None while it
-        can: the status is `Following` only once a listing came."""
-        return status_text(self.status)
-
-
 class FleetListener(Protocol):
-    """What the headset does with the feedback of the two goals."""
+    """What the headset does with the two goals: each write of their status,
+    each start, each listing, each end of a lease of the headset, and the end
+    of a goal."""
 
+    def goals_status(self, status: GoalsStatus) -> None: ...
+    def goals_started(self, generation: int) -> None: ...
     def fleet_changed(self, view: FleetView) -> None: ...
     def own_lease_ended(self, robot: str, why: str) -> None: ...
-    def let_go_of_every_robot(self, why: str) -> None: ...
+    def goals_ended(self, why: str) -> None: ...
 
 
 class FleetCalls:
@@ -305,7 +290,6 @@ class FleetCalls:
 
 async def follow_fleet(
     node_runner,
-    fleet: Fleet,
     listener: FleetListener,
     *,
     changes_module: ModuleType,
@@ -324,6 +308,7 @@ async def follow_fleet(
     # The goals of an earlier start whose cancel got no answer: the daemon
     # refuses a new lease goal while the last one runs.
     lingering: tuple = ()
+    generation = 0
     while not token.is_cancelled():
         lingering = await _cancel_quietly(lingering, timing)
         started = await _start_goals(
@@ -336,35 +321,32 @@ async def follow_fleet(
             not_yet,
         )
         if isinstance(started, Refused):
-            fleet.status = started
+            listener.goals_status(started)
             log(status_text(started))
             return
         if isinstance(started, NotYet):
-            fleet.status = Starting()
+            listener.goals_status(Starting())
             await clock.sleep(timing.retry_s)
             continue
         if started is None:
-            fleet.status = DaemonLost()
+            listener.goals_status(DaemonLost())
             await clock.sleep(timing.retry_s)
             continue
         unanswered.clear()
         not_yet.clear()
         changes_goal, lease_goal = started
-        fleet.generation += 1
-        fleet.status = Starting()
-        ended, error = await _read_until_an_end(
-            changes_goal, lease_goal, fleet, listener
-        )
+        generation += 1
+        listener.goals_started(generation)
+        listener.goals_status(Starting())
+        ended, error = await _read_until_an_end(changes_goal, lease_goal, listener)
         log(f"the {ended} goal of the fleet ended: {error!r}")
-        fleet.view = None
-        fleet.status = (
-            DaemonLost() if isinstance(error, ConnectionError) else Starting()
-        )
-        listener.let_go_of_every_robot(
-            status_text(fleet.status)
-            if isinstance(fleet.status, DaemonLost)
+        status = DaemonLost() if isinstance(error, ConnectionError) else Starting()
+        listener.goals_ended(
+            status_text(status)
+            if isinstance(status, DaemonLost)
             else f"the {ended} goal of the fleet ended"
         )
+        listener.goals_status(status)
         lingering = await _cancel_quietly((changes_goal, lease_goal), timing)
 
 
@@ -411,18 +393,16 @@ async def _start_goals(
     return tuple(started)
 
 
-async def _read_until_an_end(
-    changes_goal, lease_goal, fleet: Fleet, listener: FleetListener
-):
+async def _read_until_an_end(changes_goal, lease_goal, listener: FleetListener):
     """Hand each feedback of the two goals on until one of them ends: the
     name of that goal and the error its read raised."""
 
     async def read_changes() -> None:
         while True:
             feedback = await changes_goal.on_next_feedback_message()
-            fleet.view = FleetView.parse(feedback.listing, feedback.revision)
-            fleet.status = Following()
-            listener.fleet_changed(fleet.view)
+            view = FleetView.parse(feedback.listing, feedback.revision)
+            listener.goals_status(Following())
+            listener.fleet_changed(view)
 
     async def read_lease() -> None:
         while True:

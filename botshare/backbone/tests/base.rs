@@ -11,17 +11,18 @@ use std::f64::consts::PI;
 use std::num::NonZeroUsize;
 use std::time::SystemTime;
 
+use control_core::drive_link;
+use control_core::odometry::{Odometry, WheelGeometry};
 use frame_tree::arithmetic::yaw_of_quaternion;
 use frame_tree::{Transform, UnitQuaternion};
 
-use control_core::odometry::{Odometry, WheelGeometry};
 use helpers::{
     ANCHOR_BOUND_RAD, ANGULAR_ACCELERATION_RAD_S2, ANGULAR_DEADBAND_RAD_S,
-    ANGULAR_DECELERATION_RAD_S2, ANSWER_BUDGET, BaseState, DT, LEADER_STREAMING_WINDOW_NS,
-    LINEAR_ACCELERATION_M_S2, LINEAR_DEADBAND_M_S, LINEAR_DECELERATION_M_S2,
-    MAX_ANGULAR_SPEED_RAD_S, MAX_LINEAR_SPEED_M_S, MODEL, REPORTING_SILENT_STEPS, REST_LINEAR_M_S,
-    Rig, START_NS, STEP_NS, WHEEL_LINKS, WHEEL_RADIUS_M, WHEEL_SEPARATION_M, drive_goal,
-    forward_speed, move_goal, ns, target, turn_rate, velocity,
+    ANGULAR_DECELERATION_RAD_S2, ANSWER_BUDGET, BaseState, DT, LINEAR_ACCELERATION_M_S2,
+    LINEAR_DEADBAND_M_S, LINEAR_DECELERATION_M_S2, MAX_ANGULAR_SPEED_RAD_S, MAX_LINEAR_SPEED_M_S,
+    MODEL, REPORTING_SILENT_STEPS, REST_LINEAR_M_S, Rig, START_NS, STEP_NS, WHEEL_LINKS,
+    WHEEL_RADIUS_M, WHEEL_SEPARATION_M, drive_goal, forward_speed, move_goal, ns, target,
+    turn_rate, velocity,
 };
 use peppygen::fixtures::exposed_actions::base_motion::{drive_base, move_base};
 use peppygen::fixtures::exposed_services::base_state::describe_base;
@@ -1137,7 +1138,7 @@ async fn a_silence_holds_the_base_from_its_streaming_leader_until_the_leader_pau
     // The leader pauses: the hold lasts through 0.5 s after its last
     // setpoint, sent at the step before the clock's, and ends after that.
     let last_sent = rig.now_ns - STEP_NS;
-    while rig.now_ns < last_sent + LEADER_STREAMING_WINDOW_NS {
+    while rig.now_ns < last_sent + drive_link::WINDOW_NS {
         rig.step().await;
         assert_eq!(follow_state(&mut rig).await, "base_silence", "in the pause");
     }
@@ -1147,7 +1148,7 @@ async fn a_silence_holds_the_base_from_its_streaming_leader_until_the_leader_pau
             break;
         }
         assert!(
-            rig.now_ns < last_sent + 2 * LEADER_STREAMING_WINDOW_NS,
+            rig.now_ns < last_sent + 2 * drive_link::WINDOW_NS,
             "the hold outlasts the leader's pause"
         );
     }
@@ -1232,7 +1233,7 @@ async fn setpoints_sent_while_the_wheels_are_silent_start_a_stream_that_ends_mor
     // The node took the setpoint between `shown_ns` and `taken_by_ns`: the
     // stream refuses a goal 0.5 s after the earliest of those, and admits one
     // a step past 0.5 s after the latest.
-    rig.step_to(shown_ns + LEADER_STREAMING_WINDOW_NS).await;
+    rig.step_to(shown_ns + drive_link::WINDOW_NS).await;
     let still = refusal_of_drive(&rig, drive_goal(0.1, 1.0)).await;
     assert_eq!(
         still.kind,
@@ -1240,7 +1241,7 @@ async fn setpoints_sent_while_the_wheels_are_silent_start_a_stream_that_ends_mor
         "{}",
         still.message
     );
-    rig.step_to(taken_by_ns + LEADER_STREAMING_WINDOW_NS + STEP_NS)
+    rig.step_to(taken_by_ns + drive_link::WINDOW_NS + STEP_NS)
         .await;
     let free = rig.send_drive(&drive_goal(0.1, 1.0)).await;
     assert!(free.accepted, "the stream ended: {:?}", free.refusal);
@@ -1635,8 +1636,7 @@ async fn a_clock_that_goes_back_keeps_the_leaders_stream_from_its_new_time() {
         "the leader streams from the new time on: {}",
         refused.message
     );
-    rig.step_to(back_ns + LEADER_STREAMING_WINDOW_NS + STEP_NS)
-        .await;
+    rig.step_to(back_ns + drive_link::WINDOW_NS + STEP_NS).await;
     let goal = rig.send_drive(&drive_goal(0.1, 1.0)).await;
     assert!(
         goal.accepted,
@@ -1782,6 +1782,60 @@ async fn describe_base_answers_the_limits_and_rest_bounds_of_its_parameters_and_
         for (value, expected) in point.position.iter().zip([x, y, 0.0]) {
             assert!((value - expected).abs() < 1e-12, "{:?}", base.footprint);
         }
+    }
+    rig.shutdown().await;
+}
+
+// A leader reads the base's limits from its pair: drive_states carries
+// linear_limits and angular_limits as describe_base answers them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drive_states_carry_the_limits_describe_base_answers() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    let base = describe_base::poll(&rig.harness, ANSWER_BUDGET)
+        .await
+        .expect("describe_base answers");
+    let drive = rig.drive_state_at(rig.now_ns).await;
+    let (described, carried) = (&base.linear_limits, &drive.linear_limits);
+    for (field, actual, expected) in [
+        ("min_velocity", carried.min_velocity, described.min_velocity),
+        ("max_velocity", carried.max_velocity, described.max_velocity),
+        (
+            "max_acceleration",
+            carried.max_acceleration,
+            described.max_acceleration,
+        ),
+        (
+            "max_deceleration",
+            carried.max_deceleration,
+            described.max_deceleration,
+        ),
+        ("deadband", carried.deadband, described.deadband),
+        (
+            "rest_velocity",
+            carried.rest_velocity,
+            described.rest_velocity,
+        ),
+    ] {
+        assert_eq!(actual, expected, "linear_limits' {field}");
+    }
+    let (described, carried) = (&base.angular_limits, &drive.angular_limits);
+    for (field, actual, expected) in [
+        ("min_rate", carried.min_rate, described.min_rate),
+        ("max_rate", carried.max_rate, described.max_rate),
+        (
+            "max_acceleration",
+            carried.max_acceleration,
+            described.max_acceleration,
+        ),
+        (
+            "max_deceleration",
+            carried.max_deceleration,
+            described.max_deceleration,
+        ),
+        ("deadband", carried.deadband, described.deadband),
+        ("rest_rate", carried.rest_rate, described.rest_rate),
+    ] {
+        assert_eq!(actual, expected, "angular_limits' {field}");
     }
     rig.shutdown().await;
 }
@@ -1988,7 +2042,7 @@ async fn a_robot_stop_holds_the_base_until_more_than_half_a_second_passes_withou
         }
         assert_eq!(follow_state(&mut rig).await, "robot_stop", "step {step}");
     }
-    assert_eq!(rig.now_ns, stopped_at + LEADER_STREAMING_WINDOW_NS);
+    assert_eq!(rig.now_ns, stopped_at + drive_link::WINDOW_NS);
     rig.step().await;
     assert_eq!(follow_state(&mut rig).await, "following");
     // A stop with no goal and no stream names nothing, and holds the base.
@@ -2000,7 +2054,7 @@ async fn a_robot_stop_holds_the_base_until_more_than_half_a_second_passes_withou
     let held_setpoint = rig.now_ns;
     rig.lead([0.2, 0.0, 0.0], 0.0).await;
     rig.until_the_leader_stream_refuses_a_goal().await;
-    while rig.now_ns < held_setpoint + LEADER_STREAMING_WINDOW_NS {
+    while rig.now_ns < held_setpoint + drive_link::WINDOW_NS {
         rig.step().await;
         assert_eq!(
             follow_state(&mut rig).await,

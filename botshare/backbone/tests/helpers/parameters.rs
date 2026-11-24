@@ -1,6 +1,7 @@
 //! The parameters of the base the tests run, the one source of the harness
 //! rig's (`tests/helpers/mod.rs`) and of the unit tests' (`src/test_rig.rs`):
-//! limits with their accelerations apart from their decelerations.
+//! limits with their accelerations apart from their decelerations, and a rest
+//! velocity apart from every limit along x.
 
 pub const MAX_LINEAR_SPEED_M_S: f64 = 0.5;
 pub const MAX_ANGULAR_SPEED_RAD_S: f64 = 1.5;
@@ -13,8 +14,10 @@ pub const ANGULAR_ACCELERATION_RAD_S2: f64 = 3.0;
 pub const ANGULAR_DECELERATION_RAD_S2: f64 = 4.0;
 pub const LINEAR_DEADBAND_M_S: f64 = 0.005;
 pub const ANGULAR_DEADBAND_RAD_S: f64 = 0.01;
-/// The rest velocity, x's deadband.
-pub const REST_LINEAR_M_S: f64 = LINEAR_DEADBAND_M_S;
+/// The rest velocity: botshare_sim's, botshare's measured odometry noise
+/// floor (trans_stopped_velocity), below the slowest speed the tests drive
+/// at, 0.1 m/s.
+pub const REST_LINEAR_M_S: f64 = 0.02;
 /// The limiter's rate: a step every 50 ms.
 pub const SMOOTHING_FREQUENCY_HZ: f64 = 20.0;
 /// Nav2's regulated pure pursuit's default `rotate_to_heading_min_angle`,

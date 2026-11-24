@@ -15,34 +15,33 @@ use peppylib::runtime::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
 use tracing::error;
 
-use crate::config::{AxisSpec, BaseConfig};
+use crate::config::{BaseConfig, MotionLimits};
 use crate::control::{BASE_NAME, Event};
 use crate::transforms::ROBOT_FRAME;
 
-/// What describe_base answers: the base's name, its measured odometry, the
-/// limits of x and y (y still) and of the turn, each with its rest bound, and
-/// its outline in the robot frame, which holds at every time.
+/// What describe_base answers: the base's name, its measured odometry, its
+/// limits ([`BaseConfig::motion_limits`]), and its outline in the robot
+/// frame, which holds at every time.
 fn base_description(config: &BaseConfig) -> describe_base::Response {
-    let (linear, y, angular) = (config.axes.linear, AxisSpec::STILL, config.axes.angular);
-    let [rest_x, rest_y, rest_rate] = config.rest.bounds();
+    let MotionLimits { linear, angular } = config.motion_limits();
     describe_base::Response::new(
         BASE_NAME.to_string(),
         "measured".to_string(),
         describe_base::ResponseLinearLimits {
-            min_velocity: [linear.min_velocity, y.min_velocity],
-            max_velocity: [linear.max_velocity, y.max_velocity],
-            max_acceleration: [linear.max_acceleration, y.max_acceleration],
-            max_deceleration: [linear.max_deceleration, y.max_deceleration],
-            deadband: [linear.deadband, y.deadband],
-            rest_velocity: [rest_x, rest_y],
+            min_velocity: linear.min_velocity,
+            max_velocity: linear.max_velocity,
+            max_acceleration: linear.max_acceleration,
+            max_deceleration: linear.max_deceleration,
+            deadband: linear.deadband,
+            rest_velocity: linear.rest_velocity,
         },
         describe_base::ResponseAngularLimits {
-            min_rate: angular.min_velocity,
-            max_rate: angular.max_velocity,
+            min_rate: angular.min_rate,
+            max_rate: angular.max_rate,
             max_acceleration: angular.max_acceleration,
             max_deceleration: angular.max_deceleration,
             deadband: angular.deadband,
-            rest_rate,
+            rest_rate: angular.rest_rate,
         },
         describe_base::ResponseFootprint {
             frame: ROBOT_FRAME.to_owned(),

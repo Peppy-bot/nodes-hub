@@ -19,6 +19,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use control_core::drive_link;
 use control_core::limiter::Limiter;
 use control_core::move_slot::MoveSlot;
 use control_core::odometry::{Odometry, WheelSetpoint};
@@ -41,9 +42,9 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::clock::{self, wire_from_ns};
-use crate::config::BaseConfig;
+use crate::config::{BaseConfig, MotionLimits};
 use crate::failure::{Failure, FailureKind};
-use crate::follower::{Follower, LEADER_STREAMING_WINDOW_NS};
+use crate::follower::Follower;
 use crate::goal::{DriveRequest, MoveRequest};
 use crate::move_control::MoveController;
 use crate::reports::{PendingReports, StateReport};
@@ -116,7 +117,7 @@ pub enum Event {
 /// the limiter takes such a setpoint as one that stopped, brings the base to
 /// rest at its deceleration limits and then gives nothing.
 fn expired_at(now_ns: i64) -> i64 {
-    now_ns - LEADER_STREAMING_WINDOW_NS - 1
+    now_ns - drive_link::WINDOW_NS - 1
 }
 
 /// Why a goal fails when the base's clock reads earlier than a time the
@@ -1181,11 +1182,12 @@ impl Base {
     /// base_footprint on transforms, which the robot's tree takes, the goals
     /// placed by the report's odometry from then
     /// ([`BaseStatus::odometry_start`]); then base_states, and drive_states to
-    /// the leader with its follow_state. A goal sent on a base_states is so
-    /// placed by the odometry it reports. The mode is standing while the base
-    /// rests by base_state's rule as of the report and moving otherwise: the
-    /// node senses no state of the base's drives. The base carries no limb,
-    /// so its parts stand within its footprint.
+    /// the leader with the limits describe_base answers
+    /// ([`BaseConfig::motion_limits`]) and its follow_state. A goal sent on a
+    /// base_states is so placed by the odometry it reports. The mode is
+    /// standing while the base rests by base_state's rule as of the report and
+    /// moving otherwise: the node senses no state of the base's drives. The
+    /// base carries no limb, so its parts stand within its footprint.
     async fn publish(&mut self, report: StateReport, now_ns: i64) {
         self.published = Some(Published {
             report,
@@ -1227,6 +1229,10 @@ impl Base {
         );
         self.publishers.base_states.publish(base).await;
         let follow_state = self.follower.state(now_ns, self.slot.is_claimed());
+        let MotionLimits {
+            linear: linear_limits,
+            angular: angular_limits,
+        } = self.config.motion_limits();
         let drive = drive_states::build_message(
             timestamp,
             odometry_start,
@@ -1242,6 +1248,22 @@ impl Base {
             },
             mode.to_string(),
             true,
+            drive_states::MessageLinearLimits {
+                min_velocity: linear_limits.min_velocity,
+                max_velocity: linear_limits.max_velocity,
+                max_acceleration: linear_limits.max_acceleration,
+                max_deceleration: linear_limits.max_deceleration,
+                deadband: linear_limits.deadband,
+                rest_velocity: linear_limits.rest_velocity,
+            },
+            drive_states::MessageAngularLimits {
+                min_rate: angular_limits.min_rate,
+                max_rate: angular_limits.max_rate,
+                max_acceleration: angular_limits.max_acceleration,
+                max_deceleration: angular_limits.max_deceleration,
+                deadband: angular_limits.deadband,
+                rest_rate: angular_limits.rest_rate,
+            },
             follow_state.as_str().to_string(),
         );
         self.publishers.drive_states.publish(drive).await;

@@ -1,7 +1,7 @@
 //! botshare_backbone: the robot's backbone of botshare.ai's mobile base,
 //! the base alone. It drives the two wheels over joint_link, reports the base's
-//! odometry (base_state, drive_link's drive_states) and the transforms it
-//! measures (transforms), follows its leader's velocity setpoints
+//! odometry and its limits (base_state, drive_link's drive_states) and the
+//! transforms it measures (transforms), follows its leader's velocity setpoints
 //! (drive_link), and runs the base's planned moves (base_motion) and the
 //! robot stop (robot_stop), each goal and setpoint placed by the robot's
 //! tree (transforms). The robot's initializer names the robot's model on

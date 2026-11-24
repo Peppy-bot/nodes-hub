@@ -20,10 +20,34 @@ def test_the_defaults_parse_and_derive_the_tick_period():
     assert settings.motion_scale == pytest.approx(1.0)
 
 
-@pytest.mark.parametrize("rate", [0, -1])
-def test_a_non_positive_command_rate_is_refused(rate):
-    with pytest.raises(ValueError, match="command_rate_hz"):
+@pytest.mark.parametrize("rate", [2, 1, 0, -1])
+def test_a_command_rate_of_2_or_below_is_refused_by_drive_links_half_second(rate):
+    with pytest.raises(ValueError) as refused:
         config.from_parameters(params(command_rate_hz=rate))
+    assert str(refused.value) == (
+        f"command_rate_hz must be at least 3, got {rate}: the base stream sends "
+        "its setpoints at this rate, and drive_link asks its leader for one more "
+        "often than every 0.5 s"
+    )
+
+
+def test_a_command_rate_of_3_is_accepted():
+    assert config.from_parameters(params(command_rate_hz=3)).command_rate_hz == 3
+
+
+@pytest.mark.parametrize("stale", [0.5000001, 0.6, 10.0])
+def test_a_stale_timeout_above_drive_links_half_second_is_refused(stale):
+    with pytest.raises(ValueError) as refused:
+        config.from_parameters(params(stale_timeout_s=stale))
+    assert str(refused.value) == (
+        f"stale_timeout_s must be at most 0.5, got {stale!r}: the base streams a "
+        "frozen headset's last thumbsticks until its frames are this old, and "
+        "drive_link brings a silent leader's base to rest after 0.5 s"
+    )
+
+
+def test_a_stale_timeout_of_half_a_second_is_accepted():
+    assert config.from_parameters(params(stale_timeout_s=0.5)).stale_timeout_s == 0.5
 
 
 @pytest.mark.parametrize(
