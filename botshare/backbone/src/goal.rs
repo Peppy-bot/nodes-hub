@@ -4,7 +4,9 @@
 //! `actions`), its placed value held to the floor plane and to the base's limits, each
 //! refused with `rejected` naming the value as placed and what to send.
 
-use control_core::geometry::{GeometryError, PLANAR_TOLERANCE, Pose, Stamped, Twist};
+use control_core::geometry::{
+    GeometryError, PLANAR_TOLERANCE, Pose, Stamped, Twist, target_off_the_floor,
+};
 use control_core::move_seconds::{MAX_MOVE_DURATION_S, MoveSeconds};
 use control_core::planar_pose::PlanarPose;
 use control_core::positive_finite::PositiveFinite;
@@ -16,10 +18,7 @@ use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 
 use crate::config::{AxisSpec, BaseAxes};
 use crate::move_control::{MovePlan, Tolerances, plan_move};
-
-/// What to send in place of a target off the floor plane, as base_motion says.
-const FLOOR_TARGET: &str = "send a target in odom or the robot frame with a position [x, y, 0] \
-                            and an orientation [0, 0, sin(yaw/2), cos(yaw/2)]";
+use crate::transforms::ODOMETRY_FRAME;
 
 /// What to send in place of a velocity off the floor plane, or along y on a
 /// differential base, as base_motion says.
@@ -82,23 +81,6 @@ fn within_range(field: &str, value: f64, limits: &str, range: &AxisSpec) -> Resu
          send a velocity within them",
         range.min_velocity, range.max_velocity
     ))
-}
-
-/// The refusal of a target that, placed in odom, lies off the floor plane.
-fn target_off_the_floor(refusal: &GeometryError) -> String {
-    match refusal {
-        GeometryError::OffFloor { z } => format!(
-            "the target's position, placed in odom, lies {z} m above the floor plane: {FLOOR_TARGET}"
-        ),
-        GeometryError::Tilted {
-            orientation,
-            tilt_rad,
-        } => format!(
-            "the target's orientation, placed in odom, {orientation} tilts {tilt_rad} rad off the \
-             vertical: {FLOOR_TARGET}"
-        ),
-        other => format!("the target, placed in odom: {other}"),
-    }
 }
 
 /// The refusal of a velocity that, placed in the robot frame, moves off the
@@ -241,7 +223,7 @@ pub fn move_request(
     let on_the_floor = |pose: Pose| {
         pose.planar()
             .map(floor_pose)
-            .map_err(|refusal| target_off_the_floor(&refusal))
+            .map_err(|refusal| target_off_the_floor(&refusal, ODOMETRY_FRAME))
     };
     let target = on_the_floor(in_odometry)?;
     let plan = plan_move(
