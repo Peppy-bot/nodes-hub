@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 use control_core::drive_link;
 use control_core::limiter::Limiter;
 use control_core::move_slot::MoveSlot;
+use control_core::node_clock::wire_from_ns;
 use control_core::odometry::{Odometry, WheelSetpoint};
 use control_core::planar_pose::PlanarPose;
 use control_core::robot_tree::RobotTree;
@@ -41,7 +42,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::clock::{self, wire_from_ns};
+use crate::clock;
 use crate::config::{BaseConfig, MotionLimits};
 use crate::failure::{Failure, FailureKind};
 use crate::follower::Follower;
