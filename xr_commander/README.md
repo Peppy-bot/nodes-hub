@@ -341,11 +341,15 @@ installed.
 
 ## Parameters
 
-`command_rate_hz` sets the setpoint stream rate. The feel knobs are
-`motion_scale` (hand-to-EE travel scale) and `gripper_open_fraction` (where a
-released trigger rests). `stale_timeout_s` is the deadman on a frozen or
-disconnected headset. `view_max_width` bounds what the headset encoder is fed,
-and `status_panel_enabled: false` hides the status panel. See `peppy.json5` for the
+`command_rate_hz` sets the setpoint stream rate, at least 3 Hz: the base's
+stream sends a setpoint at each tick, and `drive_link` asks its leader for one
+more often than every 0.5 s. The feel knobs are `motion_scale` (hand-to-EE
+travel scale) and `gripper_open_fraction` (where a released trigger rests).
+`stale_timeout_s` is the deadman on a frozen or disconnected headset, at most
+0.5 s: the base drives on a frozen headset's last thumbsticks until its frames
+are that old, and `drive_link` brings a silent leader's base to rest after
+0.5 s. `view_max_width` bounds what the headset encoder is fed, and
+`status_panel_enabled: false` hides the status panel. See `peppy.json5` for the
 full list and defaults.
 
 ## Development

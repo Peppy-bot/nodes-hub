@@ -221,7 +221,8 @@ def default_parameters(**overrides) -> SimpleNamespace:
         "motion_scale": 1.0,
         "gripper_open_fraction": 1.0,
         "posture_move_duration_s": 2.0,
-        "stale_timeout_s": 10.0,
+        # The longest the node accepts, for the tests on the real clock.
+        "stale_timeout_s": 0.5,
         "view_max_width": 640,
         "status_panel_enabled": True,
     }
@@ -585,6 +586,12 @@ class ManualClock:
         while not all(task.done() or task in self._asleep for task in tasks()):
             assert time.monotonic() < deadline, "a task never came back to the clock"
             await asyncio.sleep(PARK_POLL_S)
+
+
+def measured_poses_kept_fresh() -> MeasuredPoses:
+    """Measured poses on a clock the test never moves: a pose set once stays
+    fresh however long a test on the real clock runs."""
+    return MeasuredPoses(ManualClock())
 
 
 # How long a loop may take to come back to the clock, on the wire, and how

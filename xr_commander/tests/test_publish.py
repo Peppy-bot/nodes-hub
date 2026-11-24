@@ -30,6 +30,7 @@ from tests.helpers import (
     default_settings,
     eventually,
     following_fleet,
+    measured_poses_kept_fresh,
     peer_of,
     pose_at,
     reported,
@@ -173,7 +174,7 @@ async def test_the_pose_stream_engages_once_the_follower_reports():
         driver = scripted_driver("backbone_inst")
         session = ScriptedHeadset()
         session.press(right=(False, False, True))
-        measured = publish.MeasuredPoses()
+        measured = measured_poses_kept_fresh()
         measured.set(peer_of(h, right_arm_pose_setpoints), reported(POSE))
         async with running(
             lambda token: publish.stream_pose(
@@ -241,7 +242,7 @@ async def test_a_robot_change_mid_squeeze_releases_the_robot_left_behind_alone()
         alpha_wire, bravo_wire = (
             mock.pose_setpoints for mock in h.mocks.pairings.right_arm
         )
-        measured = publish.MeasuredPoses()
+        measured = measured_poses_kept_fresh()
         measured.set(peers["alpha"], reported(POSE))
         measured.set(peers["bravo"], reported(pose_at((0.5, 0.0, 0.0))))
         session = MovableSession()
@@ -291,7 +292,7 @@ async def test_a_grip_held_across_a_robot_change_leaves_the_new_gripper_alone():
         alpha_wire, bravo_wire = (
             mock.gripper_setpoints for mock in h.mocks.pairings.right_gripper
         )
-        measured = publish.MeasuredPoses()
+        measured = measured_poses_kept_fresh()
         for peer in peers_by_robot(h, right_arm_pose_setpoints).values():
             measured.set(peer, reported(POSE))
         session = ScriptedHeadset()
@@ -443,7 +444,7 @@ async def test_releasing_the_clutch_streams_the_measured_pose_not_the_last_hand_
     async with boot_clocked(**ONE_ROBOT) as h:
         driver = scripted_driver("backbone_inst")
         session = MovableSession()
-        measured = publish.MeasuredPoses()
+        measured = measured_poses_kept_fresh()
         measured.set(peer_of(h, right_arm_pose_setpoints), reported(POSE))
         settings = default_settings(command_rate_hz=200)
         token = FakeToken()

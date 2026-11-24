@@ -136,8 +136,9 @@
       page: { kind: "page", description: "The WebXR page, HTTPS with the node's self-signed certificate." },
     },
     parameters: {
-      // Rate (Hz, 1..=1000) the setpoint streams of each hand and of the
-      // base publish at while engaged.
+      // Rate (Hz, 3..=1000) the setpoint streams of each hand and of the
+      // base publish at while engaged. The base's stream sends a setpoint
+      // more often than every 0.5 s, as drive_link asks of its leader.
       command_rate_hz: "u32",
       // Where the WebXR page is served (always TLS, self-generated cert).
       https_port: { $type: "u32", $default: 4443 },
@@ -148,8 +149,10 @@
       gripper_open_fraction: { $type: "f64", $default: 1.0 },
       // Requested duration (s) of a posture move; 0 = fastest.
       posture_move_duration_s: { $type: "f64", $default: 2.0 },
-      // Oldest headset frame or measured follower pose still trusted (s);
-      // older input reads as absent.
+      // Oldest headset frame or measured follower pose still trusted (s),
+      // at most drive_link's 0.5: the base drives on a frozen headset's last
+      // thumbsticks until its frames are this old. Older input reads as
+      // absent.
       stale_timeout_s: { $type: "f64", $default: 0.25 },
       // Widest video frame (px) relayed into the headset; 0 relays
       // sensor-native frames.
