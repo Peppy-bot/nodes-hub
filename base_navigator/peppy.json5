@@ -1,0 +1,224 @@
+// base_navigator: see src/lib.rs and README.md.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "base_navigator",
+    tag: "v1",
+    description: [
+      "Drives a robot's mobile base to a pose around what its depth cameras see, turns it in place, and drives it straight ahead or back clear of the same, as Nav2's NavigateToPose, Spin, DriveOnHeading and BackUp drive a base: it implements base_navigation on navigation_core and leads the base over drive_link.",
+      "The grid of the floor reads every depth camera of its cameras slot, an rgbd_camera bound with its camera_geometry under the same name, each a sensor that sensor_mounts' describe_sensors names fixed to the base, and every one of them sees the floor: a reading's rays that read the floor deeper than max_step_down_m, within obstacle_max_range_m of the camera along the floor, mark a drop. It keeps the grid in the base's odometry frame, plans on it with Smac 2D when a navigation starts and again at replan_rate_hz, follows the path with regulated pure pursuit, and slows and stops the base before an obstacle the grid or a camera's newest reading holds.",
+      "It reads what the base is from base_state's describe_base, again at each start of the base's odometry, the odometry, the mode and whether the base follows it from drive_link's drive_states, and places each goal and each depth frame by the robot's tree, which transforms and static_transforms fill.",
+    ],
+    implements: [
+      { name: "base_navigation", tag: "v1", link_id: "base_navigation" },
+    ],
+    depends_on: {
+      contracts: [
+        // What the base is: its name, its odometry source, the limits of its
+        // motion and its footprint, read at each start of its odometry.
+        { name: "base_state", tag: "v1", link_id: "base_state" },
+        // Which sensors the robot carries and the part that carries each:
+        // the grid reads the depth cameras fixed to the base.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts" },
+        // The robot's tree of frames, bound to every publisher of it: it
+        // places each navigation's target at its timestamp, and each depth
+        // frame by the frame its header names at its time.
+        { name: "transforms", tag: "v1", link_id: "transforms", cardinality: "one_or_more" },
+        // The depth cameras the grid reads: their depth frames (cameras)
+        // and the lens and the offset that place each sample (geometry), one
+        // camera under one name in both slots.
+        { name: "rgbd_camera", tag: "v1", link_id: "cameras", cardinality: "one_or_more" },
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "one_or_more" },
+      ],
+      pairings: [
+        // The navigator leads the base: it streams the velocity of each
+        // controller step while a goal runs, and reads the base's odometry,
+        // its mode and whether the base follows it.
+        { name: "drive_link", tag: "v1", role: "leader", link_id: "base" },
+      ],
+    },
+  },
+  interfaces: {
+    actions: {
+      exposes: [
+        { link_id: "base_navigation", name: "navigate_to_pose" },
+        { link_id: "base_navigation", name: "spin" },
+        { link_id: "base_navigation", name: "drive_on_heading" },
+        { link_id: "base_navigation", name: "back_up" },
+      ],
+    },
+    services: {
+      exposes: [
+        { link_id: "base_navigation", name: "clear_grid" },
+      ],
+      consumes: [
+        { link_id: "base_state", name: "describe_base" },
+        { link_id: "sensor_mounts", name: "describe_sensors" },
+        { link_id: "cameras", name: "depth_stream_info" },
+        { link_id: "geometry", name: "get_depth_intrinsics" },
+        { link_id: "geometry", name: "get_depth_to_color_extrinsics" },
+      ],
+    },
+    topics: {
+      emits: [
+        { link_id: "base", name: "drive_setpoints" },
+      ],
+      consumes: [
+        { link_id: "base", name: "drive_states" },
+        { link_id: "cameras", name: "depth_stream" },
+        { link_id: "transforms", name: "transforms" },
+        { link_id: "transforms", name: "static_transforms" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {
+      // The grid of the floor, in the base's odometry frame: the side (m) of
+      // the square it holds, which centers on the base while a goal runs and
+      // while the release burst after it streams, and within half of which
+      // of the base a goal's end lies; the edge (m) of a voxel, the side of a
+      // cell; and the lowest height (m) it holds, deeper than
+      // max_step_down_m. The controller's path handler searches the plan for
+      // the base's nearest pose within half the side.
+      grid: {
+        side_m: "f64",
+        voxel_size_m: "f64",
+        min_z_m: "f64",
+      },
+      // The heights (m) above the floor between which a voxel is an obstacle,
+      // both included (Nav2's min_obstacle_height and max_obstacle_height),
+      // the highest at least the robot's height with each part that raises
+      // it at its highest: a table top above it is driven under. A reading's
+      // rays that read the floor deeper than max_step_down_m below it mark a
+      // drop. Each is a whole number of voxels.
+      min_obstacle_height_m: "f64",
+      max_obstacle_height_m: "f64",
+      max_step_down_m: "f64",
+      // How far (m) from a camera's origin along the floor a reading's return
+      // marks an obstacle or votes for a drop (Nav2's obstacle_max_range); a
+      // farther return clears its ray and marks nothing.
+      obstacle_max_range_m: "f64",
+      // How far (m) the padded footprint reaches past describe_base's
+      // footprint (Nav2's footprint_padding).
+      footprint_padding_m: "f64",
+      // The inflation around each occupied cell (Nav2's inflation layer): how
+      // far (m) cells take a cost, at least the padded footprint's inscribed
+      // radius, and how fast (1/m) the cost falls beyond it.
+      inflation_radius_m: "f64",
+      cost_scaling_factor: "f64",
+      // Smac 2D's settings, by Nav2's names. The navigator plans with unknown
+      // cells passable, as base_navigation counts a cell never seen as free.
+      planner: {
+        cost_travel_multiplier: "f64",
+        max_iterations: "u32",
+        use_final_approach_orientation: "bool",
+        smoother: {
+          tolerance_m: "f64",
+          max_iterations: "u32",
+          w_data: "f64",
+          w_smooth: "f64",
+          refinements: "u32",
+        },
+      },
+      // How often (Hz) a navigation plans again while it follows, on the
+      // node's clock.
+      replan_rate_hz: "f64",
+      // The near-goal distance (m): a path shorter than this from its pose
+      // nearest the robot frame's origin to the goal, with no pose in
+      // collision, is kept, and no plan replaces it.
+      near_goal_distance_m: "f64",
+      // How often (Hz) a goal steps, on the node's clock: one setpoint and
+      // one feedback a step. Above 2 Hz, as drive_link brings the base to rest
+      // 0.5 s after a leader's last setpoint.
+      controller_rate_hz: "f64",
+      // How long (s) a follow goes on with no command that keeps the padded
+      // footprint off every occupied cell along its arc before it fails, 0
+      // or more (Nav2's failure_tolerance); the base gets zero velocity
+      // meanwhile.
+      failure_tolerance_s: "f64",
+      // The longest path (m) left to the goal at which a navigation can reach
+      // it (Nav2's path_length_tolerance).
+      path_length_tolerance_m: "f64",
+      // How far (m) the path handler keeps the plan ahead of the base (Nav2's
+      // prune_distance).
+      prune_distance_m: "f64",
+      // Regulated pure pursuit's settings, by Nav2's names, the lookahead
+      // scaled by the forward speed. Its speed is the goal's max_speed_m_s,
+      // or describe_base's forward limit. A command is valid while the
+      // padded footprint stays off every occupied cell along its arc within
+      // max_allowed_time_to_collision_up_to_carrot_s, the arc look-ahead
+      // time of base_navigation. min_approach_linear_velocity_m_s at or above
+      // the base's deadband along x lets the base close on its goal; an
+      // approach_velocity_scaling_dist_m past half of grid.side_m draws a
+      // warning at the setup.
+      controller: {
+        lookahead_time_s: "f64",
+        min_lookahead_dist_m: "f64",
+        max_lookahead_dist_m: "f64",
+        rotate_to_heading_angular_vel_rad_s: "f64",
+        rotate_to_heading_min_angle_rad: "f64",
+        max_angular_accel_rad_s2: "f64",
+        min_approach_linear_velocity_m_s: "f64",
+        approach_velocity_scaling_dist_m: "f64",
+        regulated_linear_scaling_min_radius_m: "f64",
+        regulated_linear_scaling_min_speed_m_s: "f64",
+        cost_scaling_dist_m: "f64",
+        cost_scaling_gain: "f64",
+        max_allowed_time_to_collision_up_to_carrot_s: "f64",
+      },
+      // The progress checker (Nav2's required_movement_radius and
+      // movement_time_allowance): a base whose origin moves less than
+      // required_movement_m in movement_time_allowance_s makes no progress.
+      required_movement_m: "f64",
+      movement_time_allowance_s: "f64",
+      // The stop (Nav2's collision monitor, approach): the least time (s) it
+      // projects the padded footprint along the commanded velocity, which
+      // describe_base's limits lengthen to source_timeout_s and the time the
+      // base takes to rest from its fastest velocity; its step (s); and how
+      // long (s) a sensor may go with no reading of it in the grid, a reading
+      // the robot's tree cannot place going into none, before it is silent,
+      // which stops the base, refuses a goal and fails the goal in flight.
+      time_before_collision_s: "f64",
+      simulation_time_step_s: "f64",
+      source_timeout_s: "f64",
+      // A turn, the turn of a spin or of the recoveries, stepped as Nav2's
+      // Spin steps: its slowest rate (rad/s, min_rotational_vel), at least
+      // describe_base's angular deadband.
+      min_turn_rate_rad_s: "f64",
+      // A straight drive, a drive_on_heading, a back_up or the back-up of the
+      // recoveries, stepped as Nav2's DriveOnHeading steps: its slowest speed
+      // (m/s, minimum_speed) forward and backward, at least describe_base's
+      // deadband along x.
+      min_forward_speed_m_s: "f64",
+      min_backward_speed_m_s: "f64",
+      // How far ahead (s) a turn and a straight drive sweep the padded
+      // footprint (simulate_ahead_time).
+      simulate_ahead_time_s: "f64",
+      // The recoveries of a navigation, in Nav2's default tree: the turn's
+      // angle (rad, counterclockwise) and time allowance (s), the wait (s),
+      // and the back-up's distance (m), speed (m/s) and time allowance (s).
+      recoveries: {
+        turn_angle_rad: "f64",
+        turn_time_allowance_s: "f64",
+        wait_s: "f64",
+        back_up_distance_m: "f64",
+        back_up_speed_m_s: "f64",
+        back_up_time_allowance_s: "f64",
+      },
+      // How long (s) the navigator keeps each moving transform of the robot's
+      // tree, counted back from the newest stamp of its child frame: finite
+      // and above 0. A navigation or a depth frame stamped before that is
+      // refused or dropped with extrapolation. The default is tf2's default
+      // cache time (BUFFER_CORE_DEFAULT_CACHE_TIME).
+      cache_window_s: { $type: "f64", $default: 10.0 },
+      // How long (s) the placement of a navigation or of a depth frame waits,
+      // on the node's clock, for the robot's tree to place it at its
+      // timestamp: finite and 0 or above, 0 for no wait.
+      lookup_timeout_s: "f64",
+    },
+  },
+}

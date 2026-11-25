@@ -6,6 +6,11 @@
         path: "ai_brain_vla/peppy.json5"
       }
     },
+    base_navigator: {
+      v1: {
+        path: "base_navigator/peppy.json5"
+      }
+    },
     botshare_backbone: {
       v1: {
         path: "botshare/backbone/peppy.json5"

@@ -1,0 +1,62 @@
+{
+  "grid": {"side_m": 5.0, "voxel_size_m": 0.05, "min_z_m": -0.5},
+  "min_obstacle_height_m": 0.1,
+  "max_obstacle_height_m": 0.5,
+  "max_step_down_m": 0.1,
+  "obstacle_max_range_m": 2.5,
+  "footprint_padding_m": 0.01,
+  "inflation_radius_m": 0.55,
+  "cost_scaling_factor": 3.0,
+  "planner": {
+    "cost_travel_multiplier": 2.0,
+    "max_iterations": 1000000,
+    "use_final_approach_orientation": false,
+    "smoother": {
+      "tolerance_m": 1e-10,
+      "max_iterations": 1000,
+      "w_data": 0.2,
+      "w_smooth": 0.3,
+      "refinements": 2
+    }
+  },
+  "replan_rate_hz": 1.0,
+  "near_goal_distance_m": 0.5,
+  "controller_rate_hz": 20.0,
+  "failure_tolerance_s": 0.3,
+  "path_length_tolerance_m": 1.0,
+  "prune_distance_m": 2.0,
+  "controller": {
+    "lookahead_time_s": 1.5,
+    "min_lookahead_dist_m": 0.3,
+    "max_lookahead_dist_m": 0.6,
+    "rotate_to_heading_angular_vel_rad_s": 1.0,
+    "rotate_to_heading_min_angle_rad": 0.785,
+    "max_angular_accel_rad_s2": 3.0,
+    "min_approach_linear_velocity_m_s": 0.05,
+    "approach_velocity_scaling_dist_m": 0.6,
+    "regulated_linear_scaling_min_radius_m": 0.9,
+    "regulated_linear_scaling_min_speed_m_s": 0.25,
+    "cost_scaling_dist_m": 0.6,
+    "cost_scaling_gain": 1.0,
+    "max_allowed_time_to_collision_up_to_carrot_s": 1.0
+  },
+  "required_movement_m": 0.05,
+  "movement_time_allowance_s": 2.0,
+  "time_before_collision_s": 1.0,
+  "simulation_time_step_s": 0.1,
+  "source_timeout_s": 0.5,
+  "min_turn_rate_rad_s": 0.4,
+  "min_forward_speed_m_s": 0.1,
+  "min_backward_speed_m_s": 0.1,
+  "simulate_ahead_time_s": 2.0,
+  "recoveries": {
+    "turn_angle_rad": 1.57,
+    "turn_time_allowance_s": 10.0,
+    "wait_s": 5.0,
+    "back_up_distance_m": 0.3,
+    "back_up_speed_m_s": 0.15,
+    "back_up_time_allowance_s": 10.0
+  },
+  "cache_window_s": 10.0,
+  "lookup_timeout_s": 0.1
+}

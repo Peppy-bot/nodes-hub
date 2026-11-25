@@ -102,9 +102,6 @@ class SimLauncher:
         self._anti_aliasing = anti_aliasing
         self._timeline = None
         self._extension: Optional[IsaacBridgeExtension] = extension
-        # Whether a removal took the bridge's views again (_remove_prim) since
-        # the loop last read them (_read_views_taken_again).
-        self._views_to_read = False
         # Told once how the boot ended: when the loop starts to stand the
         # robots that attach, or with the error that ended the boot first.
         # The node's setup waits for it.
@@ -593,30 +590,24 @@ class SimLauncher:
         Articulation handles the bridge and the runtime commander hold keep
         failing afterwards ('Articulation' object has no attribute
         '_physics_view') until they are created again, as does the
-        rigid-body view the object state reads. Every removal goes through
-        here: the bridge's views are dropped before the prim goes and taken
-        again after, and the loop reads them before its next step
-        (_read_views_taken_again), once the edit is whole: no update runs
-        inside it. The commander's are re-created on their next use. Adding
-        prims leaves them intact.
+        rigid-body view the object state reads. Every removal the launcher
+        makes goes through here, and through the bridge's remove_from_stage
+        once the bridge exists: the bridge's views are dropped before the
+        prim goes and taken again after, and the loop reads them before its
+        next step (_read_views_taken_again), once the edit is whole: no
+        update runs inside it. The commander's are re-created on their next
+        use. Adding prims leaves them intact.
         """
 
         if not stage.GetPrimAtPath(path).IsValid():
             return False
 
-        # A view of a prim that is edited under it stops reading, so the
-        # views go before the prim does and are taken again after.
-        if self._extension is not None:
-            self._extension.unbind()
+        if self._extension is None:
+            stage.RemovePrim(path)
+            self._scene_actions.invalidate_physics_views()
+            return True
 
-        stage.RemovePrim(path)
-
-        self._scene_actions.invalidate_physics_views()
-
-        if self._extension is not None:
-            self._extension.bind()
-            self._views_to_read = True
-
+        self._extension.remove_from_stage(lambda: stage.RemovePrim(path))
         return True
 
     def _reference_runtime_scene(self, stage, usd_path: str, scale) -> None:
@@ -1545,10 +1536,10 @@ class SimLauncher:
         last iteration and after the floor's judgment, whose take-up is a
         removal too. Up to _STAGE_SETTLE_STEPS updates run until every view
         reads (IsaacBridgeExtension.resolve); a step reads the robots whose
-        views read."""
-        if not self._views_to_read:
+        views read. A camera rig's drop on the step before is a removal
+        too."""
+        if not self._extension.views_to_read:
             return
-        self._views_to_read = False
         self._extension.resolve(self._sim_app.update, _STAGE_SETTLE_STEPS)
 
     def _shutdown(self) -> None:
