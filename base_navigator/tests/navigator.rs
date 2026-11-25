@@ -1,11 +1,11 @@
 //! The navigator booted in-process on a simulated clock the test ticks,
 //! against a mock base of drive_link that executes its setpoints through
-//! base_state's limiter and cameras that render boxes: the refusals of a goal
-//! in base_navigation's order, the drives around what the cameras see, the
-//! recoveries, a plan held across steps, the replacement, the cancels and the
-//! holds, the release burst after an ending, the silences, the start-over of
-//! the odometry, and a clock that lags the messages or leaps, each judged on
-//! the node's own clock.
+//! base_state's limiter, and cameras and 2-D lidars that render boxes: the
+//! refusals of a goal in base_navigation's order, the drives around what the
+//! cameras see, the 2-D lidar's grid, the recoveries, a plan held across
+//! steps, the replacement, the cancels and the holds, the release burst after
+//! an ending, the silences, the start-over of the odometry, and a clock that
+//! lags the messages or leaps, each judged on the node's own clock.
 
 mod helpers;
 
@@ -467,7 +467,10 @@ async fn a_goal_while_a_camera_is_silent_is_refused_resource_unavailable_naming_
         FailureKind::ResourceUnavailable,
         "{refusal:?}"
     );
-    assert_names(&refusal.message, &["the camera front", "source_timeout_s"]);
+    assert_names(
+        &refusal.message,
+        &["the depth camera front", "source_timeout_s"],
+    );
     rig.shutdown().await;
 }
 
@@ -706,21 +709,12 @@ fn padded_reach_x(base: &MockBase) -> f64 {
         .fold(f64::NEG_INFINITY, f64::max)
 }
 
-// base_navigation's grid: botshare's base drives to a goal 2.1 m ahead,
-// 0.45 m inside the edge of the grid centered on the start, and turns there
-// by a quarter turn to the goal's heading, -pi/2. Its padded footprint's
-// corners lie 0.5 m from the robot frame's origin, so they leave that square
-// during the turn. The grid centers on the base with each reading while the
-// goal runs, and the navigation completes within its tolerances.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_navigation_turning_at_a_goal_near_the_grids_first_edge_completes() {
-    let mut rig = Rig::start_with(
-        params(),
-        Scene::open(),
-        &[BOTSHARE_FRONT],
-        botshare_answer(),
-    )
-    .await;
+/// The base of `rig`, botshare's, drives to a goal 2.1 m ahead, 0.45 m inside
+/// the edge of the grid centered on the start, and turns there by a quarter
+/// turn to the goal's heading, -pi/2. Its padded footprint's corners lie 0.5 m
+/// from the robot frame's origin, so they leave that square during the turn,
+/// and the navigation completes within its tolerances.
+async fn turn_at_a_goal_near_the_grids_first_edge(mut rig: Rig) {
     let quarter_turn = GoalRequestData {
         target: in_odom(2.1, 0.0, -FRAC_PI_2),
         position_tolerance_m: 0.02,
@@ -744,6 +738,22 @@ async fn a_navigation_turning_at_a_goal_near_the_grids_first_edge_completes() {
         "{data:?}"
     );
     rig.shutdown().await;
+}
+
+// base_navigation's grid: botshare's base, its camera reading the floor,
+// turns at a goal near the first grid's edge as
+// `turn_at_a_goal_near_the_grids_first_edge` gives it: the grid centers on
+// the base with each reading while the goal runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_navigation_turning_at_a_goal_near_the_grids_first_edge_completes() {
+    let rig = Rig::start_with(
+        params(),
+        Scene::open(),
+        &[BOTSHARE_FRONT],
+        botshare_answer(),
+    )
+    .await;
+    turn_at_a_goal_near_the_grids_first_edge(rig).await;
 }
 
 // An obstacle placed ahead of the moving base slows it and stops it
@@ -1242,6 +1252,185 @@ async fn a_describe_base_bound_above_time_before_collision_lengthens_the_stops_p
     let short = speed_past_half_a_meter(3.0).await;
     assert!(long < short, "{long} m/s against {short} m/s");
     assert!(short > 0.45, "{short} m/s");
+}
+
+// ---------------------------------------------------------------------------
+// The 2-D lidar: the grid of the floor read from a lidar alone.
+// ---------------------------------------------------------------------------
+
+/// The rig with the lidar over the base's origin alone before `scene`, the
+/// rig's base measuring its odometry.
+async fn lidar_rig(scene: Scene) -> Rig {
+    Rig::start_with_lidars(params(), scene, &[], &[LIDAR], measured()).await
+}
+
+/// The lidar, which describe_sensors names carried by the left arm.
+const CARRIED_LIDAR: LidarMount = LidarMount {
+    carried_by: "left_arm",
+    ..LIDAR
+};
+
+/// A room's four walls, 1 m tall and 0.2 m thick, from -4 m to 6 m along x
+/// and -4 m to 4 m along y: the base's start and [`BEHIND_THE_BOX`] lie inside
+/// it, and every ray of [`LIDAR_LENS`] from the base on its way there meets a
+/// wall within its 8 m range.
+const ROOM_WALLS: [Box3; 4] = [
+    Box3::new([-4.0, -4.0, 0.0], [6.0, -3.8, 1.0]),
+    Box3::new([-4.0, 3.8, 0.0], [6.0, 4.0, 1.0]),
+    Box3::new([-4.0, -4.0, 0.0], [-3.8, 4.0, 1.0]),
+    Box3::new([5.8, -4.0, 0.0], [6.0, 4.0, 1.0]),
+];
+
+/// botshare's lidar, lidar_frame on lidar_joint of botshare_base.urdf: 0.33 m
+/// ahead of the robot frame's origin, 0.222 m up, facing backward.
+const BOTSHARE_LIDAR: LidarMount = LidarMount {
+    name: "lidar",
+    position: [0.33, 0.0, 0.222],
+    yaw_rad: PI,
+    lens: LIDAR_LENS,
+    carried_by: "",
+};
+
+// base_navigation's sensors: a 2-D lidar alone feeds the grid, so in a room
+// whose walls the lidar sees, a navigation drives the base around a box the
+// lidar sees to a goal behind it, without contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lidar_alone_feeds_the_grid_and_a_box_it_sees_is_driven_around() {
+    let mut rig = lidar_rig(Scene::with(&[&ROOM_WALLS[..], &[BOX_AHEAD]].concat())).await;
+    let handle = rig.send_when_ready(&to(BEHIND_THE_BOX)).await;
+    rig.run_checking(|base| {
+        assert!(
+            !touches(base, &BOX_AHEAD),
+            "the base touched the box: {:?}",
+            base.truth
+        )
+    })
+    .await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    let [x, y, _] = data.final_pose.position;
+    assert!(
+        (x - BEHIND_THE_BOX[0]).hypot(y - BEHIND_THE_BOX[1]) < 0.2,
+        "{data:?}"
+    );
+    rig.shutdown().await;
+}
+
+// A goal while the lidar the grid reads is silent is refused with
+// resource_unavailable, naming the lidar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_goal_while_the_lidar_is_silent_is_refused_resource_unavailable_naming_it() {
+    let mut rig = lidar_rig(Scene::open()).await;
+    rig.ready().await;
+    rig.world.lidars_on = false;
+    rig.steps(SILENT_STEPS).await;
+    let refusal = rig.refusal(&goal(1.0, 0.0)).await;
+    assert_eq!(
+        refusal.kind,
+        FailureKind::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert_names(&refusal.message, &["the lidar lidar", "source_timeout_s"]);
+    rig.shutdown().await;
+}
+
+// A lidar that stops publishing fails the navigation in flight with
+// resource_unavailable, naming the lidar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lidar_that_stops_publishing_fails_the_navigation_resource_unavailable_naming_it() {
+    let mut rig = lidar_rig(Scene::open()).await;
+    let handle = rig.send_when_ready(&goal(2.0, 0.0)).await;
+    rig.run_until(|base| base.velocity.linear_x() > 0.1).await;
+    rig.world.lidars_on = false;
+    rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let failure = outcome::navigate_to_pose::failure(&result);
+    assert_eq!(
+        failure.kind,
+        FailureKind::ResourceUnavailable,
+        "{failure:?}"
+    );
+    assert_names(&failure.message, &["the lidar lidar"]);
+    rig.shutdown().await;
+}
+
+// sensor_mounts' frames: a scan whose header names a frame other than the one
+// describe_sensors gives the lidar is dropped, and a goal waits for the lidar,
+// the refusal naming both frames; once its scans name its own frame, the
+// navigator takes goals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scan_naming_another_frame_is_dropped_and_the_wait_says_why() {
+    let mut rig = lidar_rig(Scene::open()).await;
+    rig.world.scan_frame = Some("rear_lidar_frame");
+    let refusal = rig
+        .refusal_once(&goal(1.0, 0.0), |refusal| {
+            refusal.message.contains("rear_lidar_frame")
+        })
+        .await;
+    assert_eq!(
+        refusal.kind,
+        FailureKind::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert_names(
+        &refusal.message,
+        &[
+            "the lidar lidar",
+            "its scans arrive and are dropped",
+            "\"rear_lidar_frame\"",
+            "\"lidar_frame\"",
+        ],
+    );
+    rig.world.scan_frame = None;
+    rig.ready().await;
+    rig.shutdown().await;
+}
+
+// base_navigation's sensors: a lidar that describe_sensors names carried by
+// a part is refused, and a goal waits for it, the refusal naming the lidar,
+// its carrier and what to run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lidar_a_part_carries_is_refused_naming_its_carrier() {
+    let mut rig =
+        Rig::start_with_lidars(params(), Scene::open(), &[], &[CARRIED_LIDAR], measured()).await;
+    let refusal = rig
+        .refusal_once(&goal(1.0, 0.0), |refusal| {
+            refusal.message.contains("carries")
+        })
+        .await;
+    assert_eq!(
+        refusal.kind,
+        FailureKind::ResourceUnavailable,
+        "{refusal:?}"
+    );
+    assert_names(
+        &refusal.message,
+        &[
+            "the lidar lidar",
+            "\"left_arm\" carries",
+            "a lidar fixed to the base",
+        ],
+    );
+    rig.shutdown().await;
+}
+
+// base_navigation's grid, read from botshare's lidar alone: botshare's base
+// turns at a goal near the first grid's edge as
+// `turn_at_a_goal_near_the_grids_first_edge` gives it, its padded
+// footprint's corners leaving the square the grid held when the goal was
+// accepted: the grid centers on the base with each scan while the goal runs,
+// where the base stood at the scan's first ray.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lidar_only_grid_rolls_with_the_base_while_a_goal_runs() {
+    let rig = Rig::start_with_lidars(
+        params(),
+        Scene::open(),
+        &[],
+        &[BOTSHARE_LIDAR],
+        botshare_answer(),
+    )
+    .await;
+    turn_at_a_goal_near_the_grids_first_edge(rig).await;
 }
 
 // ---------------------------------------------------------------------------

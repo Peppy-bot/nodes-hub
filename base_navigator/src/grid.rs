@@ -2,9 +2,12 @@
 //! square of `grid.side_m` around its center, from `grid.min_z_m` up to
 //! `max_obstacle_height_m`, with the stop that reads each sensor's newest
 //! reading beside it. Each reading goes in with the sensor's place on the base
-//! and the base's place in odom at its time; the grid drops what lies within
-//! the base's outline, marks only the returns within `obstacle_max_range_m` of
-//! the sensor along the floor, and clears the padded footprint there.
+//! and the base's place in odom at its time: a depth frame's at its timestamp,
+//! a scan's at its first and at its last ray, each ray placed where the sensor
+//! stood at the ray's time. The grid drops what lies within the base's outline,
+//! marks only the returns within `obstacle_max_range_m` of the sensor along the
+//! floor (of the sensor at a scan's first ray), and clears the padded footprint
+//! where the base stood at the reading's time, a scan's first ray.
 //!
 //! The grid answers one occupancy query, [`LiveGrid::occupancy`]: the cost
 //! grid of what the sensors have seen, inflated for the padded footprint,
@@ -21,22 +24,22 @@
 //! params/nav2_params.yaml:246 `rolling_window: true`; nav2_costmap_2d
 //! src/layered_costmap.cpp:144-148): it centers on the base when the goal is
 //! accepted ([`GridSlot::roll_from`]) and with each reading, on where the
-//! base stood at the reading's time, keeping what the square still holds.
+//! base stood at the reading's time, a scan's first ray, keeping what the
+//! square still holds.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use camera_core::laser_scan::{LaserScan, Sweep};
 use control_core::planar_pose::PlanarPose;
 use control_core::positive_finite::PositiveFinite;
 use control_core::twist::PlanarTwist;
 use frame_tree::Transform;
 use navigation_core::costmap::{ComposeError, compose};
-use navigation_core::grid::CostGrid;
+use navigation_core::grid::{CostGrid, PlacementNotFinite};
 use navigation_core::inflation::Inflation;
-use navigation_core::obstacles::{
-    GridPoses, LiveObstacles, LiveObstaclesError, PlacementNotFinite,
-};
+use navigation_core::obstacles::{GridPoses, LiveObstacles, LiveObstaclesError};
 use navigation_core::stop::{Stop, StopCause, StopDecision, StopError, StopParams, UnknownSource};
 use occupancy_map::Bounds;
 
@@ -151,6 +154,33 @@ impl LiveGrid {
     ) -> Result<(), UnknownSource> {
         self.live
             .insert_depth_frame(source, points, base, sensor_on_base, range)?;
+        self.reading_went_in(source, arrived_ns)
+    }
+
+    /// Insert the hits of a scan of `source`, the base at `base`'s poses in
+    /// odom at the scan's first and last rays and the sensor at
+    /// `sensor_on_base` in the robot frame, each hit placed at its ray's time
+    /// and `range`, the scan's farthest range, bounding its rays; the scan
+    /// arrived at `arrived_ns` on the node's clock, the source's newest reading
+    /// for the stop.
+    pub fn insert_laser_scan(
+        &mut self,
+        source: usize,
+        scan: &LaserScan,
+        base: Sweep<PlanarPose>,
+        sensor_on_base: Transform,
+        range: PositiveFinite,
+        arrived_ns: i64,
+    ) -> Result<(), UnknownSource> {
+        self.live
+            .insert_laser_scan(source, scan, base, sensor_on_base, range)?;
+        self.reading_went_in(source, arrived_ns)
+    }
+
+    /// A reading of `source` that arrived at `arrived_ns` went in: the stop's
+    /// newest of the source, read since the newest clearing, and a change of
+    /// the occupancy.
+    fn reading_went_in(&mut self, source: usize, arrived_ns: i64) -> Result<(), UnknownSource> {
         self.stop.reading_arrived(&self.live, source, arrived_ns)?;
         self.read_since_clearing[source] = true;
         self.occupancy = None;

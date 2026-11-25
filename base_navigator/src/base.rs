@@ -32,9 +32,9 @@ use crate::failure::{Failure, FailureKind};
 use crate::follow::ROBOT_FRAME;
 use crate::grid::{GridSlot, LiveGrid};
 
-/// How long one describe_base call waits for its answer; a call that runs out
-/// is asked again.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one ask of a description waits for its answer, describe_base's and a depth
+/// camera's geometry and stream info; an ask that runs out is asked again.
+pub(crate) const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the base's odometry comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

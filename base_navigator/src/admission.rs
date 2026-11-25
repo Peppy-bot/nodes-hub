@@ -39,7 +39,6 @@ use peppygen::exposed_actions::base_navigation::{
 };
 
 use crate::base::{Base, BaseReads, OdometrySource, fastest};
-use crate::cameras::Sensors;
 use crate::clock;
 use crate::config::{NavigatorConfig, duration_ns};
 use crate::drive::NavigationRequest;
@@ -50,6 +49,7 @@ use crate::follow::odometry_frame;
 use crate::grid::GridSlot;
 use crate::link::{Link, Received};
 use crate::recovery::{Direction, SpinRequest, StraightRequest};
+use crate::sensors::Sensors;
 
 /// The frame of the loaded map, as transforms names it.
 const MAP_FRAME: &str = "map";
@@ -433,12 +433,12 @@ mod tests {
 
     use crate::base::BaseRead;
     use crate::base::tests::answer;
-    use crate::cameras::tests::camera_slot;
     use crate::config::tests::config;
     use crate::follow::{ROBOT_FRAME, robot_frame};
     use crate::grid::tests::grid;
     use crate::link::Mode;
     use crate::link::tests::state;
+    use crate::sensors::tests::{camera_slot, sensors_of};
 
     const NOW_NS: i64 = 10_000_000_000;
 
@@ -567,7 +567,7 @@ mod tests {
                 clock: clock.clone(),
                 link: Arc::new(Mutex::new(link)),
                 grid: Arc::new(Mutex::new(slot)),
-                sensors: Arc::new(Sensors::new(vec![camera_slot("front")])),
+                sensors: Arc::new(sensors_of(vec![camera_slot("front")])),
             },
             base_reads: BaseReads {
                 starts,
@@ -712,7 +712,7 @@ mod tests {
             },
             None,
         );
-        assert!(sensor.contains("the camera front"), "{sensor}");
+        assert!(sensor.contains("the depth camera front"), "{sensor}");
         let every_resource = message(
             Causes {
                 silent_link: true,
@@ -722,7 +722,11 @@ mod tests {
             },
             None,
         );
-        for cause in ["no drive_states for", "base_silence", "the camera front"] {
+        for cause in [
+            "no drive_states for",
+            "base_silence",
+            "the depth camera front",
+        ] {
             assert!(every_resource.contains(cause), "{cause}: {every_resource}");
         }
     }

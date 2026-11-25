@@ -1,16 +1,18 @@
 //! base_navigator: drives a robot's mobile base to a pose around what its
-//! depth cameras see, turns it in place, and drives it straight ahead or
-//! back clear of the same, as Nav2's NavigateToPose, Spin, DriveOnHeading and
-//! BackUp drive a base, on navigation_core's ports of Nav2. It implements
-//! base_navigation and leads the base over drive_link.
+//! 2-D lidars and depth cameras see, turns it in place, and drives it straight
+//! ahead or back clear of the same, as Nav2's NavigateToPose, Spin,
+//! DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2.
+//! It implements base_navigation and leads the base over drive_link.
 //!
 //! - [`link`]: drive_states, the base's odometry, mode and whether it
 //!   follows.
 //! - [`base`]: describe_base's answer, read at each start of the odometry.
 //! - [`follow`]: the robot's tree, from transforms and static_transforms.
-//! - [`cameras`], [`intake`], [`grid`]: the depth cameras fixed to the base,
-//!   their frames placed by the tree, and navigation_core's `LiveObstacles`,
-//!   the grid of the floor in odom, with its one occupancy query and the stop.
+//! - [`sensors`], [`cameras`], [`intake`], [`grid`]: the depth cameras and the
+//!   2-D lidars fixed to the base, in one list, a depth camera's own
+//!   description, their frames and scans placed by the tree, and
+//!   navigation_core's `LiveObstacles`, the grid of the floor in odom, with its
+//!   one occupancy query and the stop.
 //! - [`admission`]: a goal checked in base_navigation's order.
 //! - [`drive`], [`following`], [`recovery`], [`moves`], [`planning`]: a
 //!   navigation's tries and recoveries, its follow, the turns and straight
@@ -45,6 +47,7 @@ mod moves;
 mod node;
 mod planning;
 mod recovery;
+mod sensors;
 mod services;
 
 pub use node::{NodeError, setup, setup_with};

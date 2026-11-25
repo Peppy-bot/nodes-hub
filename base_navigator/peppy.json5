@@ -5,9 +5,9 @@
     name: "base_navigator",
     tag: "v1",
     description: [
-      "Drives a robot's mobile base to a pose around what its depth cameras see, turns it in place, and drives it straight ahead or back clear of the same, as Nav2's NavigateToPose, Spin, DriveOnHeading and BackUp drive a base: it implements base_navigation on navigation_core and leads the base over drive_link.",
-      "The grid of the floor reads every depth camera of its cameras slot, an rgbd_camera bound with its camera_geometry under the same name, each a sensor that sensor_mounts' describe_sensors names fixed to the base, and every one of them sees the floor: a reading's rays that read the floor deeper than max_step_down_m, within obstacle_max_range_m of the camera along the floor, mark a drop. It keeps the grid in the base's odometry frame, plans on it with Smac 2D when a navigation starts and again at replan_rate_hz, follows the path with regulated pure pursuit, and slows and stops the base before an obstacle the grid or a camera's newest reading holds.",
-      "It reads what the base is from base_state's describe_base, again at each start of the base's odometry, the odometry, the mode and whether the base follows it from drive_link's drive_states, and places each goal and each depth frame by the robot's tree, which transforms and static_transforms fill.",
+      "Drives a robot's mobile base to a pose around what its 2-D lidars and depth cameras see, turns it in place, and drives it straight ahead or back clear of the same, as Nav2's NavigateToPose, Spin, DriveOnHeading and BackUp drive a base: it implements base_navigation on navigation_core and leads the base over drive_link.",
+      "The grid of the floor reads every depth camera of its cameras slot, an rgbd_camera bound with its camera_geometry under the same name, and every 2-D lidar of its lidars slot, a lidar_2d, each a sensor that sensor_mounts' describe_sensors names fixed to the base, one or more sensors in all. Every depth camera sees the floor: a reading's rays that read the floor deeper than max_step_down_m, within obstacle_max_range_m of the camera along the floor, mark a drop. A 2-D lidar marks what its scan plane meets, each ray from where the lidar stood at the ray's time, and sees the floor only where its rays cross the floor's plane, its rays there voting for a drop as a camera's do: a lidar whose scan plane is level marks no drop. It keeps the grid in the base's odometry frame, plans on it with Smac 2D when a navigation starts and again at replan_rate_hz, follows the path with regulated pure pursuit, and slows and stops the base before an obstacle the grid or a sensor's newest reading holds.",
+      "It reads what the base is from base_state's describe_base, again at each start of the base's odometry, the odometry, the mode and whether the base follows it from drive_link's drive_states, and places each goal, each depth frame and each scan by the robot's tree, which transforms and static_transforms fill.",
     ],
     implements: [
       { name: "base_navigation", tag: "v1", link_id: "base_navigation" },
@@ -18,17 +18,23 @@
         // motion and its footprint, read at each start of its odometry.
         { name: "base_state", tag: "v1", link_id: "base_state" },
         // Which sensors the robot carries and the part that carries each:
-        // the grid reads the depth cameras fixed to the base.
+        // the grid reads the depth cameras and the 2-D lidars fixed to the
+        // base.
         { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts" },
         // The robot's tree of frames, bound to every publisher of it: it
-        // places each navigation's target at its timestamp, and each depth
-        // frame by the frame its header names at its time.
+        // places each navigation's target at its timestamp, each depth frame
+        // by the frame its header names at its time, and each scan by the
+        // base's places at its first and its last ray.
         { name: "transforms", tag: "v1", link_id: "transforms", cardinality: "one_or_more" },
         // The depth cameras the grid reads: their depth frames (cameras)
         // and the lens and the offset that place each sample (geometry), one
         // camera under one name in both slots.
-        { name: "rgbd_camera", tag: "v1", link_id: "cameras", cardinality: "one_or_more" },
-        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "one_or_more" },
+        { name: "rgbd_camera", tag: "v1", link_id: "cameras", cardinality: "zero_or_more" },
+        { name: "camera_geometry", tag: "v1", link_id: "geometry", cardinality: "zero_or_more" },
+        // The 2-D lidars the grid reads: their scans. The cameras and the
+        // lidars give the grid one sensor or more, each under a name of its
+        // own; the setup refuses a launch that binds none.
+        { name: "lidar_2d", tag: "v1", link_id: "lidars", cardinality: "zero_or_more" },
       ],
       pairings: [
         // The navigator leads the base: it streams the velocity of each
@@ -66,6 +72,7 @@
       consumes: [
         { link_id: "base", name: "drive_states" },
         { link_id: "cameras", name: "depth_stream" },
+        { link_id: "lidars", name: "scan_stream" },
         { link_id: "transforms", name: "transforms" },
         { link_id: "transforms", name: "static_transforms" },
       ],
@@ -98,9 +105,10 @@
       min_obstacle_height_m: "f64",
       max_obstacle_height_m: "f64",
       max_step_down_m: "f64",
-      // How far (m) from a camera's origin along the floor a reading's return
-      // marks an obstacle or votes for a drop (Nav2's obstacle_max_range); a
-      // farther return clears its ray and marks nothing.
+      // How far (m) from a sensor's origin along the floor a reading's return
+      // marks an obstacle or votes for a drop (Nav2's obstacle_max_range), a
+      // 2-D lidar's origin where it stood at the scan's first ray; a farther
+      // return clears its ray and marks nothing.
       obstacle_max_range_m: "f64",
       // How far (m) the padded footprint reaches past describe_base's
       // footprint (Nav2's footprint_padding).
@@ -179,9 +187,10 @@
       // projects the padded footprint along the commanded velocity, which
       // describe_base's limits lengthen to source_timeout_s and the time the
       // base takes to rest from its fastest velocity; its step (s); and how
-      // long (s) a sensor may go with no reading of it in the grid, a reading
-      // the robot's tree cannot place going into none, before it is silent,
-      // which stops the base, refuses a goal and fails the goal in flight.
+      // long (s) a sensor, a depth camera or a 2-D lidar, may go with no
+      // reading of it in the grid, a reading the robot's tree cannot place
+      // going into none, before it is silent, which stops the base, refuses a
+      // goal and fails the goal in flight.
       time_before_collision_s: "f64",
       simulation_time_step_s: "f64",
       source_timeout_s: "f64",
@@ -211,13 +220,13 @@
       },
       // How long (s) the navigator keeps each moving transform of the robot's
       // tree, counted back from the newest stamp of its child frame: finite
-      // and above 0. A navigation or a depth frame stamped before that is
-      // refused or dropped with extrapolation. The default is tf2's default
-      // cache time (BUFFER_CORE_DEFAULT_CACHE_TIME).
+      // and above 0. A navigation, a depth frame or a scan stamped before
+      // that is refused or dropped with extrapolation. The default is tf2's
+      // default cache time (BUFFER_CORE_DEFAULT_CACHE_TIME).
       cache_window_s: { $type: "f64", $default: 10.0 },
-      // How long (s) the placement of a navigation or of a depth frame waits,
-      // on the node's clock, for the robot's tree to place it at its
-      // timestamp: finite and 0 or above, 0 for no wait.
+      // How long (s) each lookup that places a navigation, a depth frame or a
+      // scan waits, on the node's clock, for the robot's tree to answer it at
+      // its time: finite and 0 or above, 0 for no wait.
       lookup_timeout_s: "f64",
     },
   },

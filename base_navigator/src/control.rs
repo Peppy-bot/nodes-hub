@@ -1064,12 +1064,11 @@ mod tests {
     use hegel::TestCase;
     use hegel::generators as gs;
 
-    use crate::cameras::Sensors;
-    use crate::cameras::tests::camera_slot;
     use crate::config::tests::config;
     use crate::grid::GridSlot;
     use crate::grid::tests::{covers, grid, read_at};
     use crate::link::tests::state;
+    use crate::sensors::tests::{camera_slot, sensors_of};
     use control_core::drive_link::WINDOW_NS;
 
     use crate::link::Link;
@@ -1304,7 +1303,7 @@ mod tests {
         };
         let silent = met
             .sensor_silent
-            .then(|| "a reading of the camera front".to_string());
+            .then(|| "a reading of the depth camera front".to_string());
         let cancel = met.cancelled.then(|| "the caller".to_string());
         let ended = match met.own {
             Own::RunsOn => None,
@@ -1351,7 +1350,7 @@ mod tests {
             NOW_NS,
             start(),
             None,
-            Some("a reading of the camera front".to_string()),
+            Some("a reading of the depth camera front".to_string()),
         );
         let navigation = decide::<(), NavigationKind>(silent, Err(no_grid), |_| None, located);
         assert!(
@@ -1538,7 +1537,7 @@ mod tests {
             clock: NodeClock::simulation().0,
             link: Arc::new(Mutex::new(link)),
             grid: Arc::new(Mutex::new(slot)),
-            sensors: Arc::new(Sensors::new(vec![camera_slot("front")])),
+            sensors: Arc::new(sensors_of(vec![camera_slot("front")])),
         };
         let planning = Planning::new(Planner::default(), config.planner);
         Navigator {

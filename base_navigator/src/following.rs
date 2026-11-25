@@ -139,7 +139,7 @@ impl Follower {
     ) -> Result<Followed, FollowEnd> {
         let pruned = self
             .plan
-            .prune(pose, &grid.geometry())
+            .prune(pose, PlanarPose::IDENTITY, &grid.geometry())
             .map_err(|e| FollowEnd::CannotGoOn(e.to_string()))?;
         self.progress
             .check(pose, now_ns)

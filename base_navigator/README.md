@@ -1,7 +1,7 @@
 # base_navigator
 
-Drives a robot's mobile base to a pose around what its depth cameras see, turns it in place, and
-drives it straight ahead or back clear of the same, as Nav2 1.5.2's NavigateToPose, Spin,
+Drives a robot's mobile base to a pose around what its 2-D lidars and depth cameras see, turns it in
+place, and drives it straight ahead or back clear of the same, as Nav2 1.5.2's NavigateToPose, Spin,
 DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2. It implements
 `base_navigation` and leads the base over `drive_link`.
 
@@ -10,6 +10,7 @@ DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2. It i
                  |
                  v
    depth_stream (each camera) --> frame intake, placed by the robot's tree
+   scan_stream (each lidar)   --> scan intake, placed by the robot's tree
    transforms, static_transforms --> the robot's tree        |
    drive_states (drive_link) --> odometry, mode, follow_state |
    describe_base (base_state) --> limits, footprint           v
@@ -33,9 +34,15 @@ DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2. It i
 - `drive_link`'s `drive_states` on the `base` pair: where the odometry places the robot frame in
   odom, the velocity the base executes, its mode, `parts_within_footprint` and `follow_state`.
   Each arrival is timed on the node's clock; more than 0.5 s with none is a silence.
-- `sensor_mounts`' `describe_sensors`, asked until it answers: each camera of the `cameras` slot
-  must be a sensor of `rgbd_camera` fixed to the base, its `carried_by` empty, under the name its
-  copy's fragment wrote (its instance id outside a copy). Another camera is refused, naming why.
+- The sensors of the grid, one or more between two slots: the depth cameras of the `cameras`
+  slot, each bound with its `camera_geometry` under the same name in the `geometry` slot, and the
+  2-D lidars of the `lidars` slot. Each runs under the name its copy's fragment wrote (its instance
+  id outside a copy), and no two share a name. The setup refuses slots that bind no sensor, naming
+  both slots and what to bind.
+- `sensor_mounts`' `describe_sensors`, asked until it answers: each camera must be a sensor of
+  `rgbd_camera` and each lidar a sensor of `lidar_2d`, fixed to the base, its `carried_by` empty
+  (camera_core's `DescribedSensors::fixed_to_the_base`). Another sensor is refused, naming why. A
+  lidar is described by the frame `describe_sensors` gives it.
 - Each camera's `get_depth_intrinsics`, `get_depth_to_color_extrinsics` (the `geometry` slot,
   paired by name) and `depth_stream_info`, read by camera_core's depth camera reader, asked again
   until they answer. A camera's range is its `max_depth_m`.
@@ -47,29 +54,36 @@ DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2. It i
 The grid is navigation_core's live obstacles, kept in odom: a square of `grid.side_m`, from
 `grid.min_z_m` up to `max_obstacle_height_m`, in voxels of `grid.voxel_size_m`. Each depth frame
 of a camera is held to the camera's alignment and frame, then placed by the tree at its header's
-timestamp: the camera's frame in the robot frame, and the robot frame in odom, each lookup
-waiting up to `lookup_timeout_s`. A frame the tree cannot place is dropped and logged with the
-lookup's failure kind. The grid drops each return within the base's outline, clears the cells
-under the padded footprint, and, from the returns within `obstacle_max_range_m` of the camera
-along the floor, marks a voxel between the two obstacle heights and a column whose rays read the
-floor deeper than `max_step_down_m`: every camera sees the floor.
+timestamp: the camera's frame in the robot frame, and the robot frame in odom. Each scan of a
+lidar must name the frame `describe_sensors` gives the lidar, and is placed by the tree: the robot
+frame in odom at the scan's first ray, its timestamp, and at its last ray, before the first for a
+lidar that sweeps clockwise, and the lidar's frame in the robot frame; navigation_core places each
+ray where the lidar stood at the ray's time, and the scan's own `max_range_m` bounds its rays.
+Each lookup waits up to `lookup_timeout_s`. A reading the tree cannot place, and a scan naming
+another frame, are dropped and logged, a lookup's with its failure kind. The grid drops each
+return within the base's outline at the return's time, clears the cells under the padded
+footprint where the base stood at the reading's time (a scan's first ray), and, from the returns
+within `obstacle_max_range_m` of the sensor along the floor, marks a voxel between the two
+obstacle heights and a column whose rays read the floor deeper than `max_step_down_m`. Every
+camera sees the floor; a lidar marks what its scan plane meets and sees the floor only where its
+rays cross the floor's plane, so a lidar whose scan plane is level marks no drop.
 
 The grid answers one occupancy query, the cost grid of what the sensors have seen, inflated for
 the padded footprint, built once per change: the planner, the collision test, the sweeps and the
 slowing read it. The stop (navigation_core's port of Nav2's collision monitor) slows every command
 over the larger of `time_before_collision_s` and the sum of `source_timeout_s` and the time the
 base takes to rest from its fastest velocity, checking the padded footprint at each projected
-step against each camera's newest points, as Nav2's collision monitor checks a source's points,
+step against each sensor's newest points, as Nav2's collision monitor checks a source's points,
 and against the cost grid along its outline, a corner off the grid counting as occupied, as Nav2's
-controller costs a footprint. A camera is silent while no frame of it went into the grid within
-`source_timeout_s`; a frame the tree cannot place goes into none.
+controller costs a footprint. A sensor is silent while no reading of it went into the grid within
+`source_timeout_s`; a reading the tree cannot place goes into none.
 
 The grid empties when the odometry starts over and is built again around odom's origin for the
-footprint read then; clear_grid empties it. While a goal runs, and while the release burst after
-it streams, the grid rolls with the base, as Nav2's local costmap rolls: it centers on the base
-when the goal is accepted and with each depth frame, on where the base stood at the frame's time,
-keeping what the square still holds. A goal's end lies inside the grid centered on the base when
-it is accepted.
+footprint read then; clear_grid empties it. While a goal runs, and while the release burst after it
+streams, the grid rolls with the base, as Nav2's local costmap rolls: it centers on the base when
+the goal is accepted and with each reading, on where the base stood at the reading's time (a scan's
+first ray), keeping what the square still holds. A goal's end lies inside the grid centered on the
+base when it is accepted.
 
 ## A goal
 
@@ -77,7 +91,7 @@ A goal is checked in base_navigation's order (`admission.rs`): it waits up to `s
 for describe_base's read of the newest odometry start; its values; a target in `map`, refused with
 `not_localized` while no map is loaded; a target in another frame, placed in odom by the tree at
 its timestamp, refused with the lookup's kind; drive_states' silence, base_silence and each silent
-camera; base_mode, parts_within_footprint, robot_stop and follower_goal.
+sensor; base_mode, parts_within_footprint, robot_stop and follower_goal.
 
 A new goal replaces the goal in flight, which ends cancelled at once: by its caller's cancel when
 one came, its result where the newest drive_states placed the robot frame, and otherwise with its
@@ -86,7 +100,7 @@ Each step ends the goal in flight by the first of its endings (`control.rs`'s `C
 order: the caller's cancel, its result where the newest drive_states placed the robot frame; a
 follow_state other than following, robot_stop and follower_goal cancelling it with the result
 where drive_states first reported it, base_mode and base_silence failing it; the odometry
-starting over; more than 0.5 s with no drive_states; a silent camera; a limb outside the
+starting over; more than 0.5 s with no drive_states; a silent sensor; a limb outside the
 footprint; the passing of the goal's `timeout_s`; the goal's completion at its end, its result
 where the newest drive_states placed the robot frame; then every other failure. After each
 ending, completed, cancelled or failed, while the navigator's stream is live and the base follows
@@ -130,7 +144,7 @@ odometry measures the whole turn or distance.
 
 Every time the node reads is its instance's bound clock, the simulation clock in a simulation
 (control_core's `NodeClock`): the steps of the control loop, the arrivals of drive_states and of
-each camera's frames, the waits of the tree's lookups and of the admission, and every timeout.
+each sensor's readings, the waits of the tree's lookups and of the admission, and every timeout.
 The navigator stamps each setpoint it streams on `drive_link` with its step's time on that
 clock, the clock of transforms; a setpoint in the robot frame stands in it at any time, so the
 follower places it as it places one with no timestamp.
@@ -145,19 +159,23 @@ tests and the harness tests run; the launcher's fragment holds Nav2's defaults, 
 Each module's unit tests run on simulated clocks or on times they set: the admission's order of
 checks, the shared endings and the release burst, the tries and recoveries of a navigation with
 plans run in the test, the gated planner, the turns, the straight drives and the moves, the
-follow, the grid's marks, clearing and centering, and describe_base's parse and wait.
+follow, the grid's marks, clearing and centering, the sensors' pairing and refusals, a depth
+frame and a scan placed by the tree (a scan swept while the base turns, clockwise and
+counterclockwise), and describe_base's parse and wait.
 
 The harness tests (`tests/navigator.rs`) boot the node in-process through `setup_with` on a
 simulated clock the test ticks, against a mock base of drive_link that commands each setpoint
 through base_state's limiter and reports drive_states with the transform odom to base_footprint,
-the robot's sensors and the cameras' fixed frames, describe_base, and depth cameras that render
-boxes, tables, drops and the base's own deck, from a body that can rest tilted. The rig steps the
-node through its wire alone: each step publishes the step's drive_states and frames and ticks the
-clock; while a goal runs, it waits for the goal's feedback of that step or the end of its
+the robot's sensors and their fixed frames, describe_base, depth cameras that render boxes, tables,
+drops and the base's own deck, from a body that can rest tilted, and 2-D lidars, bound when a test
+asks, whose rays each render the boxes from where the base stood at the ray's time. The rig steps
+the node through its wire alone: each step publishes the step's drive_states, frames and scans and
+ticks the clock; while a goal runs, it waits for the goal's feedback of that step or the end of its
 feedback, and it keeps each setpoint by its stamp. The wire orders neither the node's taking of a
 step's inputs nor a plan's end against the tick, so each test asserts what holds whichever step
 these land on. They cover the refusals in base_navigation's order, the drives around what the
-cameras see, the marks of a tilted base beside a drop, the recoveries, a plan held while the
+cameras see, a grid read from a lidar alone, its silence, its dropped scans and its refusal when
+a part carries it, the marks of a tilted base beside a drop, the recoveries, a plan held while the
 controller and the stop step, the replacement, the cancels and the holds, the release burst, the
 order of endings within a step, the silences, the odometry's start-over, the rolling grid, the
 moves, and a clock that lags the messages or leaps.

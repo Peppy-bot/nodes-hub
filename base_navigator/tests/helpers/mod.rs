@@ -6,15 +6,18 @@
 //! drive_link's follower that executes the node's setpoints through
 //! base_state's limiter ([`mock_base`]) and reports each step's drive_states
 //! with the transform odom to base_footprint of the same stamp, as botshare's
-//! backbone does; the robot's initializer by a publisher of each camera's
+//! backbone does; the robot's initializer by a publisher of each sensor's
 //! fixed frame on static_transforms and by describe_sensors' answer;
-//! base_state by describe_base's answer; and each depth camera by a pinhole
-//! that renders the scene's boxes, tables, slabs and drops from where the base
-//! stands ([`scene`]).
+//! base_state by describe_base's answer; each depth camera by a pinhole that
+//! renders the scene's boxes, tables, slabs and drops from where the base
+//! stands; and each 2-D lidar, which the boot binds only when a test asks, by a
+//! fan whose rays each render the scene from where the base stood at the ray's
+//! time, between where it stood at the step before and where it stands
+//! ([`scene`]).
 //!
 //! Each step moves the base by the velocity it executes, publishes the
-//! odometry and each camera's frame of the step's time, and ticks the clock to
-//! that time. While a goal runs, the step waits for the goal's feedback of
+//! odometry, each camera's frame of the step's time and each lidar's scan whose
+//! sweep ends at that time, and ticks the clock to that time. While a goal runs, the step waits for the goal's feedback of
 //! that step, or for the end of its feedback, which the node gives at the step
 //! that ends the goal: the rig and the node step together. The node stamps
 //! each setpoint with its step's time, and the rig keeps each by its stamp. The
@@ -25,7 +28,7 @@
 //! publisher.
 //!
 //! The wire orders none of these against the clock's tick: the node's taking
-//! of a step's drive_states and depth frames, a plan finishing, a goal
+//! of a step's drive_states, depth frames and scans, a plan finishing, a goal
 //! reaching the node's control loop after its acceptance, and a navigation's
 //! setpoint reaching the base before the rig's next step. The tests assert
 //! what holds whichever step each of these lands on. The clock can lag the
@@ -46,6 +49,7 @@ use std::time::{Duration, SystemTime};
 
 use base_navigator::{PlanGate, Planner};
 use control_core::fault::Fault;
+use control_core::time::nanoseconds;
 use control_core::twist::PlanarTwist;
 use frame_tree::Stamp;
 use frame_tree::arithmetic::{Quaternion, product, quaternion_of_yaw};
@@ -56,13 +60,14 @@ use peppygen::consumed_services::base_state::describe_base::{
 };
 use peppygen::consumed_services::geometry::get_depth_to_color_extrinsics::ResponseDataDepthToColor;
 use peppygen::consumed_topics::cameras::depth_stream::{self, MessageHeader};
+use peppygen::consumed_topics::lidars::scan_stream;
 use peppygen::exposed_actions::base_navigation::navigate_to_pose::GoalTarget;
 use peppygen::fixtures::exposed_actions::base_navigation::{
     back_up, drive_on_heading, navigate_to_pose, spin,
 };
 use peppygen::fixtures::exposed_services::base_navigation::clear_grid;
 use peppygen::fixtures::harness::{Config, Harness, Mocks};
-use peppygen::mock::deps::{base_state, cameras, geometry, sensor_mounts, transforms};
+use peppygen::mock::deps::{base_state, cameras, geometry, lidars, sensor_mounts, transforms};
 use peppygen::mock::pairings::base;
 use peppygen::paired_topics::base::drive_states::{
     MessageAngularLimits, MessageLinearLimits, MessagePose, MessageTwist,
@@ -72,7 +77,7 @@ use tokio::sync::Mutex;
 
 use control_core::drive_link::FollowState;
 use mock_base::{Limits, MockBase, Planar};
-use scene::{DepthLens, Pose3, Scene, TurnedBox};
+use scene::{DepthLens, LidarLens, Pose3, Scene, TurnedBox};
 
 /// One step of the node's controller and of the rig (ns): 20 Hz.
 pub const STEP_NS: i64 = 50_000_000;
@@ -95,7 +100,7 @@ pub const BASE_NAME: &str = "base";
 
 /// The publishers of the robot's tree the rig binds on transforms: the base's
 /// backbone, which moves odom to base_footprint, and the robot's initializer,
-/// which fixes each camera's frame to the robot frame.
+/// which fixes each sensor's frame to the robot frame.
 pub const BACKBONE: &str = "backbone";
 pub const INITIALIZER: &str = "initializer";
 
@@ -144,6 +149,9 @@ pub const ALIGNED: &str = "depth_to_color";
 
 /// rgbd_camera, the kind describe_sensors names each camera of the grid.
 pub const DEPTH_CAMERA: &str = "rgbd_camera";
+
+/// lidar_2d, the kind describe_sensors names each lidar of the grid.
+pub const LIDAR_2D: &str = "lidar_2d";
 
 /// The turn from a camera's body, x ahead, y left and z up, to its colour
 /// optical frame, x right, y down and z along the view.
@@ -236,6 +244,57 @@ pub const TOP: Mount = Mount {
     lens: LENS,
 };
 
+/// The fan of the tests' lidars: 360 rays a turn, one a degree from -pi,
+/// swept counterclockwise in 35.9 ms, within a step, measuring from 0.05 m to
+/// 8 m.
+pub const LIDAR_LENS: LidarLens = LidarLens {
+    min_angle_rad: -PI as f32,
+    angle_increment_rad: (2.0 * PI / 360.0) as f32,
+    rays: 360,
+    time_increment_s: 1e-4,
+    min_range_m: 0.05,
+    max_range_m: 8.0,
+};
+
+/// A 2-D lidar of the rig: its name, where the base carries it, its sensor
+/// frame turned by `yaw_rad` about the vertical, its fan, and the part that
+/// carries it as describe_sensors names it, empty for a lidar fixed to the
+/// base.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LidarMount {
+    pub name: &'static str,
+    pub position: [f64; 3],
+    pub yaw_rad: f64,
+    pub lens: LidarLens,
+    pub carried_by: &'static str,
+}
+
+impl LidarMount {
+    /// The lidar's sensor frame, as describe_sensors names it and as each of
+    /// its scans' headers names it.
+    pub fn frame(&self) -> String {
+        format!("{}_frame", self.name)
+    }
+
+    /// The lidar's sensor frame in the robot frame.
+    pub fn pose(&self) -> Pose3 {
+        Pose3 {
+            position: self.position,
+            orientation: quaternion_of_yaw(self.yaw_rad),
+        }
+    }
+}
+
+/// The lidar over the base's origin, 0.3 m up, heading along the base, fixed
+/// to the base.
+pub const LIDAR: LidarMount = LidarMount {
+    name: "lidar",
+    position: [0.0, 0.0, 0.3],
+    yaw_rad: 0.0,
+    lens: LIDAR_LENS,
+    carried_by: "",
+};
+
 /// The base's deck as the top camera sees it, its half sizes in the robot
 /// frame: 0.01 m inside the footprint's outline on each side, 0.3 m tall.
 pub const DECK_INSIDE_HALF: [f64; 3] = [0.21, 0.19, 0.15];
@@ -249,7 +308,7 @@ pub const DECK_AT_OUTLINE_HALF: [f64; 3] = [0.22, 0.2, 0.15];
 pub const ANSWER_BUDGET: Duration = Duration::from_secs(30);
 
 /// How many steps a goal waits for the node to know the base and every
-/// camera: a bound on a test that fails, never a pass condition.
+/// sensor: a bound on a test that fails, never a pass condition.
 pub const READY_STEPS: usize = 100;
 
 /// How many steps a drive takes at most before a test calls it stuck: 60 s of
@@ -533,13 +592,14 @@ struct Wire {
     base: base::Mock,
     backbone: transforms::Mock,
     cameras: Vec<cameras::Mock>,
+    lidars: Vec<lidars::Mock>,
     _initializer: transforms::Mock,
     _sensor_mounts: sensor_mounts::Mock,
     _geometry: Vec<geometry::Mock>,
 }
 
 /// Everything the rig plays but the harness: the base, the scene, the
-/// cameras, the clock's time, and what the node streamed.
+/// cameras and the lidars, the clock's time, and what the node streamed.
 pub struct World {
     /// The time of the rig's newest step (ns); the node's clock reads it less
     /// [`World::clock_lag_ns`].
@@ -547,20 +607,26 @@ pub struct World {
     pub base: MockBase,
     pub scene: Scene,
     pub mounts: Vec<Mount>,
+    pub lidars: Vec<LidarMount>,
     /// Whether the cameras publish a frame each step.
     pub cameras_on: bool,
+    /// Whether the lidars publish a scan each step.
+    pub lidars_on: bool,
+    /// The frame each scan's header names in place of its lidar's frame,
+    /// when a test sets one.
+    pub scan_frame: Option<&'static str>,
     /// Whether the base publishes drive_states and its odometry's transform
     /// each step.
     pub base_reports: bool,
-    /// The half sizes of the base's deck, which the cameras then render as a
+    /// The half sizes of the base's deck, which the sensors then render as a
     /// box on the base's footprint.
     pub deck_half: Option<[f64; 3]>,
     /// How far (rad) the base's body rests turned nose-up about its own y
-    /// axis, which the cameras render from; the odometry and the cameras'
+    /// axis, which the sensors render from; the odometry and the sensors'
     /// fixed frames hold the body level.
     pub body_pitch_up_rad: f64,
     /// How many steps after its stamp the base's report goes out: how far the
-    /// odometry lags the cameras' frames.
+    /// odometry lags the sensors' readings.
     pub odometry_lag_steps: usize,
     /// How far (ns) the node's clock reads behind the messages' stamps.
     pub clock_lag_ns: i64,
@@ -579,6 +645,10 @@ pub struct World {
     in_flight: Option<InFlight>,
     reports: VecDeque<OdometryReport>,
     frames_sent: u64,
+    scans_sent: u64,
+    /// Where the robot frame stood in the world at the step before the
+    /// newest, from which the lidars' sweeps of the newest step start.
+    truth_before: Planar,
 }
 
 impl World {
@@ -684,24 +754,35 @@ impl World {
             .insert(report.stamp_ns, (report.odometry, report.velocity));
     }
 
-    /// Publish each camera's frame of the newest step, rendered from where the
-    /// base stands in the world.
-    async fn publish_frames(&mut self) {
-        let truth = self.base.truth;
+    /// The base's body in the world where the robot frame stands at `truth`,
+    /// resting turned nose-up by [`World::body_pitch_up_rad`].
+    fn body(&self, truth: Planar) -> Pose3 {
         let (pitch_sin, pitch_cos) = (-self.body_pitch_up_rad / 2.0).sin_cos();
-        let body = Pose3::planar(truth.x, truth.y, truth.yaw).compose(&Pose3 {
+        Pose3::planar(truth.x, truth.y, truth.yaw).compose(&Pose3 {
             position: [0.0; 3],
             orientation: [0.0, pitch_sin, 0.0, pitch_cos],
-        });
-        let deck: Vec<TurnedBox> = self
-            .deck_half
+        })
+    }
+
+    /// The base's deck where the robot frame stands at `truth`, when the
+    /// sensors render one.
+    fn deck(&self, truth: Planar) -> Vec<TurnedBox> {
+        self.deck_half
             .map(|half| TurnedBox {
                 center: [truth.x, truth.y, half[2]],
                 half,
                 yaw: truth.yaw,
             })
             .into_iter()
-            .collect();
+            .collect()
+    }
+
+    /// Publish each camera's frame of the newest step, rendered from where the
+    /// base stands in the world.
+    async fn publish_frames(&mut self) {
+        let truth = self.base.truth;
+        let body = self.body(truth);
+        let deck = self.deck(truth);
         let mut sent = self.frames_sent;
         for (mount, camera) in self.mounts.iter().zip(&self.wire.cameras) {
             let lens = mount.lens;
@@ -727,8 +808,52 @@ impl World {
         self.frames_sent = sent;
     }
 
+    /// Publish each lidar's scan of the newest step, its sweep ending at the
+    /// step's time: each ray rendered from where the base stood at the ray's
+    /// time, between where it stood at the step before and where it stands.
+    async fn publish_scans(&mut self) {
+        let step_start_ns = self.now_ns - STEP_NS;
+        let mut sent = self.scans_sent;
+        for (mount, lidar) in self.lidars.iter().zip(&self.wire.lidars) {
+            let lens = mount.lens;
+            let sweep_ns = nanoseconds(lens.time_s(lens.rays - 1));
+            let first_ray_ns = self.now_ns - sweep_ns.max(0);
+            let ranges = (0..lens.rays)
+                .map(|index| {
+                    let ray_ns = first_ray_ns + nanoseconds(lens.time_s(index));
+                    let share = (ray_ns - step_start_ns) as f64 / STEP_NS as f64;
+                    let truth = self.truth_before.toward(self.base.truth, share);
+                    let sensor = self.body(truth).compose(&mount.pose());
+                    let (sin, cos) = lens.angle_rad(index).sin_cos();
+                    let direction = sensor.turn([cos, sin, 0.0]);
+                    lens.range(&self.scene, &self.deck(truth), sensor.position, direction)
+                })
+                .collect();
+            sent += 1;
+            lidar
+                .scan_stream
+                .publish(&scan_stream::Message {
+                    header: scan_stream::MessageHeader {
+                        timestamp: wire(first_ray_ns),
+                        frame: self.scan_frame.map_or_else(|| mount.frame(), str::to_owned),
+                        capture_index: sent.try_into().expect("a capture index"),
+                    },
+                    min_angle_rad: lens.min_angle_rad,
+                    angle_increment_rad: lens.angle_increment_rad,
+                    time_increment_s: lens.time_increment_s,
+                    min_range_m: lens.min_range_m,
+                    max_range_m: lens.max_range_m,
+                    ranges,
+                    intensities: Vec::new(),
+                })
+                .await
+                .expect("the lidar publishes its scan");
+        }
+        self.scans_sent = sent;
+    }
+
     /// Publish the inputs of the newest step: the base's report once its lag
-    /// passed, then each camera's frame.
+    /// passed, then each camera's frame and each lidar's scan.
     async fn publish_inputs(&mut self) {
         if self.base_reports {
             self.reports.push_back(self.report());
@@ -739,6 +864,9 @@ impl World {
         }
         if self.cameras_on {
             self.publish_frames().await;
+        }
+        if self.lidars_on {
+            self.publish_scans().await;
         }
     }
 
@@ -835,6 +963,7 @@ impl World {
     /// The first half of a step: the base moves to the next step's time.
     pub fn advance(&mut self) {
         self.now_ns += STEP_NS;
+        self.truth_before = self.base.truth;
         self.base.advance(self.now_ns);
     }
 
@@ -882,11 +1011,17 @@ struct Booted {
 }
 
 /// The node booted on the harness's simulated clock with `params`, its
-/// cameras the mocks named after `mounts` in both camera slots, the robot's
-/// tree bound to the backbone and the initializer, and its planner running
-/// `plans`.
-async fn boot(params: peppygen::Parameters, mounts: &[Mount], plans: Plans) -> Booted {
+/// cameras the mocks named after `mounts` in both camera slots, its lidars the
+/// mocks named after `lidars`, the robot's tree bound to the backbone and the
+/// initializer, and its planner running `plans`.
+async fn boot(
+    params: peppygen::Parameters,
+    mounts: &[Mount],
+    lidars: &[LidarMount],
+    plans: Plans,
+) -> Booted {
     let names: Vec<String> = mounts.iter().map(|mount| mount.name.to_string()).collect();
+    let lidar_names = lidars.iter().map(|lidar| lidar.name.to_string()).collect();
     let fault = Fault::default();
     let (planner, gate) = match plans {
         Plans::AtOnce => (Planner::default(), None),
@@ -901,6 +1036,7 @@ async fn boot(params: peppygen::Parameters, mounts: &[Mount], plans: Plans) -> B
             clock: HarnessClock::Consumer,
             cameras_instance_ids: names.clone(),
             geometry_instance_ids: names,
+            lidars_instance_ids: lidar_names,
             transforms_instance_ids: vec![BACKBONE.to_string(), INITIALIZER.to_string()],
             ..Config::default()
         },
@@ -916,14 +1052,27 @@ async fn boot(params: peppygen::Parameters, mounts: &[Mount], plans: Plans) -> B
 }
 
 /// describe_sensors' answer: each camera of `mounts` a depth camera fixed to
-/// the base at its colour optical frame.
-pub fn sensors_answer(mounts: &[Mount]) -> sensor_mounts::describe_sensors::ResponseData {
+/// the base at its colour optical frame, then each lidar of `lidars` a lidar
+/// at its sensor frame, carried by the part it names.
+pub fn sensors_answer(
+    mounts: &[Mount],
+    lidars: &[LidarMount],
+) -> sensor_mounts::describe_sensors::ResponseData {
+    let sensors: Vec<(&str, &str, String, &str)> = mounts
+        .iter()
+        .map(|mount| (mount.name, DEPTH_CAMERA, mount.frame(), ""))
+        .chain(
+            lidars
+                .iter()
+                .map(|lidar| (lidar.name, LIDAR_2D, lidar.frame(), lidar.carried_by)),
+        )
+        .collect();
     sensor_mounts::describe_sensors::ResponseData {
         robot_frame: ROBOT_FRAME.to_string(),
-        sensor_names: mounts.iter().map(|m| m.name.to_string()).collect(),
-        sensor_kinds: mounts.iter().map(|_| DEPTH_CAMERA.to_string()).collect(),
-        sensor_frames: mounts.iter().map(Mount::frame).collect(),
-        carried_by: mounts.iter().map(|_| String::new()).collect(),
+        sensor_names: sensors.iter().map(|s| s.0.to_string()).collect(),
+        sensor_kinds: sensors.iter().map(|s| s.1.to_string()).collect(),
+        sensor_frames: sensors.iter().map(|s| s.2.clone()).collect(),
+        carried_by: sensors.iter().map(|s| s.3.to_string()).collect(),
     }
 }
 
@@ -970,16 +1119,18 @@ fn describe_cameras(mounts: &[Mount], cameras: &[cameras::Mock], geometry: &[geo
     }
 }
 
-/// Publish each camera's colour optical frame fixed to the robot frame, as
-/// the robot's initializer publishes the fixed joints of the robot's model.
-async fn fix_the_cameras(initializer: &transforms::Mock, mounts: &[Mount]) {
+/// Publish each camera's colour optical frame and each lidar's sensor frame
+/// fixed to the robot frame, as the robot's initializer publishes the fixed
+/// joints of the robot's model.
+async fn fix_the_sensors(initializer: &transforms::Mock, mounts: &[Mount], lidars: &[LidarMount]) {
     let fixed = mounts
         .iter()
-        .map(|mount| {
-            let pose = mount.pose();
+        .map(|mount| (mount.frame(), mount.pose()))
+        .chain(lidars.iter().map(|lidar| (lidar.frame(), lidar.pose())))
+        .map(|(frame, pose)| {
             peppygen::consumed_topics::transforms::static_transforms::MessageTransformsItem {
                 frame: ROBOT_FRAME.to_string(),
-                child_frame: mount.frame(),
+                child_frame: frame,
                 position: pose.position,
                 orientation: pose.orientation,
             }
@@ -989,7 +1140,7 @@ async fn fix_the_cameras(initializer: &transforms::Mock, mounts: &[Mount]) {
         .static_transforms
         .publish(&transforms::static_transforms::Message { transforms: fixed })
         .await
-        .expect("the initializer publishes the cameras' frames");
+        .expect("the initializer publishes the sensors' frames");
 }
 
 pub struct Rig {
@@ -1048,11 +1199,11 @@ macro_rules! stepping_sender {
 }
 
 /// A sender of goals to `$action` once the node knows the base and a reading
-/// of every camera, through the [`sender!`] `$send`.
+/// of every sensor, through the [`sender!`] `$send`.
 macro_rules! ready_sender {
     ($send_when_ready:ident, $send:ident, $action:ident) => {
         /// Send `goal` once the node knows the base and a reading of every
-        /// camera: while it refuses the goal with `resource_unavailable`, step
+        /// sensor: while it refuses the goal with `resource_unavailable`, step
         /// and send it again. The base rests meanwhile, so the step the goal
         /// is accepted at changes nothing of the world it drives in.
         pub async fn $send_when_ready(
@@ -1068,7 +1219,7 @@ macro_rules! ready_sender {
                     _ => return sent,
                 }
             }
-            panic!("the node waits {READY_STEPS} steps for the base or a camera");
+            panic!("the node waits {READY_STEPS} steps for the base or a sensor");
         }
     };
 }
@@ -1117,15 +1268,17 @@ impl Rig {
     /// clock at a step before [`START_NS`], before the base's first state and
     /// before any answer of describe_base.
     pub async fn booted(params: peppygen::Parameters, scene: Scene, mounts: &[Mount]) -> Self {
-        Self::booted_with(params, scene, mounts, 0, Plans::AtOnce).await
+        Self::booted_with(params, scene, mounts, &[], 0, Plans::AtOnce).await
     }
 
-    /// [`Rig::booted`] on a clock that reads `clock_lag_ns` behind the
-    /// messages' stamps from its first tick on, the planner running `plans`.
+    /// [`Rig::booted`] with the lidars of `lidars` too, on a clock that reads
+    /// `clock_lag_ns` behind the messages' stamps from its first tick on, the
+    /// planner running `plans`.
     pub async fn booted_with(
         params: peppygen::Parameters,
         scene: Scene,
         mounts: &[Mount],
+        lidars: &[LidarMount],
         clock_lag_ns: i64,
         plans: Plans,
     ) -> Self {
@@ -1133,22 +1286,25 @@ impl Rig {
             harness,
             mocks,
             gate,
-        } = boot(params, mounts, plans).await;
+        } = boot(params, mounts, lidars, plans).await;
         let Mocks { deps, pairings, .. } = mocks;
         deps.sensor_mounts
             .describe_sensors
-            .enqueue_response(sensors_answer(mounts))
+            .enqueue_response(sensors_answer(mounts, lidars))
             .expect("sensor_mounts takes its answer");
         describe_cameras(mounts, &deps.cameras, &deps.geometry);
         let [backbone, initializer] = <[_; 2]>::try_from(deps.transforms)
             .unwrap_or_else(|_| panic!("the rig binds the backbone and the initializer"));
-        fix_the_cameras(&initializer, mounts).await;
+        fix_the_sensors(&initializer, mounts, lidars).await;
         let mut world = World {
             now_ns: START_NS - STEP_NS,
             base: MockBase::new(LIMITS, ODOMETRY_STARTED_AT_NS),
             scene,
             mounts: mounts.to_vec(),
+            lidars: lidars.to_vec(),
             cameras_on: true,
+            lidars_on: true,
+            scan_frame: None,
             base_reports: true,
             deck_half: None,
             body_pitch_up_rad: 0.0,
@@ -1162,6 +1318,7 @@ impl Rig {
                 base: pairings.base,
                 backbone,
                 cameras: deps.cameras,
+                lidars: deps.lidars,
                 _initializer: initializer,
                 _sensor_mounts: deps.sensor_mounts,
                 _geometry: deps.geometry,
@@ -1169,6 +1326,8 @@ impl Rig {
             in_flight: None,
             reports: VecDeque::new(),
             frames_sent: 0,
+            scans_sent: 0,
+            truth_before: Planar::default(),
         };
         // The node's clock reads a time before the base's first state arrives.
         world.tick_and_see(&harness.clock).await;
@@ -1183,7 +1342,18 @@ impl Rig {
         mounts: &[Mount],
         answer: base_state::describe_base::ResponseData,
     ) -> Self {
-        let mut rig = Self::booted(params, scene, mounts).await;
+        Self::start_with_lidars(params, scene, mounts, &[], answer).await
+    }
+
+    /// [`Rig::start_with`] with the lidars of `lidars` too.
+    pub async fn start_with_lidars(
+        params: peppygen::Parameters,
+        scene: Scene,
+        mounts: &[Mount],
+        lidars: &[LidarMount],
+        answer: base_state::describe_base::ResponseData,
+    ) -> Self {
+        let mut rig = Self::booted_with(params, scene, mounts, lidars, 0, Plans::AtOnce).await;
         rig.first_step(answer).await;
         rig
     }
@@ -1204,7 +1374,7 @@ impl Rig {
     /// [`Rig::start`] with the plans held: no plan starts until the test
     /// releases it.
     pub async fn start_held(scene: Scene) -> Self {
-        let mut rig = Self::booted_with(params(), scene, &[FRONT], 0, Plans::Held).await;
+        let mut rig = Self::booted_with(params(), scene, &[FRONT], &[], 0, Plans::Held).await;
         rig.first_step(measured()).await;
         rig
     }
@@ -1213,7 +1383,7 @@ impl Rig {
     /// messages' stamps.
     pub async fn start_lagging(scene: Scene, clock_lag_ns: i64) -> Self {
         let mut rig =
-            Self::booted_with(params(), scene, &[FRONT], clock_lag_ns, Plans::AtOnce).await;
+            Self::booted_with(params(), scene, &[FRONT], &[], clock_lag_ns, Plans::AtOnce).await;
         rig.first_step(measured()).await;
         rig
     }
@@ -1224,7 +1394,7 @@ impl Rig {
         self.step().await;
     }
 
-    /// Step until the node knows the base and a reading of every camera, and
+    /// Step until the node knows the base and a reading of every sensor, and
     /// leave no goal in flight: while drive_states report follower_goal, a
     /// goal is refused with `precondition_failed` once every earlier check
     /// passes, and with `resource_unavailable` before.
@@ -1249,7 +1419,7 @@ impl Rig {
         }
         assert!(
             known,
-            "the node waits {READY_STEPS} steps for the base or a camera"
+            "the node waits {READY_STEPS} steps for the base or a sensor"
         );
         self.world.base.follow_state = follows;
         self.step().await;
@@ -1283,7 +1453,7 @@ impl Rig {
         seen
     }
 
-    /// The clock leaps over `steps` steps, the base's and the cameras' inputs
+    /// The clock leaps over `steps` steps, the base's and the sensors' inputs
     /// arriving meanwhile.
     pub async fn leap(&mut self, steps: usize) -> StepSeen {
         self.world.leap(steps, &self.harness.clock).await
@@ -1307,6 +1477,23 @@ impl Rig {
             .await
             .refusal
             .unwrap_or_else(|| panic!("the node accepted {goal:?}"))
+    }
+
+    /// The failure `goal` is refused with once `holds` holds of it, stepping
+    /// while it does not: a refusal that names what the node has read by then.
+    pub async fn refusal_once(
+        &mut self,
+        goal: &navigate_to_pose::GoalRequestData,
+        mut holds: impl FnMut(&navigate_to_pose::Failure) -> bool,
+    ) -> navigate_to_pose::Failure {
+        for _ in 0..READY_STEPS {
+            let refusal = self.refusal(goal).await;
+            if holds(&refusal) {
+                return refusal;
+            }
+            self.step().await;
+        }
+        panic!("no refusal of {goal:?} in {READY_STEPS} steps held");
     }
 
     /// The failure `goal` is refused with, stepping while the node waits on
