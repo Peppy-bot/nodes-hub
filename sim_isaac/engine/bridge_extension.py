@@ -25,7 +25,7 @@ from __future__ import annotations
 import gc
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from control_core_py.geometry import Pose
 from robot_description_py import FingerSpan
@@ -206,44 +206,91 @@ class IsaacBridgeExtension:
         self._timeline_base_s = 0.0
         self._timeline_read_s: Optional[float] = None
         self._standing_reported = False
+        # Whether a bind took views that no resolve has read since
+        # (views_to_read).
+        self._views_to_read = False
 
     def bind(self) -> None:
         """Builds a view of every robot on the stage, and a camera rig on
-        each robot holding a camera pair. The views read on the steps that
-        follow, once the stage is playing again. Every caller lets go of the
-        views it held first."""
+        each robot holding a camera pair. The rigs follow their pairs before
+        the views are built: a rig's drop removes its render product's prim,
+        and Isaac's Articulation drops its PhysX view on the removal of any
+        prim. The views read once resolve runs, or on the steps that follow,
+        once the stage is playing again. Every caller lets go of the views it
+        held first."""
         assert not self._limbs, "bind takes the stage up after unbind let it go"
+        self._drop_rigs(self._rigs_to_drop())
+        self._mount_rigs()
         self._limbs = {
             robot.instance: RobotLimbs(robot) for robot in self._world.robots()
         }
         self._wheels = {
             name: loops for name, loops in self._wheels.items() if name in self._limbs
         }
-        self._reconcile_rigs()
+        self._views_to_read = True
 
     def resolve(self, update, steps: int) -> None:
         """Initialises every robot's views on the live stage, running
         `update` until they all read or `steps` run out. A robot whose
         model names a joint its articulation lacks raises here, inside the
         stand that put it on the stage, so that stand takes it back out."""
+        self._views_to_read = False
         for _ in range(steps):
             if all(limbs.setup() for limbs in self._limbs.values()):
                 return
             update()
 
+    @property
+    def views_to_read(self) -> bool:
+        """Whether a bind took views that no resolve has read since."""
+        return self._views_to_read
+
+    def remove_from_stage(self, remove: Callable[[], None]) -> None:
+        """Runs `remove`, which takes prims off the live stage, between
+        letting go of every view and taking them again, and drops the object
+        reader's rigid-body view, which the next capture creates again.
+        Isaac's Articulation drops its PhysX view on the removal of any prim,
+        its own or another's. No update runs inside it; the loop resolves the
+        views before its next step (views_to_read). A robot that joins or
+        leaves lets go of the views around a stopped timeline
+        (SimLauncher.unbind and rebind)."""
+        self.unbind()
+        remove()
+        self.bind()
+        self._objects.invalidate_physics_views()
+
     def _reconcile_rigs(self) -> None:
         """Mounts the rig of its model on each robot on the stage that holds
         a camera pair and drops the rig of one that holds none: a robot's
         relays pair in after it stands, and a relay that stops takes its pair
-        with it."""
+        with it. A drop is a removal (remove_from_stage)."""
+        dropped = self._rigs_to_drop()
+        if dropped:
+            self.remove_from_stage(lambda: self._drop_rigs(dropped))
+        self._mount_rigs()
+
+    def _rigs_to_drop(self) -> list[str]:
+        """The robots whose rig stands while they hold no camera pair or
+        have left the stage."""
+        if not self._camera_sensors:
+            return []
+        rigged = self._io.camera_robots()
+        on_stage = {robot.instance for robot in self._world.robots()}
+        return [
+            instance for instance in self._camera_sensors
+            if instance not in rigged or instance not in on_stage
+        ]
+
+    def _drop_rigs(self, instances: list[str]) -> None:
+        for instance in instances:
+            self._camera_sensors.pop(instance).teardown()
+
+    def _mount_rigs(self) -> None:
+        """Mounts the rig of its model on each robot on the stage that holds
+        a camera pair and has none."""
         if not self._renders:
             return
         rigged = self._io.camera_robots()
-        on_stage = {robot.instance for robot in self._world.robots()}
-        for instance, sensor in list(self._camera_sensors.items()):
-            if instance not in rigged or instance not in on_stage:
-                sensor.teardown()
-                del self._camera_sensors[instance]
         for robot in self._world.robots():
             if robot.instance not in rigged or robot.instance in self._camera_sensors:
                 continue
@@ -272,7 +319,7 @@ class IsaacBridgeExtension:
         reading, so this runs before the stage changes, and the bind after
         the change takes the views again. The camera rigs stay: their render
         products ride the robots' prims, and the next bind drops the rigs of
-        robots that left."""
+        robots that left or hold no camera pair."""
         for limbs in self._limbs.values():
             limbs.teardown()
         self._limbs = {}
@@ -314,15 +361,17 @@ class IsaacBridgeExtension:
 
         if not self._state_pacer.take_if_due(time.monotonic()):
             return
-        # The camera and base pairs are read once per state tick: a rig
-        # follows its pair within a tick of it forming or dissolving, and a
-        # base whose pair is gone holds its wheels where they stand.
+        # The camera and base pairs are read on each state tick: a base
+        # whose pair is gone holds its wheels where they stand, and a rig
+        # follows its pair within a tick of it forming or dissolving.
         self._io.setpoints.keep_paired_bases()
-        self._reconcile_rigs()
         # Published before the state it stamps; a stopped timeline stops the
         # domain's clock with it.
         self._io.publish_clock_tick()
         self._publish_state(ready)
+        # After the publish: a rig's drop lets every view go and takes them
+        # again, and the loop resolves them before the next step.
+        self._reconcile_rigs()
 
     def _engine_time_s(self) -> float:
         """Isaac's simulated time, in seconds since the engine started: the

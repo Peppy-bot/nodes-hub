@@ -5,7 +5,8 @@ A view of a prim that is edited under it stops reading, so the bridge drops
 every view before the stage changes and builds them again after. These cover
 that the drop reaches every view of every robot, that what a view cached goes
 with it, that the camera's render products, which ride USD prims, are left
-alone, that every state tick carries the spawned objects' snapshot, and that
+alone by an edit, that a rig's drop removes a prim and so takes every view
+again, that every state tick carries the spawned objects' snapshot, and that
 the engine clock runs on across the timeline's stops.
 """
 
@@ -38,6 +39,21 @@ def _limbs_of(module, instance):
     limbs.ready = True
     limbs.robot = Mock(instance=instance, known=Mock(rolls=False))
     return limbs
+
+
+def _trace_views(bridge, monkeypatch):
+    """The trace of every view the bridge lets go of and builds, and of the
+    object reader's view it drops."""
+    trace = []
+    for name, limbs in bridge._limbs.items():
+        limbs.teardown.side_effect = lambda name=name: trace.append(f"let go of {name}")
+    monkeypatch.setattr(
+        sys.modules["_bridge_under_test"],
+        "RobotLimbs",
+        lambda robot: trace.append(f"view of {robot.instance}") or _limbs_of(None, robot.instance),
+    )
+    bridge._objects.invalidate_physics_views.side_effect = lambda: trace.append("drop the object view")
+    return trace
 
 
 @pytest.fixture
@@ -101,14 +117,65 @@ def test_the_cameras_outlive_the_views_they_stand_beside(bridge, monkeypatch):
     module.IsaacCameraSensor.assert_not_called()
 
 
-def test_the_rig_of_a_robot_gone_from_the_stage_is_dropped(bridge):
-    held_camera = bridge._camera_sensors["alpha"]
+def test_bind_drops_the_rig_of_a_robot_gone_from_the_stage_before_it_builds_a_view(
+    bridge, monkeypatch
+):
+    bridge.unbind()
+    trace = _trace_views(bridge, monkeypatch)
+    bridge._camera_sensors["alpha"].teardown.side_effect = lambda: trace.append("drop alpha's rig")
     bridge._world.robots.return_value = [Mock(instance="bravo")]
 
-    bridge._reconcile_rigs()
+    bridge.bind()
 
-    held_camera.teardown.assert_called_once_with()
+    # The drop removes a prim, and a view built before it loses its PhysX
+    # view to it.
+    assert trace == ["drop alpha's rig", "view of bravo"]
     assert "alpha" not in bridge._camera_sensors
+
+
+def test_a_removal_lets_every_view_go_before_it_and_takes_them_again_after(bridge, monkeypatch):
+    trace = _trace_views(bridge, monkeypatch)
+
+    bridge.remove_from_stage(lambda: trace.append("remove"))
+
+    assert trace == [
+        "let go of alpha", "let go of bravo", "remove", "view of alpha", "view of bravo",
+        "drop the object view",
+    ]
+    assert bridge.views_to_read
+
+
+def test_the_views_a_bind_took_wait_for_a_resolve(bridge, monkeypatch):
+    _trace_views(bridge, monkeypatch)
+    bridge.unbind()
+    bridge.bind()
+    assert bridge.views_to_read
+
+    bridge.resolve(Mock(), 10)
+
+    assert not bridge.views_to_read
+
+
+def test_a_rig_dropped_while_its_robot_stands_takes_every_view_again(bridge, monkeypatch):
+    trace = _trace_views(bridge, monkeypatch)
+    bridge._camera_sensors["alpha"].teardown.side_effect = lambda: trace.append("drop alpha's rig")
+    monkeypatch.setattr(type(bridge), "_engine_time_s", lambda self: 0.0)
+    monkeypatch.setattr(type(bridge), "_publish_state", lambda self, ready: trace.append("publish"))
+    bridge._state_pacer = Mock(take_if_due=Mock(return_value=True))
+    bridge._robots.standing.return_value = {}
+
+    # alpha's relays stop while it stands.
+    bridge._io.camera_robots.return_value = set()
+    bridge.step()
+
+    # The tick publishes off the views it read, then the drop takes them all
+    # again for the loop to resolve before its next step.
+    assert trace == [
+        "publish", "let go of alpha", "let go of bravo", "drop alpha's rig",
+        "view of alpha", "view of bravo", "drop the object view",
+    ]
+    assert bridge._camera_sensors == {}
+    assert bridge.views_to_read
 
 
 def test_taking_the_stage_up_again_builds_a_view_of_every_robot_on_it(bridge, monkeypatch):
@@ -162,6 +229,7 @@ def test_a_rig_follows_its_robots_camera_pair(bridge, monkeypatch):
     module.IsaacCameraSensor.side_effect = lambda instance, *_: built.append(instance) or Mock(
         spec=["setup", "teardown", "step"]
     )
+    monkeypatch.setattr(module, "RobotLimbs", lambda robot: _limbs_of(None, robot.instance))
     monkeypatch.setattr(type(bridge), "_engine_time_s", lambda self: 0.0)
     bridge._state_pacer = Mock(take_if_due=Mock(return_value=True))
     bridge._objects.capture_object_states.return_value = None
