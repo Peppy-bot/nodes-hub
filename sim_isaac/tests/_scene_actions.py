@@ -20,7 +20,7 @@ _ENGINE_DIR = Path(__file__).resolve().parents[1] / "engine"
 # slot, and each service of the scene and objects slots.
 _ACTIONS = (
     "apply_force", "clear_scene", "load_scene", "load_template", "move_object", "move_robot", "remove_object",
-    "spawn_object",
+    "resize_object", "spawn_object",
 )
 _SERVICES = {
     "scene": (
