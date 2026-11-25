@@ -1,15 +1,16 @@
 //! What the node runs on: its parameters, parsed once at setup ([`BaseParameters`]),
 //! the limits of the base's motion along x and of its turn, linear_limits and
 //! angular_limits as describe_base answers them and base_state's limiter
-//! holds every velocity to, the rest
-//! velocity, and the odometry's window; and, once the robot's initializer
-//! names the robot's model, the model's base ([`BaseModel`]) with them
-//! ([`BaseConfig`]): the wheel geometry and the odometry it starts from, the
-//! rest bounds the geometry gives the rest velocity ([`RestBounds`]), and the
-//! outline; and from the limits and the rest bounds, linear_limits and
-//! angular_limits as describe_base answers them and drive_states carries them
-//! ([`MotionLimits`]). A launch with a value the node cannot run on is refused
-//! at setup, by parameter name.
+//! holds every velocity to, the axes as move_base plans and steers along them,
+//! each way floored at the node's slowest turn rate and drive speeds
+//! ([`MoveAxes`]), the rest velocity, and the odometry's window; and, once
+//! the robot's initializer names the robot's model, the model's base
+//! ([`BaseModel`]) with them ([`BaseConfig`]): the wheel geometry and the
+//! odometry it starts from, the rest bounds the geometry gives the rest
+//! velocity ([`RestBounds`]), and the outline; and from the limits and the
+//! rest bounds, linear_limits and angular_limits as describe_base answers
+//! them and drive_states carries them ([`MotionLimits`]). A launch with a
+//! value the node cannot run on is refused at setup, by parameter name.
 
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
@@ -24,7 +25,9 @@ use control_core::time::{SecondsParameterError, duration_parameter, seconds, wai
 use peppygen::Parameters;
 
 use crate::model::{BaseModel, BundledBase, ModelError};
-use crate::move_control::AxisProfile;
+use crate::move_control::{
+    AxisProfile, LONGEST_SHORTEST_TURN, MoveAxes, Way, finer_than, leg_floor, shown_finest,
+};
 use crate::transforms::JointTransforms;
 
 /// A parameter the node cannot run on.
@@ -33,6 +36,17 @@ pub enum ConfigError {
     #[error("parameter {name}")]
     NotPositive {
         name: &'static str,
+        #[source]
+        source: NotPositiveFinite,
+    },
+    /// A floor of move_base's turn or drive, `example` the Nav2 default of
+    /// the same floor.
+    #[error(
+        "parameter {name}: move_base ends a turn or a drive at the stop nearest its end, which a floor above 0 reaches, so give {name} above 0, such as {example}"
+    )]
+    FloorNotPositive {
+        name: &'static str,
+        example: &'static str,
         #[source]
         source: NotPositiveFinite,
     },
@@ -59,6 +73,16 @@ pub enum ConfigError {
     OneWayTurn,
     #[error("parameter smoothing_frequency_hz")]
     Smoothing(#[source] LimiterError),
+    /// `turn` as a refusal shows it ([`shown_finest`]).
+    #[error(
+        "parameter min_turn_rate_rad_s: the shortest turn from rest at smoothing_frequency_hz, angular_limits and min_turn_rate_rad_s is {turn} rad, past 2 rad, the longest at which move_base reaches every position tolerance it takes, so give a larger smoothing_frequency_hz or angular_limits max_deceleration, a smaller angular_limits max_acceleration or deadband, or a smaller min_turn_rate_rad_s while it lies above that deadband"
+    )]
+    ShortestTurnPastLongest { turn: f64 },
+    /// `finest` as a refusal shows it ([`shown_finest`]).
+    #[error(
+        "parameter rotate_to_heading_min_angle_rad: move_base's drive turns toward its target again past this bearing, and the shortest turn from rest at angular_limits and min_turn_rate_rad_s is {finest} rad, so give rotate_to_heading_min_angle_rad of at least {finest}, got {angle}"
+    )]
+    AimBelowShortestTurn { angle: f64, finest: f64 },
     #[error("parameter velocity_rolling_window_size must be at least 1")]
     EmptyWindow,
     #[error(transparent)]
@@ -109,18 +133,34 @@ impl AxisSpec {
         .map_err(|source| ConfigError::Axis { name, source })
     }
 
-    /// The fastest the axis moves each way, with its acceleration,
-    /// deceleration and deadband: the profile move_base plans and steers a
-    /// leg along it with.
-    pub fn profile(&self) -> AxisProfile {
+    /// The fastest the axis moves each way, with its acceleration and
+    /// deceleration, and the floor of each way from the node's slowest speed
+    /// toward the axis's positive direction, `slowest_positive`, and toward
+    /// its negative one, `slowest_negative`, and from the deadband: the
+    /// profile move_base plans and steers a leg along it with.
+    pub fn profile(&self, slowest_positive: f64, slowest_negative: f64) -> AxisProfile {
+        let way = |speed: f64, slowest: f64| Way {
+            speed,
+            floor: leg_floor(slowest, self.deadband, speed),
+        };
         AxisProfile {
-            positive_speed: self.max_velocity,
-            negative_speed: -self.min_velocity,
+            positive: way(self.max_velocity, slowest_positive),
+            negative: way(-self.min_velocity, slowest_negative),
             acceleration: self.max_acceleration,
             deceleration: self.max_deceleration,
             deadband: self.deadband,
         }
     }
+}
+
+/// The slowest turn rate (rad/s) and drive speeds (m/s) move_base commands,
+/// each a magnitude: the node's min_turn_rate_rad_s, min_forward_speed_m_s
+/// and min_backward_speed_m_s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SlowestSpeeds {
+    pub turn_rate: f64,
+    pub forward: f64,
+    pub backward: f64,
 }
 
 /// The axes a differential base moves along: ahead along x (`linear`) and
@@ -152,6 +192,16 @@ impl BaseAxes {
             velocity_timeout_s,
         })
         .map_err(ConfigError::Smoothing)
+    }
+
+    /// The axes as move_base plans and steers along them under base_state's
+    /// limiter stepping every `dt` (s), each way floored at `slowest`.
+    pub fn move_axes(&self, slowest: SlowestSpeeds, dt: f64) -> MoveAxes {
+        MoveAxes::new(
+            self.linear.profile(slowest.forward, slowest.backward),
+            self.angular.profile(slowest.turn_rate, slowest.turn_rate),
+            dt,
+        )
     }
 }
 
@@ -239,6 +289,9 @@ impl LimiterSettings {
 #[derive(Debug)]
 pub struct BaseParameters {
     pub axes: BaseAxes,
+    /// The axes as move_base plans and steers along them, each way floored at
+    /// the node's slowest turn rate and drive speeds.
+    pub move_axes: MoveAxes,
     /// linear_limits' rest_velocity (m/s): the largest speed each wheel
     /// measures along the floor while the base stands.
     rest_velocity: f64,
@@ -260,6 +313,8 @@ pub struct BaseConfig {
     /// The bundled model the base is built from.
     pub model: &'static robot_description::Model,
     pub axes: BaseAxes,
+    /// The axes as move_base plans and steers along them.
+    pub move_axes: MoveAxes,
     /// base_state's rest bounds, the turn rate's from the wheel geometry
     /// ([`RestBounds::of_wheels`]).
     pub rest: RestBounds,
@@ -334,6 +389,24 @@ fn positive(name: &'static str, value: f64) -> Result<f64, ConfigError> {
         .map_err(|source| ConfigError::NotPositive { name, source })
 }
 
+/// Nav2 1.5.2's default floors (nav2_bringup params/nav2_params.yaml): Spin's
+/// min_rotational_vel (:455), and BackUp's and DriveOnHeading's
+/// minimum_speed (:439, :444).
+const NAV2_TURN_FLOOR: &str = "Spin's min_rotational_vel in Nav2's defaults, 0.4";
+const NAV2_DRIVE_FLOOR: &str = "DriveOnHeading's minimum_speed in Nav2's defaults, 0.1";
+
+/// A floor of move_base's turn or drive, `name`, above 0, as the Nav2
+/// default `example` is.
+fn floor(name: &'static str, value: f64, example: &'static str) -> Result<f64, ConfigError> {
+    PositiveFinite::parse(value)
+        .map(PositiveFinite::get)
+        .map_err(|source| ConfigError::FloorNotPositive {
+            name,
+            example,
+            source,
+        })
+}
+
 impl BaseParameters {
     pub fn parse(params: &Parameters) -> Result<Self, ConfigError> {
         let (linear, angular) = (&params.linear_limits, &params.angular_limits);
@@ -367,16 +440,47 @@ impl BaseParameters {
         let step_ns = limiter.period_ns;
         let odometry_window = NonZeroUsize::new(params.velocity_rolling_window_size as usize)
             .ok_or(ConfigError::EmptyWindow)?;
+        let slowest = SlowestSpeeds {
+            turn_rate: floor(
+                "min_turn_rate_rad_s",
+                params.min_turn_rate_rad_s,
+                NAV2_TURN_FLOOR,
+            )?,
+            forward: floor(
+                "min_forward_speed_m_s",
+                params.min_forward_speed_m_s,
+                NAV2_DRIVE_FLOOR,
+            )?,
+            backward: floor(
+                "min_backward_speed_m_s",
+                params.min_backward_speed_m_s,
+                NAV2_DRIVE_FLOOR,
+            )?,
+        };
+        let move_axes = axes.move_axes(slowest, seconds(step_ns));
+        let shortest_turn = move_axes.finest.yaw;
+        if shortest_turn.is_nan() || shortest_turn > LONGEST_SHORTEST_TURN {
+            return Err(ConfigError::ShortestTurnPastLongest {
+                turn: shown_finest(shortest_turn),
+            });
+        }
         let rotate_to_heading_min_angle_rad = positive(
             "rotate_to_heading_min_angle_rad",
             params.rotate_to_heading_min_angle_rad,
         )?;
+        if finer_than(rotate_to_heading_min_angle_rad, shortest_turn) {
+            return Err(ConfigError::AimBelowShortestTurn {
+                angle: rotate_to_heading_min_angle_rad,
+                finest: shown_finest(shortest_turn),
+            });
+        }
         let stop_answer_timeout =
             duration_parameter("stop_answer_timeout_s", params.stop_answer_timeout_s)?;
         let cache_window = duration_parameter("cache_window_s", params.cache_window_s)?;
         let lookup_timeout = wait_parameter("lookup_timeout_s", params.lookup_timeout_s)?;
         Ok(Self {
             axes,
+            move_axes,
             rest_velocity,
             limiter,
             step_ns,
@@ -404,6 +508,7 @@ impl BaseParameters {
         Ok(BaseConfig {
             model: bundled,
             axes: self.axes,
+            move_axes: self.move_axes,
             rest: RestBounds::of_wheels(self.rest_velocity, &base.wheels),
             wheels: base.wheels,
             odometry,

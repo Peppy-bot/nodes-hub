@@ -234,30 +234,57 @@ fails with `timeout` when it does not by the settle timeout after the command
 reached 0, its message giving the base's velocity then.
 
 `move_base` takes a target, which it places in odom at acceptance and steers
-to there, settle tolerances above 0, and a duration and a settle timeout from
-0 to 60 s (`move_control.rs`). The plan times, from where the robot frame
-stands at acceptance, the turn toward the target, the drive ahead and the turn
-to the target's heading, each turn the shorter way, as the fastest moves
-describe_base's limits allow at the speed of the way each leg goes, and scales
-each leg's speed to take the requested duration. The node takes a base that
-drives ahead and turns both ways: `linear_limits`' max_velocity above 0, and
-`angular_limits`' min_rate below 0 and max_rate above 0. A move whose plan
-takes longer than 60 s, as the fastest move to a far target does on a slow
-base, is refused, the refusal giving its time and saying to split it into
-moves to nearer targets. Each step steers on the odometry: a turn as Nav2's
-Spin turns, a drive as Nav2's DriveOnHeading drives, each braking at the speed
-from which the limiter's steps stop the base on the end of its leg. The drive
-turns toward the target again once the target's bearing leaves the orientation
-tolerance, or the node's `rotate_to_heading_min_angle_rad`, as Nav2's
-regulated pure pursuit's rotate_to_heading_min_angle, when the tolerance is
-wider. A turn ends once what remains of it falls below one limiter step at the
-angular deadband. A drive past its target backs up to it on a base that drives
-backward, and turns toward it again on a base that cannot. While the base
-stands outside the tolerances, the axis of the leg it is on commands at least
-just above its deadband. The move completes once, at or after its planned end,
-the base rests within both tolerances, and fails with `timeout` at the settle
-timeout after the planned end, its message giving how far the base stands from
-the target.
+to there, settle tolerances no finer than the base takes, and a duration and a
+settle timeout from 0 to 60 s (`move_control.rs`). The plan times, from where
+the robot frame stands at acceptance, the turn toward the target, the drive
+ahead and the turn to the target's heading, each turn the shorter way, as the
+fastest moves describe_base's limits allow at the speed of the way each leg
+goes, and scales each leg's speed to take the requested duration. The node
+takes a base that drives ahead and turns both ways: `linear_limits`'
+max_velocity above 0, and `angular_limits`' min_rate below 0 and max_rate
+above 0. A move whose plan takes longer than 60 s, as the fastest move to a
+far target does on a slow base, is refused, the refusal giving its time and
+saying to split it into moves to nearer targets. Each step steers on the
+odometry and the limiter's velocity: a turn as Nav2's Spin turns, a drive as
+Nav2's DriveOnHeading drives, ramping from the limiter's velocity, where
+DriveOnHeading ramps from its own last command, each braking at the speed from
+which the limiter's steps stop the base on the end of its leg, and each at
+least its floor: the node's `min_turn_rate_rad_s`, Spin's min_rotational_vel,
+for a turn, and `min_forward_speed_m_s` and `min_backward_speed_m_s`,
+DriveOnHeading's and BackUp's minimum_speed, for a drive ahead and backward,
+each above 0, as a leg ends at the stop nearest its end, which a floor above 0
+reaches, and each raised to just above the axis's deadband and held to its
+limit that way. A leg ends at the stop nearest its end: once the limiter,
+brought to 0 at the deceleration from its velocity, stops the base on or past
+the end, or nearer it than the stop from the next step that executes at the
+leg's command. A step executes at or above the axis's deadband, and the end
+counts only the steps that execute; the limiter's velocity, from which each
+step starts, is the one before the deadband. A leg that holds its floor moves
+one step at the floor each step and ends with its stop within half of that of
+its end; at rest, the shortest move a leg makes is the limiter's ramp toward
+its floor up to its first step that executes, and the stop from there, and a
+leg within half of that of its end ends where it stands. The drive starts when
+it runs from where the base stands, and the base turns toward the target
+otherwise. The drive turns toward the target again once the target's bearing
+leaves the orientation tolerance, or the node's
+`rotate_to_heading_min_angle_rad`, as Nav2's regulated pure pursuit's
+rotate_to_heading_min_angle, when the tolerance is wider. A drive past its
+target backs up to it on a base that drives backward, and turns toward it
+again on a base that cannot. A leg that ends with the base outside the
+tolerances starts again from where the base stands. The finest tolerances the
+node takes are the shortest leg from rest at the floors and the limiter: a
+position tolerance of at least the shortest drive and an orientation tolerance
+of at least the shortest turn. A finer one, below the finest by more than 1e-9
+of it, is refused with `rejected`, the message naming the finest to 9
+significant digits. A base at rest outside its tolerances so has a leg that
+runs and moves the base, while the shortest turn is at most 2 rad: the node
+refuses a longer one. These are the finest tolerances of a base whose odometry
+gives the pose of the current step. A base whose odometry lags by one step
+carries a turn at its floor one step past its end, `min_turn_rate_rad_s` times
+the limiter's step, and may need a coarser orientation tolerance to settle.
+The move completes once, at or after its planned end, the base rests within
+both tolerances, and fails with `timeout` at the settle timeout after the
+planned end, its message giving how far the base stands from the target.
 
 Each result gives `final_pose`, the robot frame's pose in odom at the time of
 the newest wheel measurement when the goal ended. A goal that a robot stop or
@@ -311,8 +338,11 @@ See `peppy.json5` for the commented list and each range the node enforces.
 Every parameter but `cache_window_s` is a required launcher argument: the
 limits along x, with its rest bound (`linear_limits`), and of the turn
 (`angular_limits`), the limiter's rate, the odometry window, the
-rotate-to-heading angle of move_base's drive, how long a robot stop waits for
-the control loop, and how long a placement waits for the robot's tree.
+rotate-to-heading angle of move_base's drive, at least the shortest turn from
+rest, the floors of move_base's turn and drive (`min_turn_rate_rad_s`,
+`min_forward_speed_m_s` and `min_backward_speed_m_s`, each above 0, their
+shortest turn from rest at most 2 rad), how long a robot stop waits for the
+control loop, and how long a placement waits for the robot's tree.
 `cache_window_s` keeps tf2's 10 s by default. The `base` slot is required and
 names the wheels' follower; the `leader_base` slot holds one leader or none.
 `robot_init`, `robot_identity` and `other_transforms` bind to the robot's

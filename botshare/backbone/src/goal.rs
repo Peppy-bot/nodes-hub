@@ -17,7 +17,7 @@ use frame_tree::arithmetic::normalize_angle;
 use peppygen::exposed_actions::base_motion::{drive_base, move_base};
 
 use crate::config::{AxisSpec, BaseAxes};
-use crate::move_control::{MovePlan, Tolerances, plan_move};
+use crate::move_control::{MoveAxes, MovePlan, Tolerances, finer_than, plan_move, shown_finest};
 use crate::transforms::ODOMETRY_FRAME;
 
 /// What to send in place of a velocity off the floor plane, or along y on a
@@ -170,24 +170,41 @@ pub fn drive_request(
     })
 }
 
+/// A move_base goal's tolerance `field` off the wire: above 0, and no finer
+/// than `finest`, the finest the base takes at its `limits` ([`MoveAxes`],
+/// [`finer_than`]).
+fn settle_tolerance(field: &str, value: f64, finest: f64, limits: &str) -> Result<f64, String> {
+    let value = PositiveFinite::parse_field(field, value)?.get();
+    if finer_than(value, finest) {
+        return Err(format!(
+            "{field} must be at least {}, the finest the base takes at its {limits}, got {value}",
+            shown_finest(finest)
+        ));
+    }
+    Ok(value)
+}
+
 /// A move_base goal's fields off the wire, its target in the frame `placer`
-/// reads the goal's frame as.
+/// reads the goal's frame as, its tolerances no finer than `finest`.
 pub fn move_fields(
     data: &move_base::GoalRequestData,
     placer: &Placer,
+    finest: Tolerances,
 ) -> Result<MoveFields, String> {
     let duration_s = MoveSeconds::from_wire("duration_s", data.duration_s)?.get();
     let tolerances = Tolerances {
-        position: PositiveFinite::parse_field(
+        position: settle_tolerance(
             "settle_position_tolerance_m",
             data.settle_position_tolerance_m,
-        )?
-        .get(),
-        yaw: PositiveFinite::parse_field(
+            finest.position,
+            "linear_limits, min_forward_speed_m_s and min_backward_speed_m_s",
+        )?,
+        yaw: settle_tolerance(
             "settle_orientation_tolerance_rad",
             data.settle_orientation_tolerance_rad,
-        )?
-        .get(),
+            finest.yaw,
+            "angular_limits and min_turn_rate_rad_s",
+        )?,
     };
     let settle_timeout_s = MoveSeconds::from_wire("settle_timeout_s", data.settle_timeout_s)?.get();
     let target = &data.target;
@@ -217,7 +234,7 @@ pub fn move_request(
     fields: MoveFields,
     in_odometry: Pose,
     from_robot: Pose,
-    axes: &BaseAxes,
+    axes: &MoveAxes,
     rotate_to_heading_min_angle: f64,
 ) -> Result<MoveRequest, String> {
     let on_the_floor = |pose: Pose| {
@@ -229,8 +246,8 @@ pub fn move_request(
     let plan = plan_move(
         on_the_floor(from_robot)?,
         fields.tolerances.position,
-        axes.linear.profile(),
-        axes.angular.profile(),
+        axes.linear,
+        axes.angular,
         fields.duration_s,
     );
     if plan.duration_s > MAX_MOVE_DURATION_S {
@@ -257,7 +274,9 @@ mod tests {
 
     use frame_tree::arithmetic::{quaternion_of_yaw, rotate};
 
-    use crate::test_rig::{AXES, ROTATE_TO_HEADING_MIN_ANGLE_RAD, placer};
+    use crate::test_rig::{
+        AXES, ROTATE_TO_HEADING_MIN_ANGLE_RAD, botshare_sim_move_axes, move_axes, placer,
+    };
 
     const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
 
@@ -320,13 +339,14 @@ mod tests {
         }
     }
 
-    /// The move_base goal of `data` with the robot frame at odom's origin,
-    /// where the target places in odom and in the robot frame as it is given.
-    fn move_with(
-        axes: &BaseAxes,
+    /// The move_base goal of `data` along `axes` with the robot frame at
+    /// odom's origin, where the target places in odom and in the robot frame
+    /// as it is given.
+    fn move_along(
+        axes: &MoveAxes,
         data: &move_base::GoalRequestData,
     ) -> Result<MoveRequest, String> {
-        let fields = move_fields(data, &placer())?;
+        let fields = move_fields(data, &placer(), axes.finest)?;
         let placed = *fields.target.value();
         move_request(
             fields,
@@ -335,6 +355,15 @@ mod tests {
             axes,
             ROTATE_TO_HEADING_MIN_ANGLE_RAD,
         )
+    }
+
+    /// The move_base goal of `data` along `axes`, floored at the rig's
+    /// slowest speeds ([`move_along`]).
+    fn move_with(
+        axes: &BaseAxes,
+        data: &move_base::GoalRequestData,
+    ) -> Result<MoveRequest, String> {
+        move_along(&move_axes(axes), data)
     }
 
     fn movement(
@@ -523,20 +552,86 @@ mod tests {
         );
     }
 
+    /// The move_base goal to 1 m ahead along `axes` within `position` (m)
+    /// and `yaw` (rad).
+    fn move_within(axes: &MoveAxes, position: f64, yaw: f64) -> Result<MoveRequest, String> {
+        move_along(
+            axes,
+            &move_base::GoalRequestData {
+                settle_position_tolerance_m: position,
+                settle_orientation_tolerance_rad: yaw,
+                ..move_goal([1.0, 0.0, 0.0], IDENTITY, 0.0, 0.0)
+            },
+        )
+    }
+
+    /// The refusal of a position tolerance of `got` (m) finer than `finest`.
+    fn finer_position(finest: &str, got: &str) -> String {
+        format!(
+            "settle_position_tolerance_m must be at least {finest}, the finest the base takes at \
+             its linear_limits, min_forward_speed_m_s and min_backward_speed_m_s, got {got}"
+        )
+    }
+
+    /// The refusal of an orientation tolerance of `got` (rad) finer than
+    /// `finest`.
+    fn finer_orientation(finest: &str, got: &str) -> String {
+        format!(
+            "settle_orientation_tolerance_rad must be at least {finest}, the finest the base takes \
+             at its angular_limits and min_turn_rate_rad_s, got {got}"
+        )
+    }
+
+    // A tolerance finer than the base takes at its limits and floors is
+    // refused, naming the finest it takes; the finest is taken. On the rig's
+    // base the shortest drive is 1 mm and the shortest turn 1.5 mrad.
+    #[test]
+    fn a_move_refuses_a_tolerance_finer_than_the_base_takes() {
+        let axes = move_axes(&AXES);
+        assert_eq!(
+            move_within(&axes, 0.0004, 0.03).unwrap_err(),
+            finer_position("0.001", "0.0004")
+        );
+        assert_eq!(
+            move_within(&axes, 0.02, 0.001).unwrap_err(),
+            finer_orientation("0.0015", "0.001")
+        );
+        assert!(move_within(&axes, axes.finest.position, axes.finest.yaw).is_ok());
+    }
+
+    // At botshare_sim's limits and floors the sums of the shortest drive and
+    // turn land a few units in the last place above 2.5 mm and 7.5 mrad: the
+    // decimals are taken, and a tolerance past the slack below each is
+    // refused, naming the decimal.
+    #[test]
+    fn a_move_at_botshare_sims_limits_takes_its_finest_decimals() {
+        let axes = botshare_sim_move_axes();
+        assert!(move_within(&axes, 0.0025, 0.0075).is_ok());
+        assert_eq!(
+            move_within(&axes, 0.002_499_999_995, 0.0075).unwrap_err(),
+            finer_position("0.0025", "0.002499999995")
+        );
+        assert_eq!(
+            move_within(&axes, 0.0025, 0.007_499_999_985).unwrap_err(),
+            finer_orientation("0.0075", "0.007499999985")
+        );
+    }
+
     // The target the loop steers to is the one in odom, and the plan runs from
     // where the robot frame stands: 1 m ahead of a robot frame 1 m along odom's
     // x plans the 1 m move.
     #[test]
     fn a_move_steers_to_its_target_in_odom_and_plans_from_the_robot_frame() {
         let data = move_goal([2.0, 0.0, 0.0], IDENTITY, 0.0, 0.0);
-        let fields = move_fields(&data, &placer()).expect("the fields");
+        let axes = move_axes(&AXES);
+        let fields = move_fields(&data, &placer(), axes.finest).expect("the fields");
         let in_odometry = Pose::parse([2.0, 0.0, 0.0], IDENTITY).unwrap();
         let from_robot = Pose::parse([1.0, 0.0, 0.0], IDENTITY).unwrap();
         let request = move_request(
             fields,
             in_odometry,
             from_robot,
-            &AXES,
+            &axes,
             ROTATE_TO_HEADING_MIN_ANGLE_RAD,
         )
         .expect("a move");
