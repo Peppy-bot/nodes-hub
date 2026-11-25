@@ -1290,33 +1290,24 @@ async fn wheels_that_start_over_fail_the_goal_and_start_the_odometry_over() {
     };
     assert_eq!(failure.kind, drive_base::FailureKind::ResourceUnavailable);
     assert_eq!(failure.message, "the base's odometry started over");
-    let restarted = rig.state_at(earlier).await;
-    assert_eq!(ns(restarted.timestamp), earlier);
-    assert_ne!(
-        restarted.odometry_start_timestamp,
-        before.odometry_start_timestamp
-    );
-    assert_eq!(
-        (
-            restarted.pose.position,
-            yaw_of_quaternion(restarted.pose.orientation)
-        ),
-        ([0.0, 0.0, 0.0], 0.0)
-    );
-    let odom = rig.transforms_at(earlier, &ROBOT_FRAME).await;
-    assert_eq!(odom.start_timestamp, restarted.odometry_start_timestamp);
-    // The new odometry integrates the measurement after it.
+    // The clock has reached the start-over's measurement, so the node
+    // reports it in the pass that ends the goal and sends the hold. The test
+    // reads the new odometry from the next step's report: the 0.5 rad the
+    // wheels rolled past the start-over's angles, from the origin.
     rig.wheels = [20.5, 20.5];
     let rolled = rig.step().await;
+    assert_ne!(
+        rolled.odometry_start_timestamp,
+        before.odometry_start_timestamp
+    );
     assert_close(
         rolled.pose.position[0],
         0.5 * WHEEL_RADIUS_M,
         "the roll after the start-over",
     );
-    assert_eq!(
-        rolled.odometry_start_timestamp,
-        restarted.odometry_start_timestamp
-    );
+    assert_eq!(yaw_of_quaternion(rolled.pose.orientation), 0.0);
+    let odom = rig.transforms_at(rig.now_ns, &ROBOT_FRAME).await;
+    assert_eq!(odom.start_timestamp, rolled.odometry_start_timestamp);
     rig.shutdown().await;
 }
 
