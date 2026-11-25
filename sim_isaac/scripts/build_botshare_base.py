@@ -9,15 +9,19 @@ bakes the same model and Waldo loads it, so the three engines stand the same
 robot, and the URDF is the one source of its geometry.
 
 MuJoCo compiles the MJCF with its mount body hanging from the world on a free
-joint, as Waldo hangs a rolling robot, and the stage is written from the
-compiled model:
+joint, as Waldo hangs a rolling robot, and each body no joint moves fused
+into the body it hangs from (the compiler's fusestatic), and the stage is
+written from the compiled model:
 
 - the mount body is the URDF's root link, base_footprint, with the sum of the
-  inertials of every link fixed to it, as the MJCF gives it; each body a hinge
-  moves is the link the URDF joint of the same name places, a wheel;
+  inertials of every link fixed to it: the MJCF's mount and each body fused
+  into it, lidar_link, which carries the lidar's housing and its scan site,
+  their masses added, their inertias combined about the mount's frame, and
+  their geoms drawn on the mount at their place; each body a hinge moves is
+  the link the URDF joint of the same name places, a wheel;
 - each link the URDF fixes to a body is a prim under the prim of the link it
-  hangs from, placed by the URDF's fixed joint, so a camera stands under the
-  link it hangs from;
+  hangs from, placed by the URDF's fixed joint, so a camera or a lidar stands
+  under the link it hangs from, on the body that carries that link;
 - each drawn geom is a mesh in a material named after the mesh, of its colour,
   and each collision geom a hidden collider: a geom that takes no friction
   (condim 1, a caster's sphere) in a frictionless material that wins over any
@@ -37,7 +41,8 @@ compiled model:
   base rolls on its wheels.
 
 The hinges are the wheels of the description's differential base, and the
-stage refuses any other.
+stage refuses any other, and any body the compiled model holds besides the
+mount and the wheels.
 
 CPU only: it needs the `mujoco`, `usd-core`, `numpy`, `robot_description_py`,
 `control_core_py` and `sim_robot_core` packages, no Isaac Sim.
@@ -115,8 +120,9 @@ BUNDLE = Bundle(
     upstream="meshes/",
     changes=(
         "The stage draws the meshes under meshes/visual/ as the base's MJCF in Waldo's catalogue draws them: "
-        "the triangles of each a USD mesh under the prim of the body it belongs to, at the body's "
-        "pose with every joint at zero, in a material named after the mesh, of its MJCF colour. "
+        "the triangles of each a USD mesh under the prim of the body that carries it, each body no "
+        "joint moves fused into the body it hangs from, at its place with every joint at zero, in a "
+        "material named after the mesh, of its MJCF colour. "
         "The bodies, their inertials and colliders, and the wheels' joints and rate loops come "
         "from that MJCF."
     ),
@@ -176,8 +182,10 @@ def read_description() -> Description:
 
 def compile_model(release: Path) -> mujoco.MjModel:
     """The base's MJCF, compiled with its mount body free, as Waldo hangs a
-    rolling robot from the world, and each drawn geom in a material named
-    after its mesh. A mesh drawn in two colours is refused."""
+    rolling robot from the world, each body no joint moves fused into the
+    body it hangs from, its mass and inertia combined with that body's and
+    its geoms and sites moved onto it, and each drawn geom in a material
+    named after its mesh. A mesh drawn in two colours is refused."""
     entry = catalogue_entry(release, ROBOT_ID)
     spec = mujoco.MjSpec.from_file(str(release / ROBOT_ID / entry["wrapper"]))
     colours: dict[str, tuple[float, ...]] = {}
@@ -190,6 +198,7 @@ def compile_model(release: Path) -> mujoco.MjModel:
         geom.material = geom.meshname
     for mesh, colour in colours.items():
         spec.add_material(name=mesh, rgba=list(colour))
+    spec.compiler.fusestatic = True
     spec.body(entry["mount"]["body"]).add_freejoint()
     return spec.compile()
 
@@ -386,7 +395,8 @@ def build_stage(release: Path, description: Description, output: Path) -> Path:
     bodies = [model.body(i).name for i in range(1, model.nbody)]
     if sorted(bodies) != sorted(links):
         raise ValueError(
-            f"the MJCF's bodies are {bodies}, and the ones its mount and its hinges make links of are {sorted(links)}"
+            f"the MJCF's bodies, each body no joint moves fused into the one it hangs from, are {bodies}, and the "
+            f"ones its mount and its hinges make links of are {sorted(links)}"
         )
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)

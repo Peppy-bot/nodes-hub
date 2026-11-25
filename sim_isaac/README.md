@@ -786,11 +786,18 @@ the one in the release of Waldo's catalogue, which Waldo's
 `tools/botshare_base` writes from the base's URDF, `robot_description`'s, so
 the URDF is the one source of its geometry, and which the MuJoCo node bakes
 and Waldo loads. `scripts/build_botshare_base.py` compiles that MJCF with its
-mount body free and writes the stage from the compiled model: the mount body
-is the robot frame, `base_footprint`, with the sum of the inertials of every
-link fixed to it, and each wheel a body of its own. Each link the URDF fixes
-to a body stands under it as a prim of its name, so the depth camera stands
-under `base_camera_link`. Each wheel turns on a revolute joint without limits
+mount body free and each body no joint moves fused into the body it hangs
+from, MuJoCo's `fusestatic`, and writes the stage from the compiled model:
+the mount body is the robot frame, `base_footprint`, with the sum of the
+inertials of every link fixed to it, and each wheel a body of its own. The
+MJCF's `lidar_link`, which carries the lidar's housing and its scan site,
+hangs from the mount with no joint, so it is part of the mount: its mass adds
+to the mount's, its inertia combines with the mount's about the mount's
+frame, and its geoms stand on the mount at their place. Each link the URDF
+fixes to a body stands under it as a prim of its name, so the depth camera
+stands under `base_camera_link` and the lidar sweeps from `lidar_frame` under
+`lidar_link`, on the mount, whose colliders its rays pass.
+Each wheel turns on a revolute joint without limits
 that carries the rate loop the MJCF runs it with: a velocity drive with no
 stiffness, the `<velocity>` actuator's `kv` as its damping and the joint's
 `actuatorfrcrange` as its maximum force, the `<intvelocity>` actuator's `kp`
@@ -824,8 +831,10 @@ changes the meshes, by whom and on the `--date` of the build, and
 `BOTSHARE_BASE_STAGE_SHA256`, for the image to bake under
 `/opt/robot_assets/botshare_base/`. `tests/test_botshare_base_stage.py` holds
 the stage to the description, its bodies and their masses, the place of every
-link and the wheels' joints, and to the model, the rate loop of each wheel,
-the contact of the tires and the casters and the colour of each mesh, and on
+link and the wheels' joints, to the model, the mount's mass, centre of mass
+and inertia, the place of every geom, the rate loop of each wheel, the
+contact of the tires and the casters and the colour of each mesh, and to what
+the engine reads off it, each wheel's loop and the lidar's mount, and on
 Linux x86_64 holds its SHA-256 to `BOTSHARE_BASE_STAGE_SHA256`.
 `download_assets.sh` refuses a bundle whose stage is another. So a change of
 the builder, of the release, of the description or of the `mujoco` pin that
