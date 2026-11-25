@@ -1,22 +1,27 @@
 //! The navigator booted in-process on a simulated clock the test ticks,
 //! against a mock base of drive_link that executes its setpoints through
-//! base_state's limiter, and cameras and 2-D lidars that render boxes: the
-//! refusals of a goal in base_navigation's order, the drives around what the
-//! cameras see, the 2-D lidar's grid, the recoveries, a plan held across
-//! steps, the replacement, the cancels and the holds, the release burst after
-//! an ending, the silences, the start-over of the odometry, and a clock that
-//! lags the messages or leaps, each judged on the node's own clock.
+//! base_state's limiter, cameras and 2-D lidars that render boxes, and a fake
+//! room_map: the refusals of a goal in base_navigation's order, the drives
+//! around what the cameras see, the 2-D lidar's grid, the recoveries, a plan
+//! held across steps, the replacement, the cancels and the holds, the release
+//! burst after an ending, the silences, the start-over of the odometry, a clock
+//! that lags the messages or leaps, and the navigations in map on room_map's
+//! loaded map, their refusals and their endings, each judged on the node's own
+//! clock.
 
 mod helpers;
 
 use std::f64::consts::{FRAC_PI_2, PI};
+use std::time::Duration;
 
 use control_core::drive_link::FollowState;
 use helpers::log::{keep_the_log, logged_with};
 use helpers::mock_base::{MockBase, ModeReport, Planar};
 use helpers::outcome;
+use helpers::room_map::{FakeMap, MAP_FRAME, RoomState};
 use helpers::scene::{Box3, DepthLens, Scene, pit};
 use helpers::*;
+use peppygen::consumed_services::room_map::get_map_state;
 use peppygen::exposed_actions::base_navigation::navigate_to_pose::GoalTarget;
 use peppygen::fixtures::exposed_actions::base_navigation::{
     back_up, drive_on_heading, navigate_to_pose, spin,
@@ -37,6 +42,10 @@ const AT_THE_BOX: [f64; 2] = [0.9, 0.0];
 
 /// The side of a cell of the tests' grid (m).
 const CELL_M: f64 = 0.05;
+
+/// What a goal refused with not_localized tells its caller to call, as
+/// base_navigation asks.
+const TO_LOCALIZE: &str = "load_map, then set_initial_pose or reinitialize_global_localization";
 
 /// How many steps a test leaves a source silent before a goal: 1 s, twice
 /// the source timeout and drive_link's 0.5 s, so the node's clock has passed
@@ -339,12 +348,14 @@ async fn a_goal_in_a_frame_the_tree_does_not_hold_is_refused_unknown_frame() {
     rig.shutdown().await;
 }
 
-// base_navigation's refusals: a goal in the map frame is refused with
-// not_localized, saying that no map is loaded and to send the target in odom
-// or the robot frame; one off the floor plane in the map frame is rejected
-// first, saying to send a planar target in map or the robot frame.
+// base_navigation's refusals: with the room_map link vacant, a goal in the
+// map frame is refused with not_localized, saying that no map is loaded, why,
+// to call load_map, then set_initial_pose or reinitialize_global_localization,
+// or to send the target in odom or the robot frame; one off the floor plane in
+// the map frame is rejected first, saying to send a planar target in map or
+// the robot frame.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_goal_in_the_map_frame_is_refused_not_localized_saying_what_to_send() {
+async fn a_map_goal_with_the_room_map_link_vacant_is_refused_not_localized_naming_load_map() {
     let mut rig = Rig::start(Scene::open()).await;
     let in_map = |z: f64| GoalRequestData {
         target: GoalTarget {
@@ -358,7 +369,12 @@ async fn a_goal_in_the_map_frame_is_refused_not_localized_saying_what_to_send() 
     assert_eq!(refusal.kind, FailureKind::NotLocalized, "{refusal:?}");
     assert_names(
         &refusal.message,
-        &["no map is loaded", "odom or the robot frame"],
+        &[
+            "no map is loaded",
+            "room_map link vacant",
+            TO_LOCALIZE,
+            "odom or the robot frame",
+        ],
     );
     let lifted = rig.refusal(&in_map(0.5)).await;
     assert_eq!(lifted.kind, FailureKind::Rejected, "{lifted:?}");
@@ -2823,5 +2839,1047 @@ async fn each_describe_base_read_logs_both_horizons_of_the_stop() {
         "3 s to rest",
     ]);
     assert_eq!(logged.len(), 1, "{logged:?}");
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Navigations in map, on room_map's loaded map.
+// ---------------------------------------------------------------------------
+
+/// Where the world stands in the tests' maps: a quarter turn and a move, so a
+/// map's boxes stay square to the world and a placement read the wrong way
+/// round puts each cell elsewhere.
+const MAP_FROM_WORLD: Planar = Planar {
+    x: 1.0,
+    y: -0.5,
+    yaw: FRAC_PI_2,
+};
+
+/// A map turned 0.4 rad in the world and moved, which no axis of the world
+/// lines up with.
+const TURNED_MAP_FROM_WORLD: Planar = Planar {
+    x: 1.0,
+    y: -0.5,
+    yaw: 0.4,
+};
+
+/// Where the base starts in a map of [`MAP_FROM_WORLD`]: the world's origin,
+/// heading along the world's x, which is map's y.
+const START_IN_MAP: [f64; 2] = [1.0, -0.5];
+
+/// A goal 3 m ahead of where the base starts, along map's y, past the half
+/// side of the grid of the floor.
+const AHEAD_IN_MAP: [f64; 2] = [1.0, 2.5];
+
+/// A navigation to `point` in map heading `yaw`, within 0.1 m and 0.2 rad.
+fn in_map(point: [f64; 2], yaw: f64) -> GoalRequestData {
+    GoalRequestData {
+        target: GoalTarget {
+            frame: Some(MAP_FRAME.to_string()),
+            ..in_odom(point[0], point[1], yaw)
+        },
+        ..goal(0.0, 0.0)
+    }
+}
+
+/// A navigation to [`AHEAD_IN_MAP`], heading along map's y.
+fn ahead_in_map() -> GoalRequestData {
+    in_map(AHEAD_IN_MAP, FRAC_PI_2)
+}
+
+/// Where the robot frame of `base` truly stands in a map placed at
+/// `map_from_world`.
+fn truly_in_map(base: &MockBase, map_from_world: Planar) -> Planar {
+    room_map::placed(map_from_world, base.truth)
+}
+
+/// Whether the footprint's outline where `base` truly stands meets `wall`, a
+/// box of a map placed at `map_from_world`.
+fn touches_in_map(base: &MockBase, map_from_world: Planar, wall: &Box3) -> bool {
+    outline(base).iter().any(|&[x, y]| {
+        let point = room_map::placed(map_from_world, Planar { x, y, yaw: 0.0 });
+        wall.covers([point.x, point.y])
+    })
+}
+
+/// `world`, a box of the world, in a map placed at [`MAP_FROM_WORLD`], whose
+/// quarter turn keeps it square.
+fn map_box(world: &Box3) -> Box3 {
+    let corner = |x, y| room_map::placed(MAP_FROM_WORLD, Planar { x, y, yaw: 0.0 });
+    let (low, high) = (
+        corner(world.min[0], world.min[1]),
+        corner(world.max[0], world.max[1]),
+    );
+    Box3::new(
+        [low.x.min(high.x), low.y.min(high.y), world.min[2]],
+        [low.x.max(high.x), low.y.max(high.y), world.max[2]],
+    )
+}
+
+/// get_map_state's answer: `map` loaded, or none, and whether mapping runs, a
+/// set_initial_pose waits and the base is localized.
+fn map_state(
+    map: Option<&FakeMap>,
+    mapping: bool,
+    waiting: bool,
+    localized: bool,
+) -> get_map_state::ResponseData {
+    get_map_state::ResponseData::new(
+        map.map(FakeMap::described),
+        mapping,
+        false,
+        waiting,
+        localized,
+    )
+}
+
+/// The rig with the cameras of `mounts` and the lidars of `lidars` before
+/// `scene`, its plans running as `plans` says, its room_map link bound to a
+/// fake that loaded `map` and localized the base in it, the world standing in
+/// map at `map_from_world`: once the node logged the map's first grid and
+/// knows the base and every sensor.
+async fn room_rig(
+    scene: Scene,
+    mounts: &[Mount],
+    lidars: &[LidarMount],
+    plans: Plans,
+    map: &FakeMap,
+    map_from_world: Planar,
+) -> Rig {
+    room_rig_with(params(), scene, mounts, lidars, plans, map, map_from_world).await
+}
+
+/// [`room_rig`] with `params`.
+async fn room_rig_with(
+    params: peppygen::Parameters,
+    scene: Scene,
+    mounts: &[Mount],
+    lidars: &[LidarMount],
+    plans: Plans,
+    map: &FakeMap,
+    map_from_world: Planar,
+) -> Rig {
+    keep_the_log();
+    let room = RoomState::localized_in(map, map_from_world);
+    let mut rig = Rig::start_in_room_with(params, scene, mounts, lidars, plans, room).await;
+    rig.publish_grid(map).await;
+    let first_grid = format!("the first grid of map {},", map.name);
+    rig.until_logged(&[first_grid.as_str()]).await;
+    rig.ready().await;
+    rig
+}
+
+/// [`room_rig`] with the front camera before an open floor, each plan
+/// starting at once, in a map of `occupied` named `name` placed at
+/// [`MAP_FROM_WORLD`].
+async fn open_room(name: &'static str, occupied: &[Box3]) -> Rig {
+    let map = FakeMap::named(name, occupied);
+    room_rig(
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::AtOnce,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await
+}
+
+/// Asserts that the node streamed no setpoint before a fence spin sent now.
+async fn assert_nothing_streamed(rig: &mut Rig, when: &str) {
+    let fence_ns = rig.fence().await;
+    assert_streams_nothing(&rig.world.setpoints_in(..fence_ns), when);
+}
+
+/// Asserts that `data`, a navigation's result, gives the robot frame in map
+/// within 0.2 m of `target`, the tolerance and what the base covers as it
+/// slows, and that the base truly stands there in a map placed at
+/// `map_from_world`.
+fn assert_reached_in_map(
+    data: &navigate_to_pose::ResultData,
+    rig: &Rig,
+    map_from_world: Planar,
+    target: [f64; 2],
+) {
+    assert_eq!(data.final_pose.frame, MAP_FRAME, "{data:?}");
+    let [x, y, _] = data.final_pose.position;
+    assert!((x - target[0]).hypot(y - target[1]) < 0.2, "{data:?}");
+    let truly = truly_in_map(&rig.world.base, map_from_world);
+    assert!(
+        truly.distance_to(target) < 0.2,
+        "the base truly stands at {truly:?} in map"
+    );
+}
+
+// base_navigation's checks: a map-frame goal while room_map's get_map_state
+// reports no map loaded is refused with not_localized, naming load_map, then
+// set_initial_pose or reinitialize_global_localization, before anything
+// moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_with_no_map_loaded_is_refused_not_localized_naming_load_map() {
+    let mut rig = open_room("no_map_loaded", &[]).await;
+    rig.room().set(|room| {
+        room.answer = map_state(None, false, false, false);
+        room.estimate = None;
+    });
+    let refusal = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(refusal.kind, FailureKind::NotLocalized, "{refusal:?}");
+    assert_names(&refusal.message, &["no map is loaded", TO_LOCALIZE]);
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal outside the loaded map's extent
+// is refused with rejected, the message naming the extent, before anything
+// moves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_outside_the_loaded_map_is_refused_rejected_naming_its_extent() {
+    let mut rig = open_room("past_its_edge", &[]).await;
+    let refusal = rig.refusal_stepping(&in_map([7.5, 0.0], 0.0)).await;
+    assert_eq!(refusal.kind, FailureKind::Rejected, "{refusal:?}");
+    assert_names(
+        &refusal.message,
+        &[
+            "outside the loaded map past_its_edge",
+            "from x -3 m to 7 m and y -3 m to 3 m",
+        ],
+    );
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal while room_map's
+// set_initial_pose waits for its scan is refused with precondition_failed,
+// saying to send the goal again once it answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_while_set_initial_pose_waits_is_refused_precondition_failed() {
+    let map = FakeMap::named("set_pose_waits", &[]);
+    let mut rig = room_rig(
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::AtOnce,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    rig.room()
+        .set(|room| room.answer = map_state(Some(&map), false, true, true));
+    let refusal = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(refusal.kind, FailureKind::PreconditionFailed, "{refusal:?}");
+    assert_names(
+        &refusal.message,
+        &["set_initial_pose waits for its scan", "once it answers"],
+    );
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal while the base is not
+// localized is refused with not_localized, naming set_initial_pose or
+// reinitialize_global_localization and load_map, and, while a
+// set_initial_pose waits, that it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_while_the_base_is_not_localized_is_refused_naming_set_initial_pose() {
+    let map = FakeMap::named("not_localized_yet", &[]);
+    let mut rig = room_rig(
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::AtOnce,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    rig.room()
+        .set(|room| room.answer = map_state(Some(&map), false, true, false));
+    let refusal = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(refusal.kind, FailureKind::NotLocalized, "{refusal:?}");
+    assert_names(
+        &refusal.message,
+        &[
+            "not localized in map not_localized_yet",
+            "call set_initial_pose or reinitialize_global_localization",
+            TO_LOCALIZE,
+            "set_initial_pose waits for its scan",
+        ],
+    );
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal with several causes gets the
+// kind of the earlier check: outside the map, rejected, before the base not
+// localized, not_localized, before a set_initial_pose that waits,
+// precondition_failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_with_two_causes_gets_the_kind_of_the_earlier_check() {
+    let map = FakeMap::named("two_causes", &[]);
+    let mut rig = room_rig(
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::AtOnce,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    rig.room()
+        .set(|room| room.answer = map_state(Some(&map), false, true, false));
+    let outside = rig.refusal_stepping(&in_map([7.5, 0.0], 0.0)).await;
+    assert_eq!(outside.kind, FailureKind::Rejected, "{outside:?}");
+    let inside = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(inside.kind, FailureKind::NotLocalized, "{inside:?}");
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal while room_map's get_map_state
+// gives no answer within the source timeout of the node's clock is refused
+// with not_localized, as no node serves room_map, naming get_map_state and
+// load_map, then set_initial_pose or reinitialize_global_localization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_while_get_map_state_gives_no_answer_is_refused_not_localized_naming_it() {
+    let mut rig = open_room("silent_mapper", &[]).await;
+    rig.room().set(|room| room.answers = false);
+    let refusal = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(refusal.kind, FailureKind::NotLocalized, "{refusal:?}");
+    assert_names(
+        &refusal.message,
+        &[
+            "room_map's get_map_state gave no answer",
+            "source_timeout_s 0.5 s",
+            TO_LOCALIZE,
+        ],
+    );
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal before any grid of the loaded
+// map arrived waits for one within the source timeout, as Nav2's planner waits
+// for its static layer's first map, and is refused with not_localized, naming
+// map_grids and load_map, then set_initial_pose or
+// reinitialize_global_localization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_before_a_grid_of_its_map_is_refused_not_localized_naming_map_grids() {
+    let map = FakeMap::named("no_grid_yet", &[]);
+    let room = RoomState::localized_in(&map, MAP_FROM_WORLD);
+    let mut rig = Rig::start_in_room(Scene::open(), &[FRONT], &[], Plans::AtOnce, room).await;
+    rig.ready().await;
+    let refusal = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(refusal.kind, FailureKind::NotLocalized, "{refusal:?}");
+    assert_names(
+        &refusal.message,
+        &[
+            "no map_grids of map no_grid_yet arrived",
+            "source_timeout_s 0.5 s",
+            TO_LOCALIZE,
+        ],
+    );
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal for which no map_poses that
+// reports the base localized arrives within the source timeout is refused
+// with not_localized, naming map_poses and load_map, then set_initial_pose or
+// reinitialize_global_localization.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_with_no_map_poses_within_the_source_timeout_is_refused_naming_map_poses() {
+    let mut rig = open_room("no_map_poses", &[]).await;
+    rig.room().set(|room| room.poses_on = false);
+    let refusal = rig.refusal_stepping(&ahead_in_map()).await;
+    assert_eq!(refusal.kind, FailureKind::NotLocalized, "{refusal:?}");
+    assert_names(
+        &refusal.message,
+        &[
+            "no map_poses of map no_map_poses",
+            "source_timeout_s 0.5 s",
+            TO_LOCALIZE,
+        ],
+    );
+    assert_nothing_streamed(&mut rig, "the refused map goal").await;
+    rig.shutdown().await;
+}
+
+// base_navigation's map-frame navigation: a goal in a map turned and moved in
+// the world drives the base to its place in map, by map_poses; each feedback
+// and the result give the robot frame in map, where map_poses places it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_drives_the_base_to_its_place_by_map_poses() {
+    let map = FakeMap::named("turned_map", &[]);
+    let mut rig = room_rig(
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::AtOnce,
+        &map,
+        TURNED_MAP_FROM_WORLD,
+    )
+    .await;
+    let target = [2.2, 0.3];
+    let handle = rig.send_stepping(&in_map(target, 0.4)).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    let ran = rig.run_until_ended().await;
+    for feedback in ran.iter().filter_map(StepSeen::navigation) {
+        let pose_record = &feedback.current_pose;
+        assert_eq!(pose_record.frame, MAP_FRAME);
+        let (odometry, _) = rig.world.reported_at(pose_record.timestamp);
+        let expected = room_map::placed(TURNED_MAP_FROM_WORLD, odometry);
+        let [x, y, _] = pose_record.position;
+        assert!(
+            (x - expected.x).hypot(y - expected.y) < 1e-6,
+            "{pose_record:?} against {expected:?}"
+        );
+    }
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, TURNED_MAP_FROM_WORLD, target);
+    rig.shutdown().await;
+}
+
+// base_navigation's map-frame navigation: a goal 3 m ahead, past the half
+// side of the grid of the floor, 2.5 m, is planned on the loaded map's grid
+// and reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_past_the_grid_of_the_floor_is_planned_on_the_loaded_map_and_reached() {
+    let mut rig = open_room("past_the_floor_grid", &[]).await;
+    assert!(
+        AHEAD_IN_MAP[1] - START_IN_MAP[1] > grid_half_side_m(),
+        "a goal past the grid's half side"
+    );
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, AHEAD_IN_MAP);
+    rig.shutdown().await;
+}
+
+/// A wall of the map across the way ahead of the base, from map's y 1.0 m to
+/// 1.1 m, with a doorway from map's x 2.0 m to 3.2 m, which no camera sees.
+fn wall_with_a_doorway() -> [Box3; 2] {
+    [
+        Box3::new([-3.0, 1.0, 0.0], [2.0, 1.1, 0.4]),
+        Box3::new([3.2, 1.0, 0.0], [7.0, 1.1, 0.4]),
+    ]
+}
+
+/// The steps of a map goal past [`wall_with_a_doorway`], the grid emptied by
+/// clear_grid once the base comes within 0.5 m of the wall when `clear`, each
+/// checked: the base never touches the wall, and the goal is reached.
+async fn through_the_doorway(name: &'static str, clear: bool) {
+    let walls = wall_with_a_doorway();
+    let mut rig = open_room(name, &walls).await;
+    let target = [1.0, 2.2];
+    let handle = rig.send_stepping(&in_map(target, FRAC_PI_2)).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    let mut cleared = !clear;
+    for _ in 0..DRIVE_STEPS {
+        let step = rig.step().await;
+        let base = &rig.world.base;
+        for wall in &walls {
+            assert!(
+                !touches_in_map(base, MAP_FROM_WORLD, wall),
+                "the base touched the map's wall: {:?}",
+                truly_in_map(base, MAP_FROM_WORLD)
+            );
+        }
+        if !cleared && truly_in_map(base, MAP_FROM_WORLD).y > 0.5 {
+            rig.clear_grid().await;
+            cleared = true;
+        }
+        if step.goal_ended {
+            break;
+        }
+    }
+    assert!(cleared, "the base came within 0.5 m of the wall");
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, target);
+    rig.shutdown().await;
+}
+
+// base_navigation's map-frame navigation counts occupied each cell the loaded
+// map holds occupied: a wall only the map holds, across the way, is driven
+// around through its doorway without contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wall_only_the_loaded_map_holds_is_driven_around_through_its_doorway() {
+    through_the_doorway("doorway", false).await;
+}
+
+// base_navigation's clear_grid: the cells the loaded map holds occupied stay
+// occupied for a map-frame navigation, so a clearing before the map's wall
+// leaves the base driving around it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_grid_during_a_map_goal_keeps_the_maps_cells() {
+    through_the_doorway("doorway_cleared", true).await;
+}
+
+// base_navigation's map-frame navigation: a box the loaded map does not hold,
+// which the lidar alone sees, is driven around to a goal behind it, without
+// contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_box_the_loaded_map_does_not_hold_is_driven_around() {
+    let map = FakeMap::named("box_unmapped", &[]);
+    let mut rig = room_rig(
+        Scene::with(&[BOX_AHEAD]),
+        &[],
+        &[LIDAR],
+        Plans::AtOnce,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    let behind = room_map::placed(
+        MAP_FROM_WORLD,
+        Planar {
+            x: BEHIND_THE_BOX[0],
+            y: BEHIND_THE_BOX[1],
+            yaw: 0.0,
+        },
+    );
+    let target = [behind.x, behind.y];
+    let handle = rig.send_stepping(&in_map(target, behind.yaw)).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_checking(|base| {
+        assert!(
+            !touches(base, &BOX_AHEAD),
+            "the base touched the box: {:?}",
+            base.truth
+        )
+    })
+    .await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, target);
+    rig.shutdown().await;
+}
+
+// base_navigation's tries: a map-frame navigation fails with
+// start_in_collision when a cell the loaded map holds occupied lies within
+// the padded footprint's inscribed radius of the robot frame's origin, under
+// the footprint, before the base moves; it streams nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_while_a_map_cell_lies_within_the_inscribed_radius_fails_start_in_collision_before_the_base_moves()
+ {
+    let under_the_base = Box3::new([1.1, -0.6, 0.0], [1.15, -0.4, 0.4]);
+    let mut rig = open_room("cell_under_the_base", &[under_the_base]).await;
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    let ran = rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let failure = outcome::navigate_to_pose::failure(&result);
+    assert_eq!(failure.kind, FailureKind::StartInCollision, "{failure:?}");
+    let after = rig.burst_after(ran[0].at_ns).await;
+    assert_streams_nothing(&after, "the failed navigation, and after it");
+    assert_eq!(
+        rig.world.base.truth,
+        Planar::default(),
+        "the base never moved"
+    );
+    rig.shutdown().await;
+}
+
+// base_navigation's tries: a navigation in map keeps a path shorter than
+// near_goal_distance_m whose far poses lie past the grid of the floor, judged
+// on the grid in map its plan ran on, where Nav2's ValidatePath judges the
+// path left on the planner's global costmap: the base follows it for three
+// planning periods and the node asks no plan after the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_path_near_its_goal_past_the_grid_of_the_floor_is_kept() {
+    let mut near = params();
+    near.near_goal_distance_m = 4.0;
+    let map = FakeMap::named("kept_past_the_floor", &[]);
+    let mut rig = room_rig_with(
+        near,
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::Held,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    rig.world.release_plans(1);
+    let target = [START_IN_MAP[0], START_IN_MAP[1] + 3.3];
+    assert!(
+        target[1] - START_IN_MAP[1] > grid_half_side_m() + 0.5,
+        "the goal lies past the grid of the floor a planning period into the follow"
+    );
+    let handle = rig.send_stepping(&in_map(target, FRAC_PI_2)).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_on(helpers::mock_base::steps_in(3.0)).await;
+    assert_eq!(rig.world.plans_asked(), 1, "the path is kept");
+    rig.shutdown().await;
+}
+
+// base_navigation's tries: a navigation in map judges a pose of the path it
+// keeps on the grid of the floor's newest readings where the pose lies on it:
+// a box that appears on the kept path inside the grid of the floor after its
+// plan, which the front camera sees, makes the node plan again at a planning
+// period before any recovery, and the base drives around the box to its goal
+// without contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_box_on_a_kept_map_path_inside_the_grid_of_the_floor_is_planned_around() {
+    let mut near = params();
+    near.near_goal_distance_m = 4.0;
+    let map = FakeMap::named("box_on_the_kept_path", &[]);
+    let mut rig = room_rig_with(
+        near,
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::Held,
+        &map,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    rig.world.release_plans(READY_STEPS);
+    let target = [START_IN_MAP[0], START_IN_MAP[1] + 3.3];
+    let handle = rig.send_stepping(&in_map(target, FRAC_PI_2)).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_until(|base| base.velocity.linear_x() > 0.2).await;
+    let asked = rig.world.plans_asked();
+    let ahead = rig.world.base.truth.x + 1.5;
+    let on_the_path = Box3::new([ahead, -0.3, 0.0], [ahead + 0.3, 0.3, 0.4]);
+    rig.world.scene.boxes.push(on_the_path);
+    let mut replanned = false;
+    for _ in 0..helpers::mock_base::steps_in(2.0) {
+        let step = rig.step().await;
+        assert!(!step.goal_ended, "the navigation goes on");
+        assert!(
+            !touches(&rig.world.base, &on_the_path),
+            "{:?}",
+            rig.world.base.truth
+        );
+        if rig.world.plans_asked() > asked {
+            assert_eq!(
+                step.navigation().map(|feedback| feedback.recoveries),
+                Some(0),
+                "the kept path's check asks the plan, before any recovery"
+            );
+            replanned = true;
+            break;
+        }
+    }
+    assert!(replanned, "a plan is asked within two planning periods");
+    rig.run_checking(|base| {
+        assert!(
+            !touches(base, &on_the_path),
+            "the base touched the box: {:?}",
+            base.truth
+        )
+    })
+    .await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, target);
+    rig.shutdown().await;
+}
+
+/// The rig of [`open_room`] in a map named `name`, a goal to [`AHEAD_IN_MAP`]
+/// sent, the base driving faster than 0.2 m/s.
+async fn driving_in_map(name: &'static str) -> (Rig, outcome::navigate_to_pose::Sent) {
+    let mut rig = open_room(name, &[]).await;
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_until(|base| base.velocity.linear_x() > 0.2).await;
+    (rig, handle)
+}
+
+/// Asserts that the navigation of `handle` ends, failed with not_localized,
+/// its message naming each of `parts`, and brings the base to rest by the
+/// release burst, nothing streaming after it.
+async fn ends_not_localized(
+    mut rig: Rig,
+    handle: &outcome::navigate_to_pose::Sent,
+    parts: &[&str],
+) {
+    let (ran, after) = ending(&mut rig).await;
+    let result = outcome::navigate_to_pose::result_of(handle).await;
+    let failure = outcome::navigate_to_pose::failure(&result);
+    assert_eq!(failure.kind, FailureKind::NotLocalized, "{failure:?}");
+    assert_names(&failure.message, parts);
+    assert_release_burst(ended_ns(&ran), &after);
+    rig.shutdown().await;
+}
+
+// base_navigation's tries: a load_map during a map-frame navigation, which
+// forgets room_map's estimate and publishes the grid of the new load at once,
+// brings the base to rest and fails the navigation with not_localized by that
+// grid, before the source timeout passes with no map_poses, the message naming
+// the change and load_map.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn load_map_during_a_map_goal_brings_the_base_to_rest_and_fails_not_localized() {
+    let (rig, handle) = driving_in_map("loaded_again").await;
+    rig.room().set(|room| room.estimate = None);
+    let loaded = FakeMap::named("loaded_again", &[]).loaded_again(Duration::from_secs(1));
+    rig.publish_grid(&loaded).await;
+    ends_not_localized(
+        rig,
+        &handle,
+        &[
+            "the loaded map changed",
+            "map loaded_again loaded again",
+            "load_map",
+        ],
+    )
+    .await;
+}
+
+// base_navigation's tries: a start_mapping during a map-frame navigation,
+// whose map_poses name the new map, brings the base to rest and fails the
+// navigation with not_localized, naming the new map and start_mapping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_mapping_during_a_map_goal_brings_the_base_to_rest_and_fails_not_localized() {
+    let (rig, handle) = driving_in_map("before_mapping").await;
+    rig.room().set(|room| {
+        if let Some(estimate) = room.estimate.as_mut() {
+            estimate.map_name = "new_map";
+        }
+    });
+    ends_not_localized(
+        rig,
+        &handle,
+        &["map_poses names map new_map", "start_mapping"],
+    )
+    .await;
+}
+
+// base_navigation's tries: a remove_map of the loaded map during a map-frame
+// navigation, after which room_map holds no estimate and publishes no
+// map_poses, brings the base to rest and fails the navigation with
+// not_localized once the source timeout passes, naming the silence and its
+// causes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_map_during_a_map_goal_brings_the_base_to_rest_and_fails_not_localized() {
+    let (rig, handle) = driving_in_map("removed").await;
+    rig.room().set(|room| room.estimate = None);
+    ends_not_localized(
+        rig,
+        &handle,
+        &[
+            "no map_poses of map removed",
+            "longer than source_timeout_s 0.5 s",
+            "remove_map",
+            "the lidar or the mapper is silent",
+        ],
+    )
+    .await;
+}
+
+// base_navigation's tries: a finish_mapping during a map-frame navigation
+// publishes the saved map's grid, a box off the way now in it, with the
+// map_load_timestamp of the mapping it finishes, and keeps room_map's
+// estimate, so the navigation goes on and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finish_mapping_during_a_map_goal_keeps_it_going() {
+    let (mut rig, handle) = driving_in_map("being_mapped").await;
+    let off_the_way = Box3::new([5.0, -2.5, 0.0], [5.5, -2.0, 0.4]);
+    rig.publish_grid(&FakeMap::named("being_mapped", &[off_the_way]))
+        .await;
+    rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, AHEAD_IN_MAP);
+    rig.shutdown().await;
+}
+
+// base_navigation's tries: a load_map of the loaded map answered by a prompt
+// set_initial_pose, whose map_poses go on, brings the base to rest and fails
+// the navigation with not_localized by the grid of the new load, its
+// map_load_timestamp new, the message naming the load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_load_whose_map_poses_go_on_brings_the_base_to_rest_and_fails_not_localized() {
+    let (rig, handle) = driving_in_map("loaded_on").await;
+    let loaded = FakeMap::named("loaded_on", &[]).loaded_again(Duration::from_secs(1));
+    rig.publish_grid(&loaded).await;
+    ends_not_localized(
+        rig,
+        &handle,
+        &[
+            "the loaded map changed",
+            "map loaded_on loaded again",
+            "load_map",
+        ],
+    )
+    .await;
+}
+
+// base_navigation's tries: a map-frame navigation whose scans stop matching
+// the map, its map_poses reporting the base not localized, brings the base to
+// rest and fails with not_localized, naming why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_whose_scans_stop_matching_brings_the_base_to_rest_and_fails_not_localized() {
+    let (rig, handle) = driving_in_map("lost_match").await;
+    rig.room().set(|room| room.unlocalized_poses = usize::MAX);
+    ends_not_localized(
+        rig,
+        &handle,
+        &[
+            "reports the base not localized in map lost_match",
+            "scans stop matching",
+        ],
+    )
+    .await;
+}
+
+// base_navigation's checks: a map-frame goal sent once get_map_state reports
+// the base localized, and before the first map_poses that reports it, waits
+// for that map_poses within the source timeout, is admitted, and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_before_the_first_localized_map_poses_is_admitted_and_completes() {
+    let mut rig = open_room("late_map_poses", &[]).await;
+    rig.room().set(|room| room.poses_on = false);
+    rig.steps(2).await;
+    rig.room().set(|room| {
+        room.poses_on = true;
+        room.unlocalized_poses = 4;
+    });
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, AHEAD_IN_MAP);
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: once the base's odometry starts over, a
+// map-frame goal sent before room_map's next map_poses waits for a map_poses
+// placed in the new odometry, and plans and drives from where it places map:
+// the base truly reaches its goal, 1 m from where the odometry before placed
+// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn after_an_odometry_restart_a_map_goal_waits_and_plans_from_the_new_placement() {
+    let mut rig = open_room("restarted_odometry", &[]).await;
+    let drive = rig.send_drive_when_ready(&ahead(1.0, 0.3, 0.0)).await;
+    assert!(drive.accepted, "{:?}", drive.refusal);
+    rig.run_until_ended().await;
+    until_at_rest(&mut rig, DRIVE_STEPS).await;
+    rig.room().set(|room| room.poses_on = false);
+    rig.answer_describe_base(measured());
+    let restart_ns = rig.world.now_ns + STEP_NS;
+    rig.world.base.start_odometry_over(restart_ns);
+    rig.ready().await;
+    rig.room().set(|room| {
+        room.poses_on = true;
+        room.skip_poses = 4;
+    });
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, AHEAD_IN_MAP);
+    rig.shutdown().await;
+}
+
+// base_navigation's map-frame navigation across an odometry restart: a
+// map_poses of the odometry before, which arrives after drive_states report
+// the new start and before the backbone's transform of the new start, admits
+// no goal sent after them. The tree places that map_poses by the odometry
+// before, and the transform of the new start drops that odometry's samples;
+// the goal waits for a map_poses that arrives after get_map_state is asked,
+// placed by the new odometry, and the base truly reaches its goal, 1 m from
+// where the odometry before placed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_poses_of_the_odometry_before_a_restart_admits_no_goal_sent_after_it() {
+    let mut rig = open_room("late_old_map_poses", &[]).await;
+    let drive = rig.send_drive_when_ready(&ahead(1.0, 0.3, 0.0)).await;
+    assert!(drive.accepted, "{:?}", drive.refusal);
+    rig.run_until_ended().await;
+    until_at_rest(&mut rig, DRIVE_STEPS).await;
+    let before_the_restart = wire(rig.world.now_ns);
+    rig.answer_describe_base(measured());
+    let restart_ns = rig.world.now_ns + STEP_NS;
+    rig.world.base.start_odometry_over(restart_ns);
+    rig.world.advance();
+    let report = rig.world.report();
+    rig.world.publish_drive_states(&report).await;
+    rig.room()
+        .follow_report(before_the_restart, rig.world.base.truth)
+        .await;
+    rig.world.publish_odometry_transform(&report).await;
+    rig.world.tick_and_see(&rig.harness.clock).await;
+    rig.ready().await;
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.run_until_ended().await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let data = outcome::navigate_to_pose::completed(&result);
+    assert_reached_in_map(data, &rig, MAP_FROM_WORLD, AHEAD_IN_MAP);
+    rig.shutdown().await;
+}
+
+// base_navigation's checks: a map-frame goal that waits in check 1 for the
+// describe_base read of a new odometry start, 0.4 s of the clock, waits up to
+// the source timeout from get_map_state's answer for a localized map_poses:
+// the one 5 steps after that answer admits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_map_goal_after_a_late_describe_base_read_waits_the_source_timeout_from_get_map_state() {
+    let mut rig = open_room("late_base_read", &[]).await;
+    let restart_ns = rig.world.now_ns + STEP_NS;
+    rig.world.base.start_odometry_over(restart_ns);
+    rig.step().await;
+    let read = within(
+        "the node's describe_base ask at the new start",
+        rig.world
+            .base_state
+            .describe_base
+            .next_request(ANSWER_BUDGET),
+    )
+    .await
+    .expect("the node asks describe_base at the new start");
+    let mut answered = rig.room().answered();
+    answered.borrow_and_update();
+    let goal = ahead_in_map();
+    let handle = {
+        let sent = navigate_to_pose::send_goal(&rig.harness, &goal, FEEDBACK_KEPT, ANSWER_BUDGET);
+        tokio::pin!(sent);
+        for _ in 0..8 {
+            let answer = tokio::select! {
+                biased;
+                handle = &mut sent => Some(handle),
+                () = std::future::ready(()) => None,
+            };
+            assert!(answer.is_none(), "the goal waits for the read");
+            rig.world.step(&rig.harness.clock).await;
+        }
+        rig.room().set(|room| room.skip_poses = 4);
+        read.respond(measured()).await.expect("the read answers");
+        within("the fake's answer of get_map_state", answered.changed())
+            .await
+            .expect("the fake counts its answers while it lives");
+        let mut steps = 0;
+        loop {
+            let answer = tokio::select! {
+                biased;
+                handle = &mut sent => Some(handle),
+                () = std::future::ready(()) => None,
+            };
+            if let Some(handle) = answer {
+                break handle.expect("navigate_to_pose answers");
+            }
+            assert!(steps < READY_STEPS, "the node answers the goal");
+            steps += 1;
+            rig.world.step(&rig.harness.clock).await;
+        }
+    };
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    rig.shutdown().await;
+}
+
+// base_navigation's stop for a map-frame navigation: a wall only the loaded
+// map holds, which a later grid of the map's load shows ahead once the base
+// cruises on a path planned before that grid, the replan held, slows the base
+// and stops it before the wall, without contact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stop_slows_the_base_before_a_wall_only_the_map_holds() {
+    let empty = FakeMap::named("unseen_wall", &[]);
+    let mut rig = room_rig(
+        Scene::open(),
+        &[FRONT],
+        &[],
+        Plans::Held,
+        &empty,
+        MAP_FROM_WORLD,
+    )
+    .await;
+    rig.world.release_plans(1);
+    let handle = rig.send_stepping(&ahead_in_map()).await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    let mut steps = rig.run_until(|base| base.velocity.linear_x() > 0.2).await;
+    let front_in_map = truly_in_map(&rig.world.base, MAP_FROM_WORLD).y + FOOTPRINT[0][0];
+    let wall = Box3::new(
+        [-3.0, front_in_map + 1.5, 0.0],
+        [7.0, front_in_map + 1.6, 0.4],
+    );
+    rig.publish_grid(&FakeMap::named("unseen_wall", &[wall]))
+        .await;
+    let mut ended = false;
+    for _ in 0..DRIVE_STEPS {
+        let step = rig.step().await;
+        ended = step.goal_ended;
+        steps.push(step);
+        assert!(
+            !touches_in_map(&rig.world.base, MAP_FROM_WORLD, &wall),
+            "{:?}",
+            truly_in_map(&rig.world.base, MAP_FROM_WORLD)
+        );
+        if ended || rig.world.base.rests() {
+            break;
+        }
+    }
+    assert!(!ended, "the navigation waits before the wall");
+    assert!(rig.world.base.rests(), "the base stops before the wall");
+    rig.fence().await;
+    let speeds: Vec<f64> = setpoints(&rig, &steps).iter().map(forward).collect();
+    let cruise_m_s = speeds.iter().copied().fold(0.0, f64::max);
+    assert!(
+        speeds
+            .iter()
+            .skip_while(|&&speed| speed < cruise_m_s)
+            .any(|&speed| speed > 0.0 && speed < cruise_m_s),
+        "the base slows from its cruise: {speeds:?}"
+    );
+    rig.shutdown().await;
+}
+
+// base_navigation's recoveries on a map-frame navigation: a turn recovery
+// whose sweep meets a cell only the loaded map holds, behind the base, fails
+// short of its angle, and the wait follows at once, as for a box the sensors
+// see; the back-up, which that cell blocks, ends the navigation with no_path.
+// The goal lies in a pen of walls the map alone holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_recovery_whose_sweep_meets_a_map_only_cell_fails_and_the_wait_follows() {
+    let walls: Vec<Box3> = pen()
+        .iter()
+        .chain([&BOX_AT_THE_BACK_EDGE])
+        .map(map_box)
+        .collect();
+    let mut rig = open_room("pen_in_the_map", &walls).await;
+    let goal_in_map = room_map::placed(
+        MAP_FROM_WORLD,
+        Planar {
+            x: PEN_GOAL[0],
+            y: PEN_GOAL[1],
+            yaw: 0.0,
+        },
+    );
+    let handle = rig
+        .send_stepping(&in_map([goal_in_map.x, goal_in_map.y], goal_in_map.yaw))
+        .await;
+    assert!(handle.accepted, "{:?}", handle.refusal);
+    let steps = run_to_its_burst(&mut rig).await;
+    let result = outcome::navigate_to_pose::result_of(&handle).await;
+    let counted = by_recoveries(&rig, &steps);
+    let failure = outcome::navigate_to_pose::failure(&result);
+    assert_eq!(
+        failure.kind,
+        FailureKind::NoPath,
+        "{failure:?}: {}",
+        timeline(&counted)
+    );
+    assert_names(&failure.message, &["the back-up"]);
+    assert_eq!(
+        counts_taken(&counted),
+        (0..=6).collect::<Vec<u32>>(),
+        "{}",
+        timeline(&counted)
+    );
+    let wait_starts = steps
+        .iter()
+        .filter_map(StepSeen::navigation)
+        .find(|feedback| feedback.recoveries == 5)
+        .expect("the wait runs");
+    let turned = yaw_of(wait_starts.current_pose.orientation) - MAP_FROM_WORLD.yaw;
+    assert!(
+        turned < 0.6,
+        "the turn ends short of its 1.57 rad: {turned} rad"
+    );
+    assert_the_wait(&counted, 5);
     rig.shutdown().await;
 }

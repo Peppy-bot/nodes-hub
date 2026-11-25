@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use camera_core::laser_scan::{LaserScan, Sweep};
-use control_core::geometry::{Point, Pose};
 use control_core::latched_log::LatchedLog;
 use control_core::node_clock::NodeClock;
 use control_core::planar_pose::PlanarPose;
@@ -37,7 +36,7 @@ use control_core::receiving::receive;
 use control_core::robot_tree::RobotTree;
 use control_core::sync::lock_ignoring_poison;
 use control_core::time::nanoseconds;
-use frame_tree::{FrameName, LookupError, LookupTime, Stamp, Transform};
+use frame_tree::{FrameName, LookupTime, Stamp, Transform};
 use occupancy_map::depth_points;
 use peppygen::consumed_topics::cameras::depth_stream;
 use peppygen::consumed_topics::lidars::scan_stream;
@@ -47,7 +46,7 @@ use tracing::error;
 
 use crate::cameras::Camera;
 use crate::clock;
-use crate::follow::{odometry_frame, robot_frame};
+use crate::follow::{robot_frame, robot_in_odom, unplaced};
 use crate::grid::{GridSlot, LiveGrid};
 use crate::sensors::Sensors;
 
@@ -152,12 +151,6 @@ async fn next_newest<M: Clone>(
     }
 }
 
-/// The message of a lookup that failed, led by its failure kind, as
-/// sensor_mounts asks a consumer to log a frame it cannot place.
-fn unplaced(what: &str, error: &LookupError) -> String {
-    format!("{}: {what}: {error}", error.failure_kind())
-}
-
 /// The stamp `offset_s` after `stamp`, before it for an offset below 0; none outside the
 /// times a stamp holds.
 fn stamp_after(stamp: Stamp, offset_s: f64) -> Option<Stamp> {
@@ -180,21 +173,7 @@ impl Intake {
     /// The robot frame in odom at `stamp`, on the floor plane; `when` names the time in a
     /// refusal.
     async fn base_at(&self, stamp: Stamp, when: &str) -> Result<PlanarPose, String> {
-        let base = self
-            .tree
-            .lookup_within(
-                &odometry_frame(),
-                &robot_frame(),
-                LookupTime::At(stamp),
-                self.lookup_timeout,
-            )
-            .await
-            .map_err(|e| unplaced(&format!("the robot frame at {when}"), &e))?
-            .placement;
-        Point::parse(base.position())
-            .map(|position| Pose::new(position, base.orientation()))
-            .and_then(Pose::planar)
-            .map_err(|e| format!("the robot frame in odom at {when}: {e}"))
+        robot_in_odom(&self.tree, stamp, self.lookup_timeout, when).await
     }
 
     /// `frame` in the robot frame at `stamp`; `what` names the lookup in a refusal.
@@ -529,7 +508,7 @@ mod tests {
         lock_ignoring_poison(&intake.grid)
             .grid_mut()
             .expect("a grid")
-            .occupancy()
+            .occupancy(None)
             .expect("an occupancy")
     }
 

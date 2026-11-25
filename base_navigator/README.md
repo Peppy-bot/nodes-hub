@@ -15,6 +15,8 @@ DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2. It i
    drive_states (drive_link) --> odometry, mode, follow_state |
    describe_base (base_state) --> limits, footprint           v
                                             grid of the floor in odom: one occupancy
+   map_grids, map_poses (room_map) --> the loaded map's grids, map placed in odom
+   get_map_state (room_map)        --> asked at each goal in map
           +---------------------------------------------------------------+
           |  control loop, a step every controller period on the node's   |
           |  clock: the shared endings, the goal's step, the stop, the    |
@@ -48,6 +50,19 @@ DriveOnHeading and BackUp drive a base, on navigation_core's ports of Nav2. It i
   until they answer. A camera's range is its `max_depth_m`.
 - `transforms` and `static_transforms` of every publisher bound to the `transforms` slot, taken
   into the robot's tree (control_core's `RobotTree`, `cache_window_s` long).
+- `room_map`'s `map_grids`, `map_poses` and `get_map_state` on the `room_map` slot (`zero_or_one`),
+  for a navigation whose target is in `map` (`room_map.rs`). Each grid in `map` is of a load of
+  the loaded map, its map's name and its `map_load_timestamp`; the newest grid is kept, the first
+  of each load logged. A grid whose extent holds its `columns` by `rows` cells becomes
+  navigation_core's saved grid; a new map's grid before its first scan, with no extent and no
+  cell, builds none. A grid in another frame, with a cell off 0, 100 and 255, whose extent does
+  not hold its cells, or with cells and no extent is dropped and logged. Each map_poses in `map`
+  is placed as it arrives: the tree gives the robot frame in odom at its timestamp, and map in odom
+  is the map pose composed with that pose undone, the transform room_mapper publishes beside it;
+  it records the odometry start the newest drive_states reported when the tree placed it, and its
+  arrival on the node's clock. A map_poses the tree cannot place
+  is dropped, logged with the lookup's failure kind, and its reason kept until a map_poses is
+  placed. With the slot vacant, no map is loaded.
 
 ## The grid of the floor
 
@@ -88,10 +103,20 @@ base when it is accepted.
 ## A goal
 
 A goal is checked in base_navigation's order (`admission.rs`): it waits up to `source_timeout_s`
-for describe_base's read of the newest odometry start; its values; a target in `map`, refused with
-`not_localized` while no map is loaded; a target in another frame, placed in odom by the tree at
-its timestamp, refused with the lookup's kind; drive_states' silence, base_silence and each silent
-sensor; base_mode, parts_within_footprint, robot_stop and follower_goal.
+for describe_base's read of the newest odometry start; its values; a target in `map`: refused with
+`not_localized` while the `room_map` slot is vacant and while get_map_state gives no answer within
+`source_timeout_s` on the node's clock, as base_navigation reads no node serving room_map as no
+map loaded; with `rejected` for a target outside the loaded map's extent or on a map with no
+extent yet; with `not_localized` while no map is loaded or the base is not localized; with
+`precondition_failed` while room_map's set_initial_pose waits; and with `not_localized` when,
+within `source_timeout_s` of get_map_state's answer, no map_poses of the loaded map that reports the
+base localized and is placed in the base's odometry arrives after get_map_state is asked, or no
+map_grids of the loaded map arrives, as Nav2's planner waits for its static layer's first map. The
+navigation runs on the load of its map's newest grid. Each `not_localized` names load_map, then
+set_initial_pose or reinitialize_global_localization. A target in another frame is placed in odom
+by the tree at its timestamp, refused with the lookup's kind. Then drive_states' silence,
+base_silence and each silent sensor; base_mode, parts_within_footprint, robot_stop and
+follower_goal.
 
 A new goal replaces the goal in flight, which ends cancelled at once: by its caller's cancel when
 one came, its result where the newest drive_states placed the robot frame, and otherwise with its
@@ -101,8 +126,12 @@ order: the caller's cancel, its result where the newest drive_states placed the 
 follow_state other than following, robot_stop and follower_goal cancelling it with the result
 where drive_states first reported it, base_mode and base_silence failing it; the odometry
 starting over; more than 0.5 s with no drive_states; a silent sensor; a limb outside the
-footprint; the passing of the goal's `timeout_s`; the goal's completion at its end, its result
-where the newest drive_states placed the robot frame; then every other failure. After each
+footprint; the passing of the goal's `timeout_s`; a navigation in map's `not_localized`, its map
+changed (the newest map_grids is of another map or another load, a load_map or a start_mapping,
+or the newest map_poses of its odometry names another map), its base not localized in it, or no
+map_poses of its odometry within `source_timeout_s`, as after a remove_map, which publishes no
+grid; the goal's completion at its end, its result where the newest drive_states
+placed the robot frame; then every other failure. After each
 ending, completed, cancelled or failed, while the navigator's stream is live and the base follows
 it, the navigator streams its release burst, zero velocity for 0.25 s and at least 3 setpoints,
 then nothing; a drive_states that reports a hold ends it, and so does the next goal's first
@@ -112,10 +141,16 @@ setpoint.
 
 A navigation runs in tries (`drive.rs`). A try plans with Smac 2D on its own task (`planning.rs`),
 so a plan still running delays no controller step, or keeps the path it has while that path is
-shorter than `near_goal_distance_m` with no pose in collision or off the grid, and follows it
-(`following.rs`): the path handler, the progress checker, regulated pure pursuit and the goal
-checker, in Nav2's controller server's order, planning again at `replan_rate_hz`. A plan the planner
-refuses leaves the navigation no path to keep, as Nav2's ComputePathToPose leaves an empty path. The
+shorter than `near_goal_distance_m` with no pose in collision or off the grid that judges it, and
+follows it (`following.rs`): the path handler, the progress checker, regulated pure pursuit and the
+goal checker, in Nav2's controller server's order, planning again at `replan_rate_hz`. The grid that
+judges a pose is the grid of the floor, with the newest readings, where the pose lies on it; for a
+navigation in map, a pose off the grid of the floor is judged on the grid in map the plan of its
+path ran on, which each plan that finds a path replaces. Nav2's ValidatePath judges the path left on
+the planner's global costmap, whose static layer takes each new map at its next update
+(nav2_costmap_2d plugins/static_layer.cpp:301-316, :380-382); the navigator judges on a newer grid in
+map once a plan that finds a path has run on it. A plan the planner refuses leaves the
+navigation no path to keep, as Nav2's ComputePathToPose leaves an empty path. The
 try after the clearing recovery reads that rule on the emptied grid, where no pose is in collision,
 and follows the path it keeps from the step after the clearing, on the emptied grid. A plan that
 finds no path, and a follow that fails, empty the grid and run once more on the readings that arrive
@@ -126,6 +161,18 @@ When a try fails, the recoveries run (`recovery.rs`): a clearing, a turn of
 `recoveries.turn_angle_rad`, a wait of `recoveries.wait_s` streaming zero velocity, and a back-up of
 `recoveries.back_up_distance_m`, each once; after the back-up the navigation fails, `blocked` or
 `no_path`. The navigation completes at the step the goal checker finds the goal reached.
+
+A navigation whose target is in `map` runs in `map`: its target, its path and its feedback and
+result are in `map`, where the newest map_poses of the base's odometry places map in odom at each
+step. Each plan runs, as Nav2's global cost map composes its layers, on the loaded map's newest grid
+padded with unknown cells out to the extent the goal was admitted against, a point on the extent's
+far edge in its last cell, the grid of the floor's obstacles projected onto it, inflated, composed
+on the planner's task; while the map's newest grid has no cell, the static layer is unknown. It
+follows, stops and turns on the grid of the floor, with the loaded map's occupied cells placed on
+it, and places its path in odom where it reads that grid; clear_grid and the clearing recovery
+leave the map's cells. The follow, the stop and the turns read the map's cells as base_navigation
+asks, a departure from Nav2, whose local costmap holds no static layer (nav2_bringup
+params/nav2_params.yaml:251) where its global costmap holds one (:305).
 
 ### The moves
 
@@ -159,9 +206,11 @@ tests and the harness tests run; the launcher's fragment holds Nav2's defaults, 
 Each module's unit tests run on simulated clocks or on times they set: the admission's order of
 checks, the shared endings and the release burst, the tries and recoveries of a navigation with
 plans run in the test, the gated planner, the turns, the straight drives and the moves, the
-follow, the grid's marks, clearing and centering, the sensors' pairing and refusals, a depth
-frame and a scan placed by the tree (a scan swept while the base turns, clockwise and
-counterclockwise), and describe_base's parse and wait.
+follow, the grid's marks, clearing and centering, the loaded map's cells on the occupancy and the
+stop, the sensors' pairing and refusals, a depth frame and a scan placed by the tree (a scan swept
+while the base turns, clockwise and counterclockwise), describe_base's parse and wait, a map's
+grids, the placement of map_poses and the causes of a step in map in order, the plan's lattice, and
+the map checks of a goal over drawn map states.
 
 The harness tests (`tests/navigator.rs`) boot the node in-process through `setup_with` on a
 simulated clock the test ticks, against a mock base of drive_link that commands each setpoint
@@ -178,4 +227,11 @@ cameras see, a grid read from a lidar alone, its silence, its dropped scans and 
 a part carries it, the marks of a tilted base beside a drop, the recoveries, a plan held while the
 controller and the stop step, the replacement, the cancels and the holds, the release burst, the
 order of endings within a step, the silences, the odometry's start-over, the rolling grid, the
-moves, and a clock that lags the messages or leaps.
+moves, a clock that lags the messages or leaps, and, against a fake room_map that gives maps of
+boxes, a map_poses after each report of the base and get_map_state's answer as the test sets them,
+the navigations in map: their refusals, drives to places in a map turned in the world, past the
+grid of the floor, around a wall only the map holds and a box only the lidar sees, the stop and a
+recovery turn on map-only cells, a start in collision with a map cell, a goal admitted on a late
+map_poses and after an odometry restart, and the endings of a load_map, a load of the loaded map,
+a start_mapping, a remove_map and scans that stop matching, and the finish_mapping that leaves the
+navigation running.

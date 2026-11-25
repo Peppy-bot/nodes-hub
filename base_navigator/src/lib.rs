@@ -13,11 +13,14 @@
 //!   description, their frames and scans placed by the tree, and
 //!   navigation_core's `LiveObstacles`, the grid of the floor in odom, with its
 //!   one occupancy query and the stop.
+//! - [`room_map`]: room_map's loaded map for a navigation whose target is in
+//!   map: its grids, the robot frame's place in it from map_poses, and
+//!   get_map_state's answer.
 //! - [`admission`]: a goal checked in base_navigation's order.
 //! - [`drive`], [`following`], [`recovery`], [`moves`], [`planning`]: a
-//!   navigation's tries and recoveries, its follow, the turns and straight
-//!   drives, the moves, and the planner on a task of its own, each a function
-//!   of its inputs and of time.
+//!   navigation's tries and recoveries, in odom or in map, its follow, the
+//!   turns and straight drives, the moves, and the planner on a task of its
+//!   own, each a function of its inputs and of time.
 //! - [`control`]: the loop that steps the goal on the node's clock, ends it by
 //!   what drive_states reports, and streams the release burst.
 //! - [`actions`], [`services`]: the four actions and clear_grid.
@@ -47,6 +50,7 @@ mod moves;
 mod node;
 mod planning;
 mod recovery;
+mod room_map;
 mod sensors;
 mod services;
 

@@ -10,22 +10,26 @@
 //! fixed frame on static_transforms and by describe_sensors' answer;
 //! base_state by describe_base's answer; each depth camera by a pinhole that
 //! renders the scene's boxes, tables, slabs and drops from where the base
-//! stands; and each 2-D lidar, which the boot binds only when a test asks, by a
+//! stands; each 2-D lidar, which the boot binds only when a test asks, by a
 //! fan whose rays each render the scene from where the base stood at the ray's
 //! time, between where it stood at the step before and where it stands
-//! ([`scene`]).
+//! ([`scene`]); and room_map, whose link the boot leaves vacant unless a test
+//! asks, by a fake that gives maps of boxes, a map_poses after each report of
+//! the base, and get_map_state's answer as the test sets them ([`room_map`]).
 //!
 //! Each step moves the base by the velocity it executes, publishes the
 //! odometry, each camera's frame of the step's time and each lidar's scan whose
-//! sweep ends at that time, and ticks the clock to that time. While a goal runs, the step waits for the goal's feedback of
-//! that step, or for the end of its feedback, which the node gives at the step
-//! that ends the goal: the rig and the node step together. The node stamps
-//! each setpoint with its step's time, and the rig keeps each by its stamp. The
-//! base commands a setpoint from the step after it arrives; a step of a spin,
-//! a drive_on_heading or a back_up, each of which streams a setpoint, waits
-//! for it. A setpoint that arrives proves that every setpoint the node
-//! streamed before it arrived, since the node streams them in order on one
-//! publisher.
+//! sweep ends at that time, and ticks the clock to that time. While a goal
+//! runs, the step waits for the goal's feedback of that step, or for the end of
+//! its feedback, which the node gives at the step that ends the goal: the rig
+//! and the node step together. A goal in map waits, the clock standing still,
+//! for the fake room_map's answer of get_map_state ([`Rig::send_stepping`]).
+//! The node stamps each setpoint with its step's time, and the rig keeps each
+//! by its stamp. The base commands a setpoint from the step after it arrives;
+//! a step of a spin, a drive_on_heading or a back_up, each of which streams a
+//! setpoint, waits for it. A setpoint that arrives proves that every setpoint
+//! the node streamed before it arrived, since the node streams them in order
+//! on one publisher.
 //!
 //! The wire orders none of these against the clock's tick: the node's taking
 //! of a step's drive_states, depth frames and scans, a plan finishing, a goal
@@ -37,6 +41,7 @@
 
 pub mod log;
 pub mod mock_base;
+pub mod room_map;
 pub mod scene;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -75,8 +80,10 @@ use peppygen::paired_topics::base::drive_states::{
 use peppylib::testing::{HarnessClock, MockClock};
 use tokio::sync::Mutex;
 
+use self::log::logged_with;
 use control_core::drive_link::FollowState;
 use mock_base::{Limits, MockBase, Planar};
+use room_map::{FakeMap, FakeRoomMap, MAP_FRAME, RoomState};
 use scene::{DepthLens, LidarLens, Pose3, Scene, TurnedBox};
 
 /// One step of the node's controller and of the rig (ns): 20 Hz.
@@ -574,11 +581,12 @@ impl InFlight {
 }
 
 /// What the base reported at a step, published once the odometry's lag
-/// passed.
+/// passed, and where the robot frame truly stood then.
 #[derive(Clone, Copy, Debug)]
-struct OdometryReport {
+pub struct OdometryReport {
     stamp_ns: i64,
     start_ns: i64,
+    truth: Planar,
     odometry: Planar,
     velocity: PlanarTwist,
     mode: &'static str,
@@ -634,6 +642,8 @@ pub struct World {
     gate: Option<PlanGate>,
     /// base_state's mock, which answers describe_base.
     pub base_state: base_state::Mock,
+    /// The fake room_map, while the rig binds the room_map link.
+    pub room: Option<FakeRoomMap>,
     /// Every setpoint the node streamed that arrived, by its stamp on the
     /// node's clock (ns).
     streamed: BTreeMap<i64, Setpoint>,
@@ -656,6 +666,14 @@ impl World {
     pub fn release_plans(&mut self, count: usize) {
         let gate = self.gate.as_ref().expect("the node's plans are held");
         gate.release(count);
+    }
+
+    /// How many plans the node asked of its held planner.
+    pub fn plans_asked(&self) -> usize {
+        self.gate
+            .as_ref()
+            .expect("the node's plans are held")
+            .asked()
     }
 
     /// The node's clock reading at the rig's time `rig_ns`.
@@ -686,10 +704,11 @@ impl World {
     }
 
     /// The base's report of the newest step.
-    fn report(&self) -> OdometryReport {
+    pub fn report(&self) -> OdometryReport {
         OdometryReport {
             stamp_ns: self.now_ns,
             start_ns: self.base.odometry_start_ns,
+            truth: self.base.truth,
             odometry: self.base.odometry,
             velocity: self.base.velocity,
             mode: self.base.mode(),
@@ -701,6 +720,13 @@ impl World {
     /// Publish `report`: the transform odom to base_footprint of its stamp,
     /// then its drive_states.
     async fn publish_report(&mut self, report: &OdometryReport) {
+        self.publish_odometry_transform(report).await;
+        self.publish_drive_states(report).await;
+    }
+
+    /// Publish the backbone's transform odom to base_footprint of `report`'s
+    /// stamp, in the odometry it started.
+    pub async fn publish_odometry_transform(&self, report: &OdometryReport) {
         let position = [report.odometry.x, report.odometry.y, 0.0];
         let orientation = quaternion_of_yaw(report.odometry.yaw);
         self.wire
@@ -720,6 +746,12 @@ impl World {
             })
             .await
             .expect("the backbone publishes the odometry's transform");
+    }
+
+    /// Publish `report`'s drive_states, kept by its stamp.
+    pub async fn publish_drive_states(&mut self, report: &OdometryReport) {
+        let position = [report.odometry.x, report.odometry.y, 0.0];
+        let orientation = quaternion_of_yaw(report.odometry.yaw);
         let velocity = report.velocity;
         let (linear_limits, angular_limits) = limits_of!(
             self.base.limits(),
@@ -853,7 +885,8 @@ impl World {
     }
 
     /// Publish the inputs of the newest step: the base's report once its lag
-    /// passed, then each camera's frame and each lidar's scan.
+    /// passed, with room_map's map_poses after it, then each camera's frame
+    /// and each lidar's scan.
     async fn publish_inputs(&mut self) {
         if self.base_reports {
             self.reports.push_back(self.report());
@@ -861,6 +894,10 @@ impl World {
         while self.reports.len() > self.odometry_lag_steps {
             let report = self.reports.pop_front().expect("a report waits");
             self.publish_report(&report).await;
+            if let Some(room) = &self.room {
+                room.follow_report(wire(report.stamp_ns), report.truth)
+                    .await;
+            }
         }
         if self.cameras_on {
             self.publish_frames().await;
@@ -933,7 +970,7 @@ impl World {
     /// step of that time: the feedback, or the end, of the goal in flight,
     /// and the setpoints that arrived, the one of a step that streams one
     /// waited for.
-    async fn tick_and_see(&mut self, clock: &MockClock) -> StepSeen {
+    pub async fn tick_and_see(&mut self, clock: &MockClock) -> StepSeen {
         let at_ns = self.node_ns(self.now_ns);
         clock
             .tick(u64::try_from(at_ns).expect("a time after the clock's origin"))
@@ -1013,11 +1050,13 @@ struct Booted {
 /// The node booted on the harness's simulated clock with `params`, its
 /// cameras the mocks named after `mounts` in both camera slots, its lidars the
 /// mocks named after `lidars`, the robot's tree bound to the backbone and the
-/// initializer, and its planner running `plans`.
+/// initializer, its room_map link bound to the mock when `room_map` and vacant
+/// otherwise, and its planner running `plans`.
 async fn boot(
     params: peppygen::Parameters,
     mounts: &[Mount],
     lidars: &[LidarMount],
+    room_map: bool,
     plans: Plans,
 ) -> Booted {
     let names: Vec<String> = mounts.iter().map(|mount| mount.name.to_string()).collect();
@@ -1037,6 +1076,7 @@ async fn boot(
             cameras_instance_ids: names.clone(),
             geometry_instance_ids: names,
             lidars_instance_ids: lidar_names,
+            room_map_vacant: !room_map,
             transforms_instance_ids: vec![BACKBONE.to_string(), INITIALIZER.to_string()],
             ..Config::default()
         },
@@ -1168,36 +1208,6 @@ macro_rules! sender {
     };
 }
 
-/// A sender of goals to `$action` while the rig steps, for a goal whose
-/// answer waits on the node's clock.
-macro_rules! stepping_sender {
-    ($send_stepping:ident, $action:ident, $variant:ident) => {
-        /// Send `goal`, stepping the rig while the node has not answered: a
-        /// goal whose checks wait on the node's clock is answered once the
-        /// clock reaches the end of the wait.
-        pub async fn $send_stepping(
-            &mut self,
-            goal: &$action::GoalRequestData,
-        ) -> Goal<$action::GoalHandle, $action::Failure> {
-            let sent = $action::send_goal(&self.harness, goal, FEEDBACK_KEPT, ANSWER_BUDGET);
-            tokio::pin!(sent);
-            for _ in 0..READY_STEPS {
-                let answered = tokio::select! {
-                    biased;
-                    handle = &mut sent => Some(handle),
-                    () = std::future::ready(()) => None,
-                };
-                if let Some(handle) = answered {
-                    let handle = handle.expect(concat!(stringify!($action), " answers"));
-                    return self.world.sent(handle, InFlight::$variant);
-                }
-                self.world.step(&self.harness.clock).await;
-            }
-            panic!("the node did not answer the goal in {READY_STEPS} steps");
-        }
-    };
-}
-
 /// A sender of goals to `$action` once the node knows the base and a reading
 /// of every sensor, through the [`sender!`] `$send`.
 macro_rules! ready_sender {
@@ -1273,7 +1283,7 @@ impl Rig {
 
     /// [`Rig::booted`] with the lidars of `lidars` too, on a clock that reads
     /// `clock_lag_ns` behind the messages' stamps from its first tick on, the
-    /// planner running `plans`.
+    /// planner running `plans`, the room_map link vacant.
     pub async fn booted_with(
         params: peppygen::Parameters,
         scene: Scene,
@@ -1282,12 +1292,30 @@ impl Rig {
         clock_lag_ns: i64,
         plans: Plans,
     ) -> Self {
+        Self::booted_in(params, scene, mounts, lidars, clock_lag_ns, plans, None).await
+    }
+
+    /// [`Rig::booted_with`] with the room_map link bound to a fake that gives
+    /// `room`, vacant for none.
+    async fn booted_in(
+        params: peppygen::Parameters,
+        scene: Scene,
+        mounts: &[Mount],
+        lidars: &[LidarMount],
+        clock_lag_ns: i64,
+        plans: Plans,
+        room: Option<RoomState>,
+    ) -> Self {
         let Booted {
             harness,
             mocks,
             gate,
-        } = boot(params, mounts, lidars, plans).await;
+        } = boot(params, mounts, lidars, room.is_some(), plans).await;
         let Mocks { deps, pairings, .. } = mocks;
+        let room = room.map(|state| {
+            let mock = deps.room_map.expect("the harness binds the room_map mock");
+            FakeRoomMap::new(mock, state)
+        });
         deps.sensor_mounts
             .describe_sensors
             .enqueue_response(sensors_answer(mounts, lidars))
@@ -1312,6 +1340,7 @@ impl Rig {
             clock_lag_ns,
             gate,
             base_state: deps.base_state,
+            room,
             streamed: BTreeMap::new(),
             reported: BTreeMap::new(),
             wire: Wire {
@@ -1368,6 +1397,34 @@ impl Rig {
         let mut rig = Self::booted(params, scene, mounts).await;
         rig.world.base = MockBase::new(limits, ODOMETRY_STARTED_AT_NS);
         rig.first_step(base_answer(limits, "measured")).await;
+        rig
+    }
+
+    /// The node with the cameras of `mounts` and the lidars of `lidars` before
+    /// `scene`, its room_map link bound to a fake that gives `room`, its plans
+    /// running as `plans` says, after the base's first step with describe_base
+    /// answering for the rig's base.
+    pub async fn start_in_room(
+        scene: Scene,
+        mounts: &[Mount],
+        lidars: &[LidarMount],
+        plans: Plans,
+        room: RoomState,
+    ) -> Self {
+        Self::start_in_room_with(params(), scene, mounts, lidars, plans, room).await
+    }
+
+    /// [`Rig::start_in_room`] with `params`.
+    pub async fn start_in_room_with(
+        params: peppygen::Parameters,
+        scene: Scene,
+        mounts: &[Mount],
+        lidars: &[LidarMount],
+        plans: Plans,
+        room: RoomState,
+    ) -> Self {
+        let mut rig = Self::booted_in(params, scene, mounts, lidars, 0, plans, Some(room)).await;
+        rig.first_step(measured()).await;
         rig
     }
 
@@ -1431,6 +1488,31 @@ impl Rig {
         Self::start_with(params(), scene, &[FRONT], measured()).await
     }
 
+    /// The fake room_map of a rig that binds the room_map link.
+    pub fn room(&self) -> &FakeRoomMap {
+        self.world
+            .room
+            .as_ref()
+            .expect("the rig binds the room_map link")
+    }
+
+    /// Publish `map`'s grid on map_grids, stamped with the rig's time.
+    pub async fn publish_grid(&self, map: &FakeMap) {
+        self.room().publish_grid(map, wire(self.world.now_ns)).await;
+    }
+
+    /// Step until the node logged a message that holds each of `parts`:
+    /// a test reads the node's log from [`log::keep_the_log`] on.
+    pub async fn until_logged(&mut self, parts: &[&str]) {
+        for _ in 0..READY_STEPS {
+            if !logged_with(parts).is_empty() {
+                return;
+            }
+            self.step().await;
+        }
+        panic!("the node logged no {parts:?} in {READY_STEPS} steps");
+    }
+
     /// Answer the node's next describe_base with `answer`.
     pub fn answer_describe_base(&self, answer: base_state::describe_base::ResponseData) {
         self.world
@@ -1460,13 +1542,62 @@ impl Rig {
     }
 
     sender!(send, navigate_to_pose, Navigate);
-    stepping_sender!(send_stepping, navigate_to_pose, Navigate);
     ready_sender!(send_when_ready, send, navigate_to_pose);
     sender!(send_spin, spin, Spin);
     ready_sender!(send_spin_when_ready, send_spin, spin);
     sender!(send_drive, drive_on_heading, DriveOnHeading);
     ready_sender!(send_drive_when_ready, send_drive, drive_on_heading);
     sender!(send_back_up, back_up, BackUp);
+
+    /// Send `goal`, stepping the rig while the node has not answered: a goal
+    /// whose checks wait on the node's clock is answered once the clock reaches
+    /// the end of the wait. A goal in map against a fake room_map that answers
+    /// get_map_state first waits, the clock standing still, until the fake
+    /// answered an ask after the send, so every map_poses of the steps arrives
+    /// after the node asked, whatever the host's speed.
+    pub async fn send_stepping(
+        &mut self,
+        goal: &navigate_to_pose::GoalRequestData,
+    ) -> Goal<navigate_to_pose::GoalHandle, navigate_to_pose::Failure> {
+        let in_map = goal.target.frame.as_deref() == Some(MAP_FRAME);
+        let room = self.world.room.as_ref().filter(|_| in_map);
+        let mut answered = room.filter(|room| room.answers()).map(|room| {
+            let mut answered = room.answered();
+            answered.borrow_and_update();
+            answered
+        });
+        let sent = navigate_to_pose::send_goal(&self.harness, goal, FEEDBACK_KEPT, ANSWER_BUDGET);
+        tokio::pin!(sent);
+        if let Some(answered) = answered.as_mut() {
+            let first = within("the fake's answer of get_map_state, or the goal's", async {
+                tokio::select! {
+                    handle = &mut sent => Some(handle),
+                    changed = answered.changed() => {
+                        changed.expect("the fake counts its answers while it lives");
+                        None
+                    }
+                }
+            })
+            .await;
+            if let Some(handle) = first {
+                let handle = handle.expect("navigate_to_pose answers");
+                return self.world.sent(handle, InFlight::Navigate);
+            }
+        }
+        for _ in 0..READY_STEPS {
+            let answered = tokio::select! {
+                biased;
+                handle = &mut sent => Some(handle),
+                () = std::future::ready(()) => None,
+            };
+            if let Some(handle) = answered {
+                let handle = handle.expect("navigate_to_pose answers");
+                return self.world.sent(handle, InFlight::Navigate);
+            }
+            self.world.step(&self.harness.clock).await;
+        }
+        panic!("the node did not answer the goal in {READY_STEPS} steps");
+    }
 
     /// The failure `goal` is refused with now.
     pub async fn refusal(

@@ -1,9 +1,11 @@
 //! One follow of a planned path with navigation_core's ports of Nav2's
 //! controller server, in its order (nav2_controller controller_server.cpp
 //! `computeControl`, `computeAndPublishVelocity`): the path handler prunes
-//! the plan to the poses ahead of the base, the progress checker judges the
-//! base's progress, regulated pure pursuit gives the command, and the goal
-//! checker judges whether the base reached the goal.
+//! the plan to the poses ahead of the base and places them in odom, where the
+//! grid of the floor is, the plan being in the frame its navigation runs in,
+//! the progress checker judges the base's progress, regulated pure pursuit
+//! gives the command, and the goal checker judges whether the base reached the
+//! goal.
 //!
 //! A follow fails when the base makes no progress, and when the controller
 //! gives no command that keeps the padded footprint off every occupied cell
@@ -129,17 +131,19 @@ impl Follower {
     }
 
     /// The step at `now_ns` of the base at `pose`, moving at `velocity`, on
-    /// `grid`, all in odom.
+    /// `grid`, all in odom, the plan's frame standing in odom at
+    /// `odom_from_plan`.
     pub fn step(
         &mut self,
         pose: PlanarPose,
         velocity: PlanarTwist,
         grid: &CostGrid,
         now_ns: i64,
+        odom_from_plan: PlanarPose,
     ) -> Result<Followed, FollowEnd> {
         let pruned = self
             .plan
-            .prune(pose, PlanarPose::IDENTITY, &grid.geometry())
+            .prune(pose, odom_from_plan, &grid.geometry())
             .map_err(|e| FollowEnd::CannotGoOn(e.to_string()))?;
         self.progress
             .check(pose, now_ns)
@@ -181,6 +185,8 @@ mod tests {
 
     use control_core::positive_finite::PositiveFinite;
 
+    use std::f64::consts::FRAC_PI_2;
+
     use crate::base::tests::base;
     use crate::config::tests::config;
     use crate::recovery::tests::grid;
@@ -219,7 +225,13 @@ mod tests {
         let free = grid(&[]);
         let mut follower = follower(0);
         let first = follower
-            .step(PlanarPose::IDENTITY, PlanarTwist::ZERO, &free, 0)
+            .step(
+                PlanarPose::IDENTITY,
+                PlanarTwist::ZERO,
+                &free,
+                0,
+                PlanarPose::IDENTITY,
+            )
             .expect("a step");
         assert!(
             matches!(first, Followed::Command(command) if command.linear_x() > 0.0),
@@ -227,7 +239,13 @@ mod tests {
         );
         let at_end = PlanarPose::new(0.97, 0.0, 0.05).unwrap();
         assert_eq!(
-            follower.step(at_end, PlanarTwist::ZERO, &free, 50_000_000),
+            follower.step(
+                at_end,
+                PlanarTwist::ZERO,
+                &free,
+                50_000_000,
+                PlanarPose::IDENTITY
+            ),
             Ok(Followed::Reached)
         );
     }
@@ -239,7 +257,13 @@ mod tests {
         let walled = grid(&[[0.3, 0.0], [0.3, 0.05], [0.3, -0.05]]);
         let mut follower = follower(100_000_000);
         assert_eq!(
-            follower.step(PlanarPose::IDENTITY, PlanarTwist::ZERO, &walled, 50_000_000),
+            follower.step(
+                PlanarPose::IDENTITY,
+                PlanarTwist::ZERO,
+                &walled,
+                50_000_000,
+                PlanarPose::IDENTITY
+            ),
             Ok(Followed::NoCommand)
         );
         assert!(matches!(
@@ -247,9 +271,34 @@ mod tests {
                 PlanarPose::IDENTITY,
                 PlanarTwist::ZERO,
                 &walled,
-                150_000_000
+                150_000_000,
+                PlanarPose::IDENTITY
             ),
             Err(FollowEnd::Failed(_))
         ));
+    }
+
+    // A path in a frame that stands in odom turned a quarter turn is followed
+    // where it lies in odom: ahead along odom's y from where it starts, and
+    // reached at its end placed in odom.
+    #[test]
+    fn a_path_in_another_frame_is_followed_where_it_lies_in_odom() {
+        let free = grid(&[]);
+        let mut follower = follower(0);
+        let odom_from_plan = PlanarPose::new(0.0, 0.0, FRAC_PI_2).unwrap();
+        let facing_y = PlanarPose::new(0.0, 0.0, FRAC_PI_2).unwrap();
+        let first = follower
+            .step(facing_y, PlanarTwist::ZERO, &free, 0, odom_from_plan)
+            .expect("a step");
+        assert!(
+            matches!(first, Followed::Command(command)
+                if command.linear_x() > 0.0 && command.angular_z().abs() < 0.1),
+            "{first:?}"
+        );
+        let at_end = PlanarPose::new(0.0, 0.97, FRAC_PI_2 + 0.05).unwrap();
+        assert_eq!(
+            follower.step(at_end, PlanarTwist::ZERO, &free, 50_000_000, odom_from_plan),
+            Ok(Followed::Reached)
+        );
     }
 }

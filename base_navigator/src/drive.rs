@@ -1,18 +1,33 @@
-//! One navigation of the base to a pose in odom, as base_navigation states it
-//! and as Nav2's NavigateToPose runs its default behavior tree: tries, each a
-//! plan and a follow, and the recoveries between them. A navigation reads
-//! time and the world as arguments and touches no wire: the control loop
-//! hands each step its inputs, runs the plans it asks for on the planner's
-//! task, empties the grid when it asks, and sends what the step gives.
+//! One navigation of the base to a pose, as base_navigation states it and as
+//! Nav2's NavigateToPose runs its default behavior tree: tries, each a plan and
+//! a follow, and the recoveries between them. A navigation reads time and the
+//! world as arguments and touches no wire: the control loop hands each step its
+//! inputs, runs the plans it asks for on the planner's task, empties the grid
+//! when it asks, and sends what the step gives.
+//!
+//! A navigation runs in odom, or in map on room_map's loaded map ([`RunFrame`]).
+//! Its goal, its path and its feedback are in the frame it runs in; it places
+//! the path in odom where it reads the grid of the floor, which is kept there,
+//! as Nav2's controller places its plan in its cost map's frame. Its turns and
+//! back-ups, and the distance it drove, read the odometry.
 //!
 //! A try plans a path, or keeps the one it has while that path, from its pose
 //! nearest the robot frame's origin to the goal, is shorter than the
-//! near-goal distance and has no pose in collision or off the grid, and
-//! follows it, planning again at the planning rate under the same rule. A
-//! plan the planner refuses leaves the navigation no path to keep, as Nav2's
-//! ComputePathToPose writes an empty path when it aborts (nav2_behavior_tree
-//! plugins/action/compute_path_to_pose_action.cpp:71-77) and IsGoalNearby
-//! fails on an empty path
+//! near-goal distance and has no pose in collision or off the grid that
+//! judges it, and follows it, planning again at the planning rate under the
+//! same rule. That grid is the grid of the floor, with the newest readings,
+//! where a pose lies on it; for a navigation in map, a pose off the grid of
+//! the floor is judged on the grid in map the plan of its path ran on, which
+//! each plan that finds a path replaces. So the newest readings count near
+//! the base and the map of that plan beyond. Nav2's ValidatePath judges the
+//! path left on the planner's global costmap, whose obstacle layer goes on
+//! marking and whose static layer takes each new map at its next update
+//! (nav2_costmap_2d plugins/static_layer.cpp:301-316, :380-382); the
+//! navigator judges on a newer grid in map once a plan that finds a path has
+//! run on it. A plan the planner refuses leaves the navigation no path to
+//! keep, as Nav2's ComputePathToPose writes an empty path when it aborts
+//! (nav2_behavior_tree plugins/action/compute_path_to_pose_action.cpp:71-77)
+//! and IsGoalNearby fails on an empty path
 //! (plugins/condition/is_goal_nearby_condition.cpp:45-47). The try that the
 //! clearing recovery starts reads that rule on the grid the clearing empties,
 //! where no pose is in collision, as Nav2's tree checks the path on the
@@ -46,7 +61,7 @@
 
 use std::sync::Arc;
 
-use control_core::planar_pose::PlanarPose;
+use control_core::planar_pose::{PlanarPose, PlanarPoseError};
 use control_core::positive_finite::PositiveFinite;
 use control_core::twist::PlanarTwist;
 use frame_tree::arithmetic::normalize_angle;
@@ -62,6 +77,7 @@ use crate::planning::{Path, PlanDone, PlanRequest, Planned};
 use crate::recovery::{
     Direction, MotionStep, RECOVERIES, Recovery, SpinRequest, StraightDrive, StraightRequest, Turn,
 };
+use crate::room_map::MapRun;
 
 /// The measured speed (m/s) at or below which the time left is 0.
 const SLOWEST_ESTIMATED_SPEED_M_S: f64 = 0.01;
@@ -69,10 +85,26 @@ const SLOWEST_ESTIMATED_SPEED_M_S: f64 = 0.01;
 /// The distance left (m) at or below which the time left is 0.
 const NEAREST_ESTIMATED_DISTANCE_M: f64 = 0.1;
 
+/// The frame a navigation runs in: odom, for a target in any frame but map,
+/// or map, on room_map's loaded map.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RunFrame {
+    Odometry,
+    Map(MapRun),
+}
+
+/// A navigation the checks admit: its request, and the frame it runs in,
+/// which the control loop places it by.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavigationGoal {
+    pub request: NavigationRequest,
+    pub frame: RunFrame,
+}
+
 /// A navigation's goal, as the navigation takes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NavigationRequest {
-    /// The target in odom, its yaw in [-pi, pi].
+    /// The target in the frame the navigation runs in, its yaw in [-pi, pi].
     pub target: PlanarPose,
     pub position_tolerance_m: PositiveFinite,
     pub orientation_tolerance_rad: PositiveFinite,
@@ -84,13 +116,54 @@ pub struct NavigationRequest {
     pub speed_m_s: PositiveFinite,
 }
 
+/// Where the robot frame stands at a step: in odom, and in the frame its
+/// navigation runs in, which stands in odom at `odom_from_run`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BasePose {
+    in_odom: PlanarPose,
+    in_run: PlanarPose,
+    odom_from_run: PlanarPose,
+}
+
+impl BasePose {
+    /// The robot frame at `in_odom`, for a navigation that runs in odom.
+    pub fn in_odometry(in_odom: PlanarPose) -> Self {
+        Self {
+            in_odom,
+            in_run: in_odom,
+            odom_from_run: PlanarPose::IDENTITY,
+        }
+    }
+
+    /// The robot frame at `in_odom`, for a navigation that runs in a frame
+    /// that stands in odom at `odom_from_run`; refused for a place in that
+    /// frame that is not finite.
+    pub fn in_frame(
+        in_odom: PlanarPose,
+        odom_from_run: PlanarPose,
+    ) -> Result<Self, PlanarPoseError> {
+        Ok(Self {
+            in_odom,
+            in_run: in_odom.seen_from(odom_from_run)?,
+            odom_from_run,
+        })
+    }
+
+    /// `pose`, a pose in the frame the navigation runs in, in odom; none for
+    /// a place in odom that is not finite.
+    fn to_odom(self, pose: PlanarPose) -> Option<PlanarPose> {
+        self.odom_from_run.compose(pose).ok()
+    }
+}
+
 /// What the base and the grid report at a step, as a navigation reads them.
 #[derive(Clone, Debug)]
 pub struct NavigationInputs<'a> {
     pub now_ns: i64,
-    /// Where the newest drive_states places the robot frame in odom.
-    pub pose: PlanarPose,
+    /// Where the newest drive_states places the robot frame.
+    pub base: BasePose,
     pub velocity: PlanarTwist,
+    /// The grid of the floor's occupancy, in odom.
     pub grid: &'a CostGrid,
     pub footprint: &'a PaddedFootprint,
     /// Whether every sensor's reading went into the grid since its newest
@@ -191,18 +264,22 @@ enum Replan {
     AwaitingReadings,
 }
 
-/// Whether `pose` is in collision on `grid`: an occupied cell lies within the
-/// padded footprint's inscribed radius of it, which the inflated grid marks
-/// at least inscribed; a pose off the grid counts in collision.
-fn in_collision(grid: &CostGrid, pose: PlanarPose) -> bool {
-    grid.geometry()
-        .cell_of([pose.x(), pose.y()])
+/// Whether `pose`, in `grid`'s frame, is in collision on `grid`: an occupied
+/// cell lies within the padded footprint's inscribed radius of it, which the
+/// inflated grid marks at least inscribed; a pose off the grid counts in
+/// collision, as Nav2's ValidatePath counts a pose off its costmap lethal
+/// (nav2_planner is_path_valid_service.hpp:262-266), and so does one whose
+/// place in that frame is not finite.
+fn in_collision(grid: &CostGrid, pose: Option<PlanarPose>) -> bool {
+    pose.and_then(|pose| grid.geometry().cell_of([pose.x(), pose.y()]))
         .is_none_or(|cell| matches!(grid.cost(cell), INSCRIBED | LETHAL))
 }
 
-/// Whether `pose` lies off `grid`.
-fn off_grid(grid: &CostGrid, pose: PlanarPose) -> bool {
-    grid.geometry().cell_of([pose.x(), pose.y()]).is_none()
+/// Whether `pose`, in `grid`'s frame, lies off `grid`, as one whose place in
+/// that frame is not finite does.
+fn off_grid(grid: &CostGrid, pose: Option<PlanarPose>) -> bool {
+    pose.and_then(|pose| grid.geometry().cell_of([pose.x(), pose.y()]))
+        .is_none()
 }
 
 /// Whether every sensor's reading went into the grid since its newest
@@ -213,6 +290,15 @@ fn read_since_clearing(inputs: &NavigationInputs, step: &StepAsks) -> bool {
     inputs.read_since_clearing && !step.clear_grid
 }
 
+/// The path a navigation has, and, for a navigation in map, the grid in map
+/// its plan ran on, which judges the poses of the path off the grid of the
+/// floor when the navigation decides whether it keeps the path.
+#[derive(Clone, Debug)]
+struct HeldPath {
+    path: Path,
+    map_grid: Option<Arc<CostGrid>>,
+}
+
 /// A navigation in flight.
 pub struct Navigation {
     request: NavigationRequest,
@@ -221,7 +307,7 @@ pub struct Navigation {
     phase: Phase,
     /// The path the navigation has, none before its first plan and after a
     /// plan the planner refuses.
-    path: Option<Path>,
+    path: Option<HeldPath>,
     /// How many of [`RECOVERIES`] have run.
     recoveries_run: usize,
     /// The clearings, turns, waits and back-ups started, the clearing of each
@@ -235,8 +321,8 @@ pub struct Navigation {
 }
 
 impl Navigation {
-    /// The navigation of `request` for `base`, the robot frame at `start`:
-    /// its first try plans at its first step.
+    /// The navigation of `request` for `base`, the robot frame at `start` in
+    /// odom: its first try plans at its first step.
     pub fn new(
         request: NavigationRequest,
         base: Arc<Base>,
@@ -273,7 +359,7 @@ impl Navigation {
         let target = self.request.target;
         let distance_remaining_m = self.path.as_ref().map_or_else(
             || pose.distance_to(target),
-            |path| path.remaining_from(pose),
+            |held| held.path.remaining_from(pose),
         );
         let estimated_time_remaining_s = if speed_m_s <= SLOWEST_ESTIMATED_SPEED_M_S
             || distance_remaining_m <= NEAREST_ESTIMATED_DISTANCE_M
@@ -290,31 +376,57 @@ impl Navigation {
         }
     }
 
-    /// The path the navigation keeps at `pose`, if it keeps the one it has:
-    /// shorter than the near-goal distance from its pose nearest the robot
-    /// frame's origin, with no pose from there on in collision on `grid`.
-    fn kept_path(&self, pose: PlanarPose, grid: &CostGrid) -> Option<&Path> {
-        self.kept_path_unless(pose, |on_path| in_collision(grid, on_path))
+    /// The path the navigation keeps with the base at `base`, if it keeps the
+    /// one it has: shorter than the near-goal distance from its pose nearest
+    /// the robot frame's origin, with no pose from there on in collision where
+    /// [`Navigation::kept_path_judged`] judges it, as Nav2's ValidatePath
+    /// checks the path left on the planner's global costmap
+    /// (nav2_bt_navigator navigate_to_pose_w_replanning_and_recovery.xml:23-25).
+    fn kept_path(&self, base: BasePose, floor: &CostGrid) -> Option<&Path> {
+        self.kept_path_judged(base, floor, in_collision)
     }
 
-    /// The path the navigation keeps at `pose` on the grid a clearing
-    /// empties of `grid`, where no pose is in collision, if it keeps the one
-    /// it has: shorter than the near-goal distance from its pose nearest the
-    /// robot frame's origin, with every pose from there on on the grid.
-    fn kept_path_after_clearing(&self, pose: PlanarPose, grid: &CostGrid) -> Option<&Path> {
-        self.kept_path_unless(pose, |on_path| off_grid(grid, on_path))
+    /// The path the navigation keeps with the base at `base` once a clearing
+    /// empties the grid of the floor, where no pose is in collision, if it
+    /// keeps the one it has: shorter than the near-goal distance from its pose
+    /// nearest the robot frame's origin, with every pose from there on on the
+    /// grid that judges it.
+    fn kept_path_after_clearing(&self, base: BasePose, floor: &CostGrid) -> Option<&Path> {
+        self.kept_path_judged(base, floor, off_grid)
+    }
+
+    /// The path the navigation keeps with the base at `base` while no pose of
+    /// it from its pose nearest the robot frame's origin on is `blocked` on
+    /// the grid that judges the pose. That is `floor`, the grid of the floor in
+    /// odom, with the newest readings, where the pose lies on it. For a
+    /// navigation in map, a pose off `floor` is judged on the grid in map its
+    /// plan ran on, which holds the map beyond the grid of the floor.
+    fn kept_path_judged(
+        &self,
+        base: BasePose,
+        floor: &CostGrid,
+        blocked: fn(&CostGrid, Option<PlanarPose>) -> bool,
+    ) -> Option<&Path> {
+        let map = self.path.as_ref()?.map_grid.as_deref();
+        self.kept_path_unless(base, |on_path| {
+            let in_odom = base.to_odom(on_path);
+            match map {
+                Some(map) if off_grid(floor, in_odom) => blocked(map, Some(on_path)),
+                _ => blocked(floor, in_odom),
+            }
+        })
     }
 
     /// The path the navigation has, if it is shorter than the near-goal
-    /// distance from its pose nearest `pose`, with no pose from there on that
-    /// `blocks`.
+    /// distance from its pose nearest the robot frame's origin at `base`, with
+    /// no pose from there on that `blocks`.
     fn kept_path_unless(
         &self,
-        pose: PlanarPose,
+        base: BasePose,
         blocks: impl Fn(PlanarPose) -> bool,
     ) -> Option<&Path> {
-        let path = self.path.as_ref()?;
-        let nearest = path.nearest_index(pose);
+        let path = &self.path.as_ref()?.path;
+        let nearest = path.nearest_index(base.in_run);
         let kept = path.length_from(nearest) < self.config.near_goal_distance_m.get()
             && !path.poses()[nearest..]
                 .iter()
@@ -322,12 +434,14 @@ impl Navigation {
         kept.then_some(path)
     }
 
-    fn ask(&mut self, pose: PlanarPose) -> PlanRequest {
+    /// A plan from the robot frame at `base` to the goal, in the frame the
+    /// navigation runs in.
+    fn ask(&mut self, base: BasePose) -> PlanRequest {
         let id = self.next_plan_id;
         self.next_plan_id += 1;
         PlanRequest {
             id,
-            start: pose,
+            start: base.in_run,
             goal: self.request.target,
         }
     }
@@ -372,7 +486,7 @@ impl Navigation {
     /// The start of a try at `inputs`: the path it keeps, followed at once,
     /// or a plan.
     fn start_try(&mut self, inputs: &NavigationInputs) -> Phase {
-        if let Some(path) = self.kept_path(inputs.pose, inputs.grid).cloned() {
+        if let Some(path) = self.kept_path(inputs.base, inputs.grid).cloned() {
             return self.follow(path, inputs);
         }
         Phase::Planning {
@@ -386,7 +500,7 @@ impl Navigation {
     /// clears: the path it keeps, followed from the next step on, or a plan
     /// on the readings after the clearing.
     fn start_try_after_clearing(&self, inputs: &NavigationInputs) -> Phase {
-        if let Some(path) = self.kept_path_after_clearing(inputs.pose, inputs.grid) {
+        if let Some(path) = self.kept_path_after_clearing(inputs.base, inputs.grid) {
             return Phase::FollowAfterClearing(path.clone());
         }
         Phase::Planning {
@@ -454,7 +568,7 @@ impl Navigation {
                     turn,
                     &self.base,
                     &self.config,
-                    inputs.pose.yaw(),
+                    inputs.base.in_odom.yaw(),
                     inputs.now_ns,
                 )))
             }
@@ -478,7 +592,7 @@ impl Navigation {
                     back_up,
                     &self.base,
                     &self.config,
-                    inputs.pose,
+                    inputs.base.in_odom,
                     inputs.now_ns,
                 );
                 Some(Phase::BackingUp(
@@ -500,18 +614,27 @@ impl Navigation {
         Self::failed(NavigationKind::NoPath, message)
     }
 
-    /// Take `planned`, a plan of this navigation, as its newest plan: the
-    /// path it found, which becomes the navigation's, or why it gives none. A
+    /// Take `done`, a plan of this navigation, as its newest plan: the path it
+    /// found, which becomes the navigation's with the grid in map it ran on, or
+    /// why it gives none. A
     /// refusal leaves the navigation no path, as Nav2's ComputePathToPose
     /// writes an empty path when it aborts.
-    fn take_plan(&mut self, planned: Planned) -> Result<Path, PlanTaken> {
-        let (newest, why) = match planned {
+    fn take_plan(&mut self, done: PlanDone) -> Result<Path, PlanTaken> {
+        let (newest, why) = match done.planned {
             Planned::Path(path) => {
                 self.newest_plan = NewestPlan::Path;
-                self.path = Some(path.clone());
+                self.path = Some(HeldPath {
+                    path: path.clone(),
+                    map_grid: done.map_grid,
+                });
                 return Ok(path);
             }
-            Planned::Lost => return Err(PlanTaken::Lost),
+            Planned::Lost => {
+                return Err(PlanTaken::Unplanned(
+                    "the planner's task ended with no plan".to_string(),
+                ));
+            }
+            Planned::GridRefused(why) => return Err(PlanTaken::Unplanned(why)),
             Planned::Refused(e @ PlanError::NoPath) => (NewestPlan::NoPath, e),
             Planned::Refused(e @ PlanError::StartOccupied(_)) => (NewestPlan::StartInCollision, e),
             Planned::Refused(e @ PlanError::GoalOccupied(_)) => (NewestPlan::GoalInCollision, e),
@@ -526,8 +649,9 @@ impl Navigation {
 
     /// The step of `inputs`.
     pub fn step(&mut self, inputs: NavigationInputs) -> NavigationStep {
-        self.driven_m += self.last_position.distance_to(inputs.pose);
-        self.last_position = inputs.pose;
+        let in_odom = inputs.base.in_odom;
+        self.driven_m += self.last_position.distance_to(in_odom);
+        self.last_position = in_odom;
         let speed_m_s = inputs.velocity.linear_x().hypot(inputs.velocity.linear_y());
         let mut asks = StepAsks::default();
         let phase = std::mem::replace(&mut self.phase, Phase::Ended);
@@ -541,7 +665,7 @@ impl Navigation {
             plan: asks.plan,
             // The step may have taken a new path, from which the feedback
             // reads the length left.
-            feedback: self.feedback(inputs.pose, speed_m_s),
+            feedback: self.feedback(inputs.base.in_run, speed_m_s),
             ended: asks.ended,
         }
     }
@@ -570,7 +694,7 @@ impl Navigation {
                         });
                     }
                     let Some(id) = asked else {
-                        let request = self.ask(inputs.pose);
+                        let request = self.ask(inputs.base);
                         step.plan = Some(request);
                         return Some(Phase::Planning {
                             retry,
@@ -585,13 +709,10 @@ impl Navigation {
                             asked,
                         });
                     };
-                    match self.take_plan(done.planned) {
+                    match self.take_plan(done) {
                         Ok(path) => self.follow(path, inputs),
-                        Err(PlanTaken::Lost) => {
-                            step.ended = Some(Self::failed(
-                                FailureKind::AttemptFailed,
-                                "the planner's task ended with no plan",
-                            ));
+                        Err(PlanTaken::Unplanned(why)) => {
+                            step.ended = Some(Self::failed(FailureKind::AttemptFailed, why));
                             return None;
                         }
                         Err(PlanTaken::Refused(_))
@@ -624,8 +745,9 @@ impl Navigation {
                 }
                 Phase::Turning(turn) => {
                     let mut turn = turn;
-                    turn.measure(inputs.pose.yaw());
-                    match turn.step(inputs.pose, inputs.now_ns, inputs.grid, inputs.footprint) {
+                    let in_odom = inputs.base.in_odom;
+                    turn.measure(in_odom.yaw());
+                    match turn.step(in_odom, inputs.now_ns, inputs.grid, inputs.footprint) {
                         MotionStep::Command(command) => {
                             step.command = Some(command);
                             return Some(Phase::Turning(turn));
@@ -646,7 +768,8 @@ impl Navigation {
                     self.start_try(inputs)
                 }
                 Phase::BackingUp(mut drive) => {
-                    match drive.step(inputs.pose, inputs.now_ns, inputs.grid, inputs.footprint) {
+                    let in_odom = inputs.base.in_odom;
+                    match drive.step(in_odom, inputs.now_ns, inputs.grid, inputs.footprint) {
                         MotionStep::Command(command) => {
                             step.command = Some(command);
                             return Some(Phase::BackingUp(drive));
@@ -690,7 +813,14 @@ impl Navigation {
                 return self.advance(phase, inputs, step);
             }
         };
-        match follower.step(inputs.pose, inputs.velocity, inputs.grid, inputs.now_ns) {
+        let base = inputs.base;
+        match follower.step(
+            base.in_odom,
+            inputs.velocity,
+            inputs.grid,
+            inputs.now_ns,
+            base.odom_from_run,
+        ) {
             Ok(Followed::Command(command)) => step.command = Some(command),
             Ok(Followed::NoCommand) => step.command = Some(PlanarTwist::ZERO),
             Ok(Followed::Reached) => {
@@ -742,7 +872,7 @@ impl Navigation {
             return Some(Phase::RetryingFollow { replan });
         }
         let phase = match self.path.clone() {
-            Some(path) => self.follow_with(path, inputs, true, replan),
+            Some(held) => self.follow_with(held.path, inputs, true, replan),
             None => self.try_failed(
                 "the follow's retry has no path: its replan found none".to_string(),
                 inputs,
@@ -765,11 +895,11 @@ impl Navigation {
         let due = self.replan_due(inputs.now_ns);
         match replan {
             Replan::Due { due_ns } if inputs.now_ns < due_ns => Ok((Replan::Due { due_ns }, None)),
-            Replan::Due { .. } if self.kept_path(inputs.pose, inputs.grid).is_some() => {
+            Replan::Due { .. } if self.kept_path(inputs.base, inputs.grid).is_some() => {
                 Ok((due, None))
             }
             Replan::Due { .. } => {
-                let request = self.ask(inputs.pose);
+                let request = self.ask(inputs.base);
                 step.plan = Some(request);
                 let asked = Replan::Asked {
                     id: request.id,
@@ -781,7 +911,7 @@ impl Navigation {
                 Ok((Replan::AwaitingReadings, None))
             }
             Replan::AwaitingReadings => {
-                let request = self.ask(inputs.pose);
+                let request = self.ask(inputs.base);
                 step.plan = Some(request);
                 let asked = Replan::Asked {
                     id: request.id,
@@ -793,9 +923,9 @@ impl Navigation {
                 let Some(done) = inputs.plan.clone().filter(|done| done.id == id) else {
                     return Ok((Replan::Asked { id, retry }, None));
                 };
-                match self.take_plan(done.planned) {
+                match self.take_plan(done) {
                     Ok(path) => Ok((due, Some(path))),
-                    Err(PlanTaken::Lost) => Err("the planner's task ended with no plan".into()),
+                    Err(PlanTaken::Unplanned(why)) => Err(why),
                     Err(PlanTaken::Refused(_))
                         if self.newest_plan == NewestPlan::NoPath && !retry =>
                     {
@@ -810,10 +940,10 @@ impl Navigation {
     }
 }
 
-/// Why a plan gives no path.
+/// Why a plan gives no path: the planner refused it, or no plan ran.
 enum PlanTaken {
     Refused(String),
-    Lost,
+    Unplanned(String),
 }
 
 #[cfg(test)]
@@ -940,7 +1070,7 @@ mod tests {
         let footprint = base(1.0).padded_footprint;
         navigation.step(NavigationInputs {
             now_ns,
-            pose,
+            base: BasePose::in_odometry(pose),
             velocity: PlanarTwist::ZERO,
             grid,
             footprint: &footprint,
@@ -954,6 +1084,7 @@ mod tests {
         Some(PlanDone {
             id: request.id,
             planned: Planned::Refused(PlanError::NoPath),
+            map_grid: None,
         })
     }
 
@@ -997,6 +1128,7 @@ mod tests {
         PlanDone {
             id: request.id,
             planned,
+            map_grid: None,
         }
     }
 
@@ -1139,6 +1271,7 @@ mod tests {
         let mut plan = Some(PlanDone {
             id: request.id,
             planned: Planned::Path(straight_to_the_goal()),
+            map_grid: None,
         });
         let mut now_ns = STEP_NS;
         let mut read_since_clearing = true;
@@ -1239,6 +1372,7 @@ mod tests {
         let path = PlanDone {
             id: request.id,
             planned: Planned::Path(straight_to_the_goal()),
+            map_grid: None,
         };
         step_at(navigation, STEP_NS, near(), &free, Some(path), true);
         let replan_due_ns = STEP_NS + config().replan_period_ns;
@@ -1431,6 +1565,7 @@ mod tests {
         let found = PlanDone {
             id: replan.id,
             planned: Planned::Path(by_the_left()),
+            map_grid: None,
         };
         let waiting = step_at(&mut navigation, now_ns, near(), &walled, Some(found), false);
         assert_eq!(waiting.command, Some(PlanarTwist::ZERO));
@@ -1481,6 +1616,7 @@ mod tests {
         let found = PlanDone {
             id: retry.id,
             planned: Planned::Path(straight_to_the_goal()),
+            map_grid: None,
         };
         let waiting = step_at(&mut navigation, now_ns, near(), &walled, Some(found), false);
         assert_eq!(waiting.command, Some(PlanarTwist::ZERO));
@@ -1605,10 +1741,11 @@ mod tests {
         let path = PlanDone {
             id: request.id,
             planned: Planned::Path(straight_to_the_goal()),
+            map_grid: None,
         };
         let at_goal = navigation.step(NavigationInputs {
             now_ns: STEP_NS,
-            pose: goal(),
+            base: BasePose::in_odometry(goal()),
             velocity: PlanarTwist::new(0.1, 0.0, 0.0).unwrap(),
             grid: &free,
             footprint: &footprint,
@@ -1638,12 +1775,13 @@ mod tests {
             let path = PlanDone {
                 id: request.id,
                 planned: Planned::Path(straight_to_the_goal()),
+                map_grid: None,
             };
             step(&mut navigation, STEP_NS, &free, Some(path), true);
             navigation
                 .step(NavigationInputs {
                     now_ns: replan_due_ns,
-                    pose,
+                    base: BasePose::in_odometry(pose),
                     velocity: PlanarTwist::ZERO,
                     grid: &free,
                     footprint: &footprint,
@@ -1659,5 +1797,48 @@ mod tests {
             plan_at_the_replan(PlanarPose::IDENTITY).is_some(),
             "a plan from 1.5 m out"
         );
+    }
+
+    // A navigation in map keeps its path by the path's poses placed in odom,
+    // where the grid of the floor is: a wall across the placed path makes it
+    // plan again at the planning rate, and one across odom's own y of 0, where
+    // the path's poses lie in the frame they are planned in, does not.
+    #[test]
+    fn a_navigation_in_map_reads_its_path_placed_in_odom() {
+        let footprint = base(1.0).padded_footprint;
+        let odom_from_run = PlanarPose::new(0.0, 1.0, 0.0).unwrap();
+        let base_at = |in_run: PlanarPose| {
+            let in_odom = odom_from_run.compose(in_run).unwrap();
+            BasePose::in_frame(in_odom, odom_from_run).unwrap()
+        };
+        let replan_due_ns = STEP_NS + config().replan_period_ns;
+        let plan_at_the_replan = |grid: &CostGrid| {
+            let mut navigation = navigation();
+            let inputs = |now_ns, in_run, plan| NavigationInputs {
+                now_ns,
+                base: base_at(in_run),
+                velocity: PlanarTwist::ZERO,
+                grid,
+                footprint: &footprint,
+                read_since_clearing: true,
+                plan,
+            };
+            let request = navigation
+                .step(inputs(0, PlanarPose::IDENTITY, None))
+                .plan
+                .expect("the first step asks for a plan");
+            let path = PlanDone {
+                id: request.id,
+                planned: Planned::Path(straight_to_the_goal()),
+                map_grid: None,
+            };
+            navigation.step(inputs(STEP_NS, PlanarPose::IDENTITY, Some(path)));
+            navigation.step(inputs(replan_due_ns, near(), None)).plan
+        };
+        let across_the_placed_path =
+            grid(|[x, y]| (1.3..1.4).contains(&x) && (y - 1.0).abs() < 0.5);
+        let across_the_unplaced_path = grid(wall_ahead);
+        assert!(plan_at_the_replan(&across_the_placed_path).is_some());
+        assert_eq!(plan_at_the_replan(&across_the_unplaced_path), None);
     }
 }

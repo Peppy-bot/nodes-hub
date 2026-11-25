@@ -1,13 +1,16 @@
 //! The node's log as the tests read it. The node runs in the test's process
 //! and logs through `tracing`, so one subscriber for the whole test binary,
 //! installed by the first test that reads the log, keeps the message of every
-//! event any test's node logs from then on. A test finds its own lines by a
-//! value no other test's node logs.
+//! event at info and above that any test's navigator logs from then on, the
+//! events of every other crate left out. A test finds its own lines by a value
+//! no other test's node logs.
 
 use std::sync::{Mutex, OnceLock};
 
 use control_core::sync::lock_ignoring_poison;
+use tracing::Level;
 use tracing::field::{Field, Visit};
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 
 /// Every message logged since [`keep_the_log`] first ran.
@@ -38,12 +41,16 @@ impl Visit for MessageOf {
     }
 }
 
-/// Keep every message logged in this test binary from now on.
+/// Keep every message the navigator logs at info and above in this test
+/// binary from now on.
 pub fn keep_the_log() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Keeper))
-            .expect("the test binary installs one subscriber");
+        let navigator = Targets::new().with_target("base_navigator", Level::INFO);
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::registry().with(Keeper.with_filter(navigator)),
+        )
+        .expect("the test binary installs one subscriber");
     });
 }
 

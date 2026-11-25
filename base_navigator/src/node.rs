@@ -2,17 +2,20 @@
 //! slots into one list, the cameras paired by name, start the robot's tree on
 //! the node's clock, then spawn the control loop, the drive_states listener,
 //! describe_base's reader, the sensors' descriptions, each sensor's intake, the
-//! depth listener and the scan listener, the four action handlers and
-//! clear_grid. Every behavior lives in the sibling modules; this is only the
-//! assembly. The setup refuses slots that bind no sensor, and waits for no base
-//! and no sensor: until they answer, a goal waits up to the source timeout and
-//! is refused with `resource_unavailable`, naming what it waits for.
+//! depth listener and the scan listener, map_grids' and map_poses' listeners
+//! while the room_map link is bound, the four action handlers and clear_grid.
+//! Every behavior lives in the sibling modules; this is only the assembly. The
+//! setup refuses slots that bind no sensor, and waits for no base, no sensor
+//! and no map: until they answer, a goal waits up to the source timeout and is
+//! refused, naming what it waits for. With the room_map link vacant, no map is
+//! loaded.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use control_core::fault::Fault;
 use control_core::robot_tree::{Placer, RobotTree};
+use peppygen::consumed_services::room_map::get_map_state;
 use peppygen::paired_topics::base::drive_setpoints;
 use peppygen::{NodeRunner, Parameters, Result};
 use tokio::sync::{mpsc, watch};
@@ -30,6 +33,7 @@ use crate::grid::GridSlot;
 use crate::intake::{self, Intake};
 use crate::link::{self, Link};
 use crate::planning::{Planner, Planning};
+use crate::room_map::{self, PoseFollower, RoomLink};
 use crate::sensors::{SensorKind, read_slots, run_descriptions};
 use crate::services;
 
@@ -131,12 +135,18 @@ async fn assemble(
     // One event waits for the control loop at a time: each source waits for
     // the loop to take its last event before it hands it the next.
     let (events_tx, events_rx) = mpsc::channel(1);
+    let room = get_map_state::bound_producer(&runner)
+        .map(|producer| Arc::new(RoomLink::new(runner.clone(), producer.clone())));
+    if room.is_none() {
+        info!("base navigator: its room_map link is vacant: no map is loaded");
+    }
     let shared = Shared {
         config: config.clone(),
         clock: clock.clone(),
         link: link.clone(),
         grid: grid.clone(),
         sensors: sensors.clone(),
+        room: room.clone(),
     };
     let navigator = Navigator::new(shared.clone(), Planning::new(planner, config.planner));
     let setpoints = drive_setpoints::declare_publisher(&runner).await?;
@@ -157,6 +167,20 @@ async fn assemble(
         spawn_supervised(&mut set, async move {
             control::run(navigator, setpoints, events_rx, token.cancelled()).await;
         });
+    }
+    if let Some(room) = room {
+        spawn_supervised(
+            &mut set,
+            room_map::run_grid_listener(runner.clone(), room.map.clone()),
+        );
+        let follower = PoseFollower {
+            room: room.map.clone(),
+            tree: tree.clone(),
+            link: link.clone(),
+            clock: clock.clone(),
+            lookup_timeout: config.lookup_timeout,
+        };
+        spawn_supervised(&mut set, follower.run(runner.clone()));
     }
     spawn_supervised(
         &mut set,

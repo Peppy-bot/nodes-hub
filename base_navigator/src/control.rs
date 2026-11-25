@@ -19,11 +19,19 @@
 //! `resource_unavailable`; more than 0.5 s with no drive_states,
 //! `resource_unavailable`; a silent sensor, `resource_unavailable`;
 //! parts_within_footprint false, `attempt_failed`; the passing of the goal's
-//! timeout_s, `timeout`; the goal's completion at its end, its result where
-//! the newest drive_states placed the robot frame; every other failure, the
-//! grid's and the goal's own step's. A goal with no ending runs on: its
-//! feedback goes out, its command passes the stop and streams as the step's
-//! setpoint, and the plans it asks for start on the planner's task.
+//! timeout_s, `timeout`; a navigation in map that room_map's loaded map does
+//! not place, `not_localized` ([`RoomMap::place`]); the goal's completion at
+//! its end, its result where the newest drive_states placed the robot frame;
+//! every other failure, the grid's and the goal's own step's. A goal with no
+//! ending runs on: its feedback goes out, its command passes the stop and
+//! streams as the step's setpoint, and the plans it asks for start on the
+//! planner's task.
+//!
+//! A navigation in map steps where the newest map_poses of its odometry places
+//! map in odom: on the grid of the floor with its map's occupied cells, the
+//! stop reading them too; its plans on its map's grid; and its feedback and its
+//! result in map, by the newest placement of its steps. A navigation in map
+//! that a step cannot place does not run its own step.
 //!
 //! Each ending ends its goal at once. When a goal ends, completed, cancelled
 //! or failed, while at most 0.5 s have passed since the navigator's newest
@@ -37,7 +45,7 @@
 //! base while a goal runs or the burst streams, and stays where it stands once
 //! neither does.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use control_core::drive_link::{FollowState, LEADER_STREAM};
@@ -49,6 +57,7 @@ use control_core::time::seconds;
 use control_core::twist::PlanarTwist;
 use frame_tree::arithmetic::quaternion_of_yaw;
 use navigation_core::grid::CostGrid;
+use navigation_core::inflation::Inflation;
 use peppygen::exposed_actions::base_navigation::{
     back_up, drive_on_heading, navigate_to_pose, spin,
 };
@@ -60,14 +69,19 @@ use tracing::{error, info, warn};
 use crate::admission::{Admitted, Shared};
 use crate::base::Base;
 use crate::clock;
-use crate::drive::{Navigation, NavigationInputs, NavigationRequest, NavigationStep};
-use crate::failure::{Ended, Failure, FailureKind, NavigationKind, of_navigation};
-use crate::follow::ODOMETRY_FRAME;
-use crate::grid::Rolling;
+use crate::drive::{
+    BasePose, Navigation, NavigationGoal, NavigationInputs, NavigationStep, RunFrame,
+};
+use crate::failure::{
+    Ended, Failure, FailureKind, NavigationFailure, NavigationKind, of_navigation,
+};
+use crate::follow::{MAP_FRAME, ODOMETRY_FRAME};
+use crate::grid::{GridSlot, MapOverlay, Rolling};
 use crate::link::{DriveState, Received, Reports};
 use crate::moves::{Move, MoveFeedback, MoveInputs, MoveStep};
-use crate::planning::Planning;
+use crate::planning::{MapLayers, PlanGrid, Planning};
 use crate::recovery::{Direction, SpinRequest, StraightRequest};
+use crate::room_map::{MapPlacement, MapRun, RoomMap};
 
 /// How long (ns) the release burst streams zero velocity at least:
 /// base_navigation's 0.25 s.
@@ -80,7 +94,7 @@ const BURST_SETPOINTS: u32 = 3;
 /// A goal the action handlers admitted, with its context.
 pub enum AcceptedGoal {
     Navigate {
-        request: NavigationRequest,
+        request: NavigationGoal,
         ctx: Box<navigate_to_pose::GoalContext>,
         admitted: Admitted,
     },
@@ -110,18 +124,21 @@ pub enum Event {
     },
 }
 
-/// Where the robot frame stood in odom, and when, for a result.
+/// Where the robot frame stood, in the frame `frame` names, and when, for a
+/// result or a feedback.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Located {
     pub pose: PlanarPose,
+    pub frame: &'static str,
     pub timestamp: SystemTime,
 }
 
 impl Located {
-    /// Where `state` places the robot frame, at its timestamp.
+    /// Where `state` places the robot frame in odom, at its timestamp.
     fn of(state: &DriveState) -> Self {
         Self {
             pose: state.pose,
+            frame: ODOMETRY_FRAME,
             timestamp: state.timestamp,
         }
     }
@@ -135,12 +152,51 @@ impl Located {
     }
 }
 
+/// The frame a goal's feedback and results give the robot frame's pose in:
+/// odom, or map for a navigation in map, where map stands in odom by the
+/// newest placement of its steps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResultFrame {
+    Odometry,
+    Map { map_from_odom: PlanarPose },
+}
+
+impl ResultFrame {
+    /// `located`, a place in odom, in this frame: in odom still, its record
+    /// naming odom, where its place in map is not finite.
+    fn locate(self, located: Located) -> Located {
+        match self {
+            Self::Odometry => located,
+            Self::Map { map_from_odom } => {
+                map_from_odom
+                    .compose(located.pose)
+                    .map_or(located, |pose| Located {
+                        pose,
+                        frame: MAP_FRAME,
+                        ..located
+                    })
+            }
+        }
+    }
+}
+
 /// How a goal ends, with a failure of kinds `K`.
 #[derive(Debug, PartialEq)]
 enum Finish<K> {
     Completed(Located),
     Cancelled(String, Located),
     Failed(robot_tree::Failure<K>),
+}
+
+impl<K> Finish<K> {
+    /// The same ending, its result's place, in odom, given in `frame`.
+    fn located_in(self, frame: ResultFrame) -> Self {
+        match self {
+            Self::Completed(located) => Self::Completed(frame.locate(located)),
+            Self::Cancelled(reason, located) => Self::Cancelled(reason, frame.locate(located)),
+            failed @ Self::Failed(_) => failed,
+        }
+    }
 }
 
 impl Finish<FailureKind> {
@@ -187,6 +243,10 @@ enum Cause {
     LimbOutsideFootprint,
     /// The goal's timeout_s passed before its end.
     Timeout,
+    /// A navigation in map that room_map's loaded map does not place: its map
+    /// changed, its base is not localized, or no map_poses of its odometry
+    /// arrived within the source timeout.
+    NotLocalized,
     /// The goal reached its end: a navigation its goal, a move its whole
     /// turn or distance.
     Reached,
@@ -237,6 +297,21 @@ impl From<Ending<FailureKind>> for Ending<NavigationKind> {
 /// earliest in [`Cause`]'s order.
 fn first_ending<K>(endings: impl IntoIterator<Item = Ending<K>>) -> Option<Ending<K>> {
     endings.into_iter().min_by_key(|ending| ending.cause)
+}
+
+/// The ending of a navigation in map that its step cannot place: the earliest
+/// of the `shared` endings and its failure `not_localized`. Its own step does
+/// not run.
+fn unplaced(
+    shared: Vec<Ending<FailureKind>>,
+    not_localized: NavigationFailure,
+) -> Ending<NavigationKind> {
+    let earlier = first_ending(shared.into_iter().map(Into::into))
+        .filter(|ending| ending.cause < Cause::NotLocalized);
+    earlier.unwrap_or(Ending {
+        cause: Cause::NotLocalized,
+        finish: Finish::Failed(not_localized),
+    })
 }
 
 /// Every ending that what every goal shares gives the goal in flight at
@@ -492,6 +567,7 @@ enum MoveContext {
 enum Motion {
     Navigation {
         navigation: Box<Navigation>,
+        frame: RunFrame,
         ctx: Box<navigate_to_pose::GoalContext>,
     },
     Move {
@@ -501,7 +577,8 @@ enum Motion {
 }
 
 /// The goal in flight: what it runs, the base it drives, the odometry it
-/// runs on, and when it was accepted on the wall clock.
+/// runs on, when it was accepted on the wall clock, and the frame its
+/// feedback and results give the robot frame's pose in.
 struct RunningGoal {
     motion: Motion,
     base: Arc<Base>,
@@ -510,16 +587,17 @@ struct RunningGoal {
     /// accepted at, then the newest at each of its steps.
     read_through: u64,
     accepted: Instant,
+    results_in: ResultFrame,
 }
 
 /// The record of a pose of an action's result or feedback, `$action`'s
-/// `$record` type, from `$located`, in odom.
+/// `$record` type, from `$located`, in the frame it names.
 macro_rules! pose_record {
     ($action:ident::$record:ident, $located:expr) => {{
         let located: Located = $located;
         let (position, orientation) = located.arrays();
         $action::$record {
-            frame: ODOMETRY_FRAME.to_owned(),
+            frame: located.frame.to_owned(),
             timestamp: located.timestamp,
             position,
             orientation,
@@ -621,15 +699,19 @@ impl RunningGoal {
         }
     }
 
-    /// End the goal on `finish`, an ending every goal shares.
+    /// End the goal on `finish`, an ending every goal shares, its result
+    /// given in the frame of the goal's results.
     async fn finish(self, finish: Finish<FailureKind>) {
         let action_time = self.accepted.elapsed().as_secs_f64();
+        let results_in = self.results_in;
         match self.motion {
-            Motion::Navigation { navigation, ctx } => {
+            Motion::Navigation {
+                navigation, ctx, ..
+            } => {
                 let driven_m = navigation.driven_m();
                 log_end(end_navigation(
                     ctx,
-                    finish.of_navigation(),
+                    finish.of_navigation().located_in(results_in),
                     driven_m,
                     action_time,
                 ))
@@ -659,6 +741,83 @@ enum GoalStep {
 struct StepGrid {
     occupancy: Arc<CostGrid>,
     read_since_clearing: bool,
+}
+
+/// Where the frame a navigation runs in stands at a step: odom, or map, where
+/// the newest map_poses of the navigation's odometry places it, with its map's
+/// newest grid.
+enum RunPlacement<'r> {
+    Odometry,
+    Map {
+        run: &'r MapRun,
+        placed: MapPlacement,
+    },
+}
+
+impl RunPlacement<'_> {
+    /// The frame the step's feedback and results give the robot frame's pose
+    /// in.
+    fn results_in(&self) -> ResultFrame {
+        match self {
+            Self::Odometry => ResultFrame::Odometry,
+            Self::Map { placed, .. } => ResultFrame::Map {
+                map_from_odom: placed.map_from_odom,
+            },
+        }
+    }
+
+    /// The occupied cells of the map's newest grid over the grid of the floor,
+    /// for a navigation in map while that grid has cells.
+    fn overlay(&self) -> Option<MapOverlay<'_>> {
+        let Self::Map { placed, .. } = self else {
+            return None;
+        };
+        placed.grid.as_deref().map(|grid| MapOverlay {
+            map: &grid.saved,
+            grid_seq: grid.seq,
+            odom_from_map: placed.odom_from_map,
+        })
+    }
+
+    /// Where the robot frame stands, at `in_odom` in odom, for the
+    /// navigation's step.
+    fn base_pose(&self, in_odom: PlanarPose) -> Result<BasePose, Failure> {
+        match self {
+            Self::Odometry => Ok(BasePose::in_odometry(in_odom)),
+            Self::Map { placed, .. } => {
+                BasePose::in_frame(in_odom, placed.odom_from_map).map_err(|e| {
+                    Failure::new(FailureKind::AttemptFailed, format!("the base in map: {e}"))
+                })
+            }
+        }
+    }
+
+    /// The grid a plan of the navigation runs on: `occupancy`, the grid of the
+    /// floor's, for a navigation in odom; for one in map, its map's layers,
+    /// the obstacles of `grid` projected onto the map's lattice, inflated by
+    /// `inflation`. Or why no grid is built.
+    fn plan_grid(
+        &self,
+        occupancy: Arc<CostGrid>,
+        grid: &Mutex<GridSlot>,
+        inflation: &Inflation,
+    ) -> Result<PlanGrid, String> {
+        let Self::Map { run, placed } = self else {
+            return Ok(PlanGrid::Floor(occupancy));
+        };
+        let lattice = run.plan_lattice(placed.grid.as_deref())?;
+        let obstacles = lock_ignoring_poison(grid)
+            .grid_mut()
+            .ok_or("the grid of the floor waits for describe_base")?
+            .obstacles_on(placed.map_from_odom, lattice.geometry)
+            .map_err(|e| format!("the grid of the floor's obstacles on the map's grid: {e}"))?;
+        Ok(PlanGrid::Map(Box::new(MapLayers {
+            lattice,
+            map: placed.grid.clone(),
+            obstacles,
+            inflation: inflation.clone(),
+        })))
+    }
 }
 
 /// The control loop's state.
@@ -723,42 +882,58 @@ impl Navigator {
         }
         let state = admitted.at.state;
         let start = state.pose;
-        let motion = match goal {
-            AcceptedGoal::Navigate { request, ctx, .. } => Motion::Navigation {
-                navigation: Box::new(Navigation::new(
-                    request,
-                    admitted.base.clone(),
-                    self.shared.config.clone(),
-                    start,
-                )),
-                ctx,
-            },
-            AcceptedGoal::Spin { request, ctx, .. } => Motion::Move {
-                motion: Move::spin(request, &admitted.base, &self.shared.config, start, now_ns),
-                ctx: MoveContext::Spin(ctx),
-            },
-            AcceptedGoal::DriveOnHeading { request, ctx, .. } => Motion::Move {
-                motion: Move::straight(
-                    Direction::Forward,
-                    request,
-                    &admitted.base,
-                    &self.shared.config,
-                    start,
-                    now_ns,
-                ),
-                ctx: MoveContext::DriveOnHeading(ctx),
-            },
-            AcceptedGoal::BackUp { request, ctx, .. } => Motion::Move {
-                motion: Move::straight(
-                    Direction::Backward,
-                    request,
-                    &admitted.base,
-                    &self.shared.config,
-                    start,
-                    now_ns,
-                ),
-                ctx: MoveContext::BackUp(ctx),
-            },
+        let (motion, results_in) = match goal {
+            AcceptedGoal::Navigate { request, ctx, .. } => {
+                let results_in = self
+                    .placement(&request.frame, state.odometry_start, now_ns)
+                    .map_or(ResultFrame::Odometry, |placement| placement.results_in());
+                let navigation = Motion::Navigation {
+                    navigation: Box::new(Navigation::new(
+                        request.request,
+                        admitted.base.clone(),
+                        self.shared.config.clone(),
+                        start,
+                    )),
+                    frame: request.frame,
+                    ctx,
+                };
+                (navigation, results_in)
+            }
+            AcceptedGoal::Spin { request, ctx, .. } => {
+                let spin = Motion::Move {
+                    motion: Move::spin(request, &admitted.base, &self.shared.config, start, now_ns),
+                    ctx: MoveContext::Spin(ctx),
+                };
+                (spin, ResultFrame::Odometry)
+            }
+            AcceptedGoal::DriveOnHeading { request, ctx, .. } => {
+                let drive = Motion::Move {
+                    motion: Move::straight(
+                        Direction::Forward,
+                        request,
+                        &admitted.base,
+                        &self.shared.config,
+                        start,
+                        now_ns,
+                    ),
+                    ctx: MoveContext::DriveOnHeading(ctx),
+                };
+                (drive, ResultFrame::Odometry)
+            }
+            AcceptedGoal::BackUp { request, ctx, .. } => {
+                let back_up = Motion::Move {
+                    motion: Move::straight(
+                        Direction::Backward,
+                        request,
+                        &admitted.base,
+                        &self.shared.config,
+                        start,
+                        now_ns,
+                    ),
+                    ctx: MoveContext::BackUp(ctx),
+                };
+                (back_up, ResultFrame::Odometry)
+            }
         };
         let running = RunningGoal {
             motion,
@@ -766,6 +941,7 @@ impl Navigator {
             odometry_start: state.odometry_start,
             read_through: admitted.at.seq,
             accepted: Instant::now(),
+            results_in,
         };
         let centered = lock_ignoring_poison(&self.shared.grid).roll_from([start.x(), start.y()]);
         if let Err(e) = centered {
@@ -859,9 +1035,39 @@ impl Navigator {
         (!silent.is_empty()).then(|| sensors.waits(&silent, source_timeout_s))
     }
 
-    /// The grid the goal in flight steps on, or the failure of a goal with
-    /// none.
-    fn step_grid(&self) -> Result<StepGrid, Failure> {
+    /// The loaded map of the room_map link, which a navigation in map is
+    /// admitted on.
+    fn room_map(&self) -> &RoomMap {
+        &self
+            .shared
+            .room
+            .as_ref()
+            .expect("a navigation in map is admitted only while room_map is bound")
+            .map
+    }
+
+    /// Where `frame`, the frame of a navigation whose odometry started at
+    /// `odometry_start`, stands at `now_ns`; or, for a navigation in map that
+    /// room_map's loaded map does not place, its failure with not_localized.
+    fn placement<'r>(
+        &self,
+        frame: &'r RunFrame,
+        odometry_start: SystemTime,
+        now_ns: i64,
+    ) -> Result<RunPlacement<'r>, NavigationFailure> {
+        let RunFrame::Map(run) = frame else {
+            return Ok(RunPlacement::Odometry);
+        };
+        let source_timeout_ns = self.shared.config.stop.source_timeout_ns();
+        self.room_map()
+            .place(run, odometry_start, now_ns, source_timeout_ns)
+            .map(|placed| RunPlacement::Map { run, placed })
+            .map_err(|why| NavigationFailure::new(NavigationKind::NotLocalized, why))
+    }
+
+    /// The grid the goal in flight steps on, with `overlay`'s map for a
+    /// navigation in map, or the failure of a goal with none.
+    fn step_grid(&self, overlay: Option<MapOverlay>) -> Result<StepGrid, Failure> {
         let mut slot = lock_ignoring_poison(&self.shared.grid);
         let Some(grid) = slot.grid_mut() else {
             return Err(Failure::new(
@@ -869,7 +1075,7 @@ impl Navigator {
                 "the grid of the floor waits for describe_base",
             ));
         };
-        let occupancy = grid.occupancy().map_err(|e| {
+        let occupancy = grid.occupancy(overlay).map_err(|e| {
             Failure::new(
                 FailureKind::AttemptFailed,
                 format!("the grid of the floor: {e}"),
@@ -882,11 +1088,18 @@ impl Navigator {
     }
 
     /// `command` as the stop passes it at `now_ns`, the base at `pose` in
-    /// odom: zero velocity when the stop cannot read the grid.
-    fn stopped(&self, command: PlanarTwist, pose: PlanarPose, now_ns: i64) -> PlanarTwist {
+    /// odom, reading `overlay`'s map for a navigation in map: zero velocity
+    /// when the stop cannot read the grid.
+    fn stopped(
+        &self,
+        command: PlanarTwist,
+        pose: PlanarPose,
+        now_ns: i64,
+        overlay: Option<MapOverlay>,
+    ) -> PlanarTwist {
         let slowed = lock_ignoring_poison(&self.shared.grid)
             .grid_mut()
-            .map(|grid| grid.slowed(command, pose, now_ns));
+            .map(|grid| grid.slowed(command, pose, now_ns, overlay));
         match slowed {
             Some(Ok(decision)) => decision.velocity(),
             Some(Err(e)) => {
@@ -899,7 +1112,8 @@ impl Navigator {
 
     /// The step of `goal` at `now_ns`, the newest drive_states being `at`:
     /// the goal's own step runs on the grid, and the step decides on every
-    /// ending the goal met ([`decide`]).
+    /// ending the goal met ([`decide`]); a navigation in map that the step
+    /// cannot place ends by [`unplaced`].
     async fn goal_step(&mut self, goal: RunningGoal, at: &Received, now_ns: i64) -> GoalStep {
         let state = at.state;
         let located = Located::of(&state);
@@ -912,39 +1126,55 @@ impl Navigator {
             goal.cancel_reason(),
             self.silent_sensors(now_ns),
         );
-        let grid = self.step_grid();
         let RunningGoal {
             motion,
             base,
             odometry_start,
             accepted,
+            results_in,
             ..
         } = goal;
         let footprint = base.padded_footprint.clone();
         let action_time = accepted.elapsed().as_secs_f64();
-        let (motion, command) = match motion {
+        let (motion, setpoint, results_in) = match motion {
             Motion::Navigation {
                 mut navigation,
+                frame,
                 ctx,
             } => {
-                let own = grid.map(|grid| {
-                    let step = navigation.step(NavigationInputs {
-                        now_ns,
-                        pose: state.pose,
-                        velocity: state.velocity,
-                        grid: &grid.occupancy,
-                        footprint: &footprint,
-                        read_since_clearing: grid.read_since_clearing,
-                        plan: self.planning.finished(),
+                let placement = match self.placement(&frame, odometry_start, now_ns) {
+                    Ok(placement) => placement,
+                    Err(not_localized) => {
+                        let ending = unplaced(shared, not_localized);
+                        let driven_m = navigation.driven_m();
+                        let finish = ending.finish.located_in(results_in);
+                        log_end(end_navigation(ctx, finish, driven_m, action_time)).await;
+                        return GoalStep::Ended;
+                    }
+                };
+                let results_in = placement.results_in();
+                let own = self
+                    .step_grid(placement.overlay())
+                    .and_then(|grid| Ok((grid, placement.base_pose(state.pose)?)))
+                    .map(|(grid, base_pose)| {
+                        let step = navigation.step(NavigationInputs {
+                            now_ns,
+                            base: base_pose,
+                            velocity: state.velocity,
+                            grid: &grid.occupancy,
+                            footprint: &footprint,
+                            read_since_clearing: grid.read_since_clearing,
+                            plan: self.planning.finished(),
+                        });
+                        (step, grid.occupancy)
                     });
-                    (step, grid.occupancy)
-                });
                 let ended = |(step, _): &(NavigationStep, Arc<CostGrid>)| step.ended.clone();
                 let (step, occupancy) = match decide(shared, own, ended, located) {
                     Decided::RunsOn(own) => own,
                     Decided::Ends(ending) => {
                         let driven_m = navigation.driven_m();
-                        log_end(end_navigation(ctx, ending.finish, driven_m, action_time)).await;
+                        let finish = ending.finish.located_in(results_in);
+                        log_end(end_navigation(ctx, finish, driven_m, action_time)).await;
                         return GoalStep::Ended;
                     }
                 };
@@ -952,12 +1182,19 @@ impl Navigator {
                     lock_ignoring_poison(&self.shared.grid).clear();
                 }
                 if let Some(request) = step.plan {
-                    self.planning.start(request, occupancy, footprint.clone());
+                    let grid = placement.plan_grid(occupancy, &self.shared.grid, &base.inflation);
+                    match grid {
+                        Ok(grid) => self.planning.start(request, grid, footprint.clone()),
+                        Err(why) => self.planning.refuse(request, why),
+                    }
                 }
                 let feedback = step.feedback;
                 let published = ctx
                     .publish_feedback(
-                        pose_record!(navigate_to_pose::NavigateToPoseFeedbackCurrentPose, located),
+                        pose_record!(
+                            navigate_to_pose::NavigateToPoseFeedbackCurrentPose,
+                            results_in.locate(located)
+                        ),
                         feedback.distance_remaining_m,
                         feedback.angle_remaining_rad,
                         feedback.estimated_time_remaining_s,
@@ -967,10 +1204,18 @@ impl Navigator {
                 if let Err(e) = published {
                     warn!("navigate_to_pose feedback: {e}");
                 }
-                (Motion::Navigation { navigation, ctx }, step.command)
+                let setpoint = step
+                    .command
+                    .map(|command| self.stopped(command, state.pose, now_ns, placement.overlay()));
+                let motion = Motion::Navigation {
+                    navigation,
+                    frame,
+                    ctx,
+                };
+                (motion, setpoint, results_in)
             }
             Motion::Move { mut motion, ctx } => {
-                let own = grid.map(|grid| {
+                let own = self.step_grid(None).map(|grid| {
                     motion.step(&MoveInputs {
                         now_ns,
                         pose: state.pose,
@@ -989,7 +1234,10 @@ impl Navigator {
                 if let Err(e) = ctx.publish_feedback(step.feedback).await {
                     warn!("base_navigation move feedback: {e}");
                 }
-                (Motion::Move { motion, ctx }, step.command)
+                let setpoint = step
+                    .command
+                    .map(|command| self.stopped(command, state.pose, now_ns, None));
+                (Motion::Move { motion, ctx }, setpoint, results_in)
             }
         };
         let goal = RunningGoal {
@@ -998,8 +1246,8 @@ impl Navigator {
             odometry_start,
             read_through: at.seq,
             accepted,
+            results_in,
         };
-        let setpoint = command.map(|command| self.stopped(command, state.pose, now_ns));
         GoalStep::Runs(Box::new(goal), setpoint)
     }
 }
@@ -1057,7 +1305,6 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
     use std::time::Duration;
 
     use control_core::node_clock::NodeClock;
@@ -1065,7 +1312,6 @@ mod tests {
     use hegel::generators as gs;
 
     use crate::config::tests::config;
-    use crate::grid::GridSlot;
     use crate::grid::tests::{covers, grid, read_at};
     use crate::link::tests::state;
     use crate::sensors::tests::{camera_slot, sensors_of};
@@ -1211,7 +1457,8 @@ mod tests {
     }
 
     /// The endings a test gives one step: each true, or `follow` other than
-    /// following, or `own` other than running on, meets one.
+    /// following, or `own` other than running on, meets one. A step that
+    /// `unplaced` does not run its own step, so it meets no ending of it.
     #[derive(Clone, Copy, Debug)]
     struct Met {
         follow: FollowState,
@@ -1220,18 +1467,21 @@ mod tests {
         sensor_silent: bool,
         limb_outside: bool,
         cancelled: bool,
+        unplaced: bool,
         own: Own,
     }
 
     /// The cause and the failure kind, none for a cancel or a completion, of
     /// the first ending `met` gives in base_navigation's order.
-    fn earliest(met: Met) -> Option<(Cause, Option<FailureKind>)> {
+    fn earliest(met: Met) -> Option<(Cause, Option<NavigationKind>)> {
         use FailureKind::{AttemptFailed, Blocked, ResourceUnavailable, Timeout};
+        let goal = |kind: FailureKind| Some(NavigationKind::from(kind));
         let hold_kind = match met.follow {
-            FollowState::BaseMode => Some(AttemptFailed),
-            FollowState::BaseSilence => Some(ResourceUnavailable),
+            FollowState::BaseMode => goal(AttemptFailed),
+            FollowState::BaseSilence => goal(ResourceUnavailable),
             _ => None,
         };
+        let own = |own| !met.unplaced && met.own == own;
         [
             (met.cancelled, (Cause::CallerCancel, None)),
             (
@@ -1240,23 +1490,27 @@ mod tests {
             ),
             (
                 met.odometry_over,
-                (Cause::OdometryStartedOver, Some(ResourceUnavailable)),
+                (Cause::OdometryStartedOver, goal(ResourceUnavailable)),
             ),
             (
                 met.drive_states_lost,
-                (Cause::DriveStatesLost, Some(ResourceUnavailable)),
+                (Cause::DriveStatesLost, goal(ResourceUnavailable)),
             ),
             (
                 met.sensor_silent,
-                (Cause::SilentSensor, Some(ResourceUnavailable)),
+                (Cause::SilentSensor, goal(ResourceUnavailable)),
             ),
             (
                 met.limb_outside,
-                (Cause::LimbOutsideFootprint, Some(AttemptFailed)),
+                (Cause::LimbOutsideFootprint, goal(AttemptFailed)),
             ),
-            (met.own == Own::TimesOut, (Cause::Timeout, Some(Timeout))),
-            (met.own == Own::Reaches, (Cause::Reached, None)),
-            (met.own == Own::Fails, (Cause::OtherFailure, Some(Blocked))),
+            (own(Own::TimesOut), (Cause::Timeout, goal(Timeout))),
+            (
+                met.unplaced,
+                (Cause::NotLocalized, Some(NavigationKind::NotLocalized)),
+            ),
+            (own(Own::Reaches), (Cause::Reached, None)),
+            (own(Own::Fails), (Cause::OtherFailure, goal(Blocked))),
         ]
         .into_iter()
         .find_map(|(meets, ending)| meets.then_some(ending))
@@ -1266,8 +1520,8 @@ mod tests {
     // the caller's cancel, a follow_state other than following, a new
     // odometry_start_timestamp, more than 0.5 s with no drive_states, a
     // silent sensor, parts_within_footprint false, the passing of its
-    // timeout_s, its completion and another failure; a goal with no ending
-    // runs on.
+    // timeout_s, a map-frame navigation's not_localized, its completion and
+    // another failure; a goal with no ending runs on.
     #[hegel::test]
     fn a_step_with_several_endings_takes_the_earliest(tc: TestCase) {
         let draw = || tc.draw(gs::booleans());
@@ -1287,6 +1541,7 @@ mod tests {
             sensor_silent: draw(),
             limb_outside: draw(),
             cancelled: draw(),
+            unplaced: draw(),
             own: [Own::RunsOn, Own::Fails, Own::TimesOut, Own::Reaches][own],
         };
         let mut at = received(met.follow);
@@ -1307,7 +1562,10 @@ mod tests {
         let cancel = met.cancelled.then(|| "the caller".to_string());
         let ended = match met.own {
             Own::RunsOn => None,
-            Own::Fails => Some(Ended::Failed(Failure::new(FailureKind::Blocked, "blocked"))),
+            Own::Fails => Some(Ended::Failed(NavigationFailure::new(
+                FailureKind::Blocked.into(),
+                "blocked",
+            ))),
             Own::TimesOut => Some(Ended::TimedOut("timeout_s passed".to_string())),
             Own::Reaches => Some(Ended::Completed),
         };
@@ -1319,10 +1577,15 @@ mod tests {
             cancel,
             silent,
         );
-        let decided = decide(shared, Ok(()), |_| ended, Located::of(&at.state));
-        let taken = match decided {
-            Decided::Ends(ending) => Some((ending.cause, kind(&ending.finish))),
-            Decided::RunsOn(()) => None,
+        let taken = if met.unplaced {
+            let not_localized = NavigationFailure::new(NavigationKind::NotLocalized, "unplaced");
+            let ending = unplaced(shared, not_localized);
+            Some((ending.cause, kind(&ending.finish)))
+        } else {
+            match decide::<(), NavigationKind>(shared, Ok(()), |_| ended, Located::of(&at.state)) {
+                Decided::Ends(ending) => Some((ending.cause, kind(&ending.finish))),
+                Decided::RunsOn(()) => None,
+            }
         };
         assert_eq!(taken, earliest(met), "{met:?}");
     }
@@ -1538,6 +1801,7 @@ mod tests {
             link: Arc::new(Mutex::new(link)),
             grid: Arc::new(Mutex::new(slot)),
             sensors: Arc::new(sensors_of(vec![camera_slot("front")])),
+            room: None,
         };
         let planning = Planning::new(Planner::default(), config.planner);
         Navigator {
