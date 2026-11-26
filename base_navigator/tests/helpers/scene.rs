@@ -1,10 +1,12 @@
-//! The world the rig's cameras render: boxes on the floor in the world frame,
+//! The world the rig's sensors render: boxes on the floor in the world frame,
 //! boxes turned about the vertical such as the base's own deck, tables, slabs
-//! of floor around a drop, and a pinhole depth camera that renders the depth
-//! at each pixel as the distance along its axis to the first box its ray
-//! enters. The world frame is where the base's odometry started at the rig's
-//! start, so it is odom until a test starts the odometry over.
+//! of floor around a drop; a pinhole depth camera that renders the depth at
+//! each pixel as the distance along its axis to the first box its ray enters;
+//! and a 2-D lidar's fan, each ray's range the distance along it to the first
+//! box it enters. The world frame is where the base's odometry started at the
+//! rig's start, so it is odom until a test starts the odometry over.
 
+use camera_core::laser_scan::{NO_RETURN_MARK_M, UNMEASURED_MARK_M};
 use frame_tree::arithmetic::{Quaternion, product, quaternion_of_yaw, rotate};
 
 /// A rigid motion of space: a turn by a unit quaternion, then a shift.
@@ -135,6 +137,17 @@ impl Scene {
         }
     }
 
+    /// The distance along `direction` from `origin` at which the ray first
+    /// enters a box of the scene or of `turned`; infinite for a ray that enters
+    /// none.
+    pub fn first_entry(&self, turned: &[TurnedBox], origin: [f64; 3], direction: [f64; 3]) -> f64 {
+        self.boxes
+            .iter()
+            .filter_map(|b| b.entry(origin, direction))
+            .chain(turned.iter().filter_map(|b| b.entry(origin, direction)))
+            .fold(f64::INFINITY, f64::min)
+    }
+
     /// A table whose top spans from `min` to `max` of the floor plane at
     /// `top_m` up, 0.05 m thick, on four legs 0.05 m square at its corners.
     pub fn table(min: [f64; 2], max: [f64; 2], top_m: f64) -> Vec<Box3> {
@@ -204,12 +217,7 @@ impl DepthLens {
                     (f64::from(v) - self.cy) / self.fy,
                     1.0,
                 ]);
-                let depth = scene
-                    .boxes
-                    .iter()
-                    .filter_map(|b| b.entry(origin, direction))
-                    .chain(turned.iter().filter_map(|b| b.entry(origin, direction)))
-                    .fold(f64::INFINITY, f64::min);
+                let depth = scene.first_entry(turned, origin, direction);
                 let sample = if depth <= self.max_depth_m {
                     (depth / f64::from(self.unit_m)).round() as u16
                 } else {
@@ -218,5 +226,53 @@ impl DepthLens {
                 sample.to_le_bytes()
             })
             .collect()
+    }
+}
+
+/// A 2-D lidar's fan, as lidar_2d's scan gives it: `rays` rays from
+/// `min_angle_rad` (rad) by `angle_increment_rad`, `time_increment_s` (s) from
+/// one ray to the next, below 0 for a lidar that sweeps clockwise, and the
+/// nearest and farthest ranges it measures (m).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LidarLens {
+    pub min_angle_rad: f32,
+    pub angle_increment_rad: f32,
+    pub rays: usize,
+    pub time_increment_s: f32,
+    pub min_range_m: f32,
+    pub max_range_m: f32,
+}
+
+impl LidarLens {
+    /// Ray `index`'s angle in the lidar's frame (rad), as lidar_2d places it.
+    pub fn angle_rad(&self, index: usize) -> f64 {
+        f64::from(self.min_angle_rad) + index as f64 * f64::from(self.angle_increment_rad)
+    }
+
+    /// Ray `index`'s time after the scan's timestamp (s), before it for a
+    /// clockwise sweep.
+    pub fn time_s(&self, index: usize) -> f64 {
+        f64::from(self.time_increment_s) * index as f64
+    }
+
+    /// The range the lidar measures along the ray from `origin` along
+    /// `direction`, a unit vector, of `scene` and `turned`: the distance to the
+    /// first box the ray enters, lidar_2d's 0 nearer than the nearest range,
+    /// and its 10000 at or past the farthest.
+    pub fn range(
+        &self,
+        scene: &Scene,
+        turned: &[TurnedBox],
+        origin: [f64; 3],
+        direction: [f64; 3],
+    ) -> f32 {
+        let distance = scene.first_entry(turned, origin, direction);
+        if distance >= f64::from(self.max_range_m) {
+            return NO_RETURN_MARK_M;
+        }
+        if distance < f64::from(self.min_range_m) {
+            return UNMEASURED_MARK_M;
+        }
+        distance as f32
     }
 }

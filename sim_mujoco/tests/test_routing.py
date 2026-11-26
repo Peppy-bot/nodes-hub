@@ -1,11 +1,13 @@
-"""Which robot, limb, base and camera a pair names, and what that decides.
+"""Which robot, limb, base, camera and lidar a pair names, and what that
+decides.
 
-Every robot's limbs reach the engine on two slots, its base on a third and its
-cameras on two more, each holding any number of pairs. The copy a pair
-carries is the robot that attached under that name, the link it comes from on
-the robot's side is its limb or its base, and its relay's name in the copy is
-its camera. These cover the ways that is read: a setpoint arriving on a pair,
-a state or a frame published back on one, and what a robot holds.
+Every robot's limbs reach the engine on two slots, its base on a third, its
+cameras on two more and its lidars on a sixth, each holding any number of
+pairs. The copy a pair carries is the robot that attached under that name,
+the link it comes from on the robot's side is its limb or its base, and its
+relay's name in the copy is its camera or its lidar. These cover the ways
+that is read: a setpoint arriving on a pair, a state, a frame or a scan
+published back on one, and what a robot holds.
 """
 
 from __future__ import annotations
@@ -47,6 +49,9 @@ ALPHA_CHEST = member("alpha_chest", "simulation", "alpha")
 CHARLO_WRIST = member("charlo_wrist", "simulation", "charlo")
 # A base node leads its robot's wheels from the link named after the base.
 INDIA_BASE = member("india_base_inst", "base", "india")
+# A lidar pair comes from its relay, named after the lidar in the copy.
+INDIA_LIDAR = member("india_lidar", "simulation", "india")
+JULIET_LIDAR = member("juliet_lidar", "simulation", "juliet")
 # An OpenArm's arm moves seven joints.
 OPENARM_ARM = 7
 
@@ -407,6 +412,64 @@ class TestCameras:
             (ALPHA_WRIST_RIGHT.info, b"other"),
             (ALPHA_WRIST_LEFT.info, b"third"),
         ]
+
+
+class TestLidars:
+    @pytest.fixture(name="bases")
+    def bases_fixture(self, scene):
+        """Two botshare bases, india's lidar paired and juliet's not."""
+        _admit(scene, "india", "botshare_base")
+        _admit(scene, "juliet", "botshare_base")
+        pair("lidars", INDIA_LIDAR)
+        _serve(scene)
+        return scene
+
+    @staticmethod
+    def _lidar(scene, robot: str):
+        (lidar,) = scene.robots.of_name(robot).entry.lidars
+        return lidar
+
+    def test_a_scan_goes_to_the_relay_named_after_the_lidar_naming_its_frame(self, bases):
+        lidar = self._lidar(bases, "india")
+        assert bases.io.publish_scan("india", lidar, 1.5, 7, [2.0, 10000.0, 0.0])
+        _publishes(bases)
+
+        ((peer, payload),) = _sent("lidars", "scan_stream")
+        header, *scan = payload
+        assert peer == INDIA_LIDAR.info
+        assert (header.timestamp, header.frame, header.capture_index) == (1.5, "lidar_frame", 7)
+        assert scan == [
+            lidar.sweep.min_angle_rad,
+            lidar.sweep.angle_increment_rad,
+            lidar.time_increment_s,
+            lidar.min_range_m,
+            lidar.max_range_m,
+            [2.0, 10000.0, 0.0],
+            [],
+        ]
+
+    def test_a_lidar_is_its_robots_on_the_lidar_slot(self, bases):
+        """The lidar of a robot that holds no pair for it is viewed by
+        nobody: another robot's relay does not stand in."""
+        assert bases.io.held_by("india") == Held(lidars=frozenset({"lidar"}))
+        assert bases.io.held_by("juliet").is_empty()
+        assert bases.io.lidar_viewed("india", "lidar")
+        assert not bases.io.lidar_viewed("juliet", "lidar")
+        assert not bases.io.publish_scan("juliet", self._lidar(bases, "juliet"), 1.5, 0, [2.0])
+        _publishes(bases)
+
+        assert [peer for peer, _ in _sent("lidars", "scan_stream")] == []
+
+    def test_a_scan_behind_one_still_in_flight_is_dropped(self, bases):
+        lidar = self._lidar(bases, "india")
+        assert bases.io.publish_scan("india", lidar, 1.0, 0, [1.0])
+        # The loop has not run, so the first scan is still in flight.
+        assert not bases.io.publish_scan("india", lidar, 1.1, 1, [1.1])
+        _publishes(bases)
+        assert bases.io.publish_scan("india", lidar, 1.2, 2, [1.2])
+        _publishes(bases)
+
+        assert [payload[0].capture_index for _, payload in _sent("lidars", "scan_stream")] == [0, 2]
 
 
 class TestSetpoints:

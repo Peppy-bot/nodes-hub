@@ -171,7 +171,7 @@ def _rolling_differences(root, known: IsaacModel) -> list[str]:
         for joint in joints
         if not joint.GetBody0Rel().GetTargets()
     ]
-    body = next((prim for prim in Usd.PrimRange(root) if prim.GetName() == frame), None)
+    body = known.link_prim(root, known.root_link)
     if body is None or not body.HasAPI(UsdPhysics.RigidBodyAPI):
         differences.append(f"its robot frame '{known.root_link}' is no rigid body of it")
     differences.extend(

@@ -61,7 +61,7 @@ def engine(monkeypatch):
         return view
 
     monkeypatch.setattr(module, "_flush_physics_changes", lambda: engine.trace.append("flush"))
-    monkeypatch.setattr(module, "_create_body_view", create_body_view)
+    monkeypatch.setattr(module, "create_body_view", create_body_view)
     monkeypatch.setattr(module, "_authored_world_pose", lambda path: engine.authored[path])
     engine.module = module
     engine.reader = module.IsaacObjectReader()

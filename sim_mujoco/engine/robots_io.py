@@ -99,8 +99,8 @@ class RobotsIO:
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        # The models this engine stands, each with the limbs, the base and the
-        # cameras a robot of it pairs.
+        # The models this engine stands, each with the limbs, the base, the
+        # cameras and the lidars a robot of it pairs.
         self._models = models
         self._robots = robots
         # The robots standing in the scene, and the scene they compose.
@@ -146,9 +146,9 @@ class RobotsIO:
     def stand(self, name: str, known: MujocoModel, placement: Pose) -> None:
         """Stands a robot of the model `known` and composes the scene around
         it, on the thread that steps the scene. A robot the scene cannot take
-        (a model asking for other simulation settings, a camera whose body
-        its MJCF lacks) is taken back out, so one robot that cannot join
-        never takes the scene down."""
+        (a model asking for other simulation settings, a camera or a lidar
+        whose body its MJCF lacks) is taken back out, so one robot that
+        cannot join never takes the scene down."""
         try:
             self._unbind()
             self._world.add(name, known, placement)
@@ -545,7 +545,7 @@ class RobotsIO:
         starting its pair grace time again, and a robot no limb or base
         reached yet keeps its place for as long as its goal runs. A robot
         holding no pair is told so, and any other which of its pairs and its
-        model's limbs, base and cameras differ."""
+        model's limbs, base, cameras and lidars differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)

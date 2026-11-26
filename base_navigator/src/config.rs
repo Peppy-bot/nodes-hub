@@ -98,7 +98,7 @@ pub struct GridSettings {
     pub voxel_m: PositiveFinite,
     pub min_z_m: f64,
     pub heights: ObstacleHeights,
-    /// How far from a camera's origin in the plane a return marks.
+    /// How far from a sensor's origin in the plane a return marks.
     pub obstacle_max_range_m: PositiveFinite,
     pub footprint_padding: NonNegativeFinite,
     pub inflation: InflationParams,

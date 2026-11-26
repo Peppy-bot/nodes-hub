@@ -8,28 +8,53 @@
 //! duration scales each leg's speed by the fastest duration over the
 //! requested one, and the planned end lies at the requested duration.
 //!
-//! A turn follows Nav2 1.5.2's Spin (nav2_behaviors plugins/spin.cpp,
-//! `Spin::onCycleUpdate`, lines 118-130): it turns the way it began at the
-//! speed from which the deceleration stops it on its angle, at most the
-//! leg's speed, and ends once the angle that remains falls below one limiter
-//! step at the deadband, the finest turn a step makes, a turn past its angle
-//! included. The drive follows Nav2 1.5.2's
-//! DriveOnHeading (nav2_behaviors include/nav2_behaviors/plugins/
-//! drive_on_heading.hpp, `DriveOnHeading::onCycleUpdate`, lines 140-164):
-//! angular 0, and the leg's speed reached from the last command by at most
+//! A turn commands Nav2 1.5.2's Spin rate (nav2_behaviors plugins/spin.cpp,
+//! `Spin::onCycleUpdate`, lines 124-125): the speed from which the
+//! deceleration stops it on its angle, at most the leg's speed, and at least
+//! the node's `min_turn_rate_rad_s`, Spin's min_rotational_vel, within the
+//! axis's speed the way it turns. The drive commands Nav2 1.5.2's
+//! DriveOnHeading velocity (nav2_behaviors include/nav2_behaviors/plugins/
+//! drive_on_heading.hpp, `DriveOnHeading::onCycleUpdate`, lines 142-164):
+//! angular 0, the leg's speed reached from the limiter's velocity by at most
 //! acceleration x dt and deceleration x dt a step, at most the speed from
 //! which the deceleration stops the base on the distance that remains along
-//! the heading. That speed is [`AxisProfile::stopping_speed`], Spin's and
-//! DriveOnHeading's sqrt(2 x deceleration x remaining) taken on the
-//! limiter's steps. Each leg runs to its end, and the next starts once the
-//! last has come to 0. The drive holds its aim: once the target's
-//! bearing leaves the yaw tolerance, or the node's
+//! the heading, and at least the node's `min_forward_speed_m_s` ahead and
+//! `min_backward_speed_m_s` backward, DriveOnHeading's and BackUp's
+//! minimum_speed, within the axis's speed that way. The drive ramps from the
+//! limiter's velocity, where DriveOnHeading ramps from its own last command,
+//! `last_vel_` (drive_on_heading.hpp:142, :175). That speed is
+//! [`AxisProfile::stopping_speed`], Spin's and DriveOnHeading's
+//! sqrt(2 x deceleration x remaining) taken on the limiter's steps. Each
+//! floor is at least just above the axis's deadband, below which base_state's
+//! limiter executes the axis as 0 ([`leg_floor`]).
+//!
+//! A leg ends at the stop nearest its end ([`AxisProfile::ends`]): at the
+//! step at which the limiter, brought to 0 at the deceleration from its
+//! velocity, stops the base on or past the end, or nearer it than the stop
+//! from the next step that executes at the leg's command. A step executes at
+//! or above the axis's deadband, and one below it moves nothing. A leg on its
+//! stopping speed so ends with the stop landing on its end. Spin ends once
+//! less than 1e-6 rad of its angle remains (spin.cpp:118-122), DriveOnHeading
+//! once it has driven its distance (drive_on_heading.hpp:131-134), each
+//! leaving the stop to the velocity smoother, which applies its deadband to
+//! what it sends after it keeps the velocity it steps from, `last_cmd_`
+//! (nav2_velocity_smoother/src/velocity_smoother.cpp:468, :471-481); the end
+//! here counts only the steps that execute. A leg that holds its floor f
+//! moves f x dt a step, and ends with its stop landing within f x dt / 2 of
+//! its end. From rest, the shortest move a leg makes is the limiter's ramp
+//! toward its floor up to its first step that executes, and the stop from
+//! there ([`AxisProfile::shortest_move`]), so a leg at rest within half of
+//! that of its end ends where it stands. A leg that ends with the base
+//! outside the tolerances starts again from where the base stands. move_base
+//! refuses a position tolerance below the shortest drive and a yaw tolerance
+//! below the shortest turn ([`MoveAxes`]).
+//!
+//! Each leg runs to its end, and the next starts once the last has come to
+//! 0. The drive starts when it runs from where the base stands, and the
+//! base turns toward the target otherwise. The drive holds its aim: once the
+//! target's bearing leaves the yaw tolerance, or the node's
 //! `rotate_to_heading_min_angle_rad` when the tolerance is wider, the base
 //! turns toward the target again and drives on.
-//! base_state's limiter executes an axis slower than its deadband as 0, so
-//! while the base stands outside the tolerances, the axis of the leg it is on
-//! commands at least just above its deadband, as Spin's min_rotational_vel
-//! and DriveOnHeading's minimum_speed floor their commands.
 
 use std::f64::consts::PI;
 
@@ -48,40 +73,57 @@ use frame_tree::arithmetic::normalize_angle;
 /// two and a half hours of ramping at the limiter's fastest rate, 1 kHz.
 const ABOVE_DEADBAND: f64 = 1e-6;
 
-/// The turn (rad) below which Nav2's Spin ends: it stops once less than this
-/// remains (nav2_behaviors/plugins/spin.cpp:116, `remaining_yaw < 1e-6`).
-const SPIN_DONE_RAD: f64 = 1e-6;
+/// The slowest speed (a magnitude) a leg commands toward a way whose fastest
+/// speed is `fastest`: `slowest`, the node's minimum that way, at least just
+/// above the axis's `deadband` and at most `fastest`, as Spin clamps its rate
+/// between min_rotational_vel and max_rotational_vel (spin.cpp:125).
+pub fn leg_floor(slowest: f64, deadband: f64, fastest: f64) -> f64 {
+    slowest.max(deadband * (1.0 + ABOVE_DEADBAND)).min(fastest)
+}
+
+/// One way an axis moves: the speed of a leg that way and its floor, the
+/// slowest speed such a leg commands while it runs ([`leg_floor`]), each a
+/// magnitude.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Way {
+    pub speed: f64,
+    pub floor: f64,
+}
 
 /// The limits of one axis of the base that move_base plans and steers
-/// under: its speed toward the axis's positive direction (ahead, or
-/// counterclockwise) and toward its negative one, magnitudes, its
-/// acceleration and deceleration, each above 0, and its deadband, the speed
-/// below which base_state's limiter executes the axis as 0.
+/// under: the way toward the axis's positive direction (ahead, or
+/// counterclockwise) and the way toward its negative one, its acceleration
+/// and deceleration, each above 0, and its deadband, below which base_state's
+/// limiter executes the axis as 0.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AxisProfile {
-    pub positive_speed: f64,
-    pub negative_speed: f64,
+    pub positive: Way,
+    pub negative: Way,
     pub acceleration: f64,
     pub deceleration: f64,
     pub deadband: f64,
 }
 
 impl AxisProfile {
-    /// The axis's speed toward its positive direction when `positive`, and
+    /// The way toward the axis's positive direction when `positive`, and
     /// toward its negative one otherwise.
-    fn speed(&self, positive: bool) -> f64 {
+    fn way(&self, positive: bool) -> Way {
         if positive {
-            self.positive_speed
+            self.positive
         } else {
-            self.negative_speed
+            self.negative
         }
     }
 
-    /// This profile with each way's speed times `scale`.
+    /// This profile with each way's speed times `scale`, its floors kept.
     fn scaled(&self, scale: f64) -> Self {
+        let scaled = |way: Way| Way {
+            speed: way.speed * scale,
+            ..way
+        };
         Self {
-            positive_speed: self.positive_speed * scale,
-            negative_speed: self.negative_speed * scale,
+            positive: scaled(self.positive),
+            negative: scaled(self.negative),
             ..*self
         }
     }
@@ -96,7 +138,7 @@ impl AxisProfile {
             deceleration,
             ..
         } = *self;
-        let speed = self.speed(distance >= 0.0);
+        let speed = self.way(distance >= 0.0).speed;
         let distance = distance.abs();
         if distance == 0.0 {
             return 0.0;
@@ -110,17 +152,85 @@ impl AxisProfile {
         peak / acceleration + peak / deceleration
     }
 
-    /// The slowest speed (a magnitude) the axis commands while it closes an
-    /// error: just above the deadband.
-    fn floor(&self) -> f64 {
-        self.deadband * (1.0 + ABOVE_DEADBAND)
+    /// The distance the axis covers, signed as `speed`, while base_state's
+    /// limiter brings `speed` to rest, slowing it by one step of the
+    /// deceleration, `a` = deceleration x `dt`, at each step of `dt` (s): a
+    /// step at each of the magnitudes |speed| - a, |speed| - 2a, ... above 0
+    /// that executes, at or above the deadband.
+    fn stopping_distance(&self, speed: f64, dt: f64) -> f64 {
+        let step = self.deceleration * dt;
+        let magnitude = speed.abs();
+        let above_zero = (magnitude / step).ceil() - 1.0;
+        let executed = ((magnitude - self.deadband) / step).floor();
+        let steps = above_zero.min(executed).max(0.0);
+        speed.signum() * dt * steps * (magnitude - step * (steps + 1.0) / 2.0)
     }
 
-    /// The finest turn (rad) one step of `dt` (s) makes: a step at the
-    /// deadband, and no less than Nav2's Spin leaves, [`SPIN_DONE_RAD`]. A
-    /// turn with less than this left ends.
-    fn finest_step(&self, dt: f64) -> f64 {
-        (self.deadband * dt).max(SPIN_DONE_RAD)
+    /// The speed base_state's limiter steps `speed` to over one step of `dt`
+    /// (s) toward `command`, both signed the same way: by at most
+    /// acceleration x `dt` while `command` is at least as fast and not the
+    /// other way, and by at most deceleration x `dt` otherwise.
+    fn next_speed(&self, speed: f64, command: f64, dt: f64) -> f64 {
+        let rate = if command.abs() >= speed.abs() && command * speed >= 0.0 {
+            self.acceleration
+        } else {
+            self.deceleration
+        };
+        rate_limited(speed, command, rate, dt)
+    }
+
+    /// The first speed base_state's limiter steps `speed` to toward
+    /// `command`, over steps of `dt` (s), that executes, at or above the
+    /// deadband, each step before it executing 0: none when the ramp comes
+    /// to `command` without one. It looks as many steps ahead as the slower
+    /// step of the acceleration and deceleration takes over |`speed`| and the
+    /// deadband, by which the ramp has crossed the deadband or come to
+    /// `command`.
+    fn first_executing(&self, speed: f64, command: f64, dt: f64) -> Option<f64> {
+        let slowest_step = self.acceleration.min(self.deceleration) * dt;
+        let ramp = ((speed.abs() + self.deadband) / slowest_step).ceil() as usize + 1;
+        std::iter::successors(Some(speed), |&last| {
+            Some(self.next_speed(last, command, dt))
+        })
+        .skip(1)
+        .take(ramp)
+        .find(|next| next.abs() >= self.deadband)
+    }
+
+    /// Whether a leg along the axis ends at this step of `dt` (s), with
+    /// `remaining` of it left, past its end when negative, base_state's
+    /// limiter at `speed` and the leg commanding `command` were it to go on,
+    /// each signed along the way the leg goes: the limiter's stop from
+    /// `speed` lands on or past the end, or nearer it than the stop from the
+    /// next step that executes at `command` lands past it, or no step at
+    /// `command` executes ([`AxisProfile::first_executing`]). The leg so ends
+    /// at the stop nearest its end of those it reaches a step at a time.
+    fn ends(&self, remaining: f64, speed: f64, command: f64, dt: f64) -> bool {
+        let short_now = remaining - self.stopping_distance(speed, dt);
+        let Some(next) = self.first_executing(speed, command, dt) else {
+            return true;
+        };
+        let short_next = remaining - next * dt - self.stopping_distance(next, dt);
+        short_now <= (-short_next).max(0.0)
+    }
+
+    /// The shortest move a leg along the axis makes from rest over steps of
+    /// `dt` (s), the longer of each way the axis moves: base_state's
+    /// limiter's ramp toward the way's floor up to its first step that
+    /// executes ([`AxisProfile::first_executing`]), and its stop from there.
+    /// A leg that rests within half of its own way's shortest move of its end
+    /// ends where it stands, and one that rests farther runs and moves the
+    /// base ([`AxisProfile::ends`]), so half of this bounds both ways: a leg
+    /// commands at least its floor, and a command above it is at most the
+    /// stopping speed of what remains, whose move covers what remains. A way
+    /// whose floor lies below the deadband never executes.
+    fn shortest_move(&self, dt: f64) -> f64 {
+        [self.positive, self.negative]
+            .into_iter()
+            .filter(|way| way.speed > 0.0)
+            .filter_map(|way| self.first_executing(0.0, way.floor, dt))
+            .map(|first| first * dt + self.stopping_distance(first, dt))
+            .fold(0.0, f64::max)
     }
 
     /// The speed (a magnitude) from which base_state's limiter, slowing the
@@ -149,36 +259,131 @@ impl AxisProfile {
     }
 
     /// Spin's rate (rad/s), signed, of a turn going `turning` with
-    /// `remaining` (rad) of it left, over a step of `dt` (s).
+    /// `remaining` (rad) of it left, past its angle when negative, over a
+    /// step of `dt` (s).
     fn turn_rate(&self, turning: Turning, remaining: f64, dt: f64) -> f64 {
-        let rate = self
-            .stopping_speed(remaining, dt)
-            .min(self.speed(turning == Turning::Counterclockwise));
-        turning.sign() * rate.max(self.floor())
+        let way = self.way(turning == Turning::Counterclockwise);
+        let rate = self.stopping_speed(remaining.max(0.0), dt).min(way.speed);
+        turning.sign() * rate.max(way.floor)
     }
 
     /// DriveOnHeading's velocity (m/s), signed, toward a target `ahead` (m)
-    /// along the heading, behind the base when negative, after commanding
-    /// `last` (m/s) one step of `dt` (s) ago.
-    fn drive_velocity(&self, ahead: f64, last: f64, dt: f64) -> f64 {
+    /// along the heading, behind the base when negative, base_state's
+    /// limiter at `speed` (m/s), over a step of `dt` (s).
+    fn drive_velocity(&self, ahead: f64, speed: f64, dt: f64) -> f64 {
         let forward = ahead >= 0.0;
-        let direction = if forward { 1.0 } else { -1.0 };
+        let way = self.way(forward);
+        let direction = drive_direction(ahead);
         let (lowest, highest) = if forward {
-            (last - self.deceleration * dt, last + self.acceleration * dt)
+            (
+                speed - self.deceleration * dt,
+                speed + self.acceleration * dt,
+            )
         } else {
-            (last - self.acceleration * dt, last + self.deceleration * dt)
+            (
+                speed - self.acceleration * dt,
+                speed + self.deceleration * dt,
+            )
         };
-        let ramped = (direction * self.speed(forward)).clamp(lowest, highest);
+        let ramped = (direction * way.speed).clamp(lowest, highest);
         let to_stop = self.stopping_speed(ahead.abs(), dt);
         let capped = if to_stop < ramped.abs() {
             direction * to_stop
         } else {
             ramped
         };
-        if capped.abs() < self.floor() {
-            direction * self.floor()
+        if capped.abs() < way.floor {
+            direction * way.floor
         } else {
             capped
+        }
+    }
+}
+
+/// The direction a drive toward a target `ahead` (m) along the heading goes:
+/// 1 ahead, -1 back toward a target behind the base.
+fn drive_direction(ahead: f64) -> f64 {
+    if ahead >= 0.0 { 1.0 } else { -1.0 }
+}
+
+/// How far below the finest a value lies, as a share of the finest, and is
+/// still taken: past the rounding of the sums that give the finest, which
+/// lands botshare_sim's 2.5 mm at 0.0025000000000000005.
+const FINEST_SLACK: f64 = 1e-9;
+/// The significant digits a refusal shows the finest with.
+const SHOWN_DIGITS: i32 = 9;
+/// The longest shortest turn from rest (rad) the node takes ([`MoveAxes`]):
+/// at it, (S_d / 2) / cos(1) is 0.93 S_d, 7% inside S_d, past the rounding
+/// of the sums and so within the finest position tolerance the node takes,
+/// S_d less [`FINEST_SLACK`] of it.
+pub const LONGEST_SHORTEST_TURN: f64 = 2.0;
+
+/// Whether `value` is finer than `finest`: below it by more than
+/// [`FINEST_SLACK`] of it.
+pub fn finer_than(value: f64, finest: f64) -> bool {
+    value < finest - finest * FINEST_SLACK
+}
+
+/// `finest` as a refusal shows it: rounded up to [`SHOWN_DIGITS`]
+/// significant digits from half [`FINEST_SLACK`] below it, a value no finer
+/// than `finest` ([`finer_than`]), the other half of the slack covering the
+/// rounding of the scaling. A finest of 0, or one whose scale or rounding is
+/// not finite, shows as itself.
+pub fn shown_finest(finest: f64) -> f64 {
+    if finest == 0.0 {
+        return finest;
+    }
+    let from = finest - finest * FINEST_SLACK / 2.0;
+    let scale = 10f64.powi(SHOWN_DIGITS - 1 - from.log10().floor() as i32);
+    let shown = (from * scale).ceil() / scale;
+    if scale.is_finite() && shown.is_finite() {
+        shown
+    } else {
+        finest
+    }
+}
+
+/// The axes move_base plans and steers along, and the finest tolerances a
+/// move along them takes, S_d and S_t: the shortest drive and the shortest
+/// turn from rest ([`AxisProfile::shortest_move`]).
+///
+/// S_d and S_t count only the steps that execute, at or above the axis's
+/// deadband, so from rest a drive runs and moves the base once its target
+/// lies more than S_d / 2 ahead or behind, and a turn once more than S_t / 2
+/// of it remains ([`AxisProfile::shortest_move`]). A move takes a
+/// position tolerance of at least S_d and a yaw tolerance of at least S_t,
+/// and its drive aims within the smaller of the yaw tolerance and the
+/// rotate-to-heading angle, which the node holds to at least S_t. So a base
+/// at rest outside its tolerances has a leg that runs. Within the position
+/// tolerance, a heading outside the yaw tolerance lies more than S_t from the
+/// target's, and the turn to the yaw runs. Outside it, a
+/// target behind the base or past the aim lies at a bearing past S_t / 2,
+/// and the turn toward it runs. A target ahead within the aim is driven to,
+/// or turned toward, unless it lies at most S_d / 2 ahead at a bearing of at
+/// most S_t / 2, at most (S_d / 2) / cos(S_t / 2) away: within the position
+/// tolerance while S_t is at most 2 rad, the most the node takes
+/// ([`LONGEST_SHORTEST_TURN`]).
+///
+/// A drive that lands past its target backs up to it on a base that drives
+/// backward, and turns toward it again on one that does not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MoveAxes {
+    pub linear: AxisProfile,
+    pub angular: AxisProfile,
+    pub finest: Tolerances,
+}
+
+impl MoveAxes {
+    /// The axes `linear` and `angular` under base_state's limiter stepping
+    /// every `dt` (s).
+    pub fn new(linear: AxisProfile, angular: AxisProfile, dt: f64) -> Self {
+        Self {
+            linear,
+            angular,
+            finest: Tolerances {
+                position: linear.shortest_move(dt),
+                yaw: angular.shortest_move(dt),
+            },
         }
     }
 }
@@ -322,8 +527,6 @@ pub struct MoveController {
     rotate_to_heading_min_angle: f64,
     /// The leg of the last command, none before the first.
     leg: Option<Leg>,
-    /// The last command: the limiter's velocity before the first.
-    last: PlanarTwist,
 }
 
 impl MoveController {
@@ -332,7 +535,6 @@ impl MoveController {
         plan: MovePlan,
         tolerances: Tolerances,
         rotate_to_heading_min_angle: f64,
-        command: PlanarTwist,
     ) -> Self {
         Self {
             target,
@@ -340,7 +542,6 @@ impl MoveController {
             tolerances,
             rotate_to_heading_min_angle,
             leg: None,
-            last: command,
         }
     }
 
@@ -359,91 +560,128 @@ impl MoveController {
         distance <= self.tolerances.position && yaw <= self.tolerances.yaw
     }
 
-    /// The leg the base is on with the target at `offset`. A drive runs to
-    /// its end, the target's foot on the heading reached, while its bearing
-    /// lies within the yaw tolerance and the rotate-to-heading angle. Within the
+    /// Spin's rate (rad/s) of a turn going `turning` toward `angle` (rad)
+    /// from the heading, base_state's limiter turning at `rate` (rad/s), over
+    /// a step of `dt` (s): none once the turn ends ([`AxisProfile::ends`]).
+    fn turn(&self, turning: Turning, angle: f64, rate: f64, dt: f64) -> Option<f64> {
+        let angular = self.plan.angular;
+        let remaining = turning.remaining(angle);
+        let command = angular.turn_rate(turning, remaining, dt);
+        let along = |value: f64| turning.sign() * value;
+        (!angular.ends(remaining, along(rate), along(command), dt)).then_some(command)
+    }
+
+    /// DriveOnHeading's velocity (m/s) toward a target `ahead` (m) along the
+    /// heading, behind the base when negative, base_state's limiter at
+    /// `speed` (m/s), over a step of `dt` (s): none once the drive ends
+    /// ([`AxisProfile::ends`]).
+    fn drive(&self, ahead: f64, speed: f64, dt: f64) -> Option<f64> {
+        let linear = self.plan.linear;
+        let command = linear.drive_velocity(ahead, speed, dt);
+        let along = |value: f64| drive_direction(ahead) * value;
+        (!linear.ends(ahead.abs(), along(speed), along(command), dt)).then_some(command)
+    }
+
+    /// The leg the base is on with the target at `offset`, base_state's
+    /// limiter at `velocity`, over a step of `dt` (s), and the leg's command
+    /// along its axis: m/s along x on the drive and rad/s about z on a turn,
+    /// 0 on a leg that ended and on arrival. A drive runs to its end
+    /// ([`MoveController::drive`]), the target ahead, while its bearing lies
+    /// within the yaw tolerance and the rotate-to-heading angle. Within the
     /// position tolerance: the turn to the yaw, which starts while the
     /// heading lies outside the yaw tolerance and runs to its end. Outside
     /// it: the turn toward the target, which runs to its end, and the drive,
-    /// which starts with the target ahead and goes on while its bearing lies
-    /// within the same bound, its rear toward a target it passed on a base
-    /// that drives backward.
-    fn next_leg(&self, offset: Offset, dt: f64) -> Leg {
+    /// which starts when it runs with the target ahead and goes on while its
+    /// bearing lies within the same bound, its rear toward a target it passed
+    /// on a base that drives backward, while it runs and while the limiter
+    /// brings its speed to 0 after its end.
+    fn next_leg(&self, offset: Offset, velocity: PlanarTwist, dt: f64) -> (Leg, f64) {
         let tolerances = self.tolerances;
         let aim = tolerances.yaw.min(self.rotate_to_heading_min_angle);
-        let turn_done = self.plan.angular.finest_step(dt);
-        if self.leg == Some(Leg::Drive) && offset.ahead > 0.0 && offset.bearing.abs() <= aim {
-            return Leg::Drive;
+        let turn = |leg: fn(Turning) -> Leg, turning: Turning, angle: f64| {
+            self.turn(turning, angle, velocity.angular_z(), dt)
+                .map(|command| (leg(turning), command))
+        };
+        let started_turn = |leg: fn(Turning) -> Leg, angle: f64| {
+            let turning = Turning::through(angle);
+            turn(leg, turning, angle).unwrap_or((leg(turning), 0.0))
+        };
+        let drive = self
+            .drive(offset.ahead, velocity.linear_x(), dt)
+            .map(|command| (Leg::Drive, command));
+        let on_drive = self.leg == Some(Leg::Drive);
+        let aimed_ahead = offset.ahead > 0.0 && offset.bearing.abs() <= aim;
+        if on_drive
+            && aimed_ahead
+            && let Some(driving) = drive
+        {
+            return driving;
         }
         if offset.distance <= tolerances.position {
-            return match self.leg {
-                Some(Leg::TurnToYaw(turning)) if turning.remaining(offset.yaw) >= turn_done => {
-                    Leg::TurnToYaw(turning)
-                }
-                _ if offset.yaw.abs() <= tolerances.yaw => Leg::Arrived,
-                _ => Leg::TurnToYaw(Turning::through(offset.yaw)),
-            };
+            if let Some(Leg::TurnToYaw(turning)) = self.leg
+                && let Some(kept) = turn(Leg::TurnToYaw, turning, offset.yaw)
+            {
+                return kept;
+            }
+            if offset.yaw.abs() <= tolerances.yaw {
+                return (Leg::Arrived, 0.0);
+            }
+            return started_turn(Leg::TurnToYaw, offset.yaw);
+        }
+        if let Some(Leg::TurnToward(turning)) = self.leg
+            && let Some(kept) = turn(Leg::TurnToward, turning, offset.bearing)
+        {
+            return kept;
         }
         let steering = if offset.ahead >= 0.0 {
             offset.bearing
         } else {
             normalize_angle(offset.bearing + PI)
         };
-        match self.leg {
-            Some(Leg::TurnToward(turning)) if turning.remaining(offset.bearing) >= turn_done => {
-                Leg::TurnToward(turning)
+        let drives_that_way = offset.ahead >= 0.0 || self.plan.linear.negative.speed > 0.0;
+        if on_drive && steering.abs() <= aim && drives_that_way {
+            if let Some(driving) = drive {
+                return driving;
             }
-            Some(Leg::Drive)
-                if steering.abs() <= aim
-                    && (offset.ahead >= 0.0 || self.plan.linear.negative_speed > 0.0) =>
-            {
-                Leg::Drive
+            if velocity.linear_x() != 0.0 {
+                return (Leg::Drive, 0.0);
             }
-            _ if offset.ahead > 0.0 && offset.bearing.abs() <= aim => Leg::Drive,
-            _ => Leg::TurnToward(Turning::through(offset.bearing)),
         }
+        if aimed_ahead && let Some(driving) = drive {
+            return driving;
+        }
+        started_turn(Leg::TurnToward, offset.bearing)
     }
 
-    /// The velocity to command at `pose`, one step of `dt` (s) after the
-    /// last command: zero once `pose` stands within both tolerances. A leg on
-    /// one axis starts once the command of the other has come to 0, the
+    /// The velocity to command at `pose`, base_state's limiter at `velocity`,
+    /// over a step of `dt` (s): zero once `pose` stands within both
+    /// tolerances, and on the axis of a leg that ended. A leg on one axis
+    /// starts once the limiter's velocity on the other has come to 0, the
     /// other brought down by its deceleration over each step meanwhile, so
     /// each leg runs on one axis through base_state's limiter, which scales
     /// the axes together.
-    pub fn command(&mut self, pose: PlanarPose, dt: f64) -> PlanarTwist {
-        let offset = Offset::of(self.target, pose);
-        let leg = self.next_leg(offset, dt);
+    pub fn command(&mut self, pose: PlanarPose, velocity: PlanarTwist, dt: f64) -> PlanarTwist {
+        let (leg, along) = self.next_leg(Offset::of(self.target, pose), velocity, dt);
+        let (speed, rate) = (velocity.linear_x(), velocity.angular_z());
+        let (linear_x, angular_z) = match leg {
+            Leg::Drive => (along, 0.0),
+            Leg::TurnToward(_) | Leg::TurnToYaw(_) => (0.0, along),
+            Leg::Arrived => (0.0, 0.0),
+        };
         let MovePlan {
             linear, angular, ..
         } = self.plan;
-        let (linear_x, angular_z) = match leg {
-            Leg::TurnToward(turning) => (
-                0.0,
-                angular.turn_rate(turning, turning.remaining(offset.bearing), dt),
-            ),
-            Leg::Drive => (
-                linear.drive_velocity(offset.ahead, self.last.linear_x(), dt),
-                0.0,
-            ),
-            Leg::TurnToYaw(turning) => (
-                0.0,
-                angular.turn_rate(turning, turning.remaining(offset.yaw), dt),
-            ),
-            Leg::Arrived => (0.0, 0.0),
-        };
         let wound_down =
             |last: f64, axis: AxisProfile| rate_limited(last, 0.0, axis.deceleration, dt);
-        let (last_linear, last_angular) = (self.last.linear_x(), self.last.angular_z());
-        let (linear_x, angular_z) = if angular_z != 0.0 && last_linear != 0.0 {
-            (wound_down(last_linear, linear), 0.0)
-        } else if linear_x != 0.0 && last_angular != 0.0 {
-            (0.0, wound_down(last_angular, angular))
+        let (linear_x, angular_z) = if angular_z != 0.0 && speed != 0.0 {
+            (wound_down(speed, linear), 0.0)
+        } else if linear_x != 0.0 && rate != 0.0 {
+            (0.0, wound_down(rate, angular))
         } else {
             (linear_x, angular_z)
         };
         self.leg = Some(leg);
-        self.last = PlanarTwist::new(linear_x, 0.0, angular_z).expect("a command of finite poses");
-        self.last
+        PlanarTwist::new(linear_x, 0.0, angular_z).expect("a command of finite poses")
     }
 }
 

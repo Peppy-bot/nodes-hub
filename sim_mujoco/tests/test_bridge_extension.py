@@ -698,19 +698,19 @@ class TestARenderingScene:
         )
         carried = first.shutdown()
         for _ in range(3):
-            carried[(ROBOT, "wrist")].next()
+            carried.camera_counters[(ROBOT, "wrist")].next()
 
         world.add("delta", known, world.free_spot())
         composed = world.compose().compile()
         second = MujocoBridgeExtension(
             composed, mujoco.MjData(composed), FakeIO(), world, _STATE_RATE_HZ,
-            renders=True, time_base_s=0.0, camera_counters=carried,
+            renders=True, time_base_s=0.0, carried_sensors=carried,
         )
 
         counted = second.shutdown()
-        assert counted[(ROBOT, "wrist")].next() == 3
+        assert counted.camera_counters[(ROBOT, "wrist")].next() == 3
         # The robot that just joined starts its own count.
-        assert counted[("delta", "wrist")].next() == 0
+        assert counted.camera_counters[("delta", "wrist")].next() == 0
 
 
 def _wheeled(io=None, xml: str = WHEELED, world=None):

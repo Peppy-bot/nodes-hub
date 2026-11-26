@@ -378,10 +378,9 @@ async fn move_base_feedback_gives_what_remains_of_the_move() {
 async fn move_base_completes_at_its_planned_end_at_rest_within_its_tolerances() {
     let mut rig = Rig::start([0.0, 0.0]).await;
     // A slow move to tolerances of 1 mm and 2 mrad: its legs' speeds, scaled
-    // to 40 s, and the approach to each end lie below the deadbands, so the
-    // move closes each leg at just above the deadband. The wheels follow
-    // every setpoint, and the base rests within the tolerances well before
-    // the planned end.
+    // to 40 s, and the approach to each end lie below the floors, so the move
+    // closes each leg at its floor. The wheels follow every setpoint, and the
+    // base rests within the tolerances well before the planned end.
     let request = move_base::GoalRequestData {
         target: target(0.05, 0.0, 0.3),
         duration_s: 40.0,
@@ -404,6 +403,16 @@ async fn move_base_completes_at_its_planned_end_at_rest_within_its_tolerances() 
         refused.message
     );
     let result = rig.follow_until_result(&goal).await;
+    assert_completes_within_tolerances(&request, result);
+    rig.shutdown().await;
+}
+
+/// Asserts that `result` completes `request`, a move to a target in the robot
+/// frame at the start, its final pose within the request's tolerances.
+fn assert_completes_within_tolerances(
+    request: &move_base::GoalRequestData,
+    result: move_base::ResultResponse,
+) {
     let move_base::ResultOutcome::Completed(data) = result.outcome else {
         panic!("the move completes: {:?}", result.outcome);
     };
@@ -420,6 +429,50 @@ async fn move_base_completes_at_its_planned_end_at_rest_within_its_tolerances() 
         yaw <= request.settle_orientation_tolerance_rad,
         "the base rests {yaw} rad from the target yaw"
     );
+}
+
+/// The wheel rate (rad/s) below which the wheels of the turn's stiction test
+/// stand still: that of a turn of 0.025 rad/s, above the 0.019 rad/s at which
+/// the test's turn's stopping speeds end and below the rig's
+/// `min_turn_rate_rad_s`, 0.03 rad/s.
+const TURN_STUCK_BELOW_RAD_S: f64 = 0.025 * WHEEL_SEPARATION_M / 2.0 / WHEEL_RADIUS_M;
+/// The wheel rate (rad/s) below which the wheels of the drive's stiction test
+/// stand still: that of 0.01 m/s ahead, above the 0.006 m/s at which the
+/// test's drive's stopping speeds end and below the rig's
+/// `min_forward_speed_m_s`, 0.02 m/s.
+const DRIVE_STUCK_BELOW_RAD_S: f64 = 0.01 / WHEEL_RADIUS_M;
+
+// A turn of 1 rad whose stopping speeds end at 0.019 rad/s, 0.04 rad/s of
+// wheel rate, on wheels that stand still below 0.05 rad/s: the turn commands
+// at least min_turn_rate_rad_s until it ends, and the move completes within
+// its tolerances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_turn_on_wheels_that_stick_below_a_rate_completes() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    let request = move_goal(0.0, 0.0, 1.0, 5.0);
+    let goal = rig.send_move(&request).await;
+    assert!(goal.accepted, "{:?}", goal.refusal);
+    let result = rig
+        .follow_sticking_until_result(&goal, TURN_STUCK_BELOW_RAD_S)
+        .await;
+    assert_completes_within_tolerances(&request, result);
+    rig.shutdown().await;
+}
+
+// A drive of 0.214 m whose stopping speeds end at 0.006 m/s, 0.06 rad/s of
+// wheel rate, on wheels that stand still below 0.1 rad/s: the drive commands at
+// least min_forward_speed_m_s until it ends, and the move completes within its
+// tolerances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drive_on_wheels_that_stick_below_a_rate_completes() {
+    let mut rig = Rig::start([0.0, 0.0]).await;
+    let request = move_goal(0.214, 0.0, 0.0, 5.0);
+    let goal = rig.send_move(&request).await;
+    assert!(goal.accepted, "{:?}", goal.refusal);
+    let result = rig
+        .follow_sticking_until_result(&goal, DRIVE_STUCK_BELOW_RAD_S)
+        .await;
+    assert_completes_within_tolerances(&request, result);
     rig.shutdown().await;
 }
 

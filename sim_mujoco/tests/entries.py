@@ -1,8 +1,8 @@
 """The entries of the robots these suites stand: what a description gives a
 robot (its arms, its grippers with where each finger closes and opens, its
-base, its cameras and its start posture), and what the release of Waldo's
-catalogue gives its MuJoCo model, written out for a fake robot of a test; and
-where a test stands a robot."""
+base, its cameras, its lidars and its start posture), and what the release
+of Waldo's catalogue gives its MuJoCo model, written out for a fake robot of
+a test; and where a test stands a robot."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from control_core_py.geometry import Pose, quaternion_of_yaw
 from robot_description_py import FingerSpan
 from sim_robot_core.cameras import CameraConfig
+from sim_robot_core.lidars import LidarConfig
 from sim_robot_core.models import Arm, Base, Gripper, ModelEntry
 from sim_robot_core.pairs import BASE_NAME
 
@@ -61,6 +62,7 @@ def entry(
     cameras: tuple[CameraConfig, ...] = (),
     start_posture: dict | None = None,
     wheels: tuple[str, ...] = (),
+    lidars: tuple[LidarConfig, ...] = (),
 ) -> ModelEntry:
     """The entry of a robot of `model`: `arms` maps each arm to its joints,
     `grippers` each gripper to its fingers, each finger a joint that moves of
@@ -80,6 +82,7 @@ def entry(
             for name, fingers in (grippers or {}).items()
         ),
         cameras=cameras,
+        lidars=lidars,
         start_posture=dict(start_posture or {}),
         base=Base(name=BASE_NAME, wheels=tuple(wheels)) if wheels else None,
     )

@@ -176,8 +176,24 @@
       // The largest bearing (rad) at which move_base's drive goes on toward
       // its target, whatever the goal's orientation tolerance, as Nav2's regulated
       // pure pursuit turns in place toward its path past its
-      // rotate_to_heading_min_angle. Above 0.
+      // rotate_to_heading_min_angle. At least the shortest turn from rest,
+      // below.
       rotate_to_heading_min_angle_rad: "f64",
+      // The slowest rate (rad/s) move_base's turn commands, Nav2's Spin's
+      // min_rotational_vel, and the slowest speeds (m/s) its drive commands
+      // ahead and backward, DriveOnHeading's and BackUp's minimum_speed:
+      // each above 0, as move_base ends a turn or a drive at the stop
+      // nearest its end, which a floor above 0 reaches, raised to just above
+      // the deadband and held to the limit of its way. The shortest move
+      // from rest is the limiter's ramp toward the floor up to its first step
+      // at or above the deadband, and the stop from there, each counting only
+      // the steps at or above the deadband. The node refuses a shortest turn
+      // past 2 rad, and move_base refuses a position tolerance below the
+      // shortest drive and a yaw tolerance below the shortest turn, each by
+      // more than 1e-9 of it.
+      min_turn_rate_rad_s: "f64",
+      min_forward_speed_m_s: "f64",
+      min_backward_speed_m_s: "f64",
       // How long (s) robot_stop's stop waits for the control loop to take
       // and answer it before it answers attempt_failed: below the deadline of
       // the stop's callers. Above 0.

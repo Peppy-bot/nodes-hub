@@ -420,7 +420,7 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 [[package]]
 name = "camera_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "control_core",
  "frame_tree",
@@ -492,7 +492,7 @@ dependencies = [
 [[package]]
 name = "chain_kinematics"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "nalgebra",
  "thiserror 2.0.21",
@@ -584,7 +584,7 @@ dependencies = [
 [[package]]
 name = "collision_geometry"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "chain_kinematics",
  "nalgebra",
@@ -645,7 +645,7 @@ dependencies = [
 [[package]]
 name = "control_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "frame_tree",
  "thiserror 2.0.21",
@@ -1148,7 +1148,7 @@ dependencies = [
 [[package]]
 name = "frame_tree"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "libstdcxx_heap"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 
 [[package]]
 name = "linux-raw-sys"
@@ -2365,7 +2365,7 @@ dependencies = [
 [[package]]
 name = "navigation_core"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "camera_core",
  "control_core",
@@ -2550,7 +2550,7 @@ dependencies = [
 [[package]]
 name = "occupancy_map"
 version = "0.1.0"
-source = "git+https://github.com/Peppy-bot/public-peppy-libs#f232df80e30f145e002131d3264c0f50dd776553"
+source = "git+https://github.com/Peppy-bot/public-peppy-libs#083006fee593ac39c3dd714e85bf64a754a27e76"
 dependencies = [
  "camera_core",
  "collision_geometry",

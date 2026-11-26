@@ -28,7 +28,7 @@ fn a_base_of_well_formed_parameters_is_configured_for_the_bundled_base() {
         .configure("botshare_base", SystemTime::UNIX_EPOCH)
         .expect("the bundled base");
     assert_eq!(config.step_ns, 50_000_000);
-    assert_eq!(config.axes.linear.profile().positive_speed, 0.5);
+    assert_eq!(config.move_axes.linear.positive.speed, 0.5);
     assert_eq!(config.rest.velocity, REST_LINEAR_M_S);
     assert_eq!(
         config.wheels,
@@ -78,6 +78,120 @@ fn a_positive_number_not_above_zero_is_refused_by_name() {
             }),
         ],
         |error, field| matches!(error, ConfigError::NotPositive { name, .. } if *name == field),
+    );
+}
+
+// move_base ends a turn or a drive at the stop nearest its end, which a floor
+// above 0 reaches: a floor of 0 or below, or not finite, is refused by name,
+// the message giving Nav2's default of the same floor.
+#[test]
+fn a_floor_not_above_zero_is_refused_by_name() {
+    assert_refused(
+        &[
+            ("min_turn_rate_rad_s", |p| p.min_turn_rate_rad_s = 0.0),
+            ("min_turn_rate_rad_s", |p| p.min_turn_rate_rad_s = f64::NAN),
+            ("min_forward_speed_m_s", |p| p.min_forward_speed_m_s = 0.0),
+            ("min_forward_speed_m_s", |p| {
+                p.min_forward_speed_m_s = f64::INFINITY
+            }),
+            ("min_backward_speed_m_s", |p| p.min_backward_speed_m_s = 0.0),
+            ("min_backward_speed_m_s", |p| {
+                p.min_backward_speed_m_s = -0.1
+            }),
+        ],
+        |error, field| matches!(error, ConfigError::FloorNotPositive { name, .. } if *name == field),
+    );
+    let mut params = parameters();
+    params.min_turn_rate_rad_s = 0.0;
+    assert_eq!(
+        BaseParameters::parse(&params)
+            .expect_err("a turn floor of 0")
+            .to_string(),
+        "parameter min_turn_rate_rad_s: move_base ends a turn or a drive at the stop nearest \
+         its end, which a floor above 0 reaches, so give min_turn_rate_rad_s above 0, such as \
+         Spin's min_rotational_vel in Nav2's defaults, 0.4"
+    );
+}
+
+// Each floor is the node's slowest speed of its way, raised to just above the
+// deadband and held to the way's speed; the finest yaw tolerance is the
+// shortest turn from rest, one step of the limiter toward the floor: at the
+// rig's 0.03 rad/s, 1.5 mrad.
+#[test]
+fn the_move_axes_are_floored_at_the_slowest_speeds() {
+    let mut params = parameters();
+    params.min_backward_speed_m_s = 0.8;
+    let axes = BaseParameters::parse(&params)
+        .expect("the parameters are taken")
+        .move_axes;
+    assert_eq!(
+        (axes.linear.positive.floor, axes.linear.negative.floor),
+        (0.02, 0.5)
+    );
+    assert_eq!(
+        (axes.angular.positive.floor, axes.angular.negative.floor),
+        (0.03, 0.03)
+    );
+    assert!((axes.finest.yaw - 0.0015).abs() < 1e-15, "{axes:?}");
+}
+
+// move_base's drive turns toward its target again past
+// rotate_to_heading_min_angle_rad, so an angle below the shortest turn from
+// rest is refused, naming both: at the rig's 0.03 rad/s, 1.5 mrad. At a
+// floor of 0.4 rad/s and the rig's 3 rad/s^2, botshare_sim's, the first step
+// turns at 0.15 rad/s, whose sum lands the shortest turn a few units in the
+// last place above 7.5 mrad: 7.5 mrad is taken, and an angle past the slack
+// below it is refused, naming 7.5 mrad.
+#[test]
+fn a_rotate_to_heading_angle_below_the_shortest_turn_is_refused() {
+    let refusal = |min_turn_rate: f64, angle: f64| {
+        let mut params = parameters();
+        params.min_turn_rate_rad_s = min_turn_rate;
+        params.rotate_to_heading_min_angle_rad = angle;
+        BaseParameters::parse(&params).map(|taken| taken.rotate_to_heading_min_angle_rad)
+    };
+    let refused = refusal(0.03, 0.001).expect_err("below the shortest turn");
+    assert!(
+        matches!(refused, ConfigError::AimBelowShortestTurn { angle, .. } if angle == 0.001),
+        "{refused:?}"
+    );
+    let message = |finest: &str, angle: &str| {
+        format!(
+            "parameter rotate_to_heading_min_angle_rad: move_base's drive turns toward its \
+             target again past this bearing, and the shortest turn from rest at angular_limits \
+             and min_turn_rate_rad_s is {finest} rad, so give rotate_to_heading_min_angle_rad of \
+             at least {finest}, got {angle}"
+        )
+    };
+    assert_eq!(refused.to_string(), message("0.0015", "0.001"));
+    assert_eq!(refusal(0.4, 0.0075).expect("the shortest turn"), 0.0075);
+    assert_eq!(
+        refusal(0.4, 0.007_499_999_985)
+            .expect_err("past the slack")
+            .to_string(),
+        message("0.0075", "0.007499999985")
+    );
+}
+
+// The shortest turn from rest past 2 rad is refused, naming it and every
+// limit that sets it: at a floor of 1.5 rad/s, the rig's fastest turn,
+// reached in one step at 30 rad/s^2, and slowed by 0.5 rad/s^2, the turn
+// takes 0.075 rad in its first step and 2.2125 rad to stop.
+#[test]
+fn a_shortest_turn_past_two_radians_is_refused() {
+    let mut params = parameters();
+    params.min_turn_rate_rad_s = 1.5;
+    params.angular_limits.max_acceleration = 30.0;
+    params.angular_limits.max_deceleration = 0.5;
+    let refused = BaseParameters::parse(&params).expect_err("past 2 rad");
+    assert_eq!(
+        refused.to_string(),
+        "parameter min_turn_rate_rad_s: the shortest turn from rest at smoothing_frequency_hz, \
+         angular_limits and min_turn_rate_rad_s is 2.2875 rad, past 2 rad, the longest at which \
+         move_base reaches every position tolerance it takes, so give a larger \
+         smoothing_frequency_hz or angular_limits max_deceleration, a smaller angular_limits \
+         max_acceleration or deadband, or a smaller min_turn_rate_rad_s while it lies above \
+         that deadband"
     );
 }
 
@@ -165,8 +279,8 @@ fn a_base_that_cannot_drive_ahead_or_turn_both_ways_is_refused() {
     let mut ahead_only = parameters();
     ahead_only.linear_limits.min_velocity = 0.0;
     let taken = BaseParameters::parse(&ahead_only).expect("a base that drives ahead alone");
-    let profile = taken.axes.linear.profile();
-    assert_eq!((profile.positive_speed, profile.negative_speed), (0.5, 0.0));
+    let profile = taken.move_axes.linear;
+    assert_eq!((profile.positive.speed, profile.negative.speed), (0.5, 0.0));
 }
 
 // The limiter steps at a whole number of hertz from 20 to 1000 whose period

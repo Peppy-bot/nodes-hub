@@ -50,7 +50,7 @@ fn movement(
     config: &BaseConfig,
     placer: &Placer,
 ) -> std::result::Result<MoveRequest, TargetFailure> {
-    let fields = move_fields(data, placer).map_err(rejected)?;
+    let fields = move_fields(data, placer, config.move_axes.finest).map_err(rejected)?;
     let unplaced = |e| Unplaced::of("the target", &e);
     let in_odometry = placer
         .place_in_now(&fields.target, &odometry_frame())
@@ -61,7 +61,7 @@ fn movement(
         fields,
         in_odometry,
         from_robot,
-        &config.axes,
+        &config.move_axes,
         config.rotate_to_heading_min_angle_rad,
     )
     .map_err(rejected)

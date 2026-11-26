@@ -1,9 +1,10 @@
 """Every robot on the stage is driven as the model it joined as: its limbs
 under the names its own robot answers to, its drives under its own model's
 gains, its gripper opening mapped onto its own fingers' travel, its base's
-wheels on their rate loops, and the rig of its own model's cameras. An SO-101
-stands beside an OpenArm here, and a botshare base rolls beside them, on
-stand-in views, so nothing of one leaks into another.
+wheels on their rate loops, the rig of its own model's cameras and the sweep
+of each of its model's lidars it pairs. An SO-101 stands beside an OpenArm
+here, and a botshare base rolls beside them, on stand-in views, so nothing of
+one leaks into another.
 """
 
 import importlib.util
@@ -50,6 +51,7 @@ class _Views:
         self.actuators = {}
         self.sensors = {}
         self.rigs = []
+        self.sweeps = []
         # Per articulation prim: the dof names it reports, in its own order.
         self.dofs = {}
         self.positions = {}
@@ -111,6 +113,12 @@ class _Views:
         self.rigs.append((robot, root_prim, known))
         return built
 
+    def sweep(self, robot, root_prim, known, lidar, io):
+        built = Mock(spec=["setup", "teardown", "step"])
+        built.setup.return_value = True
+        self.sweeps.append((robot, root_prim, known.model, lidar.name, built))
+        return built
+
 
 @pytest.fixture(name="engine")
 def _engine(monkeypatch):
@@ -131,6 +139,7 @@ def _engine(monkeypatch):
     monkeypatch.setattr(module, "IsaacActuatorCtrl", views.actuator)
     monkeypatch.setattr(module, "IsaacGripperSensor", views.sensor)
     monkeypatch.setattr(module, "IsaacCameraSensor", views.rig)
+    monkeypatch.setattr(module, "IsaacLidarSensor", views.sweep)
     module.views = views
     return module
 
@@ -276,6 +285,7 @@ def _fleet(engine, monkeypatch):
     world.take_set_down.return_value = set()
     registry.standing.return_value = {"alpha": Mock(), "charlo": Mock()}
     io.camera_robots.return_value = set()
+    io.lidar_pairs.return_value = set()
     io.setpoints.arm.return_value = None
     io.setpoints.gripper.return_value = None
     objects = Mock()
@@ -457,6 +467,7 @@ def _rolling(engine, monkeypatch):
     world.take_set_down.return_value = set()
     registry.standing.return_value = {"delta": Mock()}
     io.camera_robots.return_value = set()
+    io.lidar_pairs.return_value = set()
     io.setpoints.base.return_value = None
     io.setpoints.take_base_release.return_value = False
     objects = Mock()
@@ -650,3 +661,75 @@ class TestDrivingABase:
         rolling._world.stand_where_rolled.assert_not_called()
         assert rolling._wheels["delta"][0].angle == pytest.approx(0.03)
         assert rolling._wheels["delta"][0].integral == pytest.approx(integral + 2.0 * _STEP_S - 0.02)
+
+
+class TestSweeps:
+    """The botshare base on the stage carries one lidar, `lidar`, and this
+    engine renders no camera."""
+
+    def test_a_lidar_its_robot_pairs_is_swept_on_each_step_at_the_engine_time(self, engine, rolling):
+        rolling._io.lidar_pairs.return_value = {("delta", "lidar")}
+
+        # The state tick of this step reads the pair, and the steps after it
+        # sweep the lidar.
+        _step_at(rolling, 0.0)
+        _step_at(rolling, _STEP_S)
+        _step_at(rolling, 2 * _STEP_S)
+
+        ((robot, prim, model, lidar, sweep),) = engine.views.sweeps
+        assert (robot, prim, model, lidar) == ("delta", "/World/delta", "botshare_base", "lidar")
+        assert [call.args for call in sweep.step.call_args_list] == [(_STEP_S,), (2 * _STEP_S,)]
+
+    def test_a_robot_pairing_no_lidar_has_none_swept(self, engine, rolling):
+        _step_at(rolling, 0.0)
+
+        assert engine.views.sweeps == []
+
+    def test_a_pair_naming_a_lidar_the_model_lacks_sweeps_nothing(self, engine, rolling):
+        rolling._io.lidar_pairs.return_value = {("delta", "front_lidar")}
+
+        _step_at(rolling, 0.0)
+
+        assert engine.views.sweeps == []
+
+    def test_a_sweep_whose_pair_is_gone_is_torn_down_and_kept_while_its_robot_stands(self, engine, rolling):
+        rolling._io.lidar_pairs.return_value = {("delta", "lidar")}
+        _step_at(rolling, 0.0)
+        ((*_, sweep),) = engine.views.sweeps
+
+        rolling._io.lidar_pairs.return_value = set()
+        _step_at(rolling, _STEP_S)
+        _step_at(rolling, 2 * _STEP_S)
+        sweep.teardown.assert_called_with()
+        assert [call.args for call in sweep.step.call_args_list] == [(_STEP_S,)]
+
+        # The pair comes back: the same sweep, and its capture index, sweeps on.
+        rolling._io.lidar_pairs.return_value = {("delta", "lidar")}
+        _step_at(rolling, 3 * _STEP_S)
+        _step_at(rolling, 4 * _STEP_S)
+        assert rolling._lidar_sensors == {("delta", "lidar"): sweep}
+        assert len(engine.views.sweeps) == 1, "a sweep is mounted once while its robot stands"
+        assert [call.args for call in sweep.step.call_args_list] == [(_STEP_S,), (4 * _STEP_S,)]
+
+    def test_the_sweep_of_a_robot_gone_from_the_stage_goes(self, engine, rolling):
+        rolling._io.lidar_pairs.return_value = {("delta", "lidar")}
+        _step_at(rolling, 0.0)
+        ((*_, sweep),) = engine.views.sweeps
+
+        rolling._world.robots.return_value = []
+        rolling._reconcile_sweeps()
+
+        sweep.teardown.assert_called_once_with()
+        assert rolling._lidar_sensors == {}
+
+    def test_an_edit_of_the_stage_tears_each_sweep_down_and_keeps_it(self, engine, rolling):
+        rolling._io.lidar_pairs.return_value = {("delta", "lidar")}
+        _step_at(rolling, 0.0)
+        ((*_, sweep),) = engine.views.sweeps
+
+        rolling.unbind()
+        rolling.bind()
+
+        sweep.teardown.assert_called_once_with()
+        assert rolling._lidar_sensors == {("delta", "lidar"): sweep}
+        assert len(engine.views.sweeps) == 1, "a sweep is mounted once per pair"

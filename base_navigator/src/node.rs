@@ -1,18 +1,21 @@
-//! Node composition: parse every parameter, pair the cameras of the two camera
-//! slots by name, start the robot's tree on the node's clock, then spawn the
-//! control loop, the drive_states listener, describe_base's reader, the
-//! cameras' descriptions and each camera's frame intake, the depth listener,
-//! the four action handlers and clear_grid. Every behavior lives in the sibling
-//! modules; this is only the assembly. The setup waits for no base and no
-//! camera: until they answer, a goal waits up to the source timeout and is
-//! refused with `resource_unavailable`, naming what it waits for.
+//! Node composition: parse every parameter, read the sensors of the three sensor
+//! slots into one list, the cameras paired by name, start the robot's tree on
+//! the node's clock, then spawn the control loop, the drive_states listener,
+//! describe_base's reader, the sensors' descriptions, each sensor's intake, the
+//! depth listener and the scan listener, map_grids' and map_poses' listeners
+//! while the room_map link is bound, the four action handlers and clear_grid.
+//! Every behavior lives in the sibling modules; this is only the assembly. The
+//! setup refuses slots that bind no sensor, and waits for no base, no sensor
+//! and no map: until they answer, a goal waits up to the source timeout and is
+//! refused, naming what it waits for. With the room_map link vacant, no map is
+//! loaded.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use control_core::fault::Fault;
 use control_core::robot_tree::{Placer, RobotTree};
-use peppygen::consumed_services::cameras::depth_stream_info;
-use peppygen::consumed_services::geometry::get_depth_intrinsics;
+use peppygen::consumed_services::room_map::get_map_state;
 use peppygen::paired_topics::base::drive_setpoints;
 use peppygen::{NodeRunner, Parameters, Result};
 use tokio::sync::{mpsc, watch};
@@ -22,7 +25,6 @@ use tracing::{error, info, warn};
 use crate::actions;
 use crate::admission::{Admission, Shared};
 use crate::base::{self, BaseReads};
-use crate::cameras::{self, Sensors};
 use crate::clock;
 use crate::config::{ConfigError, NavigatorConfig};
 use crate::control::{self, Navigator};
@@ -31,6 +33,8 @@ use crate::grid::GridSlot;
 use crate::intake::{self, Intake};
 use crate::link::{self, Link};
 use crate::planning::{Planner, Planning};
+use crate::room_map::{self, PoseFollower, RoomLink};
+use crate::sensors::{SensorKind, read_slots, run_descriptions};
 use crate::services;
 
 /// Everything this node refuses to run on, by name, or the runtime's own
@@ -41,8 +45,8 @@ pub enum NodeError {
     #[error(transparent)]
     Config(#[from] ConfigError),
 
-    #[error("the camera slots: {0}")]
-    Cameras(String),
+    #[error("the sensor slots: {0}")]
+    Sensors(String),
 
     #[error(transparent)]
     Runtime(#[from] peppygen::Error),
@@ -103,14 +107,9 @@ async fn assemble(
     if let Some(warning) = config.approach_warning() {
         warn!("{warning}");
     }
-    let slots = cameras::pair_slots(
-        depth_stream_info::bound_members(&runner).as_slice(),
-        get_depth_intrinsics::bound_members(&runner).as_slice(),
-    )
-    .map_err(NodeError::Cameras)?;
-    let sensors = Arc::new(Sensors::new(slots));
+    let sensors = Arc::new(read_slots(&runner).map_err(NodeError::Sensors)?);
     info!(
-        "base navigator: its grid reads the cameras {:?}, on a grid of {} m and {} m voxels",
+        "base navigator: its grid reads the sensors {:?}, on a grid of {} m and {} m voxels",
         sensors.names(),
         config.grid.side_m.get(),
         config.grid.voxel_m.get()
@@ -136,12 +135,18 @@ async fn assemble(
     // One event waits for the control loop at a time: each source waits for
     // the loop to take its last event before it hands it the next.
     let (events_tx, events_rx) = mpsc::channel(1);
+    let room = get_map_state::bound_producer(&runner)
+        .map(|producer| Arc::new(RoomLink::new(runner.clone(), producer.clone())));
+    if room.is_none() {
+        info!("base navigator: its room_map link is vacant: no map is loaded");
+    }
     let shared = Shared {
         config: config.clone(),
         clock: clock.clone(),
         link: link.clone(),
         grid: grid.clone(),
         sensors: sensors.clone(),
+        room: room.clone(),
     };
     let navigator = Navigator::new(shared.clone(), Planning::new(planner, config.planner));
     let setpoints = drive_setpoints::declare_publisher(&runner).await?;
@@ -163,6 +168,20 @@ async fn assemble(
             control::run(navigator, setpoints, events_rx, token.cancelled()).await;
         });
     }
+    if let Some(room) = room {
+        spawn_supervised(
+            &mut set,
+            room_map::run_grid_listener(runner.clone(), room.map.clone()),
+        );
+        let follower = PoseFollower {
+            room: room.map.clone(),
+            tree: tree.clone(),
+            link: link.clone(),
+            clock: clock.clone(),
+            lookup_timeout: config.lookup_timeout,
+        };
+        spawn_supervised(&mut set, follower.run(runner.clone()));
+    }
     spawn_supervised(
         &mut set,
         link::run_listener(runner.clone(), clock.clone(), link, grid.clone(), starts_tx),
@@ -178,13 +197,12 @@ async fn assemble(
             grid.clone(),
         ),
     );
-    // The descriptions end once every camera is described or refused, so
+    // The descriptions end once every sensor is described or refused, so
     // they run outside the supervised set; they end with the node too.
-    tokio::spawn(cameras::run_descriptions(runner.clone(), sensors.clone()));
-    let mut frame_senders = Vec::new();
-    for source in 0..sensors.count().get() {
-        let (frames_tx, frames_rx) = watch::channel(None);
-        frame_senders.push(frames_tx);
+    tokio::spawn(run_descriptions(runner.clone(), sensors.clone()));
+    let mut frame_senders = BTreeMap::new();
+    let mut scan_senders = BTreeMap::new();
+    for (source, slot) in sensors.slots().iter().enumerate() {
         let intake = Intake {
             source,
             sensors: sensors.clone(),
@@ -192,11 +210,31 @@ async fn assemble(
             grid: grid.clone(),
             lookup_timeout: config.lookup_timeout,
         };
-        spawn_supervised(&mut set, intake.run(frames_rx));
+        match slot.kind {
+            SensorKind::DepthCamera { .. } => {
+                let (frames_tx, frames_rx) = watch::channel(None);
+                frame_senders.insert(source, frames_tx);
+                spawn_supervised(&mut set, intake.run_depth_frames(frames_rx));
+            }
+            SensorKind::Lidar => {
+                let (scans_tx, scans_rx) = watch::channel(None);
+                scan_senders.insert(source, scans_tx);
+                spawn_supervised(&mut set, intake.run_scans(scans_rx));
+            }
+        }
     }
     spawn_supervised(
         &mut set,
-        intake::run_listener(runner.clone(), clock, sensors, frame_senders),
+        intake::run_depth_listener(
+            runner.clone(),
+            clock.clone(),
+            sensors.clone(),
+            frame_senders,
+        ),
+    );
+    spawn_supervised(
+        &mut set,
+        intake::run_scan_listener(runner.clone(), clock, sensors, scan_senders),
     );
     set.spawn(actions::run_navigate_to_pose(
         runner.clone(),

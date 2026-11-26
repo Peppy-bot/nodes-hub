@@ -97,8 +97,8 @@ class RobotsIO:
     ) -> None:
         self._node_runner = node_runner
         self._loop = loop
-        # The models this engine stands, each with the limbs and cameras a
-        # robot of it pairs.
+        # The models this engine stands, each with the limbs, cameras and
+        # lidars a robot of it pairs.
         self._models = models
         self._world = world
         self._robots = robots
@@ -535,7 +535,7 @@ class RobotsIO:
         starting its pair grace time again, and a robot no limb or base reached
         yet keeps its place for as long as its goal runs. A robot holding no
         pair is told so, and any other which of its pairs and its model's
-        limbs, base and cameras differ."""
+        limbs, base, cameras and lidars differ."""
         now = self._loop.time()
         held = self._io.held_by(robot.name)
         mismatch = robot.entry.mismatch(held)

@@ -78,6 +78,17 @@ impl Planar {
     pub fn distance_to(&self, point: [f64; 2]) -> f64 {
         (self.x - point[0]).hypot(self.y - point[1])
     }
+
+    /// The pose `share` of the way from this pose to `other`, its heading
+    /// turning the shorter way, as the robot's tree places the robot frame
+    /// between two of its transforms.
+    pub fn toward(self, other: Planar, share: f64) -> Self {
+        Self {
+            x: self.x + share * (other.x - self.x),
+            y: self.y + share * (other.y - self.y),
+            yaw: normalize_angle(self.yaw + share * normalize_angle(other.yaw - self.yaw)),
+        }
+    }
 }
 
 /// The limits of one axis of `max` (m/s or rad/s) each way.

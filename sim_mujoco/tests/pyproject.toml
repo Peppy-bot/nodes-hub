@@ -10,7 +10,7 @@
 [project]
 name = "sim-mujoco-tests"
 version = "0.1.0"
-description = "Tests for the sim_mujoco node: its model entries, pair routing, robot stays, bridge and camera plumbing"
+description = "Tests for the sim_mujoco node: its model entries, pair routing, robot stays, bridge, camera and lidar plumbing"
 # The interpreter the node's base image is built on
 # (sim_base_images/Dockerfile.mujoco: python:3.12-slim).
 requires-python = ">=3.12,<3.13"
@@ -21,8 +21,9 @@ dependencies = [
     "mujoco==4.0.1",
     "numpy==2.5.4",
     "pyjson5==2.0.1",
-    # What the engine shares with every other one: the registry, the five
-    # slots, the model entries, the setpoints it takes on a pair, the camera
+    # What the engine shares with every other one: the registry, the six
+    # slots of the limbs, the base, the cameras and the lidars, the model
+    # entries, the setpoints it takes on a pair, the camera and lidar
     # configuration and world, the one frame of a simulation.
     "sim_robot_core",
     # The geometry types of the contracts and the rotation arithmetic the
@@ -42,6 +43,6 @@ dev = ["pytest>=8"]
 package = false
 
 [tool.uv.sources]
-control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
-sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
-robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }
+control_core_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "control_core_py", rev = "083006fee593ac39c3dd714e85bf64a754a27e76" }
+sim_robot_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "sim_robot_core", rev = "083006fee593ac39c3dd714e85bf64a754a27e76" }
+robot_description_py = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "robot_description_py", rev = "083006fee593ac39c3dd714e85bf64a754a27e76" }

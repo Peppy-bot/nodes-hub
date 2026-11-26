@@ -15,7 +15,7 @@ import mujoco
 import numpy as np
 import pytest
 import robot_description_py
-from control_core_py.geometry import normalized
+from control_core_py.geometry import normalized, rotation_of
 from entries import placement_at, staged_release
 from sim_robot_core.cameras import camera_pose
 
@@ -23,6 +23,7 @@ import runtime_fakes  # noqa: F401  pylint: disable=W0611  (installs the runtime
 
 import mujoco_models  # noqa: E402  pylint: disable=C0413
 from bridge_extension import MujocoBridgeExtension  # noqa: E402  pylint: disable=C0413
+from exts.lidar_sensor import MujocoLidarSensor  # noqa: E402  pylint: disable=C0413
 from mujoco_models import MujocoModels  # noqa: E402  pylint: disable=C0413
 from world import World, compile_spec  # noqa: E402  pylint: disable=C0413
 
@@ -249,6 +250,32 @@ class TestTheBotshareBase:
             normalized(orientation), abs=ORIENTATION_TOLERANCE
         )
         assert compiled.cam_fovy[camera.id] == pytest.approx(described.fovy_deg)
+
+    def test_its_lidar_frame_stands_where_the_description_puts_it(self):
+        """The engine stands the lidar's frame at its pose in its link, on
+        the body the MJCF gives the link: where the description puts the
+        frame on the root link, for a base standing at the origin."""
+        known = _known("botshare_base")
+        (lidar,) = known.entry.lidars
+        world = World(renders=False)
+        world.add(ROBOT, known, placement_at(0.0))
+        compiled = world.compose().compile()
+        data = mujoco.MjData(compiled)
+        mujoco.mj_forward(compiled, data)
+        sensor = MujocoLidarSensor(compiled, data, world.robots(), io=None)
+        (swept,) = sensor._lidars  # pylint: disable=W0212
+        frame = sensor._frame(swept)  # pylint: disable=W0212
+        described = next(
+            link
+            for link in _described("botshare_base").link_frames_at_zero()
+            if link.child == lidar.frame
+        )
+
+        assert swept.body == compiled.body(f"{ROBOT}/{known.body_of(lidar.parent_link)}").id
+        assert frame.position == pytest.approx(described.position, abs=POSITION_TOLERANCE_M)
+        assert np.ravel(rotation_of(frame.orientation.xyzw)) == pytest.approx(
+            np.ravel(rotation_of(described.orientation)), abs=ORIENTATION_TOLERANCE
+        )
 
     def test_it_stands_beside_an_openarm_on_the_settings_they_share(self):
         world = World(renders=False)

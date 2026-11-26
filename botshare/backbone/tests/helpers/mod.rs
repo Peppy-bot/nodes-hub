@@ -435,6 +435,17 @@ impl Rig {
         &mut self,
         goal: &move_base::GoalHandle,
     ) -> move_base::ResultResponse {
+        self.follow_sticking_until_result(goal, 0.0).await
+    }
+
+    /// [`Rig::follow_until_result`] on wheels that stick: they stand still at
+    /// each setpoint whose wheel rates are each below `stuck_below_rad_s` in
+    /// magnitude, and reach every other setpoint.
+    pub async fn follow_sticking_until_result(
+        &mut self,
+        goal: &move_base::GoalHandle,
+        stuck_below_rad_s: f64,
+    ) -> move_base::ResultResponse {
         let result = goal.get_result(ANSWER_BUDGET);
         tokio::pin!(result);
         loop {
@@ -444,7 +455,13 @@ impl Rig {
                 result = &mut result => return result.expect("a result"),
                 setpoint = self.wheel_setpoint_at(at) => setpoint,
             };
-            self.wheels = setpoint.positions;
+            if setpoint
+                .velocities
+                .iter()
+                .any(|rate| rate.abs() >= stuck_below_rad_s)
+            {
+                self.wheels = setpoint.positions;
+            }
         }
     }
 

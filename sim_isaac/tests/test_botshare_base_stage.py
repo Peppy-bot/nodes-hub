@@ -1,9 +1,12 @@
 """The botshare base's stage scripts/build_botshare_base.py writes from its
 MuJoCo model, held to its description, the URDF robot_description bundles
 (the bodies its fixed joints fuse with the sum of their masses, every link
-at its place, the wheels' continuous joints), to the model (each wheel's
-rate loop as its drive, the contact of its tires and casters, and the
-colour of each mesh), and to the bundle the base image bakes.
+at its place on the body that carries it, the wheels' continuous joints),
+to the model (the mount's mass properties, its own and those of the bodies
+no joint moves on it combined, every geom at its place, each wheel's rate
+loop as its drive, the contact of its tires and casters, and the colour of
+each mesh), to what the engine reads off it (each wheel's loop and the
+lidar's mount), and to the bundle the base image bakes.
 
 The stage is read as baked where PEPPY_ROBOT_ASSETS_DIR holds one (the base
 image's suite), and built here otherwise, from the base's model in the
@@ -35,11 +38,16 @@ from _world import known, world_module
 
 pytest.importorskip("mujoco")
 pytest.importorskip("pxr")
+import mujoco  # noqa: E402  pylint: disable=C0413
 from pxr import Usd, UsdGeom, UsdPhysics, UsdShade  # noqa: E402  pylint: disable=C0413
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+_SIM_ISAAC_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_SIM_ISAAC_DIR / "scripts"))
+sys.path.insert(0, str(_SIM_ISAAC_DIR / "engine"))
+sys.path.insert(0, str(_SIM_ISAAC_DIR / "engine" / "exts"))
 
 import build_botshare_base as builder  # noqa: E402  pylint: disable=C0413
+import lidar_sensor  # noqa: E402  pylint: disable=C0413
 import mujoco_usd  # noqa: E402  pylint: disable=C0413
 
 ROBOT = builder.ROBOT_PATH
@@ -61,6 +69,28 @@ def release(tmp_path_factory) -> Path:
 def model(release):
     """The base's MuJoCo model, as the builder compiles it."""
     return builder.compile_model(release)
+
+
+@pytest.fixture(scope="module")
+def entry(release) -> dict:
+    """The base's entry in the release's catalogue."""
+    return mujoco_usd.catalogue_entry(release, builder.ROBOT_ID)
+
+
+@pytest.fixture(scope="module")
+def mount(entry) -> str:
+    """The name of the MJCF's mount body."""
+    return entry["mount"]["body"]
+
+
+@pytest.fixture(scope="module")
+def released(release, entry):
+    """The base's MJCF as the release gives it, compiled with each of its
+    bodies a body of its own, and the model's data with every joint at zero."""
+    released = mujoco.MjModel.from_xml_path(str(release / builder.ROBOT_ID / entry["wrapper"]))
+    data = mujoco.MjData(released)
+    mujoco.mj_forward(released, data)
+    return released, data
 
 
 @pytest.fixture(scope="module")
@@ -109,6 +139,64 @@ def _urdf_link_in_root(description: builder.Description, link: str) -> np.ndarra
 def _mass_of(urdf: ET.Element, link: str) -> float:
     mass = urdf.find(f"link[@name='{link}']/inertial/mass")
     return 0.0 if mass is None else float(mass.get("value"))
+
+
+def _inertia_about(mass: float, centre: np.ndarray, axes: np.ndarray, principal, point: np.ndarray) -> np.ndarray:
+    """The inertia tensor about `point` of a body of `mass` at `centre`
+    whose principal moments `principal` lie along the columns of `axes`."""
+    offset = centre - point
+    return axes @ np.diag(principal) @ axes.T + mass * (offset @ offset * np.eye(3) - np.outer(offset, offset))
+
+
+def _combined_in(model, data, frame: int, bodies: list[int]) -> tuple[np.ndarray, np.ndarray]:
+    """The centre of mass of `bodies` of `model` and their inertia tensor
+    about it, in the frame of the body `frame`."""
+    to_frame = data.xmat[frame].reshape(3, 3).T
+    masses = [float(model.body_mass[body]) for body in bodies]
+    centres = [to_frame @ (data.xipos[body] - data.xpos[frame]) for body in bodies]
+    axes = [to_frame @ data.ximat[body].reshape(3, 3) for body in bodies]
+    centre = sum(m * c for m, c in zip(masses, centres, strict=True)) / sum(masses)
+    inertia = sum(
+        _inertia_about(m, c, a, model.body_inertia[body], centre)
+        for body, m, c, a in zip(bodies, masses, centres, axes, strict=True)
+    )
+    return centre, inertia
+
+
+def _stood_mass_properties(prim) -> tuple[float, np.ndarray, np.ndarray]:
+    """The mass, the centre of mass and the inertia tensor about it that a
+    body's MassAPI gives, in the body's frame."""
+    api = UsdPhysics.MassAPI(prim)
+    axes = api.GetPrincipalAxesAttr().Get()
+    rotation = np.array(rotation_of((*axes.GetImaginary(), axes.GetReal())))
+    inertia = rotation @ np.diag(api.GetDiagonalInertiaAttr().Get()) @ rotation.T
+    return api.GetMassAttr().Get(), np.array(api.GetCenterOfMassAttr().Get()), inertia
+
+
+def _carrier(model, mount: int, body: int) -> int:
+    """The body of `model` that `body` is fused into: the first body up from
+    it that is the mount or that a joint moves."""
+    while body != mount and model.body_jntnum[body] == 0:
+        body = int(model.body_parentid[body])
+    return body
+
+
+def _placed(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The position and the rotation of a column-vector transform, its scale
+    taken out of the rotation."""
+    rotation = matrix[:3, :3]
+    return matrix[:3, 3], rotation / np.linalg.norm(rotation, axis=0)
+
+
+def _same_place(geom, other) -> bool:
+    """Whether two geoms, each its parent's path, its position and its
+    rotation, stand under one prim at one place."""
+    (path, position, rotation), (other_path, other_position, other_rotation) = geom, other
+    return (
+        path == other_path
+        and np.allclose(position, other_position, rtol=0.0, atol=1e-6)
+        and np.allclose(rotation, other_rotation, rtol=0.0, atol=1e-6)
+    )
 
 
 @only_on_linux_x86_64
@@ -250,16 +338,84 @@ def test_each_body_weighs_the_links_its_fixed_joints_join(stage, description, ur
     assert expected["base_footprint"] == pytest.approx(51.263, abs=1e-9)
 
 
+def test_the_mount_carries_the_mjcfs_mount_and_lidar_link_combined_about_its_frame(stage, mount, released):
+    """lidar_link, the body of its own the MJCF gives the lidar's housing,
+    welded to the mount, is part of the mount on the stage: their masses
+    added, at their joint centre of mass, their inertias moved to it."""
+    model, data = released
+    mount_id, lidar_id = model.body(mount).id, model.body("lidar_link").id
+    assert (model.body_parentid[lidar_id], model.body_jntnum[lidar_id]) == (mount_id, 0)
+    centre, inertia = _combined_in(model, data, mount_id, [mount_id, lidar_id])
+
+    stood_mass, stood_centre, stood_inertia = _stood_mass_properties(stage.GetPrimAtPath(f"{ROBOT}/base_footprint"))
+
+    assert stood_mass == pytest.approx(model.body_mass[mount_id] + model.body_mass[lidar_id], rel=1e-6)
+    assert stood_centre == pytest.approx(centre, abs=1e-6)
+    assert stood_inertia == pytest.approx(inertia, abs=1e-6)
+
+
+def test_every_geom_of_the_model_stands_on_the_body_it_is_fused_into_where_the_model_places_it(
+    stage, model, mount, released, description
+):
+    """Each geom of the MJCF is drawn or collides under the prim of the body
+    that carries it, a body no joint moves fused into the body it hangs from,
+    at the place the MJCF gives it with every joint at zero: the lidar's
+    housing on the mount. Each geom stands at one place on the stage, and
+    each geom the stage holds at one of the MJCF's."""
+    unfused, data = released
+    links = builder.links_of_bodies(model, mount, description)
+    mount_id = unfused.body(mount).id
+
+    def carrier_path(geom: int) -> str:
+        carrier = unfused.body(_carrier(unfused, mount_id, int(unfused.geom_bodyid[geom]))).name
+        folder = "visuals" if unfused.geom_group[geom] == builder.VISUAL_GROUP else "collisions"
+        return f"{ROBOT}/{links[carrier]}/{folder}"
+
+    placed = [
+        (carrier_path(geom), data.geom_xpos[geom], data.geom_xmat[geom].reshape(3, 3)) for geom in range(unfused.ngeom)
+    ]
+    stood = [
+        (str(prim.GetParent().GetPath()), *_placed(_world(prim)))
+        for body in BODIES
+        for folder in ("visuals", "collisions")
+        for prim in stage.GetPrimAtPath(f"{ROBOT}/{body}/{folder}").GetChildren()
+    ]
+    assert [sum(_same_place(geom, other) for other in stood) for geom in placed] == [1] * len(placed)
+    assert [sum(_same_place(geom, other) for other in placed) for geom in stood] == [1] * len(stood)
+
+
 def test_every_link_of_the_urdf_stands_where_its_fixed_joints_place_it(stage, description, urdf):
-    """Each link is one prim under the robot, which a camera hanging from it
-    is defined under, at the URDF's place with every joint at zero."""
-    for link in (element.get("name") for element in urdf.findall("link")):
+    """Each link is one prim under the prim of the body that carries it,
+    which a camera hanging from it is defined under and a lidar's frame
+    placed by, at the URDF's place with every joint at zero: lidar_link and
+    lidar_frame on the mount."""
+    links = [element.get("name") for element in urdf.findall("link")]
+    assert {builder.body_of(link, description) for link in ("lidar_link", "lidar_frame")} == {description.root_link}
+    for link in links:
         if link in ("left_wheel_link", "right_wheel_link"):
             continue
-        ours = _world(_prim_named(stage, link))
+        prim = _prim_named(stage, link)
+        assert prim.GetPath().HasPrefix(f"{ROBOT}/{builder.body_of(link, description)}"), link
+        ours = _world(prim)
         theirs = _urdf_link_in_root(description, link)
         assert ours[:3, 3] == pytest.approx(theirs[:3, 3], abs=1e-6), link
         assert ours[:3, :3] == pytest.approx(theirs[:3, :3], abs=1e-6), link
+
+
+def test_the_engine_sweeps_the_lidar_from_lidar_frame_on_the_mount(stage, description):
+    """The engine mounts the lidar in the rigid body that carries the prim of
+    its parent link, lidar_link: the mount, whose colliders its rays pass,
+    at the place the description gives lidar_frame."""
+    botshare = known(builder.ROBOT_ID)
+    (lidar,) = botshare.entry.lidars
+
+    lidar_mount = lidar_sensor.mount_of(stage.GetPrimAtPath(ROBOT), botshare, lidar)
+
+    frame = _urdf_link_in_root(description, lidar.frame)
+    assert lidar_mount.body_path == f"{ROBOT}/{description.root_link}"
+    assert lidar_mount.frame_in_body.position == pytest.approx(tuple(frame[:3, 3]), abs=1e-6)
+    rotation = np.array(rotation_of(lidar_mount.frame_in_body.orientation.xyzw))
+    assert rotation == pytest.approx(frame[:3, :3], abs=1e-6)
 
 
 def test_the_wheels_turn_without_limits_about_their_axle(stage, description):
@@ -314,8 +470,6 @@ _RATE_LOOP = '<velocity name="p" joint="wheel" kv="64"/><intvelocity name="i" jo
 
 
 def _wheel_driven_by(actuators: str, joint: str = _CAPPED):
-    import mujoco  # pylint: disable=C0415
-
     return mujoco.MjModel.from_xml_string(_WHEEL_MJCF.format(joint=joint, actuators=actuators))
 
 
@@ -424,16 +578,33 @@ def test_hinges_other_than_the_descriptions_wheels_are_refused(tmp_path):
         builder.build_stage(release, _TWO_WHEELS, tmp_path / "stage")
 
 
-def test_a_body_that_is_neither_the_mount_nor_a_wheel_is_refused(tmp_path):
-    bumper = '<body name="bumper"><geom type="sphere" size="0.05"/></body>'
+def test_a_body_a_joint_other_than_a_wheels_moves_is_refused(tmp_path):
+    bumper = '<body name="bumper"><joint name="bumper" type="slide"/><geom type="sphere" size="0.05"/></body>'
     release = _release(tmp_path, _wheel_body("left_wheel_joint") + _wheel_body("right_wheel_joint") + bumper)
     refusal = (
-        "the MJCF's bodies are ['base', 'left_wheel_joint_body', 'right_wheel_joint_body', 'bumper'], "
-        "and the ones its mount and its hinges make links of are "
-        "['base', 'left_wheel_joint_body', 'right_wheel_joint_body']"
+        "the MJCF's bodies, each body no joint moves fused into the one it hangs from, are "
+        "['base', 'left_wheel_joint_body', 'right_wheel_joint_body', 'bumper'], and the ones its mount and its "
+        "hinges make links of are ['base', 'left_wheel_joint_body', 'right_wheel_joint_body']"
     )
     with pytest.raises(ValueError, match=f"^{re.escape(refusal)}$"):
         builder.build_stage(release, _TWO_WHEELS, tmp_path / "stage")
+
+
+def test_bodies_no_joint_moves_fuse_into_the_body_they_hang_from(tmp_path):
+    """A body no joint moves, on the mount or on another such body, is part
+    of the mount: its mass adds to the mount's and its geoms stand on it."""
+    bracket = (
+        '<body name="bracket" pos="0.1 0 0"><geom type="sphere" size="0.05"/>'
+        '<body name="bumper" pos="0.1 0 0"><geom type="sphere" size="0.05"/></body></body>'
+    )
+    release = _release(tmp_path, bracket)
+    unfused = mujoco.MjModel.from_xml_path(str(release / builder.ROBOT_ID / "base.xml"))
+
+    model = builder.compile_model(release)
+
+    assert [model.body(body).name for body in range(model.nbody)] == ["world", "base"]
+    assert model.body_mass[1] == pytest.approx(sum(unfused.body_mass))
+    assert sorted(float(x) for x in model.geom_pos[:, 0]) == pytest.approx([0.0, 0.1, 0.2])
 
 
 def test_the_engine_runs_the_loop_the_stage_carries(stage, model, description):

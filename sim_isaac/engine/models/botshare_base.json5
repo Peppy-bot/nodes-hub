@@ -1,6 +1,7 @@
-// What this engine alone knows about the botshare base. Its base, its wheels
-// and its camera come from the robot's description, through sim_robot_core's
-// entry of the same name, and each wheel's rate loop from its stage.
+// What this engine alone knows about the botshare base. Its base, its wheels,
+// its camera and its lidar come from the robot's description, through
+// sim_robot_core's entry of the same name, and each wheel's rate loop from
+// its stage.
 {
   // The robot's USD, under PEPPY_ROBOT_ASSETS_DIR, which
   // scripts/build_botshare_base.py writes from the base's MuJoCo model in
@@ -12,6 +13,6 @@
   // The stage's default prim carries the articulation root, with no joint to
   // the world: the base rolls on its wheels. Every link is a prim named after
   // its URDF link under it, which is where the camera hanging from
-  // base_camera_link is defined.
+  // base_camera_link is defined and the lidar's frame on lidar_link placed.
   articulation_root: ".",
 }

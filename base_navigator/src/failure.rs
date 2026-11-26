@@ -65,7 +65,8 @@ pub enum NavigationKind {
     StartInCollision,
     /// No path joins the base to the goal, after the recoveries.
     NoPath,
-    /// The target is in the map frame, and no map is loaded.
+    /// A navigation whose target is in the map frame has no loaded map, the
+    /// base is not localized in it, or its loaded map changed.
     NotLocalized,
 }
 

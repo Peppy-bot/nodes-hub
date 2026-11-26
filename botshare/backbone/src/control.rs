@@ -217,13 +217,9 @@ fn seen_from_start(pose: PlanarPose, start: PlanarPose) -> PlanarPose {
 }
 
 /// The motion an accepted goal runs from the time it was admitted at, a move
-/// steering in the goal's frame, the robot frame at `start` in odom, on from
-/// `command`, the limiter's velocity as it starts, and its claim on the base.
-fn goal_motion(
-    accepted: AcceptedGoal,
-    start: PlanarPose,
-    command: PlanarTwist,
-) -> (GoalMotion, Admitted) {
+/// steering in the goal's frame, the robot frame at `start` in odom, and its
+/// claim on the base.
+fn goal_motion(accepted: AcceptedGoal, start: PlanarPose) -> (GoalMotion, Admitted) {
     match accepted {
         AcceptedGoal::Drive {
             request,
@@ -255,7 +251,6 @@ fn goal_motion(
                         plan,
                         request.tolerances,
                         request.rotate_to_heading_min_angle,
-                        command,
                     ),
                     planned_end_ns,
                     settle_timeout_ns: request.settle_timeout_ns,
@@ -327,10 +322,9 @@ macro_rules! end_goal {
 }
 
 impl RunningGoal {
-    /// The accepted goal, started with the robot frame at `start` and the
-    /// limiter at `command`.
-    fn new(accepted: AcceptedGoal, start: PlanarPose, command: PlanarTwist) -> Self {
-        let (motion, claim) = goal_motion(accepted, start, command);
+    /// The accepted goal, started with the robot frame at `start`.
+    fn new(accepted: AcceptedGoal, start: PlanarPose) -> Self {
+        let (motion, claim) = goal_motion(accepted, start);
         Self {
             start,
             started: Instant::now(),
@@ -405,8 +399,15 @@ impl RunningGoal {
     }
 
     /// The setpoint of the step at `now_ns`, with the robot frame at `pose`
-    /// in the goal's frame: zero once the goal has an ending.
-    fn setpoint(&mut self, pose: PlanarPose, now_ns: i64, dt: f64) -> PlanarTwist {
+    /// in the goal's frame and the limiter at `velocity`: zero once the goal
+    /// has an ending.
+    fn setpoint(
+        &mut self,
+        pose: PlanarPose,
+        velocity: PlanarTwist,
+        now_ns: i64,
+        dt: f64,
+    ) -> PlanarTwist {
         if self.ending.is_some() {
             return PlanarTwist::ZERO;
         }
@@ -423,7 +424,7 @@ impl RunningGoal {
                 }
                 *velocity
             }
-            GoalMotion::Move { controller, .. } => controller.command(pose, dt),
+            GoalMotion::Move { controller, .. } => controller.command(pose, velocity, dt),
         }
     }
 
@@ -938,7 +939,7 @@ impl Base {
     /// way to the loop, and failed when the base's clock reads earlier than
     /// its admission or the odometry it was placed by has started over.
     async fn start_goal(&mut self, accepted: AcceptedGoal) {
-        let goal = RunningGoal::new(accepted, self.pose(), self.limits.last_velocity());
+        let goal = RunningGoal::new(accepted, self.pose());
         let admitted_ns = goal.claim.admitted_ns();
         let clock_went_back = clock::now_ns().is_some_and(|now_ns| now_ns < admitted_ns);
         let odometry_start = self.epoch.as_ref().map(|epoch| epoch.odometry_start);
@@ -1057,11 +1058,12 @@ impl Base {
         }
         let dt = seconds(self.config.step_ns);
         let pose = self.pose();
+        let velocity = self.limits.last_velocity();
         if let Some(goal) = &mut self.goal {
             if let Some(reason) = goal.cancel_reason() {
                 goal.cancel(reason);
             }
-            let setpoint = goal.setpoint(seen_from_start(pose, goal.start), now_ns, dt);
+            let setpoint = goal.setpoint(seen_from_start(pose, goal.start), velocity, now_ns, dt);
             self.limits.take_setpoint(setpoint, now_ns);
         }
         let output = self.limits.tick(now_ns);

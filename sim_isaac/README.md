@@ -3,8 +3,9 @@
 The Isaac Sim 6.2.0 simulation node. It opens an empty stage and stands every
 robot that attaches to it, of any model it has an entry for, side by side: an
 OpenArm v1, an OpenArm v2, an SO-101 and a botshare base share one stage, one
-physics scene and the same five pairing slots. It runs headless with WebRTC streaming, renders
-each robot's own cameras, and serves runtime scene and object editing.
+physics scene and the same six pairing slots. It runs headless with WebRTC
+streaming, renders each robot's own cameras, sweeps its own 2-D lidars, and
+serves runtime scene and object editing.
 
 ## Features
 
@@ -13,7 +14,7 @@ each robot's own cameras, and serves runtime scene and object editing.
   `openarm_v2`, `so101`, `botshare_base`
 - One entry per model under `engine/models/`, beside the entry
   `sim_robot_core` shares with every engine
-- Peppy runtime integration over five pairing slots that name no robot
+- Peppy runtime integration over six pairing slots that name no robot
 - A rolling robot, the botshare base, each wheel run as its driver runs it
   in profile velocity mode
 - Headless WebRTC streaming
@@ -52,7 +53,7 @@ Systems with less RAM may require additional swap during image build or startup.
 
 ```text
 sim_isaac/
-  peppy.json5          the node: its contracts, its five slots, its parameters
+  peppy.json5          the node: its contracts, its six slots, its parameters
   apptainer.def        the node image, on peppybot/sim-isaac
   engine/              the engine, copied to /opt/sim_isaac/engine
     launch.py          the entry point
@@ -64,7 +65,7 @@ sim_isaac/
   tests/               GPU-free suites, their own uv project
 ```
 
-## The five slots
+## The six slots
 
 The engine declares one slot per kind of pair, each `zero_or_more`:
 
@@ -75,9 +76,10 @@ The engine declares one slot per kind of pair, each `zero_or_more`:
 | `bases` | `joint_link` | follower | the base of a rolling robot |
 | `rgb_cameras` | `sim_rgb_camera_link` | camera | a colour camera of a robot |
 | `rgbd_cameras` | `sim_rgbd_camera_link` | camera | a colour and depth camera of a robot |
+| `lidars` | `sim_lidar_2d_link` | lidar | a 2-D lidar of a robot |
 
-Nothing in a slot's name says which robot, limb, base or camera a pair is, so
-every pair is read for it through `sim_robot_core.pairs`:
+Nothing in a slot's name says which robot, limb, base, camera or lidar a pair
+is, so every pair is read for it through `sim_robot_core.pairs`:
 
 - a pair's robot is the copy it carries, which is the name the robot attached
   under. A pair with no copy belongs to the only robot on the stage;
@@ -88,13 +90,15 @@ every pair is read for it through `sim_robot_core.pairs`:
   `limb_state`, the names `attach` answers with, and the names the engine logs;
 - a base pair's base is the link it comes from on the robot's side too,
   `base`, the one name a robot answers to for its base in `base_state`;
-- a camera pair's camera is its relay's name in the copy (`wrist_left`,
-  `wrist`): the relay's instance id without the copy's prefix.
+- a camera pair's camera and a lidar pair's lidar is its relay's name in the
+  copy (`wrist_left`, `wrist`, `lidar`): the relay's instance id without the
+  copy's prefix.
 
 A robot's pair grace time (`robot_pair_grace_ms`) starts again only while its
 pairs are its model's: every limb and the base of its model, and nothing its
-model lacks. A camera its model carries may go unpaired, since a camera nobody
-views is not rendered. When the pair grace time runs out the engine takes the
+model lacks. A camera or a lidar its model carries may go unpaired, since a
+camera nobody views is not rendered and a lidar nobody views is not swept.
+When the pair grace time runs out the engine takes the
 robot out and fails its goal with `resource_unavailable`, saying either that
 the robot held no pair or naming both lists: what its pairs name and what its
 model has. A robot is ready once it stands and holds a pair
@@ -153,7 +157,8 @@ goal carries, its URDF and SRDF, through `sim_robot_core`'s entry of that
 model, shared with the MuJoCo node: its limbs under the names the robot
 answers to, the joints each limb moves, where the gripper's closed and open
 states put each finger, the wheels of its base, left then right, its cameras
-at their optical frames, and the posture it starts in, every arm at its home
+at their optical frames, its 2-D lidars at their frames with the ranges each
+measures, and the posture it starts in, every arm at its home
 state with its gripper closed. A robot whose description gives a
 differential base rolls.
 `sim_robot_core`, `robot_description_py` and `control_core_py` are installed
@@ -175,16 +180,17 @@ parsed strictly at node setup by `engine/isaac_models.py`:
 | `gravity_compensation` | Whether gravity is taken off the robot's own links |
 | `head_camera` | Whether the robot draws the OpenArm v2 head camera pack |
 
-The engine's entries and `sim_robot_core`'s camera renders are read once at
-node setup: an entry that does not read, an unknown key, a gain that is
-negative or not finite, `kp` and `kd` of different lengths, or
+The engine's entries and `sim_robot_core`'s camera renders and lidar sweeps
+are read once at node setup: an entry that does not read, an unknown key, a
+gain that is negative or not finite, `kp` and `kd` of different lengths, or
 a stage outside the baked assets stops the node, naming the file and the key.
 What depends on the robot's description is checked at `attach`, which refuses
 with `rejected` gains whose length is not the number of joints of each arm or
 of fingers that move of their own of each gripper of the description, an
 effort limit of the description that is not positive on a joint whose drive it
-caps, and a camera the description has and no render names, or the
-reverse. A model with no entry is refused at `attach`
+caps, a camera the description has and no render names, or the reverse, and a
+lidar the description has and no sweep names, or the reverse. A model with no
+entry is refused at `attach`
 naming the models the engine stands, and none falls back to another's entry.
 
 Everything downstream of `attach` takes the robot's own model:
@@ -216,6 +222,27 @@ Everything downstream of `attach` takes the robot's own model:
   and its `capture_index`, which a colour and a depth picture of one capture
   share; an rgbd camera's geometry gives `depth_to_color`, the identity in the
   camera's frame with no timestamp, since it holds at every time;
+- the sweep of each lidar of the robot's own model that the robot holds a
+  pair for, whatever `cameras_enabled` says. Its frame is the prim of its
+  parent link on that robot, placed in the rigid body that carries that
+  prim, turned and moved by the frame's pose in the link. The lidar turns as
+  `sim_robot_core.lidars`' `LidarSweeper` sweeps it, on the engine clock:
+  after each step every ray due since the step before is cast with PhysX's
+  scene query from the frame's pose at the ray's own time, linear in
+  position and spherical in orientation between the two steps, and a scan
+  starts only while a pair views the lidar. A ray passes the colliders of
+  the body that carries the lidar and meets every other collider of the
+  scene, the robot's other bodies included; geometry with no collider is not
+  met. Each
+  scan's header names the lidar's frame, the frame the robot's description
+  gives the lidar (`lidar_frame` on a botshare base, which sensor_mounts
+  gives for it), the time of its ray 0 and its `capture_index`; its ranges
+  are in lidar_2d's marks, 0 for a surface nearer than its nearest range and
+  10000 for none within its farthest, and it carries no intensities. A scan
+  that an edit of the stage, a pair that goes or a step that does not move
+  the engine clock forward interrupts is dropped, and the sweep starts again
+  at the next scan. The capture index counts on across them for as long as
+  the robot stands;
 - the head camera pack, which is the business of the models whose entry says
   `head_camera: true`. The node reads no pack when no model draws it;
 - for a robot that rolls, its stance: it stands free on the floor, its
@@ -266,8 +293,10 @@ it through PhysX articulation views, so the USD:
   base fixed to the world, or, for a robot that rolls, no joint to the world,
   its articulation rooted at the rigid body of its robot frame;
 - has one prim per link, named after the URDF link or mapped by `link_prims`,
-  with `PhysicsRigidBodyAPI`. A camera is defined under the prim of its parent
-  link, so that name is unique under the robot's prim;
+  with `PhysicsRigidBodyAPI`. A camera is defined, and a lidar's frame
+  placed, under the prim of its parent link, so that name is unique under the
+  robot's prim. The prim of a lidar's parent link is a rigid body, or hangs
+  from one, which carries the lidar;
 - has one joint prim per joint of the shared entry, named after it, since PhysX
   names a dof after its joint prim. Each is a `PhysicsRevoluteJoint` or a
   `PhysicsPrismaticJoint` with finite limits, which a gripper's span is read
@@ -285,7 +314,8 @@ it through PhysX articulation views, so the USD:
 ### Adding a model
 
 1. Ship the model's description in `robot_description`, and, when it carries
-   a camera, its camera renders in `sim_robot_core` (`models/<model>.json5`).
+   a camera or a lidar, its camera renders and lidar sweeps in
+   `sim_robot_core` (`models/<model>.json5`).
    Move the pins in `sim_base_images/requirements.isaac.txt` and
    `tests/pyproject.toml` to the commit that carries them.
 2. Publish the model's USD bundle, pin its key and SHA-256 in
@@ -756,11 +786,18 @@ the one in the release of Waldo's catalogue, which Waldo's
 `tools/botshare_base` writes from the base's URDF, `robot_description`'s, so
 the URDF is the one source of its geometry, and which the MuJoCo node bakes
 and Waldo loads. `scripts/build_botshare_base.py` compiles that MJCF with its
-mount body free and writes the stage from the compiled model: the mount body
-is the robot frame, `base_footprint`, with the sum of the inertials of every
-link fixed to it, and each wheel a body of its own. Each link the URDF fixes
-to a body stands under it as a prim of its name, so the depth camera stands
-under `base_camera_link`. Each wheel turns on a revolute joint without limits
+mount body free and each body no joint moves fused into the body it hangs
+from, MuJoCo's `fusestatic`, and writes the stage from the compiled model:
+the mount body is the robot frame, `base_footprint`, with the sum of the
+inertials of every link fixed to it, and each wheel a body of its own. The
+MJCF's `lidar_link`, which carries the lidar's housing and its scan site,
+hangs from the mount with no joint, so it is part of the mount: its mass adds
+to the mount's, its inertia combines with the mount's about the mount's
+frame, and its geoms stand on the mount at their place. Each link the URDF
+fixes to a body stands under it as a prim of its name, so the depth camera
+stands under `base_camera_link` and the lidar sweeps from `lidar_frame` under
+`lidar_link`, on the mount, whose colliders its rays pass.
+Each wheel turns on a revolute joint without limits
 that carries the rate loop the MJCF runs it with: a velocity drive with no
 stiffness, the `<velocity>` actuator's `kv` as its damping and the joint's
 `actuatorfrcrange` as its maximum force, the `<intvelocity>` actuator's `kp`
@@ -794,8 +831,10 @@ changes the meshes, by whom and on the `--date` of the build, and
 `BOTSHARE_BASE_STAGE_SHA256`, for the image to bake under
 `/opt/robot_assets/botshare_base/`. `tests/test_botshare_base_stage.py` holds
 the stage to the description, its bodies and their masses, the place of every
-link and the wheels' joints, and to the model, the rate loop of each wheel,
-the contact of the tires and the casters and the colour of each mesh, and on
+link and the wheels' joints, to the model, the mount's mass, centre of mass
+and inertia, the place of every geom, the rate loop of each wheel, the
+contact of the tires and the casters and the colour of each mesh, and to what
+the engine reads off it, each wheel's loop and the lidar's mount, and on
 Linux x86_64 holds its SHA-256 to `BOTSHARE_BASE_STAGE_SHA256`.
 `download_assets.sh` refuses a bundle whose stage is another. So a change of
 the builder, of the release, of the description or of the `mujoco` pin that
@@ -815,7 +854,8 @@ uv run --project sim_isaac/tests --locked --group dev \
 ```
 
 On Linux ARM64, PyPI has no `usd-core` distribution. The USD-specific tests
-are skipped there; the installer, camera, startup and timing suites still run.
+are skipped there; the installer, camera, lidar, startup and timing suites
+still run.
 A native OpenUSD installation from conda-forge supports asset preparation and
 the USD tests on ARM64 without Isaac Sim or a GPU.
 

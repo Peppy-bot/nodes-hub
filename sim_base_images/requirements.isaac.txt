@@ -1,10 +1,10 @@
 pycapnp==2.2.4
 pyjson5==2.0.1
-sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@0eb26e91b92cbbf19d146063b9a8b7f19d074765#subdirectory=sim_robot_core
+sim_robot_core @ git+https://github.com/Peppy-bot/public-peppy-libs.git@083006fee593ac39c3dd714e85bf64a754a27e76#subdirectory=sim_robot_core
 # The robots' descriptions sim_robot_core reads, from the same commit: a Rust
 # extension that pip builds from its source with the toolchain the image
 # installs for the build alone.
-robot_description_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@0eb26e91b92cbbf19d146063b9a8b7f19d074765#subdirectory=robot_description_py
+robot_description_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@083006fee593ac39c3dd714e85bf64a754a27e76#subdirectory=robot_description_py
 # The geometry types of the contracts and the rotation arithmetic the engine
 # places poses with, from the same commit.
-control_core_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@0eb26e91b92cbbf19d146063b9a8b7f19d074765#subdirectory=control_core_py
+control_core_py @ git+https://github.com/Peppy-bot/public-peppy-libs.git@083006fee593ac39c3dd714e85bf64a754a27e76#subdirectory=control_core_py

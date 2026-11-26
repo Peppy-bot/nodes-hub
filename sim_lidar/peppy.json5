@@ -1,0 +1,57 @@
+// sim_lidar: one instance per lidar, and the lidar's name is the instance's
+// own in its copy: relay alpha_lidar of copy alpha is lidar lidar, and a
+// relay launched outside a copy is the lidar its instance id names.
+{
+  peppy_schema: "node/v1",
+  manifest: {
+    name: "sim_lidar",
+    tag: "v1",
+    description: [
+      "A simulated 2-D lidar: a relay between the lidar slot of a simulation (the sim_lidar_2d_link pairing) and the lidar_2d contract. It opens no device: it needs a simulation that sweeps the lidar, such as Waldo.",
+      "Toward consumers it is a lidar like a real one: scans out, each with its own angles, ray timing and range limits. Scans relay field for field, timestamps and capture_index untouched, so consumers place each ray on the capture time, and each names in its header's frame the lidar's frame, which the relay reads from sensor_mounts' describe_sensors once at its start by the name it runs under; a scan the simulation names otherwise is dropped, with a log that names both frames. A simulation sweeps each lidar on a robot, so the relay does not start without its sensor_mounts link bound to that robot.",
+    ],
+    implements: [
+      { name: "lidar_2d", tag: "v1", link_id: "lidar" },
+    ],
+    depends_on: {
+      pairings: [
+        // The simulation's lidar slot, which holds a pair per lidar: this
+        // relay views, the simulation streams the lidar this relay's name
+        // says. Required: a relay without a simulation is a
+        // misconfiguration, and the launch refuses it.
+        { name: "sim_lidar_2d_link", tag: "v1", role: "viewer", link_id: "simulation" },
+      ],
+      contracts: [
+        // The robot that carries the lidar, whose robot_identity implementer
+        // serves sensor_mounts: the frame of the lidar this relay's name
+        // says, which the relay reads once at its start and holds every
+        // relayed scan to. Required: a simulation sweeps each lidar on a
+        // robot, so a relay without that robot's sensor_mounts is a
+        // misconfiguration, and the launch fails naming the link.
+        { name: "sensor_mounts", tag: "v1", link_id: "sensor_mounts" },
+      ],
+    },
+  },
+  interfaces: {
+    topics: {
+      emits: [
+        { link_id: "lidar", name: "scan_stream" },
+      ],
+      consumes: [
+        { link_id: "simulation", name: "scan_stream" },
+      ],
+    },
+    services: {
+      consumes: [
+        { link_id: "sensor_mounts", name: "describe_sensors" },
+      ],
+    },
+  },
+  execution: {
+    language: "rust",
+    container: {
+      def_file: "apptainer.def",
+    },
+    parameters: {},
+  },
+}

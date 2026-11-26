@@ -23,6 +23,13 @@ pub const SMOOTHING_FREQUENCY_HZ: f64 = 20.0;
 /// Nav2's regulated pure pursuit's default `rotate_to_heading_min_angle`,
 /// as the launcher gives it.
 pub const ROTATE_TO_HEADING_MIN_ANGLE_RAD: f64 = 0.785;
+/// The slowest turn rate and drive speeds a move commands, each above its
+/// deadband and below one step of the acceleration: the shortest turn from
+/// rest is 1.5 mrad and the shortest drive 1 mm, the finest tolerances a
+/// move takes, no finer than the tests ask.
+pub const MIN_TURN_RATE_RAD_S: f64 = 0.03;
+pub const MIN_FORWARD_SPEED_M_S: f64 = 0.02;
+pub const MIN_BACKWARD_SPEED_M_S: f64 = 0.02;
 /// How long a stop waits for the control loop (s), as the launcher gives
 /// it.
 pub const STOP_ANSWER_TIMEOUT_S: f64 = 1.5;
@@ -55,6 +62,9 @@ pub fn params() -> peppygen::Parameters {
         smoothing_frequency_hz: SMOOTHING_FREQUENCY_HZ,
         velocity_rolling_window_size: 1,
         rotate_to_heading_min_angle_rad: ROTATE_TO_HEADING_MIN_ANGLE_RAD,
+        min_turn_rate_rad_s: MIN_TURN_RATE_RAD_S,
+        min_forward_speed_m_s: MIN_FORWARD_SPEED_M_S,
+        min_backward_speed_m_s: MIN_BACKWARD_SPEED_M_S,
         stop_answer_timeout_s: STOP_ANSWER_TIMEOUT_S,
         cache_window_s: CACHE_WINDOW_S,
         lookup_timeout_s: LOOKUP_TIMEOUT_S,

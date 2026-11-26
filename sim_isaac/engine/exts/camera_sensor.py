@@ -157,22 +157,11 @@ class IsaacCameraSensor:
         return True
 
     def _define_camera_prim(self, stage, root, camera: CameraConfig) -> str:
-        from pxr import Gf, Usd, UsdGeom  # pylint: disable=E0401
+        from pxr import Gf, UsdGeom  # pylint: disable=E0401
 
         # The prim a camera hangs from: the one its parent link is in this
         # model's stage, wherever under the robot's prim it sits.
-        parent_prim = self._known.prim_of(camera.parent_link)
-        parent = next(
-            (prim for prim in Usd.PrimRange(root) if prim.GetName() == parent_prim),
-            None,
-        )
-        if parent is None:
-            names = sorted(prim.GetName() for prim in Usd.PrimRange(root))
-            raise RuntimeError(
-                f"camera '{camera.name}' parent link '{camera.parent_link}' is not"
-                f" under {self._root} as '{parent_prim}'; prims: {names}"
-            )
-
+        parent = self._known.mount_prim(root, f"camera '{camera.name}'", camera.parent_link)
         camera_path = parent.GetPath().AppendChild(camera.name)
         usd_camera = UsdGeom.Camera.Define(stage, camera_path)
         xform = UsdGeom.Xformable(usd_camera.GetPrim())

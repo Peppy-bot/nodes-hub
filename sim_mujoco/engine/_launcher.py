@@ -8,7 +8,8 @@ a model while physics reads it, and the robots that stay carry their state
 onto the new one: their joint positions, their velocities, the targets their
 actuators hold and the activations of the actuators that integrate, such as
 the integral of a wheel's rate loop. The engine's clock carries too, so the fleet's time
-never goes back.
+never goes back, and so do the capture index counters of its cameras and
+the sweeps of its lidars.
 
 The scene is watched in a browser, on the viewer's server. The server serves
 for as long as the node runs: each scene is drawn on it and wiped off it when
@@ -23,7 +24,7 @@ import threading
 import time
 from typing import Callable, Optional
 
-from bridge_extension import MujocoBridgeExtension
+from bridge_extension import CarriedSensors, MujocoBridgeExtension
 from edits import Edits
 from viewer_server import ViewerServer
 from world import PREFIX_SEPARATOR, World
@@ -70,8 +71,9 @@ class SimLauncher:
         self._view = _NoView()
         # The engine clock, carried from one scene to the next.
         self._time_base_s = 0.0
-        # Each standing camera's capture index counter, carried the same way.
-        self._camera_counters: dict = {}
+        # Each standing camera's capture index counter and each standing
+        # lidar's sweep, carried the same way.
+        self._carried_sensors = CarriedSensors()
 
     def run(self) -> None:
         try:
@@ -132,22 +134,22 @@ class SimLauncher:
         extension, self._extension = self._extension, None
         if extension is None:
             return
-        # A scene that does not shut down hands its counters to nobody: what
-        # its cameras counted goes with it, and the scene composed next
-        # counts its own frames.
-        self._camera_counters = {}
+        # A scene that does not shut down hands its cameras' counters and its
+        # lidars' sweeps to nobody: what they counted goes with it, and the
+        # scene composed next counts its own frames and scans.
+        self._carried_sensors = CarriedSensors()
         try:
             self._time_base_s = extension.engine_time_s()
-            self._camera_counters = extension.shutdown()
+            self._carried_sensors = extension.shutdown()
         except Exception:  # pylint: disable=W0718
             logger.exception("the scene this engine held did not shut down")
 
     def rebind(self) -> None:
         """Composes the scene as it stands, carries onto it what the robots
         that stayed were doing, and shows it. A scene that cannot be composed
-        (two models asking for different settings, a camera whose body is
-        missing) raises out of the stand that asked for it, leaving the
-        engine to put the previous scene back."""
+        (two models asking for different settings, a camera or a lidar whose
+        body is missing) raises out of the stand that asked for it, leaving
+        the engine to put the previous scene back."""
         import mujoco  # pylint: disable=C0415
 
         model = self._world.compose().compile()
@@ -163,7 +165,7 @@ class SimLauncher:
             self._state_rate_hz,
             renders=self._world.renders,
             time_base_s=self._time_base_s,
-            camera_counters=self._camera_counters,
+            carried_sensors=self._carried_sensors,
         )
         extension.startup(posture_for=[r for r in robots if r.instance not in carried])
         # The scene is taken up whole: nothing of it is installed until every

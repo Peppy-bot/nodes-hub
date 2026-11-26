@@ -94,7 +94,7 @@ class IsaacObjectReader:
             # right after an edit read the body as the edit left it.
             _flush_physics_changes()
             if self._body_view is None or self._body_paths != paths:
-                self._body_view = _create_body_view(list(paths))
+                self._body_view = create_body_view(list(paths))
                 self._body_paths = paths
             view = self._body_view
             # (N, 7): position, then the quaternion x, y, z, w.
@@ -155,7 +155,10 @@ def _flush_physics_changes() -> None:
     omni.physics.core.get_physics_simulation_interface().flush_changes()
 
 
-def _create_body_view(paths: list[str]):
+def create_body_view(paths: list[str]):
+    """A tensor rigid-body view of the bodies at `paths`, which PhysX reads
+    the pose of as each body moves: a spawned object or an articulation's
+    link."""
     from isaacsim.core.simulation_manager import SimulationManager  # pylint: disable=C0415
 
     simulation_view = SimulationManager.get_physics_simulation_view()
@@ -175,9 +178,16 @@ def _authored_world_pose(
     prim = omni.usd.get_context().get_stage().GetPrimAtPath(prim_path)
     if not prim.IsValid():
         raise RuntimeError(f"no prim at {prim_path}")
-    matrix = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(
-        Usd.TimeCode.Default()
+    return pose_of_matrix(
+        UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     )
+
+
+def pose_of_matrix(
+    matrix,
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """The position and the orientation (x, y, z, w) a USD transform matrix
+    places a prim at, its scale taken out of the rotation."""
     translation = matrix.ExtractTranslation()
     rotation = matrix.RemoveScaleShear().ExtractRotationQuat()
     wxyz = (rotation.GetReal(), *rotation.GetImaginary())

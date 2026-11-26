@@ -1,0 +1,12 @@
+room_mapper is free software: you can redistribute it and/or modify it under the terms
+of the GNU General Public License as published by the Free Software Foundation, either
+version 3 of the License, or (at your option) any later version, as COPYING gives it.
+
+room_mapper links mapping_core (public-peppy-libs), which is GPL-3.0-or-later and
+translates the code of slam_toolbox, Karto, Nav2's AMCL and Ceres Solver. The image ships
+mapping_core's NOTICE, the BSD notices of the code it translates, beside the binary as
+MAPPING_CORE_NOTICE, and the corresponding source is room_mapper's folder of nodes-hub at
+the image's commit, with the libraries at the commits its Cargo.lock names.
+
+room_mapper links Qhull through navigation_core, whose license the image ships beside the
+binary as QHULL_COPYING.txt.
