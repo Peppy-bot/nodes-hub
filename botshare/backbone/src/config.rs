@@ -6,12 +6,15 @@
 //! names the robot's model, the model's base ([`BaseModel`]) with them
 //! ([`BaseConfig`]): the wheel geometry and the odometry it starts from, the
 //! rest bounds the geometry gives the rest velocity ([`RestBounds`]), and the
-//! outline. A launch with a value the node cannot run on is refused at setup,
-//! by parameter name.
+//! outline; and from the limits and the rest bounds, linear_limits and
+//! angular_limits as describe_base answers them and drive_states carries them
+//! ([`MotionLimits`]). A launch with a value the node cannot run on is refused
+//! at setup, by parameter name.
 
 use std::num::NonZeroUsize;
 use std::time::{Duration, SystemTime};
 
+use control_core::drive_link;
 use control_core::footprint::Footprint;
 use control_core::limiter::{AxisLimits, AxisLimitsParams, Limiter, LimiterError, LimiterParams};
 use control_core::non_negative_finite::{NonNegativeFinite, NotNonNegativeFinite};
@@ -20,7 +23,6 @@ use control_core::positive_finite::{NotPositiveFinite, PositiveFinite};
 use control_core::time::{SecondsParameterError, duration_parameter, seconds, wait_parameter};
 use peppygen::Parameters;
 
-use crate::follower::LEADER_STREAMING_WINDOW_NS;
 use crate::model::{BaseModel, BundledBase, ModelError};
 use crate::move_control::AxisProfile;
 use crate::transforms::JointTransforms;
@@ -133,14 +135,14 @@ pub struct BaseAxes {
 impl BaseAxes {
     /// base_state's limiter of the base, stepping at `frequency_hz`: each
     /// axis within its limits, and to rest once the leader sends nothing for
-    /// [`LEADER_STREAMING_WINDOW_NS`].
+    /// [`drive_link::WINDOW_NS`].
     pub fn limiter_settings(&self, frequency_hz: f64) -> Result<LimiterSettings, ConfigError> {
         let smoothing_frequency_hz =
             PositiveFinite::parse(frequency_hz).map_err(|source| ConfigError::NotPositive {
                 name: "smoothing_frequency_hz",
                 source,
             })?;
-        let velocity_timeout_s = NonNegativeFinite::parse(seconds(LEADER_STREAMING_WINDOW_NS))
+        let velocity_timeout_s = NonNegativeFinite::parse(seconds(drive_link::WINDOW_NS))
             .expect("drive_link's stream gap is a finite time of at least 0");
         LimiterSettings::parse(LimiterParams {
             linear_x: self.linear.limits("linear_limits")?,
@@ -183,6 +185,33 @@ impl RestBounds {
     pub fn bounds(&self) -> [f64; 3] {
         [self.velocity, 0.0, self.rate]
     }
+}
+
+/// The limits of the base's motion as describe_base answers them and
+/// drive_states carries them: linear_limits and angular_limits.
+pub struct MotionLimits {
+    pub linear: LinearLimits,
+    pub angular: AngularLimits,
+}
+
+/// linear_limits: each limit an x, y pair (m/s, m/s^2).
+pub struct LinearLimits {
+    pub min_velocity: [f64; 2],
+    pub max_velocity: [f64; 2],
+    pub max_acceleration: [f64; 2],
+    pub max_deceleration: [f64; 2],
+    pub deadband: [f64; 2],
+    pub rest_velocity: [f64; 2],
+}
+
+/// angular_limits: the limits of the turn about +z (rad/s, rad/s^2).
+pub struct AngularLimits {
+    pub min_rate: f64,
+    pub max_rate: f64,
+    pub max_acceleration: f64,
+    pub max_deceleration: f64,
+    pub deadband: f64,
+    pub rest_rate: f64,
 }
 
 /// base_state's limiter of the base as the node's parameters set it, which
@@ -271,6 +300,31 @@ impl BaseConfig {
     /// travel.
     pub fn wheel_reach_rad(&self, dt_s: f64) -> f64 {
         self.fastest_wheel_rate * dt_s + 2.0 * self.anchor_bound_rad()
+    }
+
+    /// The base's limits along x, along y ([`AxisSpec::STILL`]) and of its
+    /// turn, each with its rest bound ([`RestBounds::bounds`]).
+    pub fn motion_limits(&self) -> MotionLimits {
+        let (x, y, turn) = (self.axes.linear, AxisSpec::STILL, self.axes.angular);
+        let [rest_x, rest_y, rest_rate] = self.rest.bounds();
+        MotionLimits {
+            linear: LinearLimits {
+                min_velocity: [x.min_velocity, y.min_velocity],
+                max_velocity: [x.max_velocity, y.max_velocity],
+                max_acceleration: [x.max_acceleration, y.max_acceleration],
+                max_deceleration: [x.max_deceleration, y.max_deceleration],
+                deadband: [x.deadband, y.deadband],
+                rest_velocity: [rest_x, rest_y],
+            },
+            angular: AngularLimits {
+                min_rate: turn.min_velocity,
+                max_rate: turn.max_velocity,
+                max_acceleration: turn.max_acceleration,
+                max_deceleration: turn.max_deceleration,
+                deadband: turn.deadband,
+                rest_rate,
+            },
+        }
     }
 }
 

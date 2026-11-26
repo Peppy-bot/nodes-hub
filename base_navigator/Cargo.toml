@@ -1,0 +1,28 @@
+[package]
+name = "base_navigator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+peppygen = { path = ".peppy/libs/peppygen" }
+peppylib = { path = ".peppy/libs/peppylib" }
+camera_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "camera_core" }
+control_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "control_core" }
+frame_tree = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "frame_tree" }
+navigation_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "navigation_core" }
+occupancy_map = { git = "https://github.com/Peppy-bot/public-peppy-libs", package = "occupancy_map" }
+
+[dev-dependencies]
+hegeltest = { version = "0.51", features = ["static-engine"] }
+peppygen = { path = ".peppy/libs/peppygen", features = ["testing"] }
+serde_json = "1"
+
+[profile.dev.package.occupancy_map]
+opt-level = 3
+
+[profile.dev.package.navigation_core]
+opt-level = 3

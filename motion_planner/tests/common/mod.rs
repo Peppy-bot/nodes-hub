@@ -616,10 +616,10 @@ pub fn tree_publisher(mocks: &Mocks) -> &transforms::Mock {
         .expect("the transforms slot is bound")
 }
 
-/// The rotation of `orientation`, a unit quaternion [x, y, z, w] of an answer, as control_core
+/// The rotation of `orientation`, a unit quaternion [x, y, z, w] of an answer, as frame_tree
 /// parses and converts it.
 pub fn rotation_of(orientation: [f64; 4]) -> UnitQuaternion<f64> {
-    control_core::geometry::UnitQuaternion::parse(orientation)
+    frame_tree::UnitQuaternion::parse(orientation)
         .expect("an answer's orientation is a unit quaternion")
         .into()
 }

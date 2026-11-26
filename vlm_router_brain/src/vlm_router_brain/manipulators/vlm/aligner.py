@@ -280,8 +280,8 @@ class _Run:
         wrist_pose = await senses.camera_pose(frame.header)
         chest_pose = await senses.camera_pose(chest_frame.header)
         measured = self._measured()
-        wrist_x, wrist_y = axes_in_picture(wrist_pose.orientation)
-        chest_x, chest_y = axes_in_picture(chest_pose.orientation)
+        wrist_x, wrist_y = axes_in_picture(wrist_pose.orientation.xyzw)
+        chest_x, chest_y = axes_in_picture(chest_pose.orientation.xyzw)
         where = self.where(measured.position)
         above_cm = 100 * (measured.position[2] - self.point[2])
         into = self.request.into

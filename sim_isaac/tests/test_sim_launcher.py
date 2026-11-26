@@ -19,7 +19,7 @@ _ANTI_ALIASING_OP = "/rtx/post/aa/op"
 
 @pytest.fixture
 def loop(monkeypatch):
-    bridge = Mock(is_ready=False)
+    bridge = Mock(is_ready=False, views_to_read=False)
     bridge_module = ModuleType("bridge_extension")
     bridge_module.IsaacBridgeExtension = Mock(return_value=bridge)
     monkeypatch.setitem(sys.modules, "bridge_extension", bridge_module)
@@ -254,9 +254,17 @@ def _remove_in_the_first_frame(loop, phase: str, path: str):
     frame; the bridge's view calls go on the loop's trace."""
     stage = Mock()
     stage.GetPrimAtPath.return_value.IsValid.return_value = True
-    loop.bridge.unbind.side_effect = lambda: loop.trace.append("unbind")
-    loop.bridge.bind.side_effect = lambda: loop.trace.append("bind")
-    loop.bridge.resolve.side_effect = lambda update, steps: loop.trace.append("resolve")
+
+    def remove_from_stage(_remove):
+        loop.trace.append("remove")
+        loop.bridge.views_to_read = True
+
+    def resolve(_update, _steps):
+        loop.trace.append("resolve")
+        loop.bridge.views_to_read = False
+
+    loop.bridge.remove_from_stage.side_effect = remove_from_stage
+    loop.bridge.resolve.side_effect = resolve
 
     def run(*_):
         loop.trace.append(phase)
@@ -271,7 +279,7 @@ def test_a_removal_has_its_views_read_once_after_the_next_update_and_before_the_
     loop.launcher._run_loop()
 
     assert loop.trace == (
-        ["update", "bridge", "ready", "runtime", "scene", "unbind", "bind", "edits", "forces"]
+        ["update", "bridge", "ready", "runtime", "scene", "remove", "edits", "forces"]
         + ["wait", "update", "resolve", "bridge", "runtime", "scene", "edits", "forces"]
         + ["wait"] + _PHASES
     )
@@ -284,7 +292,7 @@ def test_the_floors_take_up_has_the_views_read_before_the_step_of_its_frame(loop
     loop.launcher._run_loop()
 
     assert loop.trace == [
-        "update", "judge", "unbind", "bind", "resolve", "bridge", "ready", "runtime", "scene", "edits", "forces",
+        "update", "judge", "remove", "resolve", "bridge", "ready", "runtime", "scene", "edits", "forces",
     ]
 
 

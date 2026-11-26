@@ -138,7 +138,8 @@ def scene(monkeypatch):
     )
     # Specced against the real bridge, so a call to a method the bridge
     # lacks raises.
-    bridge = Mock(spec=["bind", "unbind", "step", "shutdown", "is_ready"])
+    bridge = Mock(spec=["remove_from_stage", "step", "shutdown", "is_ready"])
+    bridge.remove_from_stage.side_effect = lambda remove: remove()
     launcher._extension = bridge
     return SimpleNamespace(
         launcher=launcher, stage=stage, bridge=bridge, scene_actions=scene_actions, world=world,
@@ -150,7 +151,8 @@ def test_a_removal_takes_the_views_again_and_runs_no_update(scene):
 
     assert scene.launcher._remove_prim(scene.stage, _FLOOR)
 
-    assert [name for name, _, _ in scene.bridge.mock_calls] == ["unbind", "bind"]
+    assert [name for name, _, _ in scene.bridge.mock_calls] == ["remove_from_stage"]
+    assert scene.stage.removed == [_FLOOR]
     scene.launcher._sim_app.update.assert_not_called()
 
 
@@ -168,8 +170,7 @@ def test_first_scene_load_references_the_asset_and_keeps_the_physics_views(scene
     assert prim.references == [f"{_ASSET_ROOT}/Isaac/Environments/Simple_Warehouse/warehouse.usd"]
     assert prim.scale == (2.0, 2.0, 2.0)
     assert scene.stage.removed == []
-    scene.bridge.unbind.assert_not_called()
-    scene.bridge.bind.assert_not_called()
+    scene.bridge.remove_from_stage.assert_not_called()
 
 
 def test_loading_another_scene_replaces_the_current_one_and_invalidates_the_views(scene, caplog):
@@ -181,8 +182,7 @@ def test_loading_another_scene_replaces_the_current_one_and_invalidates_the_view
     assert prim.references == [f"{_ASSET_ROOT}/Isaac/Environments/Simple_Warehouse/full_warehouse.usd"]
     assert prim.scale == (1.0, 1.0, 1.0)
     assert scene.stage.removed == [_SCENE]
-    scene.bridge.unbind.assert_called_once_with()
-    scene.bridge.bind.assert_called_once_with()
+    scene.bridge.remove_from_stage.assert_called_once()
     assert f"Replacing runtime scene {_SCENE}" in caplog.text
 
 
@@ -219,8 +219,7 @@ def test_the_stages_floor_comes_up_once_the_scenes_holds_every_robot(scene, monk
     _judge(scene, monkeypatch, [(0.0, 0.0), (2.0, -1.0)], [0.0, 0.0002])
 
     assert scene.stage.removed == [_FLOOR]
-    scene.bridge.unbind.assert_called_once_with()
-    scene.bridge.bind.assert_called_once_with()
+    scene.bridge.remove_from_stage.assert_called_once()
     assert "the stage's floor is taken up" in caplog.text
 
 
@@ -263,30 +262,26 @@ def test_scene_scale_needs_three_values(scene):
 def test_clear_scene_invalidates_the_views_only_when_a_scene_was_loaded(scene, caplog):
     caplog.set_level(logging.INFO)
     scene.launcher._runtime_clear_scene()
-    scene.bridge.unbind.assert_not_called()
-    scene.bridge.bind.assert_not_called()
+    scene.bridge.remove_from_stage.assert_not_called()
     assert "No runtime scene to remove" in caplog.text
 
     _load(scene, "Isaac/Environments/Office/office.usd")
     scene.launcher._runtime_clear_scene()
     assert _SCENE not in scene.stage.prims
-    scene.bridge.unbind.assert_called_once_with()
-    scene.bridge.bind.assert_called_once_with()
+    scene.bridge.remove_from_stage.assert_called_once()
     assert f"Removed runtime scene {_SCENE}" in caplog.text
 
 
 def test_removing_a_runtime_object_invalidates_the_views_but_a_missing_one_does_not(scene, caplog):
     caplog.set_level(logging.INFO)
     scene.launcher._runtime_remove({"name": "obj_missing"})
-    scene.bridge.unbind.assert_not_called()
-    scene.bridge.bind.assert_not_called()
+    scene.bridge.remove_from_stage.assert_not_called()
     assert "Runtime object 'obj_missing' does not exist" in caplog.text
 
     scene.stage.DefinePrim("/World/RuntimeObjects/obj_1", "Xform")
     scene.launcher._runtime_remove({"name": "obj_1"})
     assert "/World/RuntimeObjects/obj_1" not in scene.stage.prims
-    scene.bridge.unbind.assert_called_once_with()
-    scene.bridge.bind.assert_called_once_with()
+    scene.bridge.remove_from_stage.assert_called_once()
     assert "Removed runtime object 'obj_1'" in caplog.text
 
 
@@ -301,12 +296,14 @@ def test_every_removal_drops_the_rigid_body_view_the_object_state_reads(scene):
     scene.stage.DefinePrim("/World/RuntimeObjects/obj_1", "Xform")
     scene.launcher._runtime_remove({"name": "obj_1"})
     scene.launcher._runtime_remove({"name": "obj_missing"})
-    assert scene.scene_actions.invalidate_physics_views.call_count == 1
+    # The bridge drops it (IsaacBridgeExtension.remove_from_stage).
+    assert scene.bridge.remove_from_stage.call_count == 1
+    scene.scene_actions.invalidate_physics_views.assert_not_called()
 
     scene.launcher._extension = None
     _load(scene, "Isaac/Environments/Office/office.usd")
     scene.launcher._runtime_clear_scene()
-    assert scene.scene_actions.invalidate_physics_views.call_count == 2
+    assert scene.scene_actions.invalidate_physics_views.call_count == 1
 
 
 class StageReader:
@@ -396,8 +393,7 @@ def test_the_runtime_commander_refuses_to_remove_or_replace_a_scene_manipulation
 
     # Nothing left the stage or the registry, so the capture still lists it.
     assert scene.stage.removed == []
-    scene.bridge.unbind.assert_not_called()
-    scene.bridge.bind.assert_not_called()
+    scene.bridge.remove_from_stage.assert_not_called()
     assert scene_manipulation.owns(object_id)
     assert _captured(scene_manipulation) == spawned
 

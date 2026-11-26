@@ -3,10 +3,11 @@
 
 use std::num::NonZeroU32;
 
+use camera_core::depth_camera::DepthCamera;
 use camera_core::encoding::{ColorEncoding, DEPTH_ENCODING, DepthFrame};
-use camera_core::pinhole::{DepthModel, Pinhole};
+use camera_core::pinhole::Pinhole;
 use control_core::positive_finite::PositiveFinite;
-use frame_tree::{FrameName, Transform};
+use frame_tree::Transform;
 
 /// A color image as the viewer draws it: raw RGB pixels, or a JPEG as it came.
 #[derive(Debug, Clone, PartialEq)]
@@ -239,35 +240,14 @@ impl DepthImage {
         self.depth_unit
     }
 
+    /// Whether the image is of `lens`'s size.
+    pub fn fits(&self, lens: &Pinhole) -> bool {
+        self.width == lens.width() && self.height == lens.height()
+    }
+
     fn depth_frame(&self) -> DepthFrame<'_> {
         DepthFrame::parse(&self.samples, self.width, self.height)
             .expect("parse checked the length against the size")
-    }
-}
-
-/// The depth stream as the viewer reads it: its lens, how a sample reads as a depth,
-/// and where its optical frame sits in the color optical frame.
-#[derive(Debug)]
-pub struct DepthCamera {
-    pub lens: Pinhole,
-    pub depth_model: DepthModel,
-    /// The camera's frame, the color optical frame, which the frames must name.
-    pub frame: FrameName,
-    pub depth_in_color: Transform,
-    /// The alignment the geometry describes, which the frames must carry.
-    pub align_mode: String,
-}
-
-impl DepthCamera {
-    /// Where the depth optical frame stands in the robot frame, the color optical frame
-    /// standing at `color_in_robot`: a point goes through the depth-to-color pose first.
-    pub fn depth_in_robot(&self, color_in_robot: &Transform) -> Transform {
-        color_in_robot.compose(&self.depth_in_color)
-    }
-
-    /// Whether `image` is of the lens's size.
-    pub fn fits(&self, image: &DepthImage) -> bool {
-        image.width == self.lens.width() && image.height == self.lens.height()
     }
 }
 
@@ -290,7 +270,7 @@ pub fn strided_points(
     depth_in_robot: &Transform,
     stride: NonZeroU32,
 ) -> Result<Vec<[f32; 3]>, LensSizeError> {
-    if !camera.fits(image) {
+    if !image.fits(&camera.lens) {
         return Err(LensSizeError {
             image_width: image.width,
             image_height: image.height,
@@ -323,7 +303,8 @@ mod tests {
     use super::*;
     use crate::model::placement::tests::{close, quarter_turn_about_z};
     use crate::model::placement::translation;
-    use camera_core::pinhole::Intrinsics;
+    use camera_core::pinhole::{DepthModel, Intrinsics};
+    use frame_tree::FrameName;
 
     /// A 4 by 3 depth camera with a focal length of 2 pixels and its principal point at
     /// (1.5, 1), its depth frame on its color frame.
@@ -421,7 +402,7 @@ mod tests {
     fn an_image_of_another_size_than_the_lens_is_refused() {
         let unit = PositiveFinite::parse(0.5).unwrap();
         let small = DepthImage::parse("z16", 2, 1, vec![0; 4], unit).unwrap();
-        assert!(!camera().fits(&small));
+        assert!(!small.fits(&camera().lens));
         assert_eq!(
             strided_points(
                 &small,
@@ -454,18 +435,6 @@ mod tests {
                 got: 7
             })
         );
-    }
-
-    #[test]
-    fn the_depth_frame_goes_through_its_color_frame_first() {
-        // The color frame stands at (1, 0, 0) turned a quarter about z; the depth frame
-        // stands 0.1 m along the color frame's x, which the turn points along the
-        // robot's y. The other order would put the depth frame at (1.1, 0, 0).
-        let mut camera = camera();
-        camera.depth_in_color = translation([0.1, 0.0, 0.0]);
-        let color_in_robot = Transform::new([1.0, 0.0, 0.0], quarter_turn_about_z()).unwrap();
-        let depth_in_robot = camera.depth_in_robot(&color_in_robot);
-        assert!(close(depth_in_robot.origin(), [1.0, 0.1, 0.0], 1e-12));
     }
 
     #[test]

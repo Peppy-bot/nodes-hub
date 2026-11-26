@@ -4,6 +4,8 @@ import heapq
 import itertools
 import math
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
@@ -12,16 +14,34 @@ from control_core_py.geometry import Pose, Quaternion, Stamped
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from peppygen.consumed_actions.fleet import changes, lease
+from peppygen.consumed_services.fleet import check_move, release, take
+from peppygen.consumed_services.robot_stop import stop
 from peppygen.consumed_topics.color_cameras import video_stream as color_video_stream
+from peppygen.paired_topics.base import drive_states
 from peppygen.fixtures import harness
 from peppygen.parameters import Parameters
 
 from xr_commander import config
-from xr_commander.bus import REAL_CLOCK, Answered, Clock, FlashNote, Outcome
+from xr_commander.bus import REAL_CLOCK, Answered, Clock, Outcome
 from xr_commander.clutch import HandClutch
 from xr_commander.devices import HandSample, XrFrame
-from xr_commander.drive import Driver, HandState
-from xr_commander.fleet import Fleet, FleetView, Following, Holder, Timing
+from xr_commander.drive import (
+    Driver,
+    Goals,
+    GripStatus,
+    LeaseCalls,
+    RobotStops,
+    Stops,
+)
+from xr_commander.fleet import (
+    LEASE_NAME,
+    FleetCalls,
+    FleetView,
+    Following,
+    Holder,
+    Timing,
+)
+from xr_commander.grip_world import Idle, PostureTarget
 from xr_commander.panel import HandSource
 from xr_commander.publish import MeasuredPoses
 from xr_commander.robots import PairedRobots
@@ -91,6 +111,47 @@ def posture_done(module):
     )
 
 
+def controller(
+    handedness,
+    *,
+    position=(0.0, 0.0, 0.0),
+    squeezing=False,
+    trigger=0.0,
+    primary=False,
+    secondary=False,
+    axes=(0.0, 0.0, 0.0, 0.0),
+):
+    """A controller as the page sends it in an `xr_state` frame."""
+    buttons = [
+        {"pressed": trigger >= 1.0, "touched": True, "value": trigger},
+        {
+            "pressed": squeezing,
+            "touched": True,
+            "value": 1.0 if squeezing else 0.0,
+        },
+    ]
+    if primary or secondary:
+        buttons += [
+            {"pressed": False, "touched": False, "value": 0.0},
+            {"pressed": False, "touched": False, "value": 0.0},
+            {"pressed": primary, "touched": primary, "value": 0.0},
+        ]
+    if secondary:
+        buttons.append({"pressed": True, "touched": True, "value": 0.0})
+    return {
+        "role": "controller",
+        "handedness": handedness,
+        "gripPose": {
+            "position": dict(zip("xyz", position, strict=True)),
+            "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+        },
+        "gamepad": {
+            "buttons": buttons,
+            "axes": list(axes),
+        },
+    }
+
+
 def squeezing_hand():
     return HandSample(pose=POSE, squeezing=True, trigger=0.0)
 
@@ -104,7 +165,8 @@ class ScriptedHeadset:
         self, clock: Clock = REAL_CLOCK, *, hands=None, age_s: float = 0.0
     ) -> None:
         self._clock = clock
-        self._age_s = age_s
+        # How old each frame is when the stream reads it (s).
+        self.age_s = age_s
         self.hands = hands or {}
         # The trigger of every hand that `press` sets.
         self.trigger = 0.0
@@ -125,7 +187,7 @@ class ScriptedHeadset:
 
     def latest(self):
         return XrFrame(
-            received_monotonic_s=self._clock.monotonic() - self._age_s,
+            received_monotonic_s=self._clock.monotonic() - self.age_s,
             hands=self.hands,
         )
 
@@ -138,6 +200,55 @@ def left_buttons(*, x=False, y=False) -> dict:
 # A stand-in for the chosen robot's pair on a slot, for tests that read the
 # panel and the streams without a wire.
 PEER = "peer"
+
+
+@dataclass(frozen=True)
+class Peer:
+    """A pair's `PeerInfo` in a test: hashable and equal by name, as two
+    infos of one restarted pair are."""
+
+    name: str
+
+
+class GatedPublisher:
+    """A publisher whose sends wait while the test holds `gate` shut; each
+    send first yields, as a send on the wire does."""
+
+    def __init__(self) -> None:
+        self.sent: list = []
+        self.gate = asyncio.Event()
+        self.gate.set()
+
+    async def publish_to(self, peer, payload) -> None:
+        await asyncio.sleep(0)
+        self.sent.append((peer, payload))
+        await self.gate.wait()
+
+
+class NoWireSlot:
+    """A pairing slot of a test with no wire: its pairs in delivered order,
+    each with its robot, which `set_pairs` changes, a message of the fields
+    it is built from, and one gated publisher."""
+
+    def __init__(self, *pairs: tuple[str, Peer]) -> None:
+        self.set_pairs(*pairs)
+        self.publisher = GatedPublisher()
+
+    def set_pairs(self, *pairs: tuple[str, Peer]) -> None:
+        """The slot holds `pairs` from its next read on, in delivered
+        order."""
+        self._members = tuple(
+            SimpleNamespace(copy=robot, info=info) for robot, info in pairs
+        )
+
+    def peers(self, _runner):
+        return list(self._members)
+
+    def build_message(self, *fields):
+        return fields
+
+    async def declare_publisher(self, _runner):
+        return self.publisher
 
 
 def source(
@@ -153,7 +264,7 @@ def source(
     return HandSource(
         handedness=handedness,
         clutch=clutch,
-        state=HandState(FlashNote()),
+        grip=lambda: GripStatus(Idle(), frozenset(), ""),
         measured=measured,
         arm_peer=lambda: PEER if arm_bound else None,
         gripper_peer=lambda: PEER if gripper else None,
@@ -169,7 +280,8 @@ def default_parameters(**overrides) -> SimpleNamespace:
         "motion_scale": 1.0,
         "gripper_open_fraction": 1.0,
         "posture_move_duration_s": 2.0,
-        "stale_timeout_s": 10.0,
+        # The longest the node accepts, for the tests on the real clock.
+        "stale_timeout_s": 0.5,
         "view_max_width": 640,
         "status_panel_enabled": True,
     }
@@ -426,6 +538,7 @@ class FakeToken:
 
 def robots_of(h):
     """The paired robots over the harness's real runner and slot modules."""
+    from peppygen.paired_topics.base import drive_setpoints as base
     from peppygen.paired_topics.left_arm import pose_setpoints as left_arm
     from peppygen.paired_topics.left_gripper import gripper_setpoints as left_gripper
     from peppygen.paired_topics.right_arm import pose_setpoints as right_arm
@@ -435,6 +548,7 @@ def robots_of(h):
         h.node_runner,
         arms={"left": left_arm, "right": right_arm},
         grippers={"left": left_gripper, "right": right_gripper},
+        base=base,
     )
 
 
@@ -533,6 +647,19 @@ class ManualClock:
             await asyncio.sleep(PARK_POLL_S)
 
 
+@contextlib.asynccontextmanager
+async def parked(clock: ManualClock, *streams, period: float):
+    """`streams` running on `clock`, each ticking every `period`: yields a
+    step that runs `count` ticks of every stream, each to its end."""
+    async with running(*streams) as tasks:
+
+        async def step(count=1):
+            for _ in range(count):
+                await clock.advance(period, parked=tasks)
+
+        yield step
+
+
 # How long a loop may take to come back to the clock, on the wire, and how
 # often the test looks.
 PARK_TIMEOUT_S = 10.0
@@ -552,8 +679,16 @@ async def settle() -> None:
 # and a director that holds leases beside it.
 HEADSET = Holder("headset_inst", "fixture-core")
 DIRECTOR = Holder("director_inst", "fixture-core")
-# The halt of the tests, by `peppy-cli`, as a refusal and the card give it.
-HALTED = "the stack is halted by peppy-cli until peppy fleet clear-halt"
+# A third client, beside the director.
+OTHER = Holder("other_inst", "fixture-core")
+# The name of the director's lease of a robot.
+DIRECTOR_LEASE = "tidy the table"
+# Who halts the stack in the tests, and the halt as a refusal and the card
+# give it.
+HALTER = "peppy-cli"
+HALTED = f"the stack is halted by {HALTER} until peppy fleet clear-halt"
+# Why the headset lets go when the changes goal of the fleet ends.
+CHANGES_ENDED = "the changes goal of the fleet ended"
 # The bound of a call that the test answers, and the retry of the headset.
 CALL_S = 10.0
 RETRY_S = 1.0
@@ -561,6 +696,11 @@ RETRY_S = 1.0
 
 # The revision of a listing that a test gives no revision.
 FIRST_REVISION = 1
+# A measured pose away from `POSE`, so a message at it is told apart.
+ELSEWHERE = pose_at((0.4, 0.0, 0.0))
+# The pairs a robot holds on a slot at most, in a test whose pairs join,
+# leave and restart: one that restarts, and the one it replaces.
+MOST_PAIRS = 2
 
 
 def fleet_view(
@@ -574,12 +714,42 @@ def fleet_view(
     )
 
 
-def following_fleet(*robots, **view) -> Fleet:
-    """A fleet whose goals run and whose listing holds `robots`."""
-    fleet = Fleet(HEADSET)
-    fleet.view = fleet_view(robots, **view)
-    fleet.status = Following()
-    return fleet
+def listed(driver: Driver, *robots, **view) -> Driver:
+    """The driver once its goals run and a listing of `robots` came."""
+    driver.goals_started(1)
+    driver.goals_status(Following())
+    driver.fleet_changed(fleet_view(robots, **view))
+    return driver
+
+
+class OnCue:
+    """Calls, each waiting on a future of its own until the test answers it:
+    `calls` keeps what each call names and its future, in call order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, asyncio.Future]] = []
+
+    async def wait_for_answer(self, named):
+        """Wait for the test's answer to a call that names `named`."""
+        answer = asyncio.get_running_loop().create_future()
+        self.calls.append((named, answer))
+        return await answer
+
+    def unanswered(self) -> list[int]:
+        """The index in `calls` of each call the test has not answered."""
+        return [
+            index
+            for index, (_named, answer) in enumerate(self.calls)
+            if not answer.done()
+        ]
+
+    def answer(self, index: int, value) -> None:
+        """Call `index` of `calls` returns `value`."""
+        self.calls[index][1].set_result(value)
+
+    def throw(self, index: int, error: Exception) -> None:
+        """Call `index` of `calls` raises `error`."""
+        self.calls[index][1].set_exception(error)
 
 
 AGREED = Answered(None)
@@ -596,11 +766,21 @@ class FakeCalls:
         self.take_outcome: Outcome = AGREED
         self.check_outcome: Outcome = Answered(FIRST_REVISION)
         self.release_outcome: Outcome = AGREED
+        # The takes that wait for the test's answer, from `takes_on_cue` on.
+        self._takes_on_cue: OnCue | None = None
 
     async def take(self, robot):
         self._log.append(("take", robot))
         await asyncio.sleep(0)
+        if self._takes_on_cue is not None:
+            return await self._takes_on_cue.wait_for_answer(robot)
         return self.take_outcome
+
+    def takes_on_cue(self) -> OnCue:
+        """Each take from now on waits until the test answers it in the
+        returned calls."""
+        self._takes_on_cue = OnCue()
+        return self._takes_on_cue
 
     async def release(self, robot):
         self._log.append(("release", robot))
@@ -626,19 +806,201 @@ class FakeStops:
         return self.refusal
 
 
-def scripted_driver(*robots, clock=REAL_CLOCK, log=None) -> Driver:
-    """A driver whose fleet lists `robots` free, whose daemon agrees to
-    every call and whose backbones stop on demand; `log` records the
-    calls."""
+class StopsOnCue(OnCue):
+    """A backbone that answers each stop once the test answers it, each stop
+    kept in call order with its robot."""
+
+    async def stop(self, robot):
+        return await self.wait_for_answer(robot)
+
+    def answer(self, index: int, refusal: str | None = None) -> None:
+        """Answer stop `index` of `calls`: with `refusal`, None for an
+        answer."""
+        super().answer(index, refusal)
+
+
+class FakeGoals:
+    """The posture goals of a test: each fire and cancel goes to `log`; a
+    fire yields once and gives `handle`, a result waits on `results`."""
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        # The goal a fire gives: accepted by default, a refused stub or None
+        # (a send that failed) as a test sets it.
+        self.handle = SimpleNamespace(accepted=True)
+        # The notes, or the exceptions raised, of the results to come.
+        self.results: asyncio.Queue = asyncio.Queue()
+
+    async def fire(self, label, target):
+        self._log.append(("goal", label))
+        await asyncio.sleep(0)
+        return self.handle
+
+    async def result(self, label, goal) -> str:
+        outcome = await self.results.get()
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def cancel(self, label, goal) -> None:
+        self._log.append(("cancel", label))
+
+
+# The note of a move to home whose goal finished.
+HOME_REACHED = "move to home completed"
+# The posture goal a backbone refuses, with the remedy after the cause.
+REFUSED_GOAL = SimpleNamespace(
+    accepted=False, refusal=SimpleNamespace(message="busy; try again later")
+)
+
+
+def postures_of(robot: str) -> PostureTarget:
+    """The postures producer of `robot` in a test, as a press reads it."""
+    return PostureTarget(f"{robot} postures", f"{robot}_inst")
+
+
+def _no_refresh() -> None:
+    """A page that a change of a hold or of the fleet refreshes nothing on."""
+
+
+def unlisted_driver(
+    *,
+    clock: Clock = REAL_CLOCK,
+    log: list | None = None,
+    calls: LeaseCalls | None = None,
+    stops: Stops | None = None,
+    goals: Goals | None = None,
+    timing: Timing = Timing(),
+    on_change: Callable[[], None] = _no_refresh,
+) -> Driver:
+    """A driver whose goals have not started: its daemon agrees to every
+    call, its backbones stop on demand and its posture goals are accepted,
+    each a fake that records its calls in `log`, unless given."""
     log = log if log is not None else []
     return Driver(
-        following_fleet(*robots),
-        FakeCalls(log),
-        FakeStops(log),
-        timing=Timing(),
+        HEADSET,
+        calls if calls is not None else FakeCalls(log),
+        stops if stops is not None else FakeStops(log),
+        goals if goals is not None else FakeGoals(log),
+        timing=timing,
+        on_change=on_change,
+        clock=clock,
+    )
+
+
+def scripted_driver(*robots, **fakes) -> Driver:
+    """`unlisted_driver(**fakes)` once its goals run and its fleet lists
+    `robots` free."""
+    return listed(unlisted_driver(**fakes), *robots)
+
+
+# The bound of each call to a mock that the test answers, and the retry.
+WIRE_TIMING = Timing(call_timeout_s=CALL_S, retry_s=RETRY_S)
+
+# The robot of a wire rig, outside any copy: its backbone's instance id.
+ROBOT = "backbone_inst"
+SETTINGS = config.from_parameters(
+    default_parameters(command_rate_hz=100, stale_timeout_s=0.25)
+)
+TICK_S = SETTINGS.tick_period_s
+# The most ticks a test waits for a state, and the ticks a held grip gets to
+# stream where it must stream nothing.
+WIRE_TICKS = 50
+HELD_TICKS = 5
+
+
+async def ticks_until(tick, predicate, limit=WIRE_TICKS) -> None:
+    """Call `tick()` until `predicate()`, at most `limit` times."""
+    for _ in range(limit):
+        if predicate():
+            return
+        await tick()
+    raise AssertionError("the condition was never met")
+
+
+class TickedRig:
+    """A rig whose loops run on `clock`: a tick is one step of each loop of
+    `loops`."""
+
+    def __init__(self, clock: ManualClock) -> None:
+        self.clock = clock
+        # The loops that each tick waits for.
+        self.loops: list[asyncio.Task] = []
+
+    async def tick(self, count=1):
+        for _ in range(count):
+            await self.clock.advance(TICK_S, parked=self.loops)
+
+    async def ticks_until(self, predicate, limit=WIRE_TICKS):
+        """Tick until `predicate()`."""
+        await ticks_until(self.tick, predicate, limit)
+
+
+def wire_stops(h, robots: PairedRobots) -> RobotStops:
+    """The stops of the robots through the harness's mocks of `robot_stop`."""
+    return RobotStops(h.node_runner, robots, stop, WIRE_TIMING)
+
+
+def driver_on_the_wire(
+    h, stops: Stops, clock: Clock, goals: Goals | None = None
+) -> Driver:
+    """A driver whose daemon is the harness's mock of the target `fleet`,
+    whose backbones stop through `stops`, and whose posture goals are
+    `goals`, `FakeGoals` unless given. The caller lists it (`listed`)."""
+    return Driver(
+        HEADSET,
+        FleetCalls(
+            h.node_runner,
+            take_module=take,
+            release_module=release,
+            check_move_module=check_move,
+            timing=WIRE_TIMING,
+        ),
+        stops,
+        goals if goals is not None else FakeGoals([]),
+        timing=WIRE_TIMING,
         on_change=lambda: None,
         clock=clock,
     )
+
+
+async def daemon_answers_take(daemon, robot: str, refusal: str | None = None):
+    """The mock daemon's answer to the next take, of `robot` under the
+    headset's lease name: a yes, or `refusal`."""
+    request, responder = await daemon.take.next_request(CALL_S)
+    assert (request.robot, request.name) == (robot, LEASE_NAME)
+    if refusal is None:
+        await responder.respond()
+    else:
+        await responder.respond_failure(take.FailureKind.LEASED, refusal)
+
+
+async def backbone_answers_stop(stops, stopped: list[str]) -> None:
+    """A mock backbone's answer to the next stop, whose reason is the
+    headset's lease name: the parts it stopped."""
+    request, responder = await stops.next_request(CALL_S)
+    assert request.reason == LEASE_NAME
+    await responder.respond(stop.ResponseData(stopped=stopped))
+
+
+async def daemon_answers_check_move(daemon, instance: str, refusal=None) -> None:
+    """The mock daemon's answer to the next check whether the headset may
+    call a member that moves the robot of `instance`: a yes, or `refusal`."""
+    request, responder = await daemon.check_move.next_request(CALL_S)
+    assert (request.instance, request.robot) == (instance, None)
+    denied = (
+        None
+        if refusal is None
+        else check_move.ResponseDataRefusal(failure_kind="leased", message=refusal)
+    )
+    await responder.respond(check_move.ResponseData(refusal=denied, revision=1))
+
+
+async def daemon_answers_release(daemon, robot: str) -> None:
+    """The mock daemon's yes to the next release, of `robot`."""
+    request, responder = await daemon.release.next_request(CALL_S)
+    assert request.robot == robot
+    await responder.respond()
 
 
 # The fleet listing and the lease events as the daemon sends them.
@@ -704,3 +1066,62 @@ async def accept_both(mock):
     follow = await (await mock.changes.next_goal(CALL_S)).accept()
     hold = await (await mock.lease.next_goal(CALL_S)).accept()
     return follow, hold
+
+
+# The instance's clock when each base test starts (ns).
+START_NS = 1_000_000_000_000
+
+
+def limits_given(*, x=(-0.4, 0.8), y=(0.0, 0.0), turn=(-1.5, 1.0)):
+    """The limits a drive_states gives for a base with these ranges (m/s,
+    rad/s): a differential base by default, whose backward and clockwise
+    limits differ from its forward and counterclockwise ones."""
+    drives_y = y != (0.0, 0.0)
+    return SimpleNamespace(
+        linear_limits=drive_states.MessageLinearLimits(
+            min_velocity=[x[0], y[0]],
+            max_velocity=[x[1], y[1]],
+            max_acceleration=[1.0, 1.0 if drives_y else 0.0],
+            max_deceleration=[2.0, 2.0 if drives_y else 0.0],
+            deadband=[0.0, 0.0],
+            rest_velocity=[0.01, 0.01 if drives_y else 0.0],
+        ),
+        angular_limits=drive_states.MessageAngularLimits(
+            min_rate=turn[0],
+            max_rate=turn[1],
+            max_acceleration=2.0,
+            max_deceleration=3.0,
+            deadband=0.0,
+            rest_rate=0.02,
+        ),
+    )
+
+
+DIFFERENTIAL = limits_given()
+HOLONOMIC = limits_given(y=(-0.3, 0.6))
+
+
+def stick_axes(forward=0.0, left=0.0) -> list[float]:
+    """The xr-standard axes of a controller whose thumbstick is deflected
+    `forward` and `left`: the Gamepad API gives -1 forward and left."""
+    return [0.0, 0.0, -left, -forward]
+
+
+def states(follow_state="following", limits=DIFFERENTIAL):
+    """A drive_states as the headset reads it."""
+    return SimpleNamespace(
+        follow_state=follow_state,
+        mode="standing",
+        linear_limits=limits.linear_limits,
+        angular_limits=limits.angular_limits,
+    )
+
+
+def setpoint_sent(send) -> tuple[Peer, tuple[float, float, float]] | None:
+    """A base tick's send as its pair and its setpoint's x, y and turn, None
+    for silence; the setpoint carries no frame and no timestamp."""
+    if send is None:
+        return None
+    pair, (frame, timestamp, linear, angular) = send
+    assert (frame, timestamp) == (None, None)
+    return pair, (linear[0], linear[1], angular[2])

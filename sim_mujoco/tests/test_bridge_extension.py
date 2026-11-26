@@ -843,8 +843,8 @@ class TestTheWheelsOfABase:
         x, y, z = robot.placement.position.position
         assert (x, y) == pytest.approx((0.75, -0.25), abs=1e-3)
         assert z == pytest.approx(0.01, abs=1e-3)
-        assert robot.placement.orientation.quaternion == pytest.approx(
-            placement_at(0.0, yaw=0.6).orientation.quaternion, abs=1e-3
+        assert robot.placement.orientation.xyzw == pytest.approx(
+            placement_at(0.0, yaw=0.6).orientation.xyzw, abs=1e-3
         )
 
     @pytest.mark.parametrize(
@@ -918,7 +918,7 @@ class TestTheRecordsOnObjectState:
         placement = placement_at(1.5, yaw=0.5)
         assert (record.robot, record.model) == (ROBOT, "jaw_arm")
         assert record.position == placement.position.position
-        assert record.orientation == placement.orientation.quaternion
+        assert record.orientation == placement.orientation.xyzw
         assert (record.linear_velocity, record.angular_velocity) == ((0.0,) * 3, (0.0,) * 3)
 
     def test_a_robot_that_rolls_is_where_its_free_joint_stands_moving_in_world_axes(self, clock):

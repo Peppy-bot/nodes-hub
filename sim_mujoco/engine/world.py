@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-from control_core_py.geometry import IDENTITY, Point, Pose, UnitQuaternion, wxyz_of_xyzw
+from control_core_py.geometry import Point, Pose, UnitQuaternion
 from exts.camera_sensor import add_cameras, add_light_rig, widen_offscreen
 from mujoco_models import MujocoModel
 
@@ -164,7 +164,7 @@ class World:
             # a cross around the origin.
             for row, column in sorted(square, key=lambda spot: (abs(spot[0]) + abs(spot[1]), spot)):
                 spot = Pose(
-                    Point((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)), UnitQuaternion(IDENTITY)
+                    Point((row * SPOT_PITCH_M, column * SPOT_PITCH_M, 0.0)), UnitQuaternion.IDENTITY
                 )
                 if not self.occupied(spot, promised, leaving):
                     return spot
@@ -287,7 +287,7 @@ def _stance(stage, robot: Robot):
     rolls, the frame of a body of its own hanging from the world on a free
     joint, body and joint named as the robot is."""
     position = list(robot.placement.position.position)
-    orientation = list(wxyz_of_xyzw(robot.placement.orientation.quaternion))
+    orientation = list(robot.placement.orientation.wxyz)
     if not robot.known.rolls:
         frame = stage.worldbody.add_frame()
         frame.pos, frame.quat = position, orientation

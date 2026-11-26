@@ -9,8 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
+use camera_core::depth_camera::{
+    self, DepthCameraError, DepthExtrinsics, DepthIntrinsics, HeaderMismatch, read_depth_camera,
+};
 use camera_core::encoding::DEPTH_ENCODING;
-use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
 use chain_kinematics::ChainFrame;
 use chain_kinematics::nalgebra::Isometry3;
 use collision_geometry::chain::BodyGeometry;
@@ -774,18 +776,12 @@ fn openings_of<const N: usize, const K: usize>(
 
 /// The depth camera as the map reads it, as its geometry and its stream describe it.
 struct DepthStream {
-    /// The camera's frame, its color optical frame, in which its geometry places the depth
-    /// optical frame and which each depth frame names.
-    frame: String,
-    /// The depth optical frame in the camera's frame.
-    depth_in_color: Transform,
-    lens: Pinhole,
-    depth_model: DepthModel,
+    /// The camera's geometry: its frame, its color optical frame, which each depth frame
+    /// names, the depth optical frame in it, the lens, the depth model and the alignment
+    /// each depth frame carries.
+    geometry: depth_camera::DepthCamera,
     /// Meters per depth count.
     depth_unit: f32,
-    /// The alignment the lens and the depth frame's offset describe: a depth frame read
-    /// with them carries it in its header (camera_geometry's `align_mode`).
-    align_mode: String,
 }
 
 impl DepthStream {
@@ -794,29 +790,21 @@ impl DepthStream {
     fn depth_at(&self, color_in_robot: &Transform) -> DepthCamera {
         DepthCamera::new(
             color_in_robot,
-            &self.depth_in_color,
-            self.lens,
-            self.depth_model,
+            &self.geometry.depth_in_color,
+            self.geometry.lens,
+            self.geometry.depth_model,
             self.depth_unit,
         )
     }
 
-    /// Why a depth frame of `header` is no frame of this description: its alignment or its
-    /// frame differ from those the geometry describes; none where it is.
-    fn mismatch(&self, header: &depth_stream::MessageHeader) -> Option<String> {
-        if header.align_mode != self.align_mode {
-            return Some(format!(
-                "the depth frames carry align_mode {:?}, and the camera's geometry describes {:?}",
-                header.align_mode, self.align_mode
-            ));
-        }
-        (header.frame != self.frame).then(|| {
-            format!(
-                "the depth frames name the frame {:?}, and the camera's geometry places its depth \
-                 imager in {:?}",
-                header.frame, self.frame
-            )
-        })
+    /// Admits a depth frame of `header`, whose alignment and frame are those the geometry
+    /// describes; refused naming both values otherwise.
+    fn admits(
+        &self,
+        header: &depth_stream::MessageHeader,
+    ) -> std::result::Result<(), HeaderMismatch> {
+        self.geometry
+            .admits_frame(&header.align_mode, &header.frame)
     }
 }
 
@@ -861,45 +849,50 @@ async fn describe_camera(
         .await
         .map_err(|e| format!("get_depth_to_color_extrinsics: {e}"))?
         .data;
-    if intrinsics.align_mode != extrinsics.align_mode {
-        return Err(format!(
-            "get_depth_intrinsics describes align_mode {:?} and get_depth_to_color_extrinsics {:?}",
-            intrinsics.align_mode, extrinsics.align_mode
-        ));
-    }
+    let geometry = parse_depth_camera(&intrinsics, &extrinsics).map_err(|e| e.to_string())?;
     let info = depth_stream_info::poll(runner, &links.camera, SERVICE_TIMEOUT)
         .await
         .map_err(|e| format!("depth_stream_info: {e}"))?
         .data;
-    let depth_to_color = extrinsics.depth_to_color;
-    let depth_in_color = Pose::parse(depth_to_color.position, depth_to_color.orientation)
-        .map(Pose::transform)
-        .map_err(|e| format!("get_depth_to_color_extrinsics: {e}"))?;
-    let lens = Pinhole::parse(&Intrinsics {
-        width: intrinsics.width,
-        height: intrinsics.height,
-        fx: intrinsics.fx,
-        fy: intrinsics.fy,
-        cx: intrinsics.cx,
-        cy: intrinsics.cy,
-        distortion_model: &intrinsics.distortion_model,
-        distortion: &intrinsics.distortion,
-    })
-    .map_err(|e| format!("get_depth_intrinsics: {e}"))?;
-    let depth_model = DepthModel::parse(&intrinsics.depth_model)
-        .map_err(|e| format!("get_depth_intrinsics: {e}"))?;
     info!(
         "depth camera in {}: depth {}x{}, align_mode {:?}",
-        depth_to_color.frame, intrinsics.width, intrinsics.height, intrinsics.align_mode
+        geometry.frame,
+        geometry.lens.width(),
+        geometry.lens.height(),
+        geometry.align_mode
     );
     Ok(DepthStream {
-        frame: depth_to_color.frame,
-        depth_in_color,
-        lens,
-        depth_model,
+        geometry,
         depth_unit: info.depth_unit,
-        align_mode: intrinsics.align_mode,
     })
+}
+
+/// The depth camera `intrinsics` and `extrinsics` describe, read by camera_core.
+fn parse_depth_camera(
+    intrinsics: &get_depth_intrinsics::ResponseData,
+    extrinsics: &get_depth_to_color_extrinsics::ResponseData,
+) -> std::result::Result<depth_camera::DepthCamera, DepthCameraError> {
+    let depth_to_color = &extrinsics.depth_to_color;
+    read_depth_camera(
+        &DepthIntrinsics {
+            width: intrinsics.width,
+            height: intrinsics.height,
+            fx: intrinsics.fx,
+            fy: intrinsics.fy,
+            cx: intrinsics.cx,
+            cy: intrinsics.cy,
+            distortion_model: &intrinsics.distortion_model,
+            distortion: &intrinsics.distortion,
+            depth_model: &intrinsics.depth_model,
+            align_mode: &intrinsics.align_mode,
+        },
+        &DepthExtrinsics {
+            frame: &depth_to_color.frame,
+            position: depth_to_color.position,
+            orientation: depth_to_color.orientation,
+            align_mode: &extrinsics.align_mode,
+        },
+    )
 }
 
 /// The newest depth frame that has arrived, as the intake takes it.
@@ -1044,8 +1037,8 @@ async fn take_frames<const N: usize, const D: usize, const K: usize>(
         let Some(frame) = next else {
             return;
         };
-        if let Some(reason) = intake.camera.mismatch(&frame.header) {
-            intake.skip(format!("{reason}; asking the camera again"));
+        if let Err(mismatch) = intake.camera.admits(&frame.header) {
+            intake.skip(format!("{mismatch}; asking the camera again"));
             tokio::select! {
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(RETRY) => {}
@@ -2944,6 +2937,7 @@ mod tests {
     };
 
     use crate::config::tests::parameters;
+    use camera_core::pinhole::{DepthModel, Intrinsics, Pinhole};
 
     /// The node for an OpenArm v2 from `params`, the camera linked or not, on the wall clock.
     fn started(params: &Parameters, camera_linked: bool) -> Node {
@@ -3550,11 +3544,6 @@ mod tests {
         }
     }
 
-    /// The transform that moves nothing.
-    fn identity() -> Transform {
-        Transform::new([0.0; 3], [0.0, 0.0, 0.0, 1.0]).expect("the identity is a transform")
-    }
-
     /// The frame of the one-pixel camera of `intake`.
     const CAMERA_FRAME: &str = "chest_optical_frame";
 
@@ -3574,12 +3563,14 @@ mod tests {
         Intake::new(
             node,
             DepthStream {
-                frame: CAMERA_FRAME.to_string(),
-                depth_in_color: identity(),
-                lens,
-                depth_model: DepthModel::Z,
+                geometry: depth_camera::DepthCamera {
+                    lens,
+                    depth_model: DepthModel::Z,
+                    frame: FrameName::parse(CAMERA_FRAME).expect("a frame name"),
+                    depth_in_color: Transform::IDENTITY,
+                    align_mode: "depth_to_color".to_string(),
+                },
                 depth_unit: 0.001,
-                align_mode: "depth_to_color".to_string(),
             },
         )
     }
@@ -3729,8 +3720,8 @@ mod tests {
         else {
             panic!("the camera's transform of 2 s places the frame");
         };
-        assert_eq!(pose.origin(), [0.5, 0.0, 1.0]);
-        assert_eq!(pose.orientation(), [0.0, 0.0, 0.0, 1.0]);
+        assert_eq!(pose.position(), [0.5, 0.0, 1.0]);
+        assert_eq!(pose.orientation(), frame_tree::UnitQuaternion::IDENTITY);
 
         let at_once = started(
             &Parameters {
@@ -3786,16 +3777,16 @@ mod tests {
     fn a_frame_of_another_frame_or_alignment_than_the_geometry_describes_is_named() {
         let camera = intake(Arc::new(started(&parameters(), true))).camera;
         let header = || frame_at(after(0)).header;
-        assert_eq!(camera.mismatch(&header()), None);
+        assert_eq!(camera.admits(&header()), Ok(()));
         let elsewhere = depth_stream::MessageHeader {
             frame: "head_optical_frame".to_string(),
             ..header()
         };
         assert_eq!(
-            camera.mismatch(&elsewhere),
-            Some(
+            camera.admits(&elsewhere).map_err(|e| e.to_string()),
+            Err(
                 "the depth frames name the frame \"head_optical_frame\", and the camera's \
-                 geometry places its depth imager in \"chest_optical_frame\""
+                 geometry places the depth stream in \"chest_optical_frame\""
                     .to_string()
             )
         );
@@ -3804,8 +3795,8 @@ mod tests {
             ..header()
         };
         assert_eq!(
-            camera.mismatch(&unaligned),
-            Some(
+            camera.admits(&unaligned).map_err(|e| e.to_string()),
+            Err(
                 "the depth frames carry align_mode \"none\", and the camera's geometry \
                  describes \"depth_to_color\""
                     .to_string()
@@ -3828,7 +3819,7 @@ mod tests {
         let first = after(1_000);
         let mut intake = intake(node.clone());
         assert!(!intake.took_recently(first), "no frame taken yet");
-        take_frame(&mut intake, &frame_at(first), &identity());
+        take_frame(&mut intake, &frame_at(first), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(first));
         assert!(intake.took_recently(first + interval / 2));
         assert!(!intake.took_recently(first + interval));
@@ -3951,7 +3942,7 @@ mod tests {
         measure_at(&node, after(1_100), still());
         clear(&node);
         assert_eq!(given(&mut waiting), Some(after(1_050)));
-        take_frame(&mut intake, &frame_at(after(1_050)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_050)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None, "the frame taken before the clear");
         assert_eq!(snapshot(&node), waiting_on(AWAITING_FRAME.to_string()));
 
@@ -3971,7 +3962,7 @@ mod tests {
     fn a_clock_that_steps_back_clears_the_map() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(1_000)));
         let (newest, mut waiting) = waiting_frames(&node);
         send_frame(&newest, 2_050);
@@ -3992,9 +3983,9 @@ mod tests {
         );
         measure(&node, 600, 2_100);
         assert_eq!(given(&mut waiting), None, "the frame of the clock before");
-        take_frame(&mut intake, &frame_at(after(500)), &identity());
+        take_frame(&mut intake, &frame_at(after(500)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None, "the frame at the restart");
-        take_frame(&mut intake, &frame_at(after(700)), &identity());
+        take_frame(&mut intake, &frame_at(after(700)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(700)));
     }
 
@@ -4143,7 +4134,7 @@ mod tests {
         measure_at(&node, after(1_000), opened(0.0));
         measure_at(&node, after(1_100), opened(1.0));
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_050)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_050)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(1_050)));
         let mut halfway = node.own.clone();
         halfway.set_openings(&PerArm::new([0.5, 0.5]));
@@ -4164,18 +4155,18 @@ mod tests {
     fn a_frame_taken_before_a_clear_marks_nothing() {
         let node = measured_node(0, 2_000);
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(1_000)));
         clear(&node);
         assert_eq!(map_stamp(&node), None);
-        take_frame(&mut intake, &frame_at(after(1_500)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_500)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None, "the frame of 1.5 s");
         assert_eq!(
             lock(&node.map).waiting,
             Waiting::Passing(AWAITING_FRAME.to_string())
         );
         measure(&node, 2_100, 2_500);
-        take_frame(&mut intake, &frame_at(after(2_400)), &identity());
+        take_frame(&mut intake, &frame_at(after(2_400)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(2_400)));
     }
 
@@ -4192,12 +4183,12 @@ mod tests {
         };
         let mut intake = intake(node.clone());
         node.wait_on("a depth frame was skipped: no joint positions were measured at its stamp");
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         clear(&node);
         assert_eq!(snapshot(&node), waiting(AWAITING_FRAME));
 
         measure(&node, 2_100, 2_500);
-        take_frame(&mut intake, &frame_at(after(2_400)), &identity());
+        take_frame(&mut intake, &frame_at(after(2_400)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), Some(after(2_400)));
         let lasting = "the depth camera: get_depth_intrinsics: no answer";
         node.wait_on_lasting(lasting);
@@ -4218,7 +4209,7 @@ mod tests {
                 encoding: "rgb8".to_string(),
                 ..frame_at(after(1_000))
             },
-            &identity(),
+            &Transform::IDENTITY,
         );
         assert_eq!(map_stamp(&node), None);
         assert_eq!(
@@ -4236,7 +4227,7 @@ mod tests {
     fn a_frame_whose_objects_the_tree_cannot_place_is_skipped() {
         let node = Arc::new(holding_an_object_the_tree_cannot_place());
         let mut intake = intake(node.clone());
-        take_frame(&mut intake, &frame_at(after(1_000)), &identity());
+        take_frame(&mut intake, &frame_at(after(1_000)), &Transform::IDENTITY);
         assert_eq!(map_stamp(&node), None);
         let Waiting::Passing(reason) = &lock(&node.map).waiting else {
             panic!("the map waits on the frame");
@@ -4309,7 +4300,8 @@ mod tests {
         let eye = point + Vector3::new(0.3, 0.0, 0.0);
         let facing = UnitQuaternion::rotation_between(&Vector3::z(), &-Vector3::x())
             .expect("a turn from +z to -x");
-        let camera = transform_of(&Isometry3::from_parts(eye.coords.into(), facing));
+        let camera = Transform::try_from(&Isometry3::from_parts(eye.coords.into(), facing))
+            .expect("a finite pose");
         let mut intake = intake(node.clone());
         take_frame(&mut intake, &frame_seeing(after(1_050), 300), &camera);
         assert_eq!(map_stamp(&node), Some(after(1_050)));
@@ -4324,16 +4316,11 @@ mod tests {
     /// A camera 0.3 m above `point`, looking down at it.
     fn above(point: [f64; 3]) -> Transform {
         let down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
-        transform_of(&Isometry3::from_parts(
+        Transform::try_from(&Isometry3::from_parts(
             Translation3::new(point[0], point[1], point[2] + 0.3),
             down,
         ))
-    }
-
-    /// `pose` as tf2's transform.
-    fn transform_of(pose: &Isometry3<f64>) -> Transform {
-        let (position, orientation) = pose_arrays(pose);
-        Transform::new(position, orientation).expect("a pose is a transform")
+        .expect("a finite pose")
     }
 
     /// The entry of apply_collision_objects that applies `operation` to the cube `id`,

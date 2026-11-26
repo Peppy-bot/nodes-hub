@@ -46,7 +46,7 @@ async fn a_lime_is_added_then_attached_to_the_right_arm() -> Result<(), String> 
         panic!("the shell is a shape")
     };
     assert!(look.wireframe);
-    assert_eq!(shape.pose.origin(), [0.4, -0.2, 0.1]);
+    assert_eq!(shape.pose.position(), [0.4, -0.2, 0.1]);
     planner
         .get_planning_scene
         .next_request(TIMEOUT)
@@ -76,7 +76,7 @@ async fn a_lime_is_added_then_attached_to_the_right_arm() -> Result<(), String> 
         panic!("the carried lime is a shape")
     };
     assert_eq!(
-        shape.pose.origin(),
+        shape.pose.position(),
         [0.0, 0.0, 0.05],
         "in the grasp link's frame"
     );
@@ -194,7 +194,7 @@ async fn a_scene_in_another_frame_than_the_robot_frame_is_dropped_and_logged() -
     else {
         panic!("the shell is a shape")
     };
-    assert_eq!(shape.pose.origin(), [0.4, -0.2, 0.1]);
+    assert_eq!(shape.pose.position(), [0.4, -0.2, 0.1]);
     assert_eq!(canvas.log_lines(CHANGES_PATH), ["added brain/lime_1"]);
     harness.shutdown().await.map_err(|e| e.to_string())
 }

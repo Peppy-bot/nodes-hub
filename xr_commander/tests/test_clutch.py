@@ -30,7 +30,7 @@ AT_HOME = reported(HOME)
 def at(pose: Pose, offset) -> Pose:
     """`pose` moved by `offset` (m), its orientation kept."""
     moved = tuple(p + o for p, o in zip(pose.position.position, offset))
-    return pose_at(moved, pose.orientation.quaternion)
+    return pose_at(moved, pose.orientation.xyzw)
 
 
 def position_of(target):
@@ -38,7 +38,7 @@ def position_of(target):
 
 
 def orientation_of(target):
-    return target.pose.orientation.quaternion
+    return target.pose.orientation.xyzw
 
 
 def engaged_clutch(motion_scale=1.0, measured=AT_HOME, hand=HAND):
@@ -265,6 +265,6 @@ def test_displacing_by_the_delta_between_two_poses_rebuilds_the_second():
     assert rebuilt.position.position == pytest.approx(
         moved.position.position, abs=1e-12
     )
-    assert rebuilt.orientation.quaternion == pytest.approx(
-        moved.orientation.quaternion, abs=1e-12
+    assert rebuilt.orientation.xyzw == pytest.approx(
+        moved.orientation.xyzw, abs=1e-12
     )

@@ -491,7 +491,7 @@ fn depth_to_color_extrinsics(
         get_depth_to_color_extrinsics::ResponseDepthToColor {
             frame: camera_frame.to_owned(),
             position: pose.position().position(),
-            orientation: pose.orientation().quaternion(),
+            orientation: pose.orientation().to_xyzw(),
         },
     ))
 }

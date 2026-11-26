@@ -54,12 +54,12 @@ async fn the_description_draws_the_links_and_each_snapshot_places_them() -> Resu
     };
     let expected = [-0.02, 0.0, 0.2];
     assert!(
-        pose.origin()
+        pose.position()
             .iter()
             .zip(expected)
             .all(|(got, want)| (got - want).abs() < 1e-12),
         "the finger at {:?}, not {expected:?}",
-        pose.origin()
+        pose.position()
     );
     harness.shutdown().await.map_err(|e| e.to_string())
 }

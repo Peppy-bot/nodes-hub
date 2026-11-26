@@ -106,7 +106,7 @@ mod tests {
                 radius: 0.03
             }
         );
-        assert_eq!(shape.pose.origin(), [0.0, 0.0, 0.1]);
+        assert_eq!(shape.pose.position(), [0.0, 0.0, 0.1]);
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
         assert!(matches!(drawn[0], Drawn::Time(time) if time == at));
         assert!(matches!(
             &drawn[1],
-            Drawn::Place { path, pose } if path == "world/robot/upper" && pose.origin() == [0.0, 0.0, 0.1]
+            Drawn::Place { path, pose } if path == "world/robot/upper" && pose.position() == [0.0, 0.0, 0.1]
         ));
     }
 }

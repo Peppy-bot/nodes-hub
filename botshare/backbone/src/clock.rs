@@ -64,15 +64,11 @@ pub fn ns_from_wire(time: SystemTime) -> Option<i64> {
         .and_then(|stamp| i64::try_from(stamp.as_nanos()).ok())
 }
 
-/// Nanoseconds on the node's clock as a wire time: the time of their
-/// [`Stamp`], the clock's origin for a time before it.
-pub fn wire_from_ns(time_ns: i64) -> SystemTime {
-    Stamp::from_nanos(time_ns.max(0).unsigned_abs()).time()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use control_core::node_clock::wire_from_ns;
 
     #[test]
     fn a_wire_time_and_its_nanoseconds_round_trip() {

@@ -95,7 +95,7 @@ fn response_of(lookup: &Lookup, found: Found) -> Response {
         lookup.source.to_string(),
         report_timestamp(found.time),
         found.placement.position(),
-        found.placement.orientation(),
+        found.placement.orientation().to_xyzw(),
     )
 }
 

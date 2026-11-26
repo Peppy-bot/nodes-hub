@@ -51,4 +51,4 @@ peppygen = { path = ".peppy/libs/peppygen" }
 peppylib = { path = ".peppy/libs/peppylib" }
 # brain_core lives in the public-peppy-libs repository, pinned to one commit
 # of it: the node image holds the node's own directory alone.
-brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "cd01c2250adb5632e4562b0a9e03cb66ca201e94" }
+brain_core = { git = "https://github.com/Peppy-bot/public-peppy-libs", subdirectory = "brain_core", rev = "0eb26e91b92cbbf19d146063b9a8b7f19d074765" }

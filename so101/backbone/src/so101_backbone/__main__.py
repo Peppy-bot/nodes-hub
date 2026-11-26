@@ -207,7 +207,7 @@ async def _consume_pose_setpoints(
         except Refusal as e:
             raise SetpointError(str(e)) from None
         coordinator.leader_pose.set(
-            (pose.position.position, pose.orientation.quaternion),
+            (pose.position.position, pose.orientation.xyzw),
             wire_timestamp_s=_now_s() if m.timestamp is None else m.timestamp,
         )
 

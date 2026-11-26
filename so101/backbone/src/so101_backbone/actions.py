@@ -1346,7 +1346,7 @@ def _goal_of(target: PoseTarget, duration_s: float) -> PoseGoal:
     """The goal of `target`, placed in the robot frame, taking `duration_s`."""
     return PoseGoal(
         position=target.position.position,
-        orientation=None if target.orientation is None else target.orientation.quaternion,
+        orientation=None if target.orientation is None else target.orientation.xyzw,
         duration_s=duration_s,
     )
 

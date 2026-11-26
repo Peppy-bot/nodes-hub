@@ -1,17 +1,30 @@
+from dataclasses import replace
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
+import pytest
 from peppygen.consumed_topics.alerts import alerts as alerts_topic
 
-from tests.helpers import ManualClock, ScriptedHeadset, source, squeezing_hand
+from tests.helpers import (
+    DIRECTOR_LEASE,
+    HOME_REACHED,
+    FakeStops,
+    ScriptedHeadset,
+    source,
+    squeezing_hand,
+)
 from xr_commander import panel
 from xr_commander.alerts import ActiveAlerts
 from xr_commander.clutch import HandClutch
 from xr_commander.motor_health import HealthRow, Level, MotorHealthReports
 from xr_commander.panel import (
+    BaseSource,
     HandSource,
     PanelLine,
     PanelState,
     alert_lines,
+    base_line,
     fit_text,
     hand_line,
     health_lines,
@@ -19,9 +32,17 @@ from xr_commander.panel import (
     render,
     snapshot,
 )
-from xr_commander.bus import FlashNote
-from xr_commander.drive import HandState, RobotLine
-from xr_commander.postures import PostureStatus
+from xr_commander.base import (
+    AxisLimits,
+    BaseLimits,
+    BaseReport,
+    BaseReports,
+    FollowState,
+    NotedStops,
+)
+from xr_commander.devices import Hand
+from xr_commander.drive import GripStatus, RobotLine
+from xr_commander.grip_world import Idle, Lingering, Pin, Slot
 from xr_commander.publish import MeasuredPoses
 from xr_commander.record import RecorderStatus
 from xr_commander.task_page import UNNAMED_TASK
@@ -81,7 +102,7 @@ def states(**overrides):
         "gripper_bound": True,
         "tracked": True,
         "squeezing": True,
-        "wait_release": False,
+        "must_release": False,
         "follower_fresh": True,
         "engaged": True,
     }
@@ -110,8 +131,6 @@ def test_a_posture_note_takes_the_hands_row():
 
 
 def test_the_posture_state_rides_the_right_hands_row():
-    posture = PostureStatus()
-    posture.moving = "home"
     session = ScriptedHeadset(hands={"left": squeezing_hand()})
     moving = "moving to home..."
     state = snapshot(
@@ -120,24 +139,22 @@ def test_the_posture_state_rides_the_right_hands_row():
         10.0,
         quiet(),
         no_health(),
-        posture=posture,
+        posture=lambda: moving,
     )
     rows = {row.label: row.state for row in state.hands}
     assert rows["RIGHT"] == moving
     assert rows["LEFT"] != moving
-    posture.moving = None
-    posture.set_note("move to home completed")
     state = snapshot(
         session,
         [source("left"), source("right")],
         10.0,
         quiet(),
         no_health(),
-        posture=posture,
+        posture=lambda: HOME_REACHED,
     )
     assert {row.label: row.state for row in state.hands}[
         "RIGHT"
-    ] == "move to home completed"
+    ] == HOME_REACHED
 
 
 def test_each_gate_the_operator_hits_gets_its_own_wording():
@@ -146,7 +163,7 @@ def test_each_gate_the_operator_hits_gets_its_own_wording():
     assert state_of(arm_bound=False, gripper_bound=False) == "nothing bound"
     assert state_of(tracked=False) == "no controller"
     assert state_of(squeezing=False) == "grip released"
-    assert state_of(wait_release=True) == "release the grip, then squeeze again"
+    assert state_of(must_release=True) == "release the grip, then squeeze again"
     assert state_of(follower_fresh=False) == "waiting for arm"
     assert state_of(engaged=False) == "re-anchoring"
     assert state_of() == "driving"
@@ -222,7 +239,7 @@ def test_a_pair_established_after_boot_reaches_the_panel():
     hand = HandSource(
         handedness="left",
         clutch=HandClutch(1.0),
-        state=HandState(FlashNote()),
+        grip=lambda: GripStatus(Idle(), frozenset(), ""),
         measured=MeasuredPoses(),
         arm_peer=lambda: paired[0] if paired else None,
         gripper_peer=lambda: None,
@@ -247,11 +264,16 @@ def test_a_long_row_state_stays_inside_the_panel():
 
 
 def test_a_one_armed_robots_only_row_carries_the_posture_note():
-    posture = PostureStatus()
-    posture.moving = "home"
     session = ScriptedHeadset(hands={"left": squeezing_hand()})
     hands = [source("left"), source("right", arm_bound=False, gripper_bound=False)]
-    rows = snapshot(session, hands, 10.0, quiet(), no_health(), posture=posture).hands
+    rows = snapshot(
+        session,
+        hands,
+        10.0,
+        quiet(),
+        no_health(),
+        posture=lambda: "moving to home...",
+    ).hands
     assert [(row.label, row.state) for row in rows] == [("ARM", "moving to home...")]
 
 
@@ -688,7 +710,7 @@ def test_a_task_too_long_for_its_column_stays_inside_the_canvas():
 def test_the_robot_row_comes_first_and_wears_the_colour_of_who_holds_the_robot():
     driving = panel.robot_row(RobotLine("alpha: driven from this headset", "driving"))
     leased = panel.robot_row(
-        RobotLine("alpha: leased by director_inst (tidy the table)", "waiting")
+        RobotLine(f"alpha: leased by director_inst ({DIRECTOR_LEASE})", "waiting")
     )
     assert (driving.label, driving.colour) == ("ROBOT", panel._DRIVING)
     assert leased.colour == panel._WAITING
@@ -710,16 +732,15 @@ def test_the_robot_row_comes_first_and_wears_the_colour_of_who_holds_the_robot()
 
 
 def test_a_refused_squeeze_flashes_its_cause_on_the_hand_that_squeezed():
-    clock = ManualClock()
+    note = "squeeze refused: robot `alpha` is leased by `director_inst`"
     hand = HandSource(
         handedness="left",
         clutch=HandClutch(1.0),
-        state=HandState(FlashNote(clock)),
+        grip=lambda: GripStatus(Idle(), frozenset(), note),
         measured=MeasuredPoses(),
         arm_peer=lambda: "peer",
         gripper_peer=lambda: None,
     )
-    hand.state.note.set("squeeze refused: robot `alpha` is leased by `director_inst`")
     rows = snapshot(
         ScriptedHeadset(hands={"left": squeezing_hand()}),
         [hand],
@@ -727,9 +748,20 @@ def test_a_refused_squeeze_flashes_its_cause_on_the_hand_that_squeezed():
         quiet(),
         no_health(),
     ).hands
-    assert (
-        rows[0].state == "squeeze refused: robot `alpha` is leased by `director_inst`"
+    assert rows[0].state == note
+
+
+def test_a_hand_that_must_release_its_squeeze_says_so_on_its_row():
+    session = ScriptedHeadset(hands={"left": squeezing_hand()})
+    hand = replace(
+        source("left"),
+        grip=lambda: GripStatus(Idle(), frozenset({Hand.LEFT}), ""),
     )
+    rows = snapshot(session, [hand, source("right")], 10.0, quiet(), no_health())
+    assert [row.state for row in rows.hands] == [
+        "release the grip, then squeeze again",
+        "no controller",
+    ]
 
 
 def test_the_four_status_rows_end_above_the_alerts_and_the_motors_inside_the_canvas():
@@ -789,3 +821,299 @@ def test_truncation_only_when_the_whole_text_cannot_fit_at_the_floor():
             assert width_at_floor > available, (
                 f"truncated at {available}px though the whole text fits at the floor"
             )
+
+
+# A differential base's limits along x, y and of the turn (m/s, rad/s).
+LIMITS = BaseLimits(AxisLimits(-0.4, 0.8), AxisLimits(0.0, 0.0), AxisLimits(-1.5, 1.0))
+# A base's report as the panel reads it: following, standing, arrived at the
+# start of the instance's clock.
+FOLLOWING = BaseReport(FollowState.FOLLOWING, "standing", LIMITS, 0)
+
+
+def base_states(**overrides):
+    """The base row's conditions, all met: the base drives."""
+    conditions = {
+        "dropped": None,
+        "report": FOLLOWING,
+        "tracked": True,
+        "squeezing": True,
+        "must_release": False,
+        "engaged": True,
+        "following": True,
+    }
+    return {**conditions, **overrides}
+
+
+def base_state_of(**overrides) -> str:
+    return base_line(**base_states(**overrides)).state
+
+
+def holding(follow_state: FollowState, mode="standing") -> BaseReport:
+    return BaseReport(follow_state, mode, LIMITS, 0)
+
+
+DROPPED = "max_rate nan is not 0 or above"
+BASE_NOTE = "squeeze refused: the base does not report"
+# Each row of the base, by its place in the row's order: the conditions that
+# give it, its text and its colour.
+BASE_ROWS = {
+    1: ({"note": BASE_NOTE}, BASE_NOTE, panel._WAITING),
+    2: (
+        {"dropped": DROPPED},
+        f"drive_states unreadable ({DROPPED}): check its base node",
+        panel._NOT_REPORTING_MAGENTA,
+    ),
+    3: (
+        {"report": None},
+        "the base does not report: check its base node",
+        panel._NOT_REPORTING_MAGENTA,
+    ),
+    4: (
+        {"report": holding(FollowState.BASE_SILENCE)},
+        "the base's motion sensing is silent: it rests until it reports and 0.5 s"
+        " pass with no setpoint",
+        panel._WAITING,
+    ),
+    5: (
+        {"report": holding(FollowState.ROBOT_STOP)},
+        "a robot stop holds the base",
+        panel._WAITING,
+    ),
+    6: (
+        {"report": holding(FollowState.FOLLOWER_GOAL)},
+        "a goal of the base's node holds it: cancel it or let it end",
+        panel._WAITING,
+    ),
+    7: (
+        {"report": holding(FollowState.BASE_MODE, mode="damped")},
+        "base damped, no velocity: release its hold, such as its e-stop",
+        panel._WAITING,
+    ),
+    8: ({"tracked": False, "squeezing": False}, "no controller", panel._RESTING),
+    9: ({"squeezing": False}, "grip released", panel._RESTING),
+    10: (
+        {"must_release": True},
+        "release the grip, then squeeze again",
+        panel._WAITING,
+    ),
+    11: (
+        {"engaged": False, "following": False},
+        "taking the robot",
+        panel._WAITING,
+    ),
+    12: ({"following": False}, "waiting for the base", panel._WAITING),
+    13: ({}, "driving", panel._DRIVING),
+}
+
+
+def test_each_hold_of_the_base_says_why():
+    texts = {
+        follow_state: base_state_of(report=holding(follow_state, mode="damped"))
+        for follow_state in FollowState
+        if follow_state is not FollowState.FOLLOWING
+    }
+    assert texts == {
+        FollowState.BASE_MODE: (
+            "base damped, no velocity: release its hold, such as its e-stop"
+        ),
+        FollowState.BASE_SILENCE: (
+            "the base's motion sensing is silent: it rests until it reports and"
+            " 0.5 s pass with no setpoint"
+        ),
+        FollowState.ROBOT_STOP: "a robot stop holds the base",
+        FollowState.FOLLOWER_GOAL: (
+            "a goal of the base's node holds it: cancel it or let it end"
+        ),
+    }
+    assert {
+        base_line(**base_states(report=holding(state))).colour for state in texts
+    } == {panel._WAITING}
+
+
+@pytest.mark.parametrize("row", range(3, 14))
+def test_every_fixed_base_text_fits_the_row_whole_in_the_longest_mode(row):
+    width = panel._WIDTH - panel._MARGIN_X - panel._STATE_X
+    conditions, _text, _colour = BASE_ROWS[row]
+    if row == 7:
+        conditions = {"report": holding(FollowState.BASE_MODE, mode="transition")}
+    text = base_state_of(**conditions)
+    fitted, _scale = fit_text(
+        text, panel._FONT, panel._BODY_SCALE, panel._STROKE, width
+    )
+    assert fitted == text
+
+
+@pytest.mark.parametrize("row", sorted(BASE_ROWS))
+def test_each_base_row_gives_its_text_and_colour(row):
+    conditions, text, colour = BASE_ROWS[row]
+    assert base_line(**base_states(**conditions)) == panel.Row("BASE", text, colour)
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later"),
+    [
+        (1, 2),
+        (2, 3),
+        (3, 8),
+        (4, 8),
+        (5, 8),
+        (6, 8),
+        (7, 8),
+        (8, 9),
+        (9, 10),
+        (10, 11),
+        (11, 12),
+        (12, 13),
+    ],
+)
+def test_the_earliest_base_row_wins(earlier, later):
+    conditions = {**BASE_ROWS[later][0], **BASE_ROWS[earlier][0]}
+    assert base_state_of(**conditions) == BASE_ROWS[earlier][1]
+
+
+IDLE_BASE = GripStatus(Idle(), frozenset(), "")
+
+
+def base_source(
+    *, peer="base peer", reports=None, now_ns=0, status=IDLE_BASE
+) -> BaseSource:
+    """The panel's view of a base paired as `peer`, reporting into
+    `reports`, on an instance clock at `now_ns`, with the base grip at
+    `status`."""
+    reports = reports if reports is not None else BaseReports(lambda: now_ns)
+    return BaseSource(
+        grip=lambda: status,
+        reports=reports,
+        stops=NotedStops(FakeStops([]), reports),
+        peer=lambda: peer,
+    )
+
+
+def reported_base(peer, follow_state="following", *, at_ns=0):
+    """A base's reports holding one drive_states of `peer` that arrived at
+    `at_ns` on the instance's clock, on a clock the test sets."""
+    clock = {"now_ns": at_ns}
+    reports = BaseReports(lambda: clock["now_ns"])
+    reports.record(
+        peer,
+        SimpleNamespace(
+            follow_state=follow_state,
+            mode="standing",
+            linear_limits=SimpleNamespace(
+                min_velocity=[-0.4, 0.0], max_velocity=[0.8, 0.0]
+            ),
+            angular_limits=SimpleNamespace(min_rate=-1.5, max_rate=1.0),
+        ),
+    )
+    return reports, clock
+
+
+def test_a_base_reports_for_half_a_second_of_the_instances_clock_after_its_report():
+    reports, clock = reported_base("base peer")
+    session = ScriptedHeadset(hands={"left": squeezing_hand()})
+
+    def row():
+        base = base_source(reports=reports)
+        return snapshot(session, [], 10.0, quiet(), no_health(), base=base).base
+
+    assert row().state == "taking the robot"
+    clock["now_ns"] = 500_000_000
+    assert row().state == "taking the robot"
+    clock["now_ns"] = 500_000_001
+    assert row().state == "the base does not report: check its base node"
+
+
+def test_the_base_row_asks_for_a_release_while_every_squeezing_hand_must_release():
+    reports, _clock = reported_base("base peer")
+    both = ScriptedHeadset(
+        hands={"left": squeezing_hand(), "right": squeezing_hand()}
+    )
+
+    def row(session, must_release):
+        status = GripStatus(Idle(), frozenset(must_release), "")
+        base = base_source(reports=reports, status=status)
+        return snapshot(session, [], 10.0, quiet(), no_health(), base=base).base
+
+    release_first = "release the grip, then squeeze again"
+    assert row(both, {Hand.LEFT, Hand.RIGHT}).state == release_first
+    # The right hand's squeeze is a claim of its own on the base.
+    assert row(both, {Hand.LEFT}).state == "taking the robot"
+    left_only = ScriptedHeadset(hands={"left": squeezing_hand()})
+    assert row(left_only, {Hand.LEFT}).state == release_first
+
+
+def test_the_base_row_reads_the_pair_its_grip_drives_else_the_chosen_robots():
+    reports, _clock = reported_base("driven peer", "robot_stop")
+    session = ScriptedHeadset(hands={"left": squeezing_hand()})
+    lingering = GripStatus(
+        Lingering("alpha", frozenset({Pin(Slot.BASE, "driven peer")}), 1),
+        frozenset(),
+        "",
+    )
+
+    def row(status):
+        base = base_source(peer="chosen peer", reports=reports, status=status)
+        return snapshot(session, [], 10.0, quiet(), no_health(), base=base).base
+
+    assert row(lingering).state == "a robot stop holds the base"
+    assert row(IDLE_BASE).state == "the base does not report: check its base node"
+
+
+def test_a_robot_that_pairs_a_base_alone_shows_the_base_and_no_hand():
+    session = ScriptedHeadset(hands={"left": squeezing_hand()})
+    hands = [source("left", arm_bound=False), source("right", arm_bound=False)]
+    state = snapshot(session, hands, 10.0, quiet(), no_health(), base=base_source())
+    assert state.hands == ()
+    assert state.base == panel.Row(
+        "BASE",
+        "the base does not report: check its base node",
+        panel._NOT_REPORTING_MAGENTA,
+    )
+    # A robot with no base gets no base row.
+    unpaired = snapshot(
+        session, hands, 10.0, quiet(), no_health(), base=base_source(peer=None)
+    )
+    assert unpaired.base is None
+    assert [row.state for row in unpaired.hands] == ["nothing bound"] * 2
+
+
+def test_the_base_row_is_drawn_after_the_hands_and_before_the_recorder():
+    rows = (hand_line("LEFT", **states()), hand_line("RIGHT", **states()))
+    without = render(PanelState(headset_live=True, hands=rows))
+    with_base = render(
+        PanelState(headset_live=True, hands=rows, base=base_line(**base_states()))
+    )
+    third_band = slice(
+        panel._FIRST_ROW_BASELINE + 2 * panel._ROW_STEP - 30,
+        panel._FIRST_ROW_BASELINE + 2 * panel._ROW_STEP + 6,
+    )
+    assert not np.array_equal(without[third_band], with_base[third_band])
+    recorder = recorder_row(recording_status())
+    both = render(
+        PanelState(
+            headset_live=True,
+            hands=rows,
+            base=base_line(**base_states()),
+            recorder=recorder,
+        )
+    )
+    fourth_band = slice(
+        panel._FIRST_ROW_BASELINE + 3 * panel._ROW_STEP - 30,
+        panel._FIRST_ROW_BASELINE + 3 * panel._ROW_STEP + 6,
+    )
+    assert not np.array_equal(with_base[fourth_band], both[fourth_band])
+
+
+def test_a_base_row_past_the_four_status_rows_fails_loudly():
+    # The robot's row, two hands and the recorder's fill the four rows.
+    session = ScriptedHeadset(hands={"left": squeezing_hand()})
+    full = {
+        "recorder": recording_status(),
+        "robot": RobotLine("alpha: free", "resting"),
+    }
+    hands = [source("left"), source("right")]
+    snapshot(session, hands, 10.0, quiet(), no_health(), **full)
+    with pytest.raises(AssertionError):
+        snapshot(
+            session, hands, 10.0, quiet(), no_health(), base=base_source(), **full
+        )

@@ -20,12 +20,16 @@ from xr_commander.robots import JOIN_HINT
 from xr_commander.xr import include_router_first
 
 from tests.helpers import (
+    DIRECTOR_LEASE,
     FORM,
     FakeRobots,
     FakeToken,
     ManualClock,
     asgi_request,
 )
+
+# A robot's state on the page while the director leases it.
+LEASED_BY_DIRECTOR = f"leased by director_inst ({DIRECTOR_LEASE})"
 
 
 def states_of(robots, states=None) -> RobotStates:
@@ -47,16 +51,14 @@ def names_of(served) -> list[str]:
 
 def test_the_offer_lists_the_paired_robots_their_states_and_the_chosen_one():
     robots = FakeRobots(["alpha", "bravo"], "bravo")
-    states = states_of(
-        robots, {"alpha": "free", "bravo": "leased by director_inst (tidy the table)"}
-    )
+    states = states_of(robots, {"alpha": "free", "bravo": LEASED_BY_DIRECTOR})
     states.refresh()
     served = asgi_request(app_over(robots, states), "GET", ROBOT_PATH)
     assert served.status == 200
     assert json.loads(served.body) == {
         "robots": [
             {"name": "alpha", "state": "free"},
-            {"name": "bravo", "state": "leased by director_inst (tidy the table)"},
+            {"name": "bravo", "state": LEASED_BY_DIRECTOR},
         ],
         "chosen": "bravo",
         "empty": NO_ROBOT_TEXT,
@@ -220,7 +222,7 @@ async def test_a_page_that_falls_behind_gets_the_latest_robots_only():
     held = {"alpha": "free"}
     states = states_of(robots, held)
     queue = states.follow()
-    for state in ("leased by director_inst (tidy the table)", "free"):
+    for state in (LEASED_BY_DIRECTOR, "free"):
         held["alpha"] = state
         states.refresh()
     await asyncio.sleep(0)

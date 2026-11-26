@@ -7,9 +7,10 @@
 use std::time::SystemTime;
 
 use chain_kinematics::nalgebra::Isometry3;
-use control_core::geometry::{Point, Pose, Stamped, UnitQuaternion};
+use control_core::geometry::{Point, Pose, Stamped};
 use control_core::robot_tree::PlaceError;
 use frame_tree::FrameName;
+use frame_tree::UnitQuaternion;
 use motion_planning_core::{AttachRequest, ObjectRequest, SceneSnapshot, ShapeFields};
 use peppygen::exposed_services::motion_planning::get_planning_scene::{
     Response, ResponseAllowedPairsItem, ResponseAttachedObjectsItem,
@@ -202,7 +203,7 @@ fn shapes_of(
                     .collect(),
                 mesh_triangles: shape.mesh_triangles.clone(),
                 position: pose.position().position(),
-                orientation: pose.orientation().quaternion(),
+                orientation: pose.orientation().to_xyzw(),
             })
         })
         .collect()
