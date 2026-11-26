@@ -6,9 +6,9 @@ under its own stamp, every completed edit included, what get_object answers
 for one object of that capture, what get_robots_list answers, how a goal's
 target, force and timestamp reach the stage, what a load_scene or
 spawn_object goal reports on its feedback, and the failure kind of each goal
-refused when it arrives, a goal in a frame other than world and each
-load_template goal among them, of each goal whose command fails, and of each
-error reply."""
+refused when it arrives, a goal in a frame other than world, each
+load_template goal and each resize_object goal among them, of each goal whose
+command fails, and of each error reply."""
 
 import asyncio
 import contextlib
@@ -1467,7 +1467,7 @@ def test_a_goal_that_arrives_before_the_catalogue_is_refused_until_it_is_discove
 
 def test_the_engine_serves_each_action_the_node_exposes_on_the_scene_slot(provider):
     """The manifest exposes each action of scene_manipulation on the scene slot, as peppy asks of a node that
-    implements the contract, and the engine serves each of them, load_template among them."""
+    implements the contract, and the engine serves each of them, load_template and resize_object among them."""
     node = pyjson5.loads((Path(__file__).resolve().parents[1] / "peppy.json5").read_text())
     exposed = {action["name"] for action in node["interfaces"]["actions"]["exposes"] if action["link_id"] == "scene"}
 
@@ -1505,6 +1505,40 @@ def test_each_load_template_goal_is_refused_with_rejected_and_changes_nothing(pr
     assert provider.launcher.mock_calls == []
     assert provider.io._handle_get_scene(None).asset_id == "scene/full_warehouse"
     assert _spawned_ids(provider) == [object_id]
+
+
+def test_each_resize_object_goal_is_refused_with_rejected_and_changes_nothing(provider):
+    """Isaac gives an object its size when it spawns it and changes no size after that, so it refuses each
+    resize_object goal with `rejected` when it arrives, before the catalogue is discovered as after, for an object
+    that stands on the stage as for an id that names none: no command is queued, and the spawned object stays as it
+    was spawned."""
+    events = []
+    provider.io._pending = _Commands(events)
+
+    def goals(object_id):
+        return [
+            _Goal(SimpleNamespace(object_id=object_id, scale=2.0, height_m=0.0), events),
+            _Goal(SimpleNamespace(object_id=object_id, scale=0.0, height_m=0.4), events),
+            _Goal(SimpleNamespace(object_id="obj_none", scale=0.5, height_m=0.0), events),
+        ]
+
+    before = _serve_goals(provider, "resize_object", *goals("obj_none"))
+    provider.io.set_assets(_CATALOGUE)
+    object_id = _spawn(provider)
+    spawned = provider.io._object(object_id)
+    provider.launcher.reset_mock()
+    after = _serve_goals(provider, "resize_object", *goals(object_id))
+
+    no_resize = (
+        "rejected",
+        "this simulation resizes no object where it stands: remove the object with remove_object and spawn it at "
+        "another scale with spawn_object instead",
+    )
+    assert [_refusal(decision) for decision in (*before.decisions, *after.decisions)] == [no_resize] * 6
+    assert events == []
+    assert provider.launcher.mock_calls == []
+    assert _spawned_ids(provider) == [object_id]
+    assert provider.io._object(object_id) == spawned
 
 
 def test_a_goal_whose_object_is_gone_by_the_time_its_command_runs_fails_with_the_same_kind(provider):

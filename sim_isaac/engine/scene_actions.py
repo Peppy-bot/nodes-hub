@@ -7,7 +7,8 @@ its values, and each goal that places a value in a frame other than world is
 refused with `unknown_frame`. A goal this bridge cannot run otherwise is
 refused when it arrives, with a failure kind of peppy: `rejected` for a
 request that names an asset or an object the stage does not hold or a value
-it does not take, and for each load_template, as the stage holds no template;
+it does not take, for each load_template, as the stage holds no template,
+and for each resize_object, as the stage resizes no object where it stands;
 `resource_unavailable` for a robot that does not stand on the stage; and
 `precondition_failed` while the asset catalogue is not discovered yet. A goal
 it accepted runs its command on the Isaac main thread, which checks the
@@ -45,6 +46,7 @@ from peppygen.exposed_actions.scene import (
     move_object,
     move_robot,
     remove_object,
+    resize_object,
     spawn_object,
 )
 from peppygen.exposed_services.objects import get_object_states
@@ -83,6 +85,7 @@ _ACTIONS: dict[str, ModuleType] = {
     "clear_scene": clear_scene,
     "spawn_object": spawn_object,
     "move_object": move_object,
+    "resize_object": resize_object,
     "remove_object": remove_object,
     "move_robot": move_robot,
 }
@@ -90,11 +93,17 @@ _ACTIONS: dict[str, ModuleType] = {
 # The actions of scene_manipulation whose every goal the stage refuses with
 # `rejected` when it arrives, by name, with the reason each refusal gives. A
 # goal of one runs no command. Isaac holds no template, so it loads none, as
-# scene_manipulation:v1 asks of an implementer that holds no template.
+# scene_manipulation:v1 asks of an implementer that holds no template. It
+# gives an object its size when it spawns it and changes no size after that,
+# as scene_manipulation:v1 asks of an implementer that resizes no object.
 _REFUSED_ACTIONS: dict[str, str] = {
     "load_template": (
         "this simulation holds no template, so it loads none: "
         "load a scene with load_scene instead"
+    ),
+    "resize_object": (
+        "this simulation resizes no object where it stands: remove the object "
+        "with remove_object and spawn it at another scale with spawn_object instead"
     ),
 }
 
