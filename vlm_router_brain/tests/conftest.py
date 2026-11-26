@@ -1,6 +1,8 @@
 """Shared test pieces: a scripted provider, a catalog of the test's own,
-and the records of one logger, so the router's parts run with no network,
-no key and no model."""
+the records of one logger, and no OpenAI-compatible API from the shell, so
+the router's parts run with no network, no key and no model. A test that
+calls an API calls the fake one of fake_api.py, on 127.0.0.1, with a key
+of the test's own (`through_api`)."""
 
 from __future__ import annotations
 
@@ -14,10 +16,80 @@ from typing import Iterator, Optional
 
 import pytest
 
-from vlm_router_brain.catalog import Catalog, Route, parse_catalog
+from fake_api import FakeApi
+
+from vlm_router_brain import provider as provider_module
+from vlm_router_brain.catalog import Catalog, Route, load_catalog, parse_catalog
+from vlm_router_brain.openai_compatible import API_BASE_VARIABLE, API_KEY_VARIABLE
 from vlm_router_brain.provider import Reply
 
 NOTHING = '{"boxes": []}'
+
+
+@pytest.fixture(autouse=True)
+def no_api_from_the_shell(monkeypatch):
+    """No test reads an OpenAI-compatible API from the shell that runs the
+    suite: a test that wants one sets it."""
+    monkeypatch.delenv(API_BASE_VARIABLE, raising=False)
+    monkeypatch.delenv(API_KEY_VARIABLE, raising=False)
+
+
+# The key the tests give the fake API: it passes peppy's value filter and
+# is no real key.
+API_KEY = "sentinel-api-key-0451"
+# The provider keys that the node or a library could read on its own.
+PROVIDER_KEY_VARIABLES = ("GEMINI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY")
+
+
+def sentinel_of(variable: str) -> str:
+    """The value a test gives the provider key `variable`, which no request
+    to the fake API may carry."""
+    return f"sentinel-{variable.lower().replace('_', '-')}"
+
+
+@pytest.fixture(scope="module")
+def module_api() -> Iterator[FakeApi]:
+    """One fake OpenAI-compatible API for the whole test module."""
+    api = FakeApi()
+    yield api
+    api.close()
+
+
+@pytest.fixture
+def fake_api(module_api: FakeApi) -> FakeApi:
+    """The module's fake API, serving the shipped catalog's models, with no
+    request and no answer left by an earlier test."""
+    module_api.reset(entry.name for entry in load_catalog().entries)
+    return module_api
+
+
+@dataclass
+class ThroughApi:
+    api: FakeApi
+    #: The provider of each provider client the node made: none may be.
+    provider_clients: list[str]
+
+
+@pytest.fixture
+def through_api(monkeypatch, fake_api: FakeApi) -> ThroughApi:
+    """The node's environment names the fake API, with API_KEY, and holds a
+    sentinel in each provider key; 127.0.0.1 goes through no proxy.
+    AnyLLM.create, which makes a provider's client, records each call and
+    fails it."""
+    monkeypatch.setenv(API_BASE_VARIABLE, fake_api.base)
+    monkeypatch.setenv(API_KEY_VARIABLE, API_KEY)
+    for variable in PROVIDER_KEY_VARIABLES:
+        monkeypatch.setenv(variable, sentinel_of(variable))
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    made: list[str] = []
+
+    def create(provider, **kwargs):
+        made.append(provider)
+        raise RuntimeError(f"a client of the provider {provider} was made")
+
+    monkeypatch.setattr(provider_module.AnyLLM, "create", staticmethod(create))
+    return ThroughApi(fake_api, made)
 
 
 @dataclass(frozen=True)
